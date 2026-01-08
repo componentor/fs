@@ -446,11 +446,13 @@ Another tab or operation has the file open. The library uses `navigator.locks` t
 
 ## Changelog
 
-### v2.0.3 (2025)
+### v2.0.4 (2025)
 
 **Bug Fixes:**
 - Handle idle timeout now works for both Tier 1 and Tier 2
 - Previously only Tier 1 kernel had idle release; Tier 2 kernel now also releases handles after 2s
+
+### v2.0.3 (2025)
 - Reduced handle idle timeout from 5s to 2s for faster external tool access
 - Added tests verifying handles are properly released after idle timeout
 
