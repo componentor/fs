@@ -1,0 +1,66 @@
+{
+  "name": "@componentor/fs",
+  "version": "1.2.8",
+  "description": "A blazing-fast, Node.js-compatible filesystem for the browser using OPFS",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./worker": {
+      "types": "./dist/opfs-worker-proxy.d.ts",
+      "import": "./dist/opfs-worker-proxy.js"
+    },
+    "./worker-script": {
+      "import": "./dist/opfs-worker.js"
+    },
+    "./hybrid": {
+      "types": "./dist/opfs-hybrid.d.ts",
+      "import": "./dist/opfs-hybrid.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/componentor/fs.git"
+  },
+  "author": "Componentor",
+  "license": "MIT",
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "npm run build && vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "opfs",
+    "fs",
+    "isomorphic-git",
+    "filesystem",
+    "browser",
+    "web",
+    "typescript"
+  ],
+  "bugs": {
+    "url": "https://github.com/componentor/fs/issues"
+  },
+  "homepage": "https://github.com/componentor/fs#readme",
+  "devDependencies": {
+    "@isomorphic-git/lightning-fs": "^4.6.2",
+    "@types/node": "^25.0.3",
+    "happy-dom": "^20.0.10",
+    "isomorphic-git": "^1.35.1",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3",
+    "vitest": "^4.0.12"
+  }
+}

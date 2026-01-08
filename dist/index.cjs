@@ -326,8 +326,9 @@ var FSError = class _FSError extends Error {
     this.errno = errno;
     this.syscall = syscall;
     this.path = path;
-    if (Error.captureStackTrace) {
-      Error.captureStackTrace(this, _FSError);
+    const ErrorWithCapture = Error;
+    if (ErrorWithCapture.captureStackTrace) {
+      ErrorWithCapture.captureStackTrace(this, _FSError);
     }
   }
 };

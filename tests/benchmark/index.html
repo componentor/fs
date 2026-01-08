@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>OPFS-FS Benchmark Suite</title>
+  <title>@componentor/fs v2.0.0 Benchmark Suite</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -154,7 +154,7 @@
 
   <div class="legend">
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #ffc107, #ff9800);"></div> LightningFS (IndexedDB)</div>
-    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #e83e8c, #ff6b9d);"></div> @componentor/fs (OPFS)</div>
+    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #e83e8c, #ff6b9d);"></div> @componentor/fs v1.2.8 (Legacy)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #28a745, #20c997);"></div> OPFS Tier 1 Sync (Worker + Atomics)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #17a2b8, #20c997);"></div> OPFS Tier 1 Promises (Worker + fastCall)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #007bff, #00d4ff);"></div> OPFS Tier 2 (Main Thread Promises)</div>
@@ -316,11 +316,11 @@
       LightningFS = lfsModule.default;
       log('LightningFS loaded', 'success');
 
-      log('Loading @componentor/fs...', 'info');
+      log('Loading @componentor/fs v1.2.8 (legacy for comparison)...', 'info');
       const componentorModule = await import('https://esm.sh/@componentor/fs@1.2.8');
       ComponentorFS = componentorModule.default;
       componentorFs = new ComponentorFS();
-      log('@componentor/fs loaded', 'success');
+      log('@componentor/fs v1.2.8 loaded', 'success');
 
       log('Loading isomorphic-git...', 'info');
       const gitModule = await import('https://esm.sh/isomorphic-git@1.27.1');

@@ -1,0 +1,67 @@
+# Page snapshot
+
+```yaml
+- generic [ref=e1]:
+  - heading "OPFS-FS Benchmark Suite" [level=1] [ref=e2]
+  - generic [ref=e3]:
+    - heading "Environment" [level=3] [ref=e4]
+    - generic [ref=e5]:
+      - generic [ref=e6]: "Yes"
+      - generic [ref=e7]: Cross-Origin Isolated
+    - generic [ref=e8]:
+      - generic [ref=e9]: "Yes"
+      - generic [ref=e10]: SharedArrayBuffer
+    - generic [ref=e11]:
+      - generic [ref=e12]: "Yes"
+      - generic [ref=e13]: Atomics
+    - generic [ref=e14]:
+      - generic [ref=e15]: "Yes"
+      - generic [ref=e16]: OPFS Available
+  - generic [ref=e17]:
+    - button "Run All Benchmarks" [ref=e18] [cursor=pointer]
+    - button "Write Test" [ref=e19] [cursor=pointer]
+    - button "Read Test" [ref=e20] [cursor=pointer]
+    - button "Large File Test" [active] [ref=e21] [cursor=pointer]
+    - button "Batch Write" [ref=e22] [cursor=pointer]
+    - button "Batch Read" [ref=e23] [cursor=pointer]
+    - button "Git Clone" [ref=e24] [cursor=pointer]
+    - button "Git Status" [ref=e25] [cursor=pointer]
+  - generic [ref=e26]: Benchmark complete!
+  - generic [ref=e27]:
+    - generic [ref=e28]: LightningFS (IndexedDB)
+    - generic [ref=e30]: "@componentor/fs v1.2.8 (Legacy)"
+    - generic [ref=e32]: OPFS Tier 1 Sync (Worker + Atomics)
+    - generic [ref=e34]: OPFS Tier 1 Promises (Worker + fastCall)
+    - generic [ref=e36]: OPFS Tier 2 (Main Thread Promises)
+  - heading "Results" [level=2] [ref=e38]
+  - generic [ref=e39]:
+    - table [ref=e40]:
+      - rowgroup [ref=e41]:
+        - row "Test LightningFS @componentor/fs Tier 1 Sync Tier 1 Promises Tier 2 Best" [ref=e42]:
+          - columnheader "Test" [ref=e43]
+          - columnheader "LightningFS" [ref=e44]
+          - columnheader "@componentor/fs" [ref=e45]
+          - columnheader "Tier 1 Sync" [ref=e46]
+          - columnheader "Tier 1 Promises" [ref=e47]
+          - columnheader "Tier 2" [ref=e48]
+          - columnheader "Best" [ref=e49]
+      - rowgroup [ref=e50]:
+        - row "Large 10 x 1MB 10.4ms (958 ops/s) 22.3ms (448 ops/s) 23.1ms (433 ops/s) 23.4ms (427 ops/s) 24.4ms (409 ops/s) LightningFS 1.00x vs LFS" [ref=e51]:
+          - cell "Large 10 x 1MB" [ref=e52]:
+            - strong [ref=e53]: Large 10 x 1MB
+          - cell "10.4ms (958 ops/s)" [ref=e54]: 10.4ms (958 ops/s)
+          - cell "22.3ms (448 ops/s)" [ref=e57]: 22.3ms (448 ops/s)
+          - cell "23.1ms (433 ops/s)" [ref=e60]: 23.1ms (433 ops/s)
+          - cell "23.4ms (427 ops/s)" [ref=e63]: 23.4ms (427 ops/s)
+          - cell "24.4ms (409 ops/s)" [ref=e66]: 24.4ms (409 ops/s)
+          - cell "LightningFS 1.00x vs LFS" [ref=e69]:
+            - strong [ref=e70]: LightningFS
+            - text: 1.00x vs LFS
+    - generic [ref=e71]:
+      - heading "Summary" [level=3] [ref=e72]
+      - paragraph [ref=e73]:
+        - text: "Average OPFS speedup vs LightningFS:"
+        - strong [ref=e74]: 0.45x
+  - heading "Log" [level=2] [ref=e75]
+  - generic [ref=e76]: "[8:10:02 PM] Loading OPFS-FS... [8:10:02 PM] OPFS-FS loaded (fs + fsTier2 for async-only testing) [8:10:02 PM] Loading LightningFS... [8:10:02 PM] LightningFS loaded [8:10:02 PM] Loading @componentor/fs v1.2.8 (legacy for comparison)... [8:10:02 PM] @componentor/fs v1.2.8 loaded [8:10:02 PM] Loading isomorphic-git... [8:10:02 PM] isomorphic-git loaded [8:10:02 PM] Initializing Tier 1 worker (Atomics)... [8:10:02 PM] [T1Worker] Worker script loaded [8:10:02 PM] [T1Worker] Received: init [8:10:02 PM] [T1Worker] Importing module... [8:10:02 PM] [T1Worker] Module imported [8:10:02 PM] [T1Worker] Got fs: true [8:10:02 PM] [T1Worker] Got OPFS root: true [8:10:02 PM] [T1Worker] Calling initSync(/kernel.js)... [8:10:02 PM] [T1Worker] initSync done - Tier 1 ready! [8:10:02 PM] Tier 1 worker ready [8:10:02 PM] Initializing sync kernel for main thread... [8:10:02 PM] Sync kernel ready (main thread can use Atomics.waitAsync) [8:10:02 PM] fsTier2 will use async worker path (Tier 2) [8:10:02 PM] Testing LightningFS large write (10 x 1MB)... [8:10:02 PM] LightningFS: 10.43ms [8:10:02 PM] Testing @componentor/fs large write (10 x 1MB)... [8:10:02 PM] @componentor/fs: 22.31ms [8:10:02 PM] Testing OPFS Tier 2 (Promises)... [8:10:02 PM] OPFS Tier 2: 24.43ms [8:10:02 PM] Testing OPFS Tier 1 Sync (Atomics) for large files... [8:10:02 PM] [T1Worker] Received: benchmark-write [8:10:02 PM] [T1Worker] Creating benchmark directory... [8:10:02 PM] [T1Worker] Directory created, starting benchmark... [8:10:02 PM] [T1Worker] Benchmark done, cleaning up... [8:10:02 PM] OPFS Tier 1 Sync: 23.09ms [8:10:02 PM] Testing OPFS Tier 1 Promises for large files... [8:10:02 PM] [T1Worker] Received: benchmark-promises-write [8:10:02 PM] [T1Worker] Creating promises write benchmark directory... [8:10:02 PM] [T1Worker] Starting promises write benchmark... [8:10:02 PM] [T1Worker] Promises write done, cleaning up... [8:10:02 PM] OPFS Tier 1 Promises: 23.42ms"
+```

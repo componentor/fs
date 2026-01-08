@@ -589,7 +589,7 @@ declare namespace path {
  *
  * @example
  * ```typescript
- * import { fs } from 'opfs-fs';
+ * import { fs } from '@componentor/fs';
  *
  * // Sync API (requires crossOriginIsolated)
  * fs.writeFileSync('/hello.txt', 'Hello World!');

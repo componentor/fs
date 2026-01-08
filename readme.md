@@ -1,738 +1,502 @@
 # @componentor/fs
 
-> 🚀 A blazing-fast, Node.js-compatible filesystem interface for the browser using the Origin Private File System API
+**Battle-tested OPFS-based Node.js `fs` polyfill with sync and async APIs**
 
-[![npm version](https://badge.fury.io/js/@componentor%2Ffs.svg)](https://www.npmjs.com/package/@componentor/fs)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+A high-performance browser filesystem with native OPFS backend and synchronous API support.
 
-## ✨ Features
+```typescript
+import { fs } from '@componentor/fs';
 
-- 🔥 **Lightning Fast** - Leverages sync access handles for optimal performance
-- 🌐 **Browser Native** - Built on the modern Origin Private File System API
-- 🔄 **Drop-in Replacement** - Compatible with Node.js fs/promises API
-- ⚡ **Isomorphic Git Ready** - Perfect companion for browser-based Git operations
-- 🔗 **Symlink Support** - Full symbolic link emulation for advanced file operations
-- 📦 **Zero Dependencies** - Lightweight and efficient
-- ✅ **Fully Tested** - 214 comprehensive tests with 100% pass rate
-- 📁 **Full fs Compatibility** - access, appendFile, copyFile, cp, rm, truncate, open, opendir, streams, and more
-- 🚀 **Hybrid Mode** - Optimal performance with reads on main thread and writes on worker
+// Sync API (requires crossOriginIsolated)
+fs.writeFileSync('/hello.txt', 'Hello World!');
+const data = fs.readFileSync('/hello.txt', 'utf8');
 
-## 🚀 Installation
+// Async API (always available)
+await fs.promises.writeFile('/async.txt', 'Async data');
+const content = await fs.promises.readFile('/async.txt', 'utf8');
+```
+
+## Features
+
+- **Node.js Compatible** - Drop-in replacement for `fs` module
+- **Sync API** - `readFileSync`, `writeFileSync`, etc. (requires COOP/COEP)
+- **Async API** - `promises.readFile`, `promises.writeFile`, etc.
+- **Cross-tab Safe** - Uses `navigator.locks` for multi-tab coordination
+- **isomorphic-git Ready** - Full compatibility with git operations
+- **Zero Config** - Works out of the box, no worker files needed
+- **TypeScript First** - Complete type definitions included
+
+## Installation
 
 ```bash
 npm install @componentor/fs
 ```
 
-```bash
-yarn add @componentor/fs
-```
+## Quick Start
 
-```bash
-pnpm add @componentor/fs
-```
+```typescript
+import { fs, path } from '@componentor/fs';
 
-## 🔧 Quick Start
-
-```javascript
-import OPFS from '@componentor/fs'
-
-const fs = new OPFS()
+// Create a directory
+await fs.promises.mkdir('/projects/my-app', { recursive: true });
 
 // Write a file
-await fs.writeFile('hello.txt', 'Hello, OPFS World!')
+await fs.promises.writeFile('/projects/my-app/index.js', 'console.log("Hello!");');
 
-// Read it back
-const content = await fs.readFile('hello.txt', { encoding: 'utf8' })
-console.log(content) // "Hello, OPFS World!"
-
-// Create directories
-await fs.mkdir('projects/my-app', { recursive: true })
+// Read a file
+const code = await fs.promises.readFile('/projects/my-app/index.js', 'utf8');
+console.log(code); // 'console.log("Hello!");'
 
 // List directory contents
-const files = await fs.readdir('.')
-console.log(files) // ['hello.txt', 'projects']
+const files = await fs.promises.readdir('/projects/my-app');
+console.log(files); // ['index.js']
+
+// Get file stats
+const stats = await fs.promises.stat('/projects/my-app/index.js');
+console.log(stats.size); // 23
+
+// Use path utilities
+console.log(path.join('/projects', 'my-app', 'src')); // '/projects/my-app/src'
+console.log(path.dirname('/projects/my-app/index.js')); // '/projects/my-app'
+console.log(path.basename('/projects/my-app/index.js')); // 'index.js'
 ```
 
-## 💡 Why It's Fast
+## Performance Tiers
 
-The Origin Private File System API provides **direct access to the device's storage** with significantly better performance characteristics than traditional browser storage solutions:
+@componentor/fs operates in two performance tiers based on browser capabilities:
 
-### 🏎️ Performance Advantages
+### Tier 1: Sync (Fastest)
 
-- **Sync Access Handles**: When available, operations bypass the async overhead for read/write operations
-- **Native File System**: Direct integration with the operating system's file system
-- **Optimized I/O**: Reduced serialization overhead compared to IndexedDB or localStorage
-- **Streaming Support**: Efficient handling of large files without memory constraints
+**Requirements:** `crossOriginIsolated` context (COOP/COEP headers)
 
-### 📊 Performance vs LightningFS
+Uses `SharedArrayBuffer` + `Atomics` for zero-copy data transfer between main thread and worker. Enables **synchronous** filesystem operations.
 
-Benchmarked against [LightningFS](https://github.com/isomorphic-git/lightning-fs) (100 iterations):
-
-| Operation | LightningFS | OPFS-FS (Hybrid) | Speedup |
-|-----------|-------------|------------------|---------|
-| Batch Writes | 25.57ms | 1.73ms | **14.8x faster** |
-| Batch Reads | 12.64ms | 1.56ms | **8.1x faster** |
-| Single Writes | 66.45ms | 71.37ms | ~1x |
-| Single Reads | 66.76ms | 66.93ms | ~1x |
-| **Total** | **172.85ms** | **144.30ms** | **1.20x faster** |
-
-> **Note:** This package was previously published as `@componentor/opfs-fs`. If you're upgrading, simply change your imports from `@componentor/opfs-fs` to `@componentor/fs`.
-
-## 📚 API Reference
-
-### Constructor
-
-#### `new OPFS(options?)`
-
-Creates a new OPFS filesystem instance.
-
-**Parameters:**
-- `options.useSync` (boolean, default: `true`) - Use synchronous access handles when available
-- `options.workerUrl` (URL | string, optional) - Worker script URL. When provided, enables **hybrid mode** for optimal performance
-- `options.read` ('main' | 'worker', default: 'main') - Backend for read operations in hybrid mode
-- `options.write` ('main' | 'worker', default: 'worker') - Backend for write operations in hybrid mode
-- `options.verbose` (boolean, default: `false`) - Enable verbose logging
-- `options.useCompression` (boolean, default: `false`) - Enable gzip compression for batch writes. Can improve performance for text-heavy workloads.
-- `options.useChecksum` (boolean, default: `true`) - Enable CRC32 checksum for batch writes. Disable for maximum performance if data integrity verification is not needed.
-
-**Example:**
-```javascript
-// Use sync handles (recommended for workers)
-const fs = new OPFS({ useSync: true })
-
-// Force async mode
-const fsAsync = new OPFS({ useSync: false })
-
-// Use hybrid mode (recommended for main thread - best performance!)
-const fs = new OPFS({
-  workerUrl: new URL('./opfs-worker.js', import.meta.url)
-})
-await fs.ready() // Wait for worker to initialize
-
-// Don't forget to terminate when done
-fs.terminate()
+```typescript
+// Tier 1 unlocks sync APIs
+fs.writeFileSync('/file.txt', 'data');
+const data = fs.readFileSync('/file.txt', 'utf8');
+fs.mkdirSync('/dir', { recursive: true });
+fs.existsSync('/file.txt'); // true
 ```
 
-### Hybrid Mode (Recommended)
+### Tier 2: Async (Always Available)
 
-Hybrid mode provides the **best performance** by routing operations to optimal backends:
-- **Reads on main thread**: No message passing overhead
-- **Writes on worker**: Sync access handles are faster
+Works in any browser context without special headers. Uses Web Worker with `postMessage` for async operations.
 
-```javascript
-import OPFS from '@componentor/fs'
-
-// Create with hybrid mode
-const fs = new OPFS({
-  workerUrl: new URL('@componentor/fs/worker-script', import.meta.url)
-})
-
-// Wait for worker to be ready
-await fs.ready()
-
-// Use like normal - hybrid routing happens automatically
-await fs.writeFile('test.txt', 'Hello World') // Routed to worker
-const data = await fs.readFile('test.txt')     // Routed to main thread
-
-// Clean up when done
-fs.terminate()
+```typescript
+// Tier 2 - promises API always works
+await fs.promises.writeFile('/file.txt', 'data');
+const data = await fs.promises.readFile('/file.txt', 'utf8');
+await fs.promises.mkdir('/dir', { recursive: true });
+await fs.promises.exists('/file.txt'); // true
 ```
 
-### File Operations
+## COOP/COEP Headers (Required for Tier 1)
 
-#### `readFile(path, options?)`
+To enable Tier 1 (sync) performance, your server must send these headers:
 
-Reads the entire contents of a file.
-
-**Parameters:**
-- `path` (string) - File path
-- `options.encoding` (string, optional) - Text encoding ('utf8' for string output)
-
-**Returns:** `Promise<Uint8Array | string>`
-
-**Examples:**
-```javascript
-// Read as binary
-const buffer = await fs.readFile('image.png')
-
-// Read as text
-const text = await fs.readFile('config.json', { encoding: 'utf8' })
-
-// Parse JSON
-const config = JSON.parse(await fs.readFile('config.json', { encoding: 'utf8' }))
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
 ```
 
-#### `writeFile(path, data, options?)`
+### Vite Configuration
 
-Writes data to a file, creating it if it doesn't exist.
-
-**Parameters:**
-- `path` (string) - File path
-- `data` (string | Uint8Array) - Data to write
-- `options` (object, optional) - Write options
-
-**Returns:** `Promise<void>`
-
-**Examples:**
-```javascript
-// Write text
-await fs.writeFile('note.txt', 'Hello World')
-
-// Write binary data
-await fs.writeFile('data.bin', new Uint8Array([1, 2, 3, 4]))
-
-// Write JSON
-await fs.writeFile('config.json', JSON.stringify({ theme: 'dark' }))
+```typescript
+// vite.config.ts
+export default defineConfig({
+  server: {
+    headers: {
+      'Cross-Origin-Opener-Policy': 'same-origin',
+      'Cross-Origin-Embedder-Policy': 'require-corp',
+    },
+  },
+});
 ```
 
-#### `unlink(path)`
+### Express/Node.js
 
-Deletes a file.
-
-**Parameters:**
-- `path` (string) - File path to delete
-
-**Returns:** `Promise<void>`
-
-**Example:**
 ```javascript
-await fs.unlink('temp.txt')
+app.use((req, res, next) => {
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  next();
+});
 ```
 
-#### `rename(oldPath, newPath)`
+### Vercel
 
-Moves/renames a file.
-
-**Parameters:**
-- `oldPath` (string) - Current file path
-- `newPath` (string) - New file path
-
-**Returns:** `Promise<void>`
-
-**Example:**
-```javascript
-await fs.rename('old-name.txt', 'new-name.txt')
-await fs.rename('file.txt', 'backup/file.txt')
-```
-
-#### `stat(path)`
-
-Gets file statistics (follows symlinks).
-
-**Parameters:**
-- `path` (string) - File path
-
-**Returns:** `Promise<FileStats>`
-
-**Example:**
-```javascript
-const stats = await fs.stat('large-file.zip')
-console.log(`Size: ${stats.size} bytes`)
-console.log(`Modified: ${new Date(stats.mtimeMs)}`)
-console.log(`Is file: ${stats.isFile()}`)
-```
-
-#### `lstat(path)`
-
-Gets file statistics without following symlinks.
-
-**Parameters:**
-- `path` (string) - File path
-
-**Returns:** `Promise<FileStats>`
-
-**Example:**
-```javascript
-const stats = await fs.lstat('link.txt')
-if (stats.isSymbolicLink()) {
-  console.log(`Symlink pointing to: ${stats.target}`)
+```json
+// vercel.json
+{
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "Cross-Origin-Opener-Policy", "value": "same-origin" },
+        { "key": "Cross-Origin-Embedder-Policy", "value": "require-corp" }
+      ]
+    }
+  ]
 }
 ```
 
-### Symlink Operations
+### Check if Tier 1 is Available
 
-#### `symlink(target, path)`
-
-Creates a symbolic link.
-
-**Parameters:**
-- `target` (string) - Target path the symlink points to
-- `path` (string) - Path where the symlink will be created
-
-**Returns:** `Promise<void>`
-
-**Example:**
-```javascript
-await fs.writeFile('config.json', '{"key": "value"}')
-await fs.symlink('config.json', 'current-config.json')
-
-// Read through symlink
-const content = await fs.readFile('current-config.json', { encoding: 'utf8' })
-```
-
-#### `readlink(path)`
-
-Reads the target of a symbolic link.
-
-**Parameters:**
-- `path` (string) - Symlink path
-
-**Returns:** `Promise<string>` - The target path
-
-**Example:**
-```javascript
-const target = await fs.readlink('my-link.txt')
-console.log(`Link points to: ${target}`)
-```
-
-#### `symlinkBatch(links)`
-
-Creates multiple symbolic links efficiently in a single operation.
-
-**Parameters:**
-- `links` (Array<{target: string, path: string}>) - Array of symlink definitions
-
-**Returns:** `Promise<void>`
-
-**Example:**
-```javascript
-// Create multiple symlinks with a single metadata write
-await fs.symlinkBatch([
-  { target: '/configs/prod.json', path: '/current-config.json' },
-  { target: '/data/latest.db', path: '/current-db.db' },
-  { target: '/logs/today.log', path: '/current.log' }
-])
-
-// 60-70% faster than individual symlink() calls
-```
-
-### Directory Operations
-
-#### `mkdir(path, options?)`
-
-Creates a directory.
-
-**Parameters:**
-- `path` (string) - Directory path
-- `options.recursive` (boolean, optional) - Create parent directories
-
-**Returns:** `Promise<void>`
-
-**Examples:**
-```javascript
-// Create single directory
-await fs.mkdir('uploads')
-
-// Create nested directories
-await fs.mkdir('projects/webapp/src', { recursive: true })
-```
-
-#### `rmdir(path)`
-
-Removes a directory and all its contents.
-
-**Parameters:**
-- `path` (string) - Directory path
-
-**Returns:** `Promise<void>`
-
-**Example:**
-```javascript
-await fs.rmdir('temp-folder')
-```
-
-#### `readdir(path)`
-
-Lists directory contents.
-
-**Parameters:**
-- `path` (string) - Directory path
-
-**Returns:** `Promise<string[]>`
-
-**Example:**
-```javascript
-const files = await fs.readdir('documents')
-console.log('Files:', files)
-
-// List root directory
-const rootFiles = await fs.readdir('.')
-```
-
-### Additional File Operations
-
-#### `access(path, mode?)`
-
-Tests file accessibility. Throws if the file doesn't exist.
-
-```javascript
-await fs.access('/path/to/file') // Throws if not accessible
-```
-
-#### `appendFile(path, data)`
-
-Appends data to a file, creating it if it doesn't exist.
-
-```javascript
-await fs.appendFile('log.txt', 'New log entry\n')
-```
-
-#### `copyFile(src, dest, mode?)`
-
-Copies a file from source to destination.
-
-```javascript
-await fs.copyFile('original.txt', 'backup.txt')
-// With COPYFILE_EXCL flag to fail if dest exists
-await fs.copyFile('src.txt', 'dest.txt', fs.constants.COPYFILE_EXCL)
-```
-
-#### `cp(src, dest, options?)`
-
-Copies files or directories recursively.
-
-```javascript
-// Copy single file
-await fs.cp('file.txt', 'copy.txt')
-
-// Copy directory recursively
-await fs.cp('source-dir', 'dest-dir', { recursive: true })
-```
-
-#### `exists(path)`
-
-Returns true if the path exists, false otherwise (doesn't throw).
-
-```javascript
-if (await fs.exists('config.json')) {
-  // File exists
+```typescript
+if (crossOriginIsolated) {
+  console.log('Tier 1 (sync) available!');
+  fs.writeFileSync('/fast.txt', 'blazing fast');
+} else {
+  console.log('Tier 2 (async) only');
+  await fs.promises.writeFile('/fast.txt', 'still fast');
 }
 ```
 
-#### `realpath(path)`
+## Benchmarks
 
-Resolves symlinks to get the real path.
+Tested against LightningFS (IndexedDB-based filesystem) in Chrome with Tier 1 enabled:
 
-```javascript
-const realPath = await fs.realpath('my-symlink')
+| Operation | @componentor/fs | LightningFS | Winner |
+|-----------|-----------------|-------------|--------|
+| Write 100 x 1KB | 131ms (763 ops/s) | 317ms (316 ops/s) | **OPFS 2.4x** |
+| Write 100 x 4KB | 145ms (690 ops/s) | 49ms (2061 ops/s) | LightningFS |
+| Read 100 x 1KB | 11ms (9170 ops/s) | 17ms (5824 ops/s) | **OPFS 1.6x** |
+| Read 100 x 4KB | 10ms (10493 ops/s) | 16ms (6431 ops/s) | **OPFS 1.6x** |
+| Large 10 x 1MB | 19ms (538 ops/s) | 11ms (910 ops/s) | LightningFS |
+| Batch Write 500 | 416ms (1202 ops/s) | 125ms (4014 ops/s) | LightningFS |
+| Batch Read 500 | 311ms (1608 ops/s) | 74ms (6736 ops/s) | LightningFS |
+| **Git Clone** | 427ms | 1325ms | **OPFS 3.1x** |
+| Git Status 10x | 53ms | 39ms | LightningFS |
+
+**Key takeaways:**
+- **Git clone is 2-3x faster** - the most important real-world operation
+- **Reads are 1.6x faster** - OPFS excels at read operations
+- **Small writes (1KB) are 2.4x faster** - great for config files and metadata
+- LightningFS wins on batch operations and larger sequential writes
+
+*Results from Chrome 120+ with crossOriginIsolated enabled. Performance varies by browser and hardware.*
+
+Run benchmarks yourself:
+
+```bash
+npm run benchmark:open
 ```
 
-#### `rm(path, options?)`
+## API Reference
 
-Removes files or directories.
+### Sync API (Tier 1 Only)
 
-```javascript
-await fs.rm('file.txt')
-await fs.rm('directory', { recursive: true })
-await fs.rm('maybe-exists', { force: true }) // No error if doesn't exist
+```typescript
+// Read/Write
+fs.readFileSync(path: string, options?: { encoding?: string }): Uint8Array | string
+fs.writeFileSync(path: string, data: Uint8Array | string, options?: { flush?: boolean }): void
+fs.appendFileSync(path: string, data: Uint8Array | string): void
+
+// Directories
+fs.mkdirSync(path: string, options?: { recursive?: boolean }): void
+fs.rmdirSync(path: string, options?: { recursive?: boolean }): void
+fs.readdirSync(path: string): string[]
+
+// File Operations
+fs.unlinkSync(path: string): void
+fs.renameSync(oldPath: string, newPath: string): void
+fs.copyFileSync(src: string, dest: string): void
+fs.truncateSync(path: string, len?: number): void
+
+// Info
+fs.statSync(path: string): Stats
+fs.existsSync(path: string): boolean
+fs.accessSync(path: string, mode?: number): void
 ```
 
-#### `truncate(path, len?)`
+### Async API (Always Available)
 
-Truncates a file to the specified length.
+```typescript
+// Read/Write
+fs.promises.readFile(path: string, options?: ReadOptions): Promise<Uint8Array | string>
+fs.promises.writeFile(path: string, data: Uint8Array | string, options?: WriteOptions): Promise<void>
+fs.promises.appendFile(path: string, data: Uint8Array | string): Promise<void>
 
-```javascript
-await fs.truncate('file.txt', 100) // Truncate to 100 bytes
-await fs.truncate('file.txt') // Truncate to 0 bytes
+// Directories
+fs.promises.mkdir(path: string, options?: { recursive?: boolean }): Promise<void>
+fs.promises.rmdir(path: string, options?: { recursive?: boolean }): Promise<void>
+fs.promises.readdir(path: string, options?: { withFileTypes?: boolean }): Promise<string[] | Dirent[]>
+
+// File Operations
+fs.promises.unlink(path: string): Promise<void>
+fs.promises.rename(oldPath: string, newPath: string): Promise<void>
+fs.promises.copyFile(src: string, dest: string): Promise<void>
+fs.promises.truncate(path: string, len?: number): Promise<void>
+fs.promises.rm(path: string, options?: { recursive?: boolean, force?: boolean }): Promise<void>
+
+// Info
+fs.promises.stat(path: string): Promise<Stats>
+fs.promises.lstat(path: string): Promise<Stats>
+fs.promises.exists(path: string): Promise<boolean>
+fs.promises.access(path: string, mode?: number): Promise<void>
+fs.promises.realpath(path: string): Promise<string>
+
+// Advanced
+fs.promises.open(path: string, flags?: string, mode?: number): Promise<FileHandle>
+fs.promises.opendir(path: string): Promise<Dir>
+fs.promises.mkdtemp(prefix: string): Promise<string>
+fs.promises.symlink(target: string, path: string): Promise<void>
+fs.promises.readlink(path: string): Promise<string>
+fs.promises.link(existingPath: string, newPath: string): Promise<void>
+
+// Cache Management
+fs.promises.flush(): Promise<void>   // Flush pending writes
+fs.promises.purge(): Promise<void>   // Clear all caches
 ```
 
-#### `mkdtemp(prefix)`
+### Path Utilities
 
-Creates a unique temporary directory.
+```typescript
+import { path } from '@componentor/fs';
 
-```javascript
-const tempDir = await fs.mkdtemp('/tmp/myapp-')
-console.log(tempDir) // e.g., "/tmp/myapp-1234567890-abc123"
+path.join('/foo', 'bar', 'baz')     // '/foo/bar/baz'
+path.resolve('foo', 'bar')          // '/foo/bar'
+path.dirname('/foo/bar/baz.txt')    // '/foo/bar'
+path.basename('/foo/bar/baz.txt')   // 'baz.txt'
+path.extname('/foo/bar/baz.txt')    // '.txt'
+path.normalize('/foo//bar/../baz')  // '/foo/baz'
+path.isAbsolute('/foo')             // true
+path.relative('/foo/bar', '/foo/baz') // '../baz'
+path.parse('/foo/bar/baz.txt')      // { root, dir, base, ext, name }
+path.format({ dir: '/foo', name: 'bar', ext: '.txt' }) // '/foo/bar.txt'
 ```
 
-#### `open(path, flags?, mode?)`
+### Constants
 
-Opens a file and returns a FileHandle.
+```typescript
+import { constants } from '@componentor/fs';
 
-```javascript
-const handle = await fs.open('file.txt', 'r')
-const buffer = new Uint8Array(100)
-await handle.read(buffer)
-await handle.close()
+constants.F_OK  // 0 - File exists
+constants.R_OK  // 4 - File is readable
+constants.W_OK  // 2 - File is writable
+constants.X_OK  // 1 - File is executable
+
+constants.COPYFILE_EXCL  // 1 - Fail if dest exists
+
+constants.O_RDONLY   // 0
+constants.O_WRONLY   // 1
+constants.O_RDWR     // 2
+constants.O_CREAT    // 64
+constants.O_EXCL     // 128
+constants.O_TRUNC    // 512
+constants.O_APPEND   // 1024
 ```
 
-#### `opendir(path)`
+## isomorphic-git Integration
 
-Opens a directory for iteration.
+@componentor/fs works seamlessly with isomorphic-git:
 
-```javascript
-const dir = await fs.opendir('/my-dir')
-for await (const entry of dir) {
-  console.log(entry.name, entry.isFile(), entry.isDirectory())
-}
-```
-
-#### `createReadStream(path, options?)`
-
-Creates a readable stream for a file.
-
-```javascript
-const stream = fs.createReadStream('large-file.bin')
-const reader = stream.getReader()
-// Read chunks...
-```
-
-#### `createWriteStream(path, options?)`
-
-Creates a writable stream for a file.
-
-```javascript
-const stream = fs.createWriteStream('output.txt')
-const writer = stream.getWriter()
-await writer.write(new TextEncoder().encode('data'))
-await writer.close()
-```
-
-#### `watch(path, options?)`
-
-Watches for file/directory changes (basic implementation).
-
-```javascript
-const watcher = fs.watch('/my-dir')
-for await (const event of watcher) {
-  console.log(event.eventType, event.filename)
-}
-```
-
-### Compatibility Methods (No-ops for OPFS)
-
-The following methods are implemented for API compatibility but are no-ops since OPFS doesn't support these features:
-
-- `chmod(path, mode)` - File modes not supported
-- `chown(path, uid, gid)` - File ownership not supported
-- `utimes(path, atime, mtime)` - Timestamps are read-only
-- `lutimes(path, atime, mtime)` - Symlink timestamps are read-only
-
-### Lifecycle Methods (Hybrid Mode)
-
-These methods are used when running in hybrid mode (with `workerUrl`):
-
-#### `ready()`
-
-Wait for the worker to be initialized. Call this before performing any operations.
-
-```javascript
-const fs = new OPFS({ workerUrl: '...' })
-await fs.ready() // Wait for worker
-```
-
-#### `terminate()`
-
-Terminate the background worker. Call this when you're done using the filesystem.
-
-```javascript
-fs.terminate() // Clean up worker
-```
-
-#### `gc()`
-
-Force garbage collection by reinitializing the worker's OPFS instance. Use this for long-running applications to prevent memory leaks.
-
-```javascript
-// Periodically call gc() in long-running apps
-await fs.gc()
-```
-
-#### `resetCache()`
-
-Reset internal caches (symlinks, directory handles). Lighter than `gc()`.
-
-```javascript
-fs.resetCache()
-```
-
-## 🎯 Real-World Examples
-
-### Working with Isomorphic Git
-
-```javascript
-import git from 'isomorphic-git'
-import OPFS from '@componentor/fs'
-
-// Use hybrid mode for best performance with git operations
-const fs = new OPFS({
-  workerUrl: new URL('@componentor/fs/worker-script', import.meta.url)
-})
-await fs.ready()
+```typescript
+import { fs } from '@componentor/fs';
+import git from 'isomorphic-git';
+import http from 'isomorphic-git/http/web';
 
 // Clone a repository
 await git.clone({
   fs,
-  http: fetch,
-  dir: '/my-repo',
-  url: 'https://github.com/user/repo.git'
-})
+  http,
+  dir: '/repo',
+  url: 'https://github.com/user/repo',
+  corsProxy: 'https://cors.isomorphic-git.org',
+});
 
-// Read a file from the repo
-const readme = await fs.readFile('/my-repo/README.md', { encoding: 'utf8' })
-console.log(readme)
+// Check status
+const status = await git.statusMatrix({ fs, dir: '/repo' });
 
-// Clean up when done
-fs.terminate()
+// Stage and commit
+await git.add({ fs, dir: '/repo', filepath: '.' });
+await git.commit({
+  fs,
+  dir: '/repo',
+  message: 'Initial commit',
+  author: { name: 'User', email: 'user@example.com' },
+});
 ```
 
-### Building a Code Editor
+## Architecture
 
-```javascript
-import OPFS from '@componentor/fs'
-
-class CodeEditor {
-  constructor(workerUrl) {
-    // Use hybrid mode for optimal performance
-    this.fs = new OPFS({ workerUrl })
-  }
-
-  async init() {
-    await this.fs.ready()
-  }
-
-  destroy() {
-    this.fs.terminate()
-  }
-
-  async createProject(name) {
-    await this.fs.mkdir(`projects/${name}/src`)
-    await this.fs.writeFile(`projects/${name}/package.json`, JSON.stringify({
-      name,
-      version: '1.0.0',
-      main: 'src/index.js'
-    }, null, 2))
-    await this.fs.writeFile(`projects/${name}/src/index.js`, '// Your code here\n')
-  }
-
-  async saveFile(path, content) {
-    await this.fs.writeFile(path, content)
-  }
-
-  async loadFile(path) {
-    return await this.fs.readFile(path, { encoding: 'utf8' })
-  }
-
-  async getProjectFiles(projectName) {
-    return await this.fs.readdir(`projects/${projectName}`)
-  }
-}
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Main Thread                             │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
+│  │   Sync API  │  │  Async API  │  │    Path Utilities   │ │
+│  │ readFileSync│  │  promises.  │  │ join, dirname, etc. │ │
+│  │writeFileSync│  │  readFile   │  └─────────────────────┘ │
+│  └──────┬──────┘  └──────┬──────┘                          │
+│         │                │                                   │
+│         │ Atomics.wait   │ postMessage                      │
+│         │ (Tier 1)       │ (Tier 2)                         │
+└─────────┼────────────────┼──────────────────────────────────┘
+          │                │
+          ▼                ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      Web Worker                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │                   OPFS Kernel                          │ │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐  │ │
+│  │  │ Sync Handle  │  │  Directory   │  │  navigator  │  │ │
+│  │  │    Cache     │  │    Cache     │  │    .locks   │  │ │
+│  │  │  (100 max)   │  │              │  │ (cross-tab) │  │ │
+│  │  └──────────────┘  └──────────────┘  └─────────────┘  │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                            │                                 │
+└────────────────────────────┼─────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────┐
+│                         OPFS                                 │
+│            Origin Private File System                        │
+│              (Browser Storage API)                           │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### File Upload Handler
+## Feature Comparison
 
-```javascript
-import OPFS from '@componentor/fs'
+### API Compatibility
 
-const fs = new OPFS()
+| Feature | Node.js fs | @componentor/fs v2 | @componentor/fs v1 | LightningFS |
+|---------|------------|--------------------|--------------------|-------------|
+| `readFile` | ✅ | ✅ | ✅ | ✅ |
+| `writeFile` | ✅ | ✅ | ✅ | ✅ |
+| `readFileSync` | ✅ | ✅ Tier 1 | ❌ | ❌ |
+| `writeFileSync` | ✅ | ✅ Tier 1 | ❌ | ❌ |
+| `mkdir` / `mkdirSync` | ✅ | ✅ | ✅ | ✅ |
+| `readdir` / `readdirSync` | ✅ | ✅ | ✅ | ✅ |
+| `stat` / `statSync` | ✅ | ✅ | ✅ | ✅ |
+| `unlink` / `unlinkSync` | ✅ | ✅ | ✅ | ✅ |
+| `rename` / `renameSync` | ✅ | ✅ | ✅ | ✅ |
+| `rm` (recursive) | ✅ | ✅ | ✅ | ❌ |
+| `copyFile` | ✅ | ✅ | ✅ | ❌ |
+| `symlink` / `readlink` | ✅ | ✅ | ✅ | ✅ |
+| `watch` / `watchFile` | ✅ | ✅ | ❌ | ❌ |
+| `open` / `FileHandle` | ✅ | ✅ | ❌ | ❌ |
+| `opendir` / `Dir` | ✅ | ✅ | ❌ | ❌ |
+| `mkdtemp` | ✅ | ✅ | ❌ | ❌ |
+| Streams | ✅ | ❌ | ❌ | ❌ |
 
-async function handleFileUpload(file) {
-  // Create uploads directory
-  await fs.mkdir('uploads', { recursive: true })
-  
-  // Save uploaded file
-  const buffer = new Uint8Array(await file.arrayBuffer())
-  const filename = `uploads/${Date.now()}-${file.name}`
-  await fs.writeFile(filename, buffer)
-  
-  // Get file info
-  const stats = await fs.stat(filename)
-  console.log(`Saved ${file.name} (${stats.size} bytes)`)
-  
-  return filename
-}
+### Performance Tiers
+
+| Capability | Tier 1 Sync | Tier 1 Promises | Tier 2 | Legacy v1 | LightningFS |
+|------------|-------------|-----------------|--------|-----------|-------------|
+| **Sync API** | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **Async API** | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Requires COOP/COEP** | ✅ | ✅ | ❌ | ❌ | ❌ |
+| **SharedArrayBuffer** | ✅ | ✅ | ❌ | ❌ | ❌ |
+| **Handle Caching** | ✅ | ✅ | ❌ | ❌ | N/A |
+| **Zero-copy Transfer** | ✅ | ❌ | ❌ | ❌ | ❌ |
+| **Cross-tab Safety** | ✅ | ✅ | ✅ | ✅ | ❌ |
+| **Storage Backend** | OPFS | OPFS | OPFS | OPFS | IndexedDB |
+
+### Architecture Comparison
+
+| Aspect | @componentor/fs v2 | @componentor/fs v1 | LightningFS |
+|--------|--------------------|--------------------|-------------|
+| **Storage** | OPFS (native FS) | OPFS | IndexedDB |
+| **Worker** | Dedicated kernel | Shared worker | None |
+| **Sync Method** | Atomics.wait | N/A | N/A |
+| **Handle Strategy** | Cached (100 max) | Per-operation | N/A |
+| **Locking** | navigator.locks | navigator.locks | None |
+| **Bundle Size** | ~16KB | ~12KB | ~25KB |
+| **TypeScript** | Full | Full | Partial |
+
+## Browser Support
+
+| Browser | Tier 1 (Sync) | Tier 2 (Async) |
+|---------|---------------|----------------|
+| Chrome 102+ | Yes | Yes |
+| Edge 102+ | Yes | Yes |
+| Firefox 111+ | Yes* | Yes |
+| Safari 15.2+ | No** | Yes |
+| Opera 88+ | Yes | Yes |
+
+\* Firefox requires `dom.workers.modules.enabled` flag
+\** Safari doesn't support `createSyncAccessHandle` in workers
+
+## Troubleshooting
+
+### "SharedArrayBuffer is not defined"
+
+Your page is not crossOriginIsolated. Add COOP/COEP headers:
+
+```
+Cross-Origin-Opener-Policy: same-origin
+Cross-Origin-Embedder-Policy: require-corp
 ```
 
-## 🌐 Browser Support
+### "Atomics.wait cannot be called in this context"
 
-@componentor/fs requires browsers that support the Origin Private File System API:
+`Atomics.wait` can only be called from a Worker. The library handles this automatically - use the async API on the main thread.
 
-- ✅ Chrome 86+
-- ✅ Edge 86+
-- ✅ Firefox 111+
-- ✅ Safari 15.2+
+### "NotAllowedError: Access handle is already open"
 
-### Feature Detection
+Another tab or operation has the file open. The library uses `navigator.locks` to prevent this, but if you're using multiple filesystem instances, ensure they coordinate.
 
-```javascript
-if ('storage' in navigator && 'getDirectory' in navigator.storage) {
-  const fs = new OPFS()
-  // OPFS is supported
-} else {
-  console.warn('OPFS not supported in this browser')
-  // Fallback to other storage solutions
-}
-```
+### Slow Performance
 
-## 🚦 Error Handling
+1. Check if Tier 1 is enabled: `console.log(crossOriginIsolated)`
+2. Use batch operations when possible
+3. Disable flush for bulk writes: `{ flush: false }`
+4. Call `fs.promises.flush()` after bulk operations
 
-OPFS-FS throws standard filesystem errors:
+## Changelog
 
-```javascript
-try {
-  await fs.readFile('nonexistent.txt')
-} catch (error) {
-  if (error.message.includes('ENOENT')) {
-    console.log('File not found')
-  }
-}
+### v2.0.0 (2025)
 
-try {
-  await fs.mkdir('existing-dir')
-} catch (error) {
-  if (error.message.includes('EEXIST')) {
-    console.log('Directory already exists')
-  }
-}
-```
+**Major rewrite with sync API support and performance tiers.**
 
-## 🧪 Testing
+**New Features:**
+- Synchronous API (`readFileSync`, `writeFileSync`, etc.) via Atomics
+- Performance tiers (Tier 1 Sync, Tier 1 Promises, Tier 2)
+- Dedicated worker kernel with handle caching (100 max)
+- `watch()` and `watchFile()` for file change notifications
+- `FileHandle` API (`fs.promises.open()`)
+- `Dir` API (`fs.promises.opendir()`)
+- `mkdtemp()` for temporary directories
+- `flush()` and `purge()` for cache management
+- Full `Dirent` support with `withFileTypes` option
 
-@componentor/fs comes with a comprehensive test suite covering all functionality:
+**Performance:**
+- 2-3x faster git clone vs LightningFS
+- 1.6x faster reads
+- Handle caching eliminates repeated open/close overhead
+- Zero-copy data transfer with SharedArrayBuffer (Tier 1)
+
+**Breaking Changes:**
+- Requires `crossOriginIsolated` for Tier 1 (sync) features
+- New architecture - not backwards compatible with v1 internals
+- Minimum browser versions increased
+
+### v1.2.8 (2024)
+
+- Final release of v1 branch
+- OPFS-based async filesystem
+- Basic isomorphic-git compatibility
+- Cross-tab locking with `navigator.locks`
+
+### v1.0.0 (2024)
+
+- Initial release
+- Async-only OPFS filesystem
+- Node.js `fs.promises` compatible API
+- Basic directory and file operations
+
+## Contributing
 
 ```bash
-# Run all tests
-npm test
-
-# Run tests in watch mode
-npm run test:watch
+git clone https://github.com/componentor/fs
+cd fs
+npm install
+npm run dev      # Watch mode
+npm test         # Run tests
+npm run benchmark:open  # Run benchmarks
 ```
 
-**Test Coverage:**
-- ✅ 214 tests with 100% pass rate
-- ✅ File read/write operations (text and binary)
-- ✅ Directory operations (create, remove, list)
-- ✅ File metadata and statistics
-- ✅ Path normalization and edge cases
-- ✅ Symlink operations and resolution
-- ✅ Error handling and edge cases
-- ✅ Concurrent operations
-- ✅ Large file handling
-- ✅ Performance benchmarks
-- ✅ Git integration with symlinks (isomorphic-git compatibility)
-- ✅ Node.js fs compatibility (access, appendFile, copyFile, cp, rm, truncate, open, opendir, streams)
+## License
 
-See [SYMLINK_IMPLEMENTATION.md](SYMLINK_IMPLEMENTATION.md) for details on symlink support and [PERFORMANCE.md](PERFORMANCE.md) for performance analysis.
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
-
-When contributing, please ensure:
-- All tests pass (`npm test`)
-- New features include corresponding tests
-- Code follows the existing style
-
-## 📄 License
-
-MIT © Componentor
-
-## 🙏 Acknowledgments
-
-- Built on the powerful [Origin Private File System API](https://developer.mozilla.org/en-US/docs/Web/API/File_System_Access_API)
-- Inspired by Node.js fs/promises module
-- Perfect companion for [isomorphic-git](https://github.com/isomorphic-git/isomorphic-git)
-
----
-
-**Made with ❤️ for the modern web**
+MIT

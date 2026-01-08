@@ -1,66 +1,60 @@
 {
   "name": "@componentor/fs",
-  "version": "1.2.8",
-  "description": "A blazing-fast, Node.js-compatible filesystem for the browser using OPFS",
+  "version": "2.0.0",
+  "description": "Battle-tested OPFS-based Node.js fs polyfill with sync and async APIs",
+  "license": "MIT",
+  "author": "Componentor",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/componentor/fs.git"
+  },
+  "bugs": {
+    "url": "https://github.com/componentor/fs/issues"
+  },
+  "homepage": "https://github.com/componentor/fs#readme",
   "type": "module",
-  "main": "./dist/index.js",
+  "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js"
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
     },
-    "./worker": {
-      "types": "./dist/opfs-worker-proxy.d.ts",
-      "import": "./dist/opfs-worker-proxy.js"
-    },
-    "./worker-script": {
-      "import": "./dist/opfs-worker.js"
-    },
-    "./hybrid": {
-      "types": "./dist/opfs-hybrid.d.ts",
-      "import": "./dist/opfs-hybrid.js"
-    }
+    "./sw": "./dist/service-worker.js"
   },
   "files": [
-    "dist",
-    "src"
+    "dist"
   ],
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/componentor/fs.git"
-  },
-  "author": "Componentor",
-  "license": "MIT",
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
-    "test": "npm run build && vitest run",
-    "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run build"
+    "test": "vitest",
+    "test:browser": "vitest run",
+    "benchmark": "npm run build && playwright test",
+    "benchmark:server": "node tests/benchmark/server.js",
+    "benchmark:open": "npm run build && node tests/benchmark/server.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@isomorphic-git/lightning-fs": "^4.6.0",
+    "@playwright/test": "^1.40.0",
+    "@types/node": "^25.0.3",
+    "@vitest/browser": "^4.0.16",
+    "@vitest/browser-playwright": "^4.0.16",
+    "playwright": "^1.40.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0",
+    "vitest": "^4.0.16"
   },
   "keywords": [
     "opfs",
-    "fs",
-    "isomorphic-git",
     "filesystem",
+    "fs",
+    "polyfill",
     "browser",
-    "web",
-    "typescript"
-  ],
-  "bugs": {
-    "url": "https://github.com/componentor/fs/issues"
-  },
-  "homepage": "https://github.com/componentor/fs#readme",
-  "devDependencies": {
-    "@isomorphic-git/lightning-fs": "^4.6.2",
-    "@types/node": "^25.0.3",
-    "happy-dom": "^20.0.10",
-    "isomorphic-git": "^1.35.1",
-    "tsup": "^8.5.1",
-    "typescript": "^5.9.3",
-    "vitest": "^4.0.12"
-  }
+    "sync",
+    "async"
+  ]
 }

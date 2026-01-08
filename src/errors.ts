@@ -1,88 +1,148 @@
 /**
- * Custom error class for filesystem errors
+ * Node.js compatible filesystem error classes
  */
+
 export class FSError extends Error {
-  code: string
-  syscall?: string
-  path?: string
-  original?: Error
+  code: string;
+  errno: number;
+  syscall?: string;
+  path?: string;
 
-  constructor(message: string, code: string, options?: { syscall?: string; path?: string; original?: Error }) {
-    super(message)
-    this.name = 'FSError'
-    this.code = code
-    this.syscall = options?.syscall
-    this.path = options?.path
-    this.original = options?.original
+  constructor(code: string, errno: number, message: string, syscall?: string, path?: string) {
+    super(message);
+    this.name = 'FSError';
+    this.code = code;
+    this.errno = errno;
+    this.syscall = syscall;
+    this.path = path;
+
+    // Maintain proper stack trace (V8 specific)
+    const ErrorWithCapture = Error as unknown as { captureStackTrace?: (target: object, constructor: Function) => void };
+    if (ErrorWithCapture.captureStackTrace) {
+      ErrorWithCapture.captureStackTrace(this, FSError);
+    }
   }
 }
 
-/**
- * Create ENOENT (No such file or directory) error
- */
-export function createENOENT(path: string): FSError {
-  return new FSError(`ENOENT: No such file or directory, '${path}'`, 'ENOENT', { path })
+export const ErrorCodes = {
+  ENOENT: -2,
+  EEXIST: -17,
+  EISDIR: -21,
+  ENOTDIR: -20,
+  ENOTEMPTY: -39,
+  EACCES: -13,
+  EBADF: -9,
+  EINVAL: -22,
+  EMFILE: -24,
+  ENOSPC: -28,
+  EPERM: -1,
+  ENOSYS: -38,
+  ELOOP: -40,
+} as const;
+
+export function createENOENT(syscall: string, path: string): FSError {
+  return new FSError(
+    'ENOENT',
+    ErrorCodes.ENOENT,
+    `ENOENT: no such file or directory, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
 }
 
-/**
- * Create EEXIST (File exists) error
- */
-export function createEEXIST(path: string, operation?: string): FSError {
-  const message = operation
-    ? `EEXIST: file already exists, ${operation} '${path}'`
-    : `EEXIST: File exists, '${path}'`
-  return new FSError(message, 'EEXIST', { path })
+export function createEEXIST(syscall: string, path: string): FSError {
+  return new FSError(
+    'EEXIST',
+    ErrorCodes.EEXIST,
+    `EEXIST: file already exists, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
 }
 
-/**
- * Create EACCES (Permission denied) error
- */
-export function createEACCES(path: string, syscall?: string): FSError {
-  return new FSError(`EACCES: permission denied, access '${path}'`, 'EACCES', { syscall, path })
+export function createEISDIR(syscall: string, path: string): FSError {
+  return new FSError(
+    'EISDIR',
+    ErrorCodes.EISDIR,
+    `EISDIR: illegal operation on a directory, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
 }
 
-/**
- * Create EISDIR (Is a directory) error
- */
-export function createEISDIR(path: string, operation = 'operation'): FSError {
-  return new FSError(`EISDIR: illegal operation on a directory, ${operation} '${path}'`, 'EISDIR', { path })
+export function createENOTDIR(syscall: string, path: string): FSError {
+  return new FSError(
+    'ENOTDIR',
+    ErrorCodes.ENOTDIR,
+    `ENOTDIR: not a directory, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
 }
 
-/**
- * Create ELOOP (Too many symbolic links) error
- */
-export function createELOOP(path: string): FSError {
-  return new FSError(`ELOOP: Too many symbolic links, '${path}'`, 'ELOOP', { path })
+export function createENOTEMPTY(syscall: string, path: string): FSError {
+  return new FSError(
+    'ENOTEMPTY',
+    ErrorCodes.ENOTEMPTY,
+    `ENOTEMPTY: directory not empty, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
 }
 
-/**
- * Create EINVAL (Invalid argument) error
- */
-export function createEINVAL(path: string): FSError {
-  return new FSError(`EINVAL: Invalid argument, '${path}'`, 'EINVAL', { path })
+export function createEACCES(syscall: string, path: string): FSError {
+  return new FSError(
+    'EACCES',
+    ErrorCodes.EACCES,
+    `EACCES: permission denied, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
 }
 
-/**
- * Create ECORRUPTED (Data corruption detected) error
- */
-export function createECORRUPTED(path: string): FSError {
-  return new FSError(`ECORRUPTED: Pack file integrity check failed, '${path}'`, 'ECORRUPTED', { path })
+export function createEINVAL(syscall: string, path: string): FSError {
+  return new FSError(
+    'EINVAL',
+    ErrorCodes.EINVAL,
+    `EINVAL: invalid argument, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
 }
 
-/**
- * Wrap an error with a standard code if it doesn't have one
- */
-export function wrapError(err: unknown): FSError {
-  if (err instanceof FSError) return err
+export function createENOSYS(syscall: string, path: string): FSError {
+  return new FSError(
+    'ENOSYS',
+    ErrorCodes.ENOSYS,
+    `ENOSYS: function not implemented, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
+}
 
-  const error = err as Error
-  if (typeof (error as FSError).code === 'string') {
-    const fsErr = new FSError(error.message, (error as FSError).code)
-    fsErr.original = error
-    return fsErr
+export function createELOOP(syscall: string, path: string): FSError {
+  return new FSError(
+    'ELOOP',
+    ErrorCodes.ELOOP,
+    `ELOOP: too many symbolic links encountered, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
+}
+
+export function mapErrorCode(errorName: string, syscall: string, path: string): FSError {
+  switch (errorName) {
+    case 'NotFoundError':
+      return createENOENT(syscall, path);
+    case 'NotAllowedError':
+      return createEACCES(syscall, path);
+    case 'TypeMismatchError':
+      return createENOTDIR(syscall, path);
+    case 'InvalidModificationError':
+      return createENOTEMPTY(syscall, path);
+    case 'QuotaExceededError':
+      return new FSError('ENOSPC', ErrorCodes.ENOSPC, `ENOSPC: no space left on device, ${syscall} '${path}'`, syscall, path);
+    default:
+      return new FSError('EINVAL', ErrorCodes.EINVAL, `${errorName}: ${syscall} '${path}'`, syscall, path);
   }
-
-  const wrapped = new FSError(error.message || 'Unknown error', 'UNKNOWN')
-  wrapped.original = error
-  return wrapped
 }

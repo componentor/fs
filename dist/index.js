@@ -1,15 +1,282 @@
+var __defProp = Object.defineProperty;
+var __export = (target, all) => {
+  for (var name in all)
+    __defProp(target, name, { get: all[name], enumerable: true });
+};
+
+// src/path.ts
+var path_exports = {};
+__export(path_exports, {
+  basename: () => basename,
+  default: () => path_default,
+  delimiter: () => delimiter,
+  dirname: () => dirname,
+  extname: () => extname,
+  format: () => format,
+  isAbsolute: () => isAbsolute,
+  join: () => join,
+  normalize: () => normalize,
+  parse: () => parse,
+  posix: () => posix,
+  relative: () => relative,
+  resolve: () => resolve,
+  sep: () => sep
+});
+var sep = "/";
+var delimiter = ":";
+function normalize(p) {
+  if (p.length === 0) return ".";
+  const isAbsolute2 = p.charCodeAt(0) === 47;
+  const trailingSlash = p.charCodeAt(p.length - 1) === 47;
+  const segments = p.split("/");
+  const result = [];
+  for (const segment of segments) {
+    if (segment === "" || segment === ".") {
+      continue;
+    }
+    if (segment === "..") {
+      if (result.length > 0 && result[result.length - 1] !== "..") {
+        result.pop();
+      } else if (!isAbsolute2) {
+        result.push("..");
+      }
+    } else {
+      result.push(segment);
+    }
+  }
+  let normalized = result.join("/");
+  if (isAbsolute2) {
+    normalized = "/" + normalized;
+  }
+  if (trailingSlash && normalized.length > 1) {
+    normalized += "/";
+  }
+  return normalized || (isAbsolute2 ? "/" : ".");
+}
+function join(...paths) {
+  if (paths.length === 0) return ".";
+  let joined;
+  for (const path of paths) {
+    if (path.length > 0) {
+      if (joined === void 0) {
+        joined = path;
+      } else {
+        joined += "/" + path;
+      }
+    }
+  }
+  if (joined === void 0) return ".";
+  return normalize(joined);
+}
+function resolve(...paths) {
+  let resolvedPath = "";
+  let resolvedAbsolute = false;
+  for (let i = paths.length - 1; i >= -1 && !resolvedAbsolute; i--) {
+    const path = i >= 0 ? paths[i] : "/";
+    if (path == null || path.length === 0) continue;
+    resolvedPath = resolvedPath ? path + "/" + resolvedPath : path;
+    resolvedAbsolute = path.charCodeAt(0) === 47;
+  }
+  resolvedPath = normalize(resolvedPath);
+  if (resolvedPath.length > 1 && resolvedPath.endsWith("/")) {
+    resolvedPath = resolvedPath.slice(0, -1);
+  }
+  if (resolvedAbsolute) {
+    return resolvedPath.length > 0 ? resolvedPath : "/";
+  }
+  return resolvedPath.length > 0 ? resolvedPath : ".";
+}
+function isAbsolute(p) {
+  return p.length > 0 && p.charCodeAt(0) === 47;
+}
+function dirname(p) {
+  if (p.length === 0) return ".";
+  const hasRoot = p.charCodeAt(0) === 47;
+  let end = -1;
+  let matchedSlash = true;
+  for (let i = p.length - 1; i >= 1; --i) {
+    if (p.charCodeAt(i) === 47) {
+      if (!matchedSlash) {
+        end = i;
+        break;
+      }
+    } else {
+      matchedSlash = false;
+    }
+  }
+  if (end === -1) return hasRoot ? "/" : ".";
+  if (hasRoot && end === 1) return "//";
+  return p.slice(0, end);
+}
+function basename(p, ext) {
+  let start = 0;
+  let end = -1;
+  let matchedSlash = true;
+  for (let i = p.length - 1; i >= 0; --i) {
+    if (p.charCodeAt(i) === 47) {
+      if (!matchedSlash) {
+        start = i + 1;
+        break;
+      }
+    } else if (end === -1) {
+      matchedSlash = false;
+      end = i + 1;
+    }
+  }
+  if (end === -1) return "";
+  const base = p.slice(start, end);
+  if (ext && base.endsWith(ext)) {
+    return base.slice(0, base.length - ext.length);
+  }
+  return base;
+}
+function extname(p) {
+  let startDot = -1;
+  let startPart = 0;
+  let end = -1;
+  let matchedSlash = true;
+  let preDotState = 0;
+  for (let i = p.length - 1; i >= 0; --i) {
+    const code = p.charCodeAt(i);
+    if (code === 47) {
+      if (!matchedSlash) {
+        startPart = i + 1;
+        break;
+      }
+      continue;
+    }
+    if (end === -1) {
+      matchedSlash = false;
+      end = i + 1;
+    }
+    if (code === 46) {
+      if (startDot === -1) {
+        startDot = i;
+      } else if (preDotState !== 1) {
+        preDotState = 1;
+      }
+    } else if (startDot !== -1) {
+      preDotState = -1;
+    }
+  }
+  if (startDot === -1 || end === -1 || preDotState === 0 || preDotState === 1 && startDot === end - 1 && startDot === startPart + 1) {
+    return "";
+  }
+  return p.slice(startDot, end);
+}
+function relative(from, to) {
+  if (from === to) return "";
+  from = resolve(from);
+  to = resolve(to);
+  if (from === to) return "";
+  const fromParts = from.split("/").filter(Boolean);
+  const toParts = to.split("/").filter(Boolean);
+  let commonLength = 0;
+  const minLength = Math.min(fromParts.length, toParts.length);
+  for (let i = 0; i < minLength; i++) {
+    if (fromParts[i] === toParts[i]) {
+      commonLength++;
+    } else {
+      break;
+    }
+  }
+  const upCount = fromParts.length - commonLength;
+  const relativeParts = [];
+  for (let i = 0; i < upCount; i++) {
+    relativeParts.push("..");
+  }
+  for (let i = commonLength; i < toParts.length; i++) {
+    relativeParts.push(toParts[i]);
+  }
+  return relativeParts.join("/") || ".";
+}
+function parse(p) {
+  const ret = { root: "", dir: "", base: "", ext: "", name: "" };
+  if (p.length === 0) return ret;
+  const isAbsolutePath = p.charCodeAt(0) === 47;
+  if (isAbsolutePath) {
+    ret.root = "/";
+  }
+  let start = 0;
+  let end = -1;
+  let startDot = -1;
+  let matchedSlash = true;
+  let preDotState = 0;
+  for (let i = p.length - 1; i >= 0; --i) {
+    const code = p.charCodeAt(i);
+    if (code === 47) {
+      if (!matchedSlash) {
+        start = i + 1;
+        break;
+      }
+      continue;
+    }
+    if (end === -1) {
+      matchedSlash = false;
+      end = i + 1;
+    }
+    if (code === 46) {
+      if (startDot === -1) {
+        startDot = i;
+      } else if (preDotState !== 1) {
+        preDotState = 1;
+      }
+    } else if (startDot !== -1) {
+      preDotState = -1;
+    }
+  }
+  if (end !== -1) {
+    if (startDot === -1 || preDotState === 0 || preDotState === 1 && startDot === end - 1 && startDot === start + 1) {
+      ret.base = p.slice(start, end);
+      ret.name = ret.base;
+    } else {
+      ret.name = p.slice(start, startDot);
+      ret.base = p.slice(start, end);
+      ret.ext = p.slice(startDot, end);
+    }
+  }
+  if (start > 0) {
+    ret.dir = p.slice(0, start - 1);
+  } else if (isAbsolutePath) {
+    ret.dir = "/";
+  }
+  return ret;
+}
+function format(pathObject) {
+  const dir = pathObject.dir || pathObject.root || "";
+  const base = pathObject.base || (pathObject.name || "") + (pathObject.ext || "");
+  if (!dir) return base;
+  if (dir === pathObject.root) return dir + base;
+  return dir + "/" + base;
+}
+var posix = {
+  sep,
+  delimiter,
+  normalize,
+  join,
+  resolve,
+  isAbsolute,
+  dirname,
+  basename,
+  extname,
+  relative,
+  parse,
+  format
+};
+var path_default = posix;
+
 // src/constants.ts
 var constants = {
-  // File access modes
+  // File access constants
   F_OK: 0,
   R_OK: 4,
   W_OK: 2,
   X_OK: 1,
-  // Copy file flags
+  // File copy constants
   COPYFILE_EXCL: 1,
   COPYFILE_FICLONE: 2,
   COPYFILE_FICLONE_FORCE: 4,
-  // File open flags
+  // File open constants
   O_RDONLY: 0,
   O_WRONLY: 1,
   O_RDWR: 2,
@@ -17,2726 +284,2337 @@ var constants = {
   O_EXCL: 128,
   O_TRUNC: 512,
   O_APPEND: 1024,
-  // File type masks
+  O_SYNC: 4096,
+  // File type constants
   S_IFMT: 61440,
   S_IFREG: 32768,
   S_IFDIR: 16384,
-  S_IFLNK: 40960
+  S_IFCHR: 8192,
+  S_IFBLK: 24576,
+  S_IFIFO: 4096,
+  S_IFLNK: 40960,
+  S_IFSOCK: 49152,
+  // File mode constants
+  S_IRWXU: 448,
+  S_IRUSR: 256,
+  S_IWUSR: 128,
+  S_IXUSR: 64,
+  S_IRWXG: 56,
+  S_IRGRP: 32,
+  S_IWGRP: 16,
+  S_IXGRP: 8,
+  S_IRWXO: 7,
+  S_IROTH: 4,
+  S_IWOTH: 2,
+  S_IXOTH: 1
 };
-function flagsToString(flags) {
-  if (typeof flags === "string") return flags;
-  const map = {
-    [constants.O_RDONLY]: "r",
-    [constants.O_WRONLY]: "w",
-    [constants.O_RDWR]: "r+",
-    [constants.O_CREAT | constants.O_WRONLY]: "w",
-    [constants.O_CREAT | constants.O_WRONLY | constants.O_TRUNC]: "w",
-    [constants.O_CREAT | constants.O_RDWR]: "w+",
-    [constants.O_APPEND | constants.O_WRONLY]: "a",
-    [constants.O_APPEND | constants.O_RDWR]: "a+"
-  };
-  return map[flags] || "r";
-}
 
 // src/errors.ts
-var FSError = class extends Error {
+var FSError = class _FSError extends Error {
   code;
+  errno;
   syscall;
   path;
-  original;
-  constructor(message, code, options) {
+  constructor(code, errno, message, syscall, path) {
     super(message);
     this.name = "FSError";
     this.code = code;
-    this.syscall = options?.syscall;
-    this.path = options?.path;
-    this.original = options?.original;
+    this.errno = errno;
+    this.syscall = syscall;
+    this.path = path;
+    const ErrorWithCapture = Error;
+    if (ErrorWithCapture.captureStackTrace) {
+      ErrorWithCapture.captureStackTrace(this, _FSError);
+    }
   }
 };
-function createENOENT(path) {
-  return new FSError(`ENOENT: No such file or directory, '${path}'`, "ENOENT", { path });
+var ErrorCodes = {
+  ENOENT: -2,
+  EEXIST: -17,
+  EISDIR: -21,
+  ENOTDIR: -20,
+  ENOTEMPTY: -39,
+  EACCES: -13,
+  EINVAL: -22,
+  ENOSPC: -28};
+function createENOENT(syscall, path) {
+  return new FSError(
+    "ENOENT",
+    ErrorCodes.ENOENT,
+    `ENOENT: no such file or directory, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
 }
-function createEEXIST(path, operation) {
-  const message = `EEXIST: File exists, '${path}'`;
-  return new FSError(message, "EEXIST", { path });
+function createEEXIST(syscall, path) {
+  return new FSError(
+    "EEXIST",
+    ErrorCodes.EEXIST,
+    `EEXIST: file already exists, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
 }
-function createEACCES(path, syscall) {
-  return new FSError(`EACCES: permission denied, access '${path}'`, "EACCES", { syscall, path });
+function createEISDIR(syscall, path) {
+  return new FSError(
+    "EISDIR",
+    ErrorCodes.EISDIR,
+    `EISDIR: illegal operation on a directory, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
 }
-function createEISDIR(path, operation = "operation") {
-  return new FSError(`EISDIR: illegal operation on a directory, ${operation} '${path}'`, "EISDIR", { path });
+function createENOTDIR(syscall, path) {
+  return new FSError(
+    "ENOTDIR",
+    ErrorCodes.ENOTDIR,
+    `ENOTDIR: not a directory, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
 }
-function createELOOP(path) {
-  return new FSError(`ELOOP: Too many symbolic links, '${path}'`, "ELOOP", { path });
+function createENOTEMPTY(syscall, path) {
+  return new FSError(
+    "ENOTEMPTY",
+    ErrorCodes.ENOTEMPTY,
+    `ENOTEMPTY: directory not empty, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
 }
-function createEINVAL(path) {
-  return new FSError(`EINVAL: Invalid argument, '${path}'`, "EINVAL", { path });
+function createEACCES(syscall, path) {
+  return new FSError(
+    "EACCES",
+    ErrorCodes.EACCES,
+    `EACCES: permission denied, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
 }
-function createECORRUPTED(path) {
-  return new FSError(`ECORRUPTED: Pack file integrity check failed, '${path}'`, "ECORRUPTED", { path });
+function createEINVAL(syscall, path) {
+  return new FSError(
+    "EINVAL",
+    ErrorCodes.EINVAL,
+    `EINVAL: invalid argument, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
 }
-function wrapError(err) {
-  if (err instanceof FSError) return err;
-  const error = err;
-  if (typeof error.code === "string") {
-    const fsErr = new FSError(error.message, error.code);
-    fsErr.original = error;
-    return fsErr;
+function mapErrorCode(errorName, syscall, path) {
+  switch (errorName) {
+    case "NotFoundError":
+      return createENOENT(syscall, path);
+    case "NotAllowedError":
+      return createEACCES(syscall, path);
+    case "TypeMismatchError":
+      return createENOTDIR(syscall, path);
+    case "InvalidModificationError":
+      return createENOTEMPTY(syscall, path);
+    case "QuotaExceededError":
+      return new FSError("ENOSPC", ErrorCodes.ENOSPC, `ENOSPC: no space left on device, ${syscall} '${path}'`, syscall, path);
+    default:
+      return new FSError("EINVAL", ErrorCodes.EINVAL, `${errorName}: ${syscall} '${path}'`, syscall, path);
   }
-  const wrapped = new FSError(error.message || "Unknown error", "UNKNOWN");
-  wrapped.original = error;
-  return wrapped;
 }
 
-// src/path-utils.ts
-var normalizeCache = /* @__PURE__ */ new Map();
-var CACHE_MAX_SIZE = 1e3;
-function normalize(path) {
-  if (path === void 0 || path === null) {
-    throw new TypeError("Path cannot be undefined or null");
+// src/filesystem.ts
+var isWorkerContext = typeof WorkerGlobalScope !== "undefined" && self instanceof WorkerGlobalScope;
+var KERNEL_SOURCE = `
+const LOCK_NAME = 'opfs_fs_lock';
+let messageQueue = [];
+let isReady = false;
+let cachedRoot = null;
+const dirCache = new Map();
+
+// Sync handle cache - MAJOR performance optimization
+const syncHandleCache = new Map();
+const MAX_HANDLES = 100;
+
+async function getSyncHandle(filePath, create) {
+  const cached = syncHandleCache.get(filePath);
+  if (cached) return cached;
+
+  // Evict oldest handles if cache is full
+  if (syncHandleCache.size >= MAX_HANDLES) {
+    const keys = Array.from(syncHandleCache.keys()).slice(0, 10);
+    for (const key of keys) {
+      const h = syncHandleCache.get(key);
+      if (h) { try { h.close(); } catch {} syncHandleCache.delete(key); }
+    }
   }
-  if (typeof path !== "string") {
-    throw new TypeError(`Expected string path, got ${typeof path}`);
+
+  const fh = await getFileHandle(filePath, create);
+  const access = await fh.createSyncAccessHandle();
+  syncHandleCache.set(filePath, access);
+  return access;
+}
+
+function closeSyncHandle(filePath) {
+  const h = syncHandleCache.get(filePath);
+  if (h) { try { h.close(); } catch {} syncHandleCache.delete(filePath); }
+}
+
+function closeHandlesUnder(prefix) {
+  for (const [p, h] of syncHandleCache) {
+    if (p === prefix || p.startsWith(prefix + '/')) {
+      try { h.close(); } catch {}
+      syncHandleCache.delete(p);
+    }
   }
-  if (path === "") {
-    return "/";
+}
+
+// Clear directory cache entries for a path and all descendants
+function clearDirCacheUnder(filePath) {
+  // Convert to cache key format (no leading slash)
+  const prefix = parsePath(filePath).join('/');
+  if (!prefix) {
+    // Root directory - clear everything
+    dirCache.clear();
+    return;
   }
-  const cached = normalizeCache.get(path);
-  if (cached !== void 0) {
-    return cached;
+  for (const key of dirCache.keys()) {
+    if (key === prefix || key.startsWith(prefix + '/')) {
+      dirCache.delete(key);
+    }
   }
-  const parts = path.split("/");
-  const stack = [];
+}
+
+async function getRoot() {
+  if (!cachedRoot) {
+    cachedRoot = await navigator.storage.getDirectory();
+  }
+  return cachedRoot;
+}
+
+function parsePath(filePath) {
+  return filePath.split('/').filter(Boolean);
+}
+
+async function getDirectoryHandle(parts, create = false) {
+  if (parts.length === 0) return getRoot();
+
+  const cacheKey = parts.join('/');
+  if (dirCache.has(cacheKey)) {
+    return dirCache.get(cacheKey);
+  }
+
+  let curr = await getRoot();
+  let pathSoFar = '';
+
   for (const part of parts) {
-    if (part === "" || part === ".") {
-      continue;
-    } else if (part === "..") {
-      if (stack.length > 0) stack.pop();
+    pathSoFar += (pathSoFar ? '/' : '') + part;
+
+    if (dirCache.has(pathSoFar)) {
+      curr = dirCache.get(pathSoFar);
     } else {
-      stack.push(part);
+      curr = await curr.getDirectoryHandle(part, { create });
+      dirCache.set(pathSoFar, curr);
     }
   }
-  const result = "/" + stack.join("/");
-  if (normalizeCache.size >= CACHE_MAX_SIZE) {
-    const deleteCount = CACHE_MAX_SIZE / 4;
-    let count = 0;
-    for (const key of normalizeCache.keys()) {
-      if (count++ >= deleteCount) break;
-      normalizeCache.delete(key);
-    }
-  }
-  normalizeCache.set(path, result);
-  return result;
-}
-function dirname(path) {
-  const normalized = normalize(path);
-  const parts = normalized.split("/").filter(Boolean);
-  if (parts.length < 2) return "/";
-  return "/" + parts.slice(0, -1).join("/");
-}
-function isRoot(path) {
-  const normalized = normalize(path);
-  return normalized === "/" || normalized === "";
-}
-function segments(path) {
-  return normalize(path).split("/").filter(Boolean);
+
+  return curr;
 }
 
-// src/handle-manager.ts
-var FILE_HANDLE_POOL_SIZE = 50;
-var DIR_CACHE_MAX_SIZE = 200;
-var FileLock = class {
-  active = /* @__PURE__ */ new Set();
-  queues = /* @__PURE__ */ new Map();
-  async acquire(path) {
-    if (!this.active.has(path)) {
-      this.active.add(path);
-      return this.createRelease(path);
-    }
-    await new Promise((resolve) => {
-      let queue = this.queues.get(path);
-      if (!queue) {
-        queue = [];
-        this.queues.set(path, queue);
-      }
-      queue.push(resolve);
-    });
-    return this.createRelease(path);
-  }
-  createRelease(path) {
-    return () => {
-      const queue = this.queues.get(path);
-      if (queue && queue.length > 0) {
-        const next = queue.shift();
-        if (queue.length === 0) {
-          this.queues.delete(path);
-        }
-        next();
-      } else {
-        this.active.delete(path);
-      }
-    };
-  }
-};
-var fileLock = new FileLock();
-var HandleManager = class {
-  rootPromise;
-  dirCache = /* @__PURE__ */ new Map();
-  fileHandlePool = /* @__PURE__ */ new Map();
-  constructor() {
-    this.rootPromise = navigator.storage.getDirectory();
-  }
-  /**
-   * Get the root directory handle
-   */
-  async getRoot() {
-    return this.rootPromise;
-  }
-  /**
-   * Cache a directory handle with LRU eviction
-   */
-  cacheDirHandle(path, handle) {
-    if (this.dirCache.size >= DIR_CACHE_MAX_SIZE) {
-      const firstKey = this.dirCache.keys().next().value;
-      if (firstKey) this.dirCache.delete(firstKey);
-    }
-    this.dirCache.set(path, handle);
-  }
-  /**
-   * Clear directory cache for a path and its children
-   */
-  clearCache(path = "") {
-    const normalizedPath = normalize(path);
-    if (normalizedPath === "/" || normalizedPath === "") {
-      this.dirCache.clear();
-      this.fileHandlePool.clear();
-      return;
-    }
-    if (this.dirCache.size > 0) {
-      for (const key of this.dirCache.keys()) {
-        if (key === normalizedPath || key.startsWith(normalizedPath + "/")) {
-          this.dirCache.delete(key);
-        }
-      }
-    }
-    if (this.fileHandlePool.size > 0) {
-      for (const key of this.fileHandlePool.keys()) {
-        if (key === normalizedPath || key.startsWith(normalizedPath + "/")) {
-          this.fileHandlePool.delete(key);
-        }
-      }
-    }
-  }
-  /**
-   * Get a file handle from the pool or create a new one
-   */
-  async getPooledFileHandle(path, create = false) {
-    const normalizedPath = normalize(path);
-    const pooled = this.fileHandlePool.get(normalizedPath);
-    if (pooled) {
-      return pooled;
-    }
-    const { fileHandle } = await this.getHandle(normalizedPath, { create });
-    if (!fileHandle) return null;
-    if (this.fileHandlePool.size >= FILE_HANDLE_POOL_SIZE) {
-      const firstKey = this.fileHandlePool.keys().next().value;
-      if (firstKey) this.fileHandlePool.delete(firstKey);
-    }
-    this.fileHandlePool.set(normalizedPath, fileHandle);
-    return fileHandle;
-  }
-  /**
-   * Invalidate a specific file handle from the pool
-   */
-  invalidateFileHandle(path) {
-    const normalizedPath = normalize(path);
-    this.fileHandlePool.delete(normalizedPath);
-  }
-  /**
-   * Get file or directory handle for a path
-   */
-  async getHandle(path, opts = {}) {
-    const parts = segments(path);
-    if (parts.length === 0) {
-      const root = await this.rootPromise;
-      return { dir: root, name: "", fileHandle: null, dirHandle: root };
-    }
-    let dir = await this.rootPromise;
-    let currentPath = "";
-    for (let i = 0; i < parts.length - 1; i++) {
-      currentPath += "/" + parts[i];
-      if (this.dirCache.has(currentPath)) {
-        dir = this.dirCache.get(currentPath);
-        continue;
-      }
-      try {
-        dir = await dir.getDirectoryHandle(parts[i], { create: opts.create });
-        this.cacheDirHandle(currentPath, dir);
-      } catch {
-        throw createENOENT(path);
-      }
-    }
-    const name = parts[parts.length - 1];
-    try {
-      if (opts.kind === "directory") {
-        const dirHandle = await dir.getDirectoryHandle(name, { create: opts.create });
-        return { dir, name, fileHandle: null, dirHandle };
-      } else {
-        const fileHandle = await dir.getFileHandle(name, { create: opts.create });
-        return { dir, name, fileHandle, dirHandle: null };
-      }
-    } catch {
-      if (!opts.create) {
-        return { dir, name, fileHandle: null, dirHandle: null };
-      }
-      throw createENOENT(path);
-    }
-  }
-  /**
-   * Get directory handle with caching
-   */
-  async getDirectoryHandle(path) {
-    const normalizedPath = normalize(path);
-    if (normalizedPath === "/" || normalizedPath === "") {
-      return this.rootPromise;
-    }
-    if (this.dirCache.has(normalizedPath)) {
-      return this.dirCache.get(normalizedPath);
-    }
-    const parts = segments(normalizedPath);
-    let dir = await this.rootPromise;
-    let currentPath = "";
-    for (const part of parts) {
-      currentPath += "/" + part;
-      if (this.dirCache.has(currentPath)) {
-        dir = this.dirCache.get(currentPath);
-        continue;
-      }
-      dir = await dir.getDirectoryHandle(part);
-      this.cacheDirHandle(currentPath, dir);
-    }
-    return dir;
-  }
-  /**
-   * Ensure parent directory exists
-   */
-  async ensureParentDir(path) {
-    const parentPath = dirname(path);
-    if (parentPath === "/" || parentPath === "") return;
-    const parts = segments(parentPath);
-    let dir = await this.rootPromise;
-    let currentPath = "";
-    for (const part of parts) {
-      currentPath += "/" + part;
-      if (this.dirCache.has(currentPath)) {
-        dir = this.dirCache.get(currentPath);
-        continue;
-      }
-      dir = await dir.getDirectoryHandle(part, { create: true });
-      this.cacheDirHandle(currentPath, dir);
-    }
-  }
-  /**
-   * Create directory (with automatic parent creation)
-   */
-  async mkdir(path) {
-    const normalizedPath = normalize(path);
-    this.clearCache(normalizedPath);
-    const parts = segments(normalizedPath);
-    let dir = await this.rootPromise;
-    for (let i = 0; i < parts.length; i++) {
-      const part = parts[i];
-      const subPath = "/" + parts.slice(0, i + 1).join("/");
-      if (this.dirCache.has(subPath)) {
-        dir = this.dirCache.get(subPath);
-      } else {
-        dir = await dir.getDirectoryHandle(part, { create: true });
-        this.cacheDirHandle(subPath, dir);
-      }
-    }
-  }
-};
+async function getFileHandle(filePath, create = false) {
+  const parts = parsePath(filePath);
+  const fileName = parts.pop();
+  if (!fileName) throw new Error('Invalid file path');
+  const dir = parts.length > 0 ? await getDirectoryHandle(parts, create) : await getRoot();
+  return await dir.getFileHandle(fileName, { create });
+}
 
-// src/symlink-manager.ts
-var SYMLINK_FILE = "/.opfs-symlinks.json";
-var MAX_SYMLINK_DEPTH = 10;
-var SymlinkManager = class {
-  cache = null;
-  cacheCount = 0;
-  // Track count to avoid Object.keys() calls
-  resolvedCache = /* @__PURE__ */ new Map();
-  // Cache resolved paths
-  dirty = false;
-  handleManager;
-  useSync;
-  loadPromise = null;
-  // Avoid multiple concurrent loads
-  diskLoaded = false;
-  // Track if we've loaded from disk
-  constructor(handleManager, useSync) {
-    this.handleManager = handleManager;
-    this.useSync = useSync;
-    this.cache = {};
-    this.cacheCount = 0;
-  }
-  /**
-   * Reset all symlink state (called when root directory is cleared)
-   */
-  reset() {
-    this.cache = {};
-    this.cacheCount = 0;
-    this.resolvedCache.clear();
-    this.dirty = false;
-    this.loadPromise = null;
-    this.diskLoaded = false;
-  }
-  /**
-   * Load symlinks from metadata file
-   * Uses loadPromise to avoid multiple concurrent disk reads
-   */
-  async load() {
-    if (this.diskLoaded) return this.cache;
-    if (this.loadPromise) return this.loadPromise;
-    this.loadPromise = this.loadFromDisk();
-    const result = await this.loadPromise;
-    this.loadPromise = null;
-    return result;
-  }
-  /**
-   * Actually read from disk
-   */
-  async loadFromDisk() {
-    try {
-      const { fileHandle } = await this.handleManager.getHandle(SYMLINK_FILE);
-      if (!fileHandle) {
-        this.diskLoaded = true;
-        return this.cache;
-      }
-      const file = await fileHandle.getFile();
-      const text = await file.text();
-      this.cache = JSON.parse(text);
-      this.cacheCount = Object.keys(this.cache).length;
-      this.diskLoaded = true;
-    } catch {
-      if (!this.cache) {
-        this.cache = {};
-        this.cacheCount = 0;
-      }
-      this.diskLoaded = true;
-    }
-    return this.cache;
-  }
-  /**
-   * Save symlinks to metadata file
-   */
-  async save() {
-    if (!this.cache) return;
-    const data = JSON.stringify(this.cache);
-    const { fileHandle } = await this.handleManager.getHandle(SYMLINK_FILE, { create: true });
-    if (!fileHandle) return;
-    const buffer = new TextEncoder().encode(data);
-    if (this.useSync) {
-      const release = await fileLock.acquire(SYMLINK_FILE);
-      try {
-        const access = await fileHandle.createSyncAccessHandle();
-        try {
-          access.truncate(0);
-          let written = 0;
-          while (written < buffer.length) {
-            written += access.write(buffer.subarray(written), { at: written });
-          }
-        } finally {
-          access.close();
-        }
-      } finally {
-        release();
-      }
-    } else {
-      const writable = await fileHandle.createWritable();
-      await writable.write(buffer);
-      await writable.close();
-    }
-    this.dirty = false;
-  }
-  /**
-   * Flush pending changes if dirty
-   */
-  async flush() {
-    if (this.dirty) {
-      await this.save();
-    }
-  }
-  /**
-   * Resolve a path through symlinks
-   * Fast synchronous path when cache is already loaded
-   * Uses resolved cache for O(1) repeated lookups
-   *
-   * OPTIMIZATION: If we haven't loaded from disk yet AND no symlinks have been
-   * created in this session, we skip the disk check entirely. This makes pure
-   * file operations (no symlinks) very fast.
-   */
-  async resolve(path, maxDepth = MAX_SYMLINK_DEPTH) {
-    if (this.cacheCount === 0) {
-      return path;
-    }
-    const cached = this.resolvedCache.get(path);
-    if (cached !== void 0) {
-      return cached;
-    }
-    return this.resolveSync(path, this.cache, maxDepth);
-  }
-  /**
-   * Synchronous resolution helper - caches the result
-   */
-  resolveSync(path, symlinks, maxDepth) {
-    let currentPath = path;
-    let depth = 0;
-    while (symlinks[currentPath] && depth < maxDepth) {
-      currentPath = symlinks[currentPath];
-      depth++;
-    }
-    if (depth >= maxDepth) {
-      throw createELOOP(path);
-    }
-    if (currentPath !== path) {
-      this.resolvedCache.set(path, currentPath);
-    }
-    return currentPath;
-  }
-  /**
-   * Clear the resolved path cache (called when symlinks change)
-   */
-  clearResolvedCache() {
-    this.resolvedCache.clear();
-  }
-  /**
-   * Check if a path is a symlink
-   */
-  async isSymlink(path) {
-    const symlinks = await this.load();
-    return !!symlinks[path];
-  }
-  /**
-   * Get symlink target
-   */
-  async readlink(path) {
-    const normalizedPath = normalize(path);
-    const symlinks = await this.load();
-    if (!symlinks[normalizedPath]) {
-      throw createEINVAL(path);
-    }
-    return symlinks[normalizedPath];
-  }
-  /**
-   * Create a symlink
-   */
-  async symlink(target, path, checkExists) {
-    const normalizedPath = normalize(path);
-    const normalizedTarget = normalize(target);
-    const symlinks = await this.load();
-    if (symlinks[normalizedPath]) {
-      throw createEEXIST(normalizedPath);
-    }
-    await checkExists();
-    symlinks[normalizedPath] = normalizedTarget;
-    this.cacheCount++;
-    this.clearResolvedCache();
-    this.dirty = true;
-    await this.flush();
-  }
-  /**
-   * Create multiple symlinks efficiently
-   */
-  async symlinkBatch(links, checkExists) {
-    const symlinks = await this.load();
-    const normalizedLinks = links.map(({ target, path }) => ({
-      normalizedPath: normalize(path),
-      normalizedTarget: normalize(target)
-    }));
-    for (const { normalizedPath } of normalizedLinks) {
-      if (symlinks[normalizedPath]) {
-        throw createEEXIST(normalizedPath);
-      }
-    }
-    await Promise.all(normalizedLinks.map(({ normalizedPath }) => checkExists(normalizedPath)));
-    for (const { normalizedPath, normalizedTarget } of normalizedLinks) {
-      symlinks[normalizedPath] = normalizedTarget;
-    }
-    this.cacheCount += links.length;
-    this.clearResolvedCache();
-    this.dirty = true;
-    await this.flush();
-  }
-  /**
-   * Remove a symlink
-   */
-  async unlink(path) {
-    const symlinks = await this.load();
-    if (symlinks[path]) {
-      delete symlinks[path];
-      this.cacheCount--;
-      this.clearResolvedCache();
-      this.dirty = true;
-      await this.flush();
-      return true;
-    }
-    return false;
-  }
-  /**
-   * Rename/move a symlink
-   */
-  async rename(oldPath, newPath) {
-    const symlinks = await this.load();
-    if (symlinks[oldPath]) {
-      const target = symlinks[oldPath];
-      delete symlinks[oldPath];
-      symlinks[newPath] = target;
-      this.clearResolvedCache();
-      this.dirty = true;
-      await this.flush();
-      return true;
-    }
-    return false;
-  }
-  /**
-   * Get all symlinks in a directory
-   */
-  async getSymlinksInDir(dirPath) {
-    const symlinks = await this.load();
-    const result = [];
-    for (const symlinkPath of Object.keys(symlinks)) {
-      const parts = symlinkPath.split("/").filter(Boolean);
-      const parentPath = "/" + parts.slice(0, -1).join("/");
-      if (parentPath === dirPath || dirPath === "/" && parts.length === 1) {
-        result.push(parts[parts.length - 1]);
-      }
-    }
-    return result;
-  }
-  /**
-   * Check if path is the symlink metadata file
-   */
-  isMetadataFile(name) {
-    return name === SYMLINK_FILE.replace(/^\/+/, "");
-  }
-};
+async function getParentAndName(filePath) {
+  const parts = parsePath(filePath);
+  const name = parts.pop();
+  if (!name) throw new Error('Invalid path');
+  const parent = parts.length > 0 ? await getDirectoryHandle(parts, false) : await getRoot();
+  return { parent, name };
+}
 
-// src/packed-storage.ts
-async function compress(data) {
-  if (data.length < 100) return data;
+async function handleRead(filePath, payload) {
+  const access = await getSyncHandle(filePath, false);
+  const size = access.getSize();
+  const offset = payload?.offset || 0;
+  const len = payload?.len || (size - offset);
+  const buf = new Uint8Array(len);
+  const bytesRead = access.read(buf, { at: offset });
+  return { data: buf.slice(0, bytesRead) };
+}
+
+async function handleWrite(filePath, payload) {
+  const access = await getSyncHandle(filePath, true);
+  if (payload?.data) {
+    const offset = payload.offset ?? 0;
+    if (offset === 0) access.truncate(0);
+    access.write(payload.data, { at: offset });
+    // Only flush if explicitly requested (default: true for safety)
+    if (payload?.flush !== false) access.flush();
+  }
+  return { success: true };
+}
+
+async function handleAppend(filePath, payload) {
+  const access = await getSyncHandle(filePath, true);
+  if (payload?.data) {
+    const size = access.getSize();
+    access.write(payload.data, { at: size });
+    if (payload?.flush !== false) access.flush();
+  }
+  return { success: true };
+}
+
+async function handleTruncate(filePath, payload) {
+  const access = await getSyncHandle(filePath, false);
+  access.truncate(payload?.len ?? 0);
+  access.flush();
+  return { success: true };
+}
+
+async function handleStat(filePath) {
+  const parts = parsePath(filePath);
+  // Node.js compatible stat shape: mode 33188 = file (0o100644), 16877 = dir (0o40755)
+  if (parts.length === 0) {
+    return { size: 0, mtimeMs: Date.now(), mode: 16877, type: 'directory' };
+  }
+  const name = parts.pop();
+  const parent = parts.length > 0 ? await getDirectoryHandle(parts, false) : await getRoot();
   try {
-    const stream = new CompressionStream("gzip");
-    const writer = stream.writable.getWriter();
-    writer.write(data);
-    writer.close();
-    const chunks = [];
-    const reader = stream.readable.getReader();
-    let totalSize = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      totalSize += value.length;
-    }
-    if (totalSize >= data.length) return data;
-    const result = new Uint8Array(totalSize);
-    let offset = 0;
-    for (const chunk of chunks) {
-      result.set(chunk, offset);
-      offset += chunk.length;
-    }
-    return result;
+    const fh = await parent.getFileHandle(name);
+    // Use getFile() for metadata - faster than createSyncAccessHandle
+    const file = await fh.getFile();
+    return { size: file.size, mtimeMs: file.lastModified, mode: 33188, type: 'file' };
   } catch {
-    return data;
-  }
-}
-async function decompress(data) {
-  const stream = new DecompressionStream("gzip");
-  const writer = stream.writable.getWriter();
-  writer.write(data);
-  writer.close();
-  const chunks = [];
-  const reader = stream.readable.getReader();
-  let totalSize = 0;
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    totalSize += value.length;
-  }
-  const result = new Uint8Array(totalSize);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return result;
-}
-var CRC32_TABLE = new Uint32Array(256);
-for (let i = 0; i < 256; i++) {
-  let c = i;
-  for (let j = 0; j < 8; j++) {
-    c = c & 1 ? 3988292384 ^ c >>> 1 : c >>> 1;
-  }
-  CRC32_TABLE[i] = c;
-}
-function crc32(data) {
-  let crc = 4294967295;
-  for (let i = 0; i < data.length; i++) {
-    crc = CRC32_TABLE[(crc ^ data[i]) & 255] ^ crc >>> 8;
-  }
-  return (crc ^ 4294967295) >>> 0;
-}
-var PACK_FILE = "/.opfs-pack";
-var PackedStorage = class {
-  handleManager;
-  useSync;
-  useCompression;
-  useChecksum;
-  index = null;
-  indexLoaded = false;
-  constructor(handleManager, useSync, useCompression = false, useChecksum = true) {
-    this.handleManager = handleManager;
-    this.useSync = useSync;
-    this.useCompression = useCompression && typeof CompressionStream !== "undefined";
-    this.useChecksum = useChecksum;
-  }
-  /**
-   * Reset pack storage state (memory only)
-   */
-  reset() {
-    this.index = null;
-    this.indexLoaded = false;
-  }
-  /**
-   * Clear pack storage completely (deletes pack file from disk)
-   */
-  async clear() {
-    this.index = null;
-    this.indexLoaded = false;
     try {
-      const root = await this.handleManager.getRoot();
-      await root.removeEntry(PACK_FILE.replace(/^\//, ""));
+      await parent.getDirectoryHandle(name);
+      return { size: 0, mtimeMs: Date.now(), mode: 16877, type: 'directory' };
     } catch {
+      throw new Error('NotFoundError');
     }
   }
-  /**
-   * Load pack index from disk (always reloads to support hybrid mode)
-   * Verifies CRC32 checksum for integrity
-   * Note: Caller must hold the lock
-   */
-  async loadIndex() {
-    try {
-      const { fileHandle } = await this.handleManager.getHandle(PACK_FILE);
-      if (!fileHandle) {
-        return {};
-      }
-      if (this.useSync) {
-        const release = await fileLock.acquire(PACK_FILE);
-        try {
-          const access = await fileHandle.createSyncAccessHandle();
-          try {
-            const size = access.getSize();
-            if (size < 8) {
-              return {};
-            }
-            const header = new Uint8Array(8);
-            access.read(header, { at: 0 });
-            const view = new DataView(header.buffer);
-            const indexLen = view.getUint32(0, true);
-            const storedCrc = view.getUint32(4, true);
-            const contentSize = size - 8;
-            const content = new Uint8Array(contentSize);
-            access.read(content, { at: 8 });
-            if (this.useChecksum && storedCrc !== 0) {
-              const calculatedCrc = crc32(content);
-              if (calculatedCrc !== storedCrc) {
-                throw createECORRUPTED(PACK_FILE);
-              }
-            }
-            const indexJson = new TextDecoder().decode(content.subarray(0, indexLen));
-            return JSON.parse(indexJson);
-          } finally {
-            access.close();
-          }
-        } finally {
-          release();
-        }
-      } else {
-        const file = await fileHandle.getFile();
-        const data = new Uint8Array(await file.arrayBuffer());
-        if (data.length < 8) {
-          return {};
-        }
-        const view = new DataView(data.buffer);
-        const indexLen = view.getUint32(0, true);
-        const storedCrc = view.getUint32(4, true);
-        const content = data.subarray(8);
-        if (this.useChecksum && storedCrc !== 0) {
-          const calculatedCrc = crc32(content);
-          if (calculatedCrc !== storedCrc) {
-            throw createECORRUPTED(PACK_FILE);
-          }
-        }
-        const indexJson = new TextDecoder().decode(content.subarray(0, indexLen));
-        return JSON.parse(indexJson);
-      }
-    } catch {
-      return {};
-    }
+}
+
+async function handleExists(filePath) {
+  try {
+    await handleStat(filePath);
+    return { exists: true };
+  } catch {
+    return { exists: false };
   }
-  /**
-   * Check if a path exists in the pack
-   */
-  async has(path) {
-    const index = await this.loadIndex();
-    return path in index;
+}
+
+async function handleMkdir(filePath, payload) {
+  const parts = parsePath(filePath);
+  if (payload?.recursive) {
+    let curr = await getRoot();
+    for (const part of parts) {
+      curr = await curr.getDirectoryHandle(part, { create: true });
+    }
+  } else {
+    const name = parts.pop();
+    if (!name) throw new Error('Invalid path');
+    const parent = parts.length > 0 ? await getDirectoryHandle(parts, false) : await getRoot();
+    await parent.getDirectoryHandle(name, { create: true });
   }
-  /**
-   * Get file size from pack (for stat)
-   * Returns originalSize if compressed, otherwise size
-   */
-  async getSize(path) {
-    const index = await this.loadIndex();
-    const entry = index[path];
-    if (!entry) return null;
-    return entry.originalSize ?? entry.size;
+  return { success: true };
+}
+
+async function handleRmdir(filePath, payload) {
+  closeHandlesUnder(filePath); // Close all cached file handles under this directory
+  clearDirCacheUnder(filePath); // Clear stale directory cache entries
+  const { parent, name } = await getParentAndName(filePath);
+  if (payload?.recursive) {
+    await parent.removeEntry(name, { recursive: true });
+  } else {
+    const dir = await parent.getDirectoryHandle(name);
+    const entries = dir.entries();
+    const first = await entries.next();
+    if (!first.done) {
+      const e = new Error('InvalidModificationError');
+      e.name = 'InvalidModificationError';
+      throw e;
+    }
+    await parent.removeEntry(name);
   }
-  /**
-   * Read a file from the pack
-   * Handles decompression if file was stored compressed
-   */
-  async read(path) {
-    const index = await this.loadIndex();
-    const entry = index[path];
-    if (!entry) return null;
-    const { fileHandle } = await this.handleManager.getHandle(PACK_FILE);
-    if (!fileHandle) return null;
-    let buffer;
-    if (this.useSync) {
-      const release = await fileLock.acquire(PACK_FILE);
-      try {
-        const access = await fileHandle.createSyncAccessHandle();
-        try {
-          buffer = new Uint8Array(entry.size);
-          access.read(buffer, { at: entry.offset });
-        } finally {
-          access.close();
-        }
-      } finally {
-        release();
-      }
-    } else {
-      const file = await fileHandle.getFile();
-      const data = new Uint8Array(await file.arrayBuffer());
-      buffer = data.slice(entry.offset, entry.offset + entry.size);
-    }
-    if (entry.originalSize !== void 0) {
-      return decompress(buffer);
-    }
-    return buffer;
+  return { success: true };
+}
+
+async function handleUnlink(filePath) {
+  closeSyncHandle(filePath); // Close cached handle before deleting
+  const { parent, name } = await getParentAndName(filePath);
+  await parent.removeEntry(name);
+  return { success: true };
+}
+
+async function handleReaddir(filePath) {
+  const parts = parsePath(filePath);
+  const dir = parts.length > 0 ? await getDirectoryHandle(parts, false) : await getRoot();
+  const entries = [];
+  for await (const [name] of dir.entries()) {
+    entries.push(name);
   }
-  /**
-   * Read multiple files from the pack in a single operation
-   * Loads index once, reads all data in parallel
-   * Handles decompression if files were stored compressed
-   */
-  async readBatch(paths) {
-    const results = /* @__PURE__ */ new Map();
-    if (paths.length === 0) return results;
-    const index = await this.loadIndex();
-    const toRead = [];
-    for (const path of paths) {
-      const entry = index[path];
-      if (entry) {
-        toRead.push({ path, offset: entry.offset, size: entry.size, originalSize: entry.originalSize });
-      } else {
-        results.set(path, null);
-      }
-    }
-    if (toRead.length === 0) return results;
-    const { fileHandle } = await this.handleManager.getHandle(PACK_FILE);
-    if (!fileHandle) {
-      for (const { path } of toRead) {
-        results.set(path, null);
-      }
-      return results;
-    }
-    const decompressPromises = [];
-    if (this.useSync) {
-      const release = await fileLock.acquire(PACK_FILE);
-      try {
-        const access = await fileHandle.createSyncAccessHandle();
-        try {
-          for (const { path, offset, size, originalSize } of toRead) {
-            const buffer = new Uint8Array(size);
-            access.read(buffer, { at: offset });
-            if (originalSize !== void 0) {
-              decompressPromises.push({ path, promise: decompress(buffer) });
-            } else {
-              results.set(path, buffer);
-            }
-          }
-        } finally {
-          access.close();
-        }
-      } finally {
-        release();
-      }
-    } else {
-      const file = await fileHandle.getFile();
-      const data = new Uint8Array(await file.arrayBuffer());
-      for (const { path, offset, size, originalSize } of toRead) {
-        const buffer = data.slice(offset, offset + size);
-        if (originalSize !== void 0) {
-          decompressPromises.push({ path, promise: decompress(buffer) });
-        } else {
-          results.set(path, buffer);
-        }
-      }
-    }
-    for (const { path, promise } of decompressPromises) {
-      results.set(path, await promise);
-    }
-    return results;
-  }
-  /**
-   * Write multiple files to the pack in a single operation
-   * This is the key optimization - 100 files become 1 write!
-   * Includes CRC32 checksum for integrity verification.
-   * Optionally compresses data for smaller storage.
-   * Note: This replaces the entire pack with the new entries
-   */
-  async writeBatch(entries) {
-    if (entries.length === 0) return;
-    const encoder = new TextEncoder();
-    let processedEntries;
-    if (this.useCompression) {
-      processedEntries = await Promise.all(
-        entries.map(async ({ path, data }) => {
-          const compressed = await compress(data);
-          if (compressed.length < data.length) {
-            return { path, data: compressed, originalSize: data.length };
-          }
-          return { path, data };
-        })
-      );
-    } else {
-      processedEntries = entries;
-    }
-    let totalDataSize = 0;
-    for (const { data } of processedEntries) {
-      totalDataSize += data.length;
-    }
-    const newIndex = {};
-    let headerSize = 8;
-    let prevHeaderSize = 0;
-    while (headerSize !== prevHeaderSize) {
-      prevHeaderSize = headerSize;
-      let currentOffset = headerSize;
-      for (const { path, data, originalSize } of processedEntries) {
-        const entry = { offset: currentOffset, size: data.length };
-        if (originalSize !== void 0) {
-          entry.originalSize = originalSize;
-        }
-        newIndex[path] = entry;
-        currentOffset += data.length;
-      }
-      const indexBuf = encoder.encode(JSON.stringify(newIndex));
-      headerSize = 8 + indexBuf.length;
-    }
-    const finalIndexBuf = encoder.encode(JSON.stringify(newIndex));
-    const totalSize = headerSize + totalDataSize;
-    const packBuffer = new Uint8Array(totalSize);
-    const view = new DataView(packBuffer.buffer);
-    packBuffer.set(finalIndexBuf, 8);
-    for (const { path, data } of processedEntries) {
-      const entry = newIndex[path];
-      packBuffer.set(data, entry.offset);
-    }
-    const content = packBuffer.subarray(8);
-    const checksum = this.useChecksum ? crc32(content) : 0;
-    view.setUint32(0, finalIndexBuf.length, true);
-    view.setUint32(4, checksum, true);
-    await this.writePackFile(packBuffer);
-    this.index = newIndex;
-  }
-  /**
-   * Write the pack file to OPFS
-   * Note: Caller must hold the lock
-   */
-  async writePackFile(data) {
-    const { fileHandle } = await this.handleManager.getHandle(PACK_FILE, { create: true });
-    if (!fileHandle) return;
-    if (this.useSync) {
-      const release = await fileLock.acquire(PACK_FILE);
-      try {
-        const access = await fileHandle.createSyncAccessHandle();
-        try {
-          access.truncate(data.length);
+  return { entries };
+}
+
+async function handleRename(oldPath, payload) {
+  if (!payload?.newPath) throw new Error('newPath required');
+  const newPath = payload.newPath;
+
+  // Close cached handles for old path (file will be deleted)
+  closeSyncHandle(oldPath);
+  closeHandlesUnder(oldPath); // For directory renames
+  clearDirCacheUnder(oldPath); // Clear stale directory cache entries
+
+  const oldParts = parsePath(oldPath);
+  const newParts = parsePath(newPath);
+  const oldName = oldParts.pop();
+  const newName = newParts.pop();
+  const oldParent = oldParts.length > 0 ? await getDirectoryHandle(oldParts, false) : await getRoot();
+  const newParent = newParts.length > 0 ? await getDirectoryHandle(newParts, true) : await getRoot();
+
+  try {
+    const fh = await oldParent.getFileHandle(oldName);
+    const file = await fh.getFile();
+    const data = new Uint8Array(await file.arrayBuffer());
+
+    // Use cached handle for new file
+    const access = await getSyncHandle(newPath, true);
+    access.truncate(0);
+    access.write(data, { at: 0 });
+    access.flush();
+
+    await oldParent.removeEntry(oldName);
+    return { success: true };
+  } catch {
+    const oldDir = await oldParent.getDirectoryHandle(oldName);
+    async function copyDir(src, dst, dstPath) {
+      for await (const [name, handle] of src.entries()) {
+        if (handle.kind === 'file') {
+          const srcFile = await handle.getFile();
+          const data = new Uint8Array(await srcFile.arrayBuffer());
+          const filePath = dstPath + '/' + name;
+          const access = await getSyncHandle(filePath, true);
+          access.truncate(0);
           access.write(data, { at: 0 });
-        } finally {
-          access.close();
+          access.flush();
+        } else {
+          const newSubDir = await dst.getDirectoryHandle(name, { create: true });
+          await copyDir(handle, newSubDir, dstPath + '/' + name);
         }
-      } finally {
-        release();
       }
+    }
+    const newDir = await newParent.getDirectoryHandle(newName, { create: true });
+    await copyDir(oldDir, newDir, newPath);
+    await oldParent.removeEntry(oldName, { recursive: true });
+    return { success: true };
+  }
+}
+
+async function handleCopy(srcPath, payload) {
+  if (!payload?.newPath) throw new Error('newPath required');
+  const dstPath = payload.newPath;
+  const srcParts = parsePath(srcPath);
+  const srcName = srcParts.pop();
+  const srcParent = srcParts.length > 0 ? await getDirectoryHandle(srcParts, false) : await getRoot();
+  const srcFh = await srcParent.getFileHandle(srcName);
+  const srcFile = await srcFh.getFile();
+  const data = new Uint8Array(await srcFile.arrayBuffer());
+
+  // Use cached handle for destination
+  const access = await getSyncHandle(dstPath, true);
+  access.truncate(0);
+  access.write(data, { at: 0 });
+  access.flush();
+  return { success: true };
+}
+
+function handleFlush() {
+  // Flush all cached sync handles
+  for (const [, handle] of syncHandleCache) {
+    try { handle.flush(); } catch {}
+  }
+  return { success: true };
+}
+
+function handlePurge() {
+  // Flush and close all cached sync handles
+  for (const [, handle] of syncHandleCache) {
+    try { handle.flush(); handle.close(); } catch {}
+  }
+  syncHandleCache.clear();
+  dirCache.clear();
+  cachedRoot = null;
+  return { success: true };
+}
+
+async function processMessage(msg) {
+  const { type, path, payload } = msg;
+  switch (type) {
+    case 'read': return handleRead(path, payload);
+    case 'write': return handleWrite(path, payload);
+    case 'append': return handleAppend(path, payload);
+    case 'truncate': return handleTruncate(path, payload);
+    case 'stat': return handleStat(path);
+    case 'exists': return handleExists(path);
+    case 'mkdir': return handleMkdir(path, payload);
+    case 'rmdir': return handleRmdir(path, payload);
+    case 'unlink': return handleUnlink(path);
+    case 'readdir': return handleReaddir(path);
+    case 'rename': return handleRename(path, payload);
+    case 'copy': return handleCopy(path, payload);
+    case 'flush': return handleFlush();
+    case 'purge': return handlePurge();
+    default: throw new Error('Unknown operation: ' + type);
+  }
+}
+
+function sendAtomicsResponse(result, payload) {
+  const ctrl = payload.ctrl;
+  if (result.data && payload.dataBuffer) {
+    const view = new Uint8Array(payload.dataBuffer);
+    view.set(result.data);
+    Atomics.store(ctrl, 0, result.data.length);
+  } else if (result.entries && payload.resultBuffer) {
+    const json = JSON.stringify(result);
+    const encoded = new TextEncoder().encode(json);
+    const view = new Uint8Array(payload.resultBuffer);
+    view.set(encoded);
+    Atomics.store(ctrl, 0, encoded.length);
+  } else if (result.success) {
+    Atomics.store(ctrl, 0, 1);
+  } else if (result.exists !== undefined) {
+    Atomics.store(ctrl, 0, result.exists ? 1 : 0);
+  } else if (result.isFile !== undefined) {
+    if (payload.resultBuffer) {
+      const json = JSON.stringify(result);
+      const encoded = new TextEncoder().encode(json);
+      const view = new Uint8Array(payload.resultBuffer);
+      view.set(encoded);
+      Atomics.store(ctrl, 0, encoded.length);
     } else {
-      const writable = await fileHandle.createWritable();
-      await writable.write(data);
-      await writable.close();
+      Atomics.store(ctrl, 0, result.size || 0);
     }
   }
-  /**
-   * Remove a path from the pack index
-   * Note: Doesn't reclaim space, just removes from index and recalculates CRC32
-   */
-  async remove(path) {
-    const index = await this.loadIndex();
-    if (!(path in index)) return false;
-    delete index[path];
-    const { fileHandle } = await this.handleManager.getHandle(PACK_FILE);
-    if (!fileHandle) return true;
-    const encoder = new TextEncoder();
-    const newIndexBuf = encoder.encode(JSON.stringify(index));
-    if (this.useSync) {
-      const release = await fileLock.acquire(PACK_FILE);
-      try {
-        const access = await fileHandle.createSyncAccessHandle();
-        try {
-          const size = access.getSize();
-          const oldHeader = new Uint8Array(8);
-          access.read(oldHeader, { at: 0 });
-          const oldIndexLen = new DataView(oldHeader.buffer).getUint32(0, true);
-          const dataStart = 8 + oldIndexLen;
-          const dataSize = size - dataStart;
-          const dataPortion = new Uint8Array(dataSize);
-          if (dataSize > 0) {
-            access.read(dataPortion, { at: dataStart });
-          }
-          const newContent = new Uint8Array(newIndexBuf.length + dataSize);
-          newContent.set(newIndexBuf, 0);
-          if (dataSize > 0) {
-            newContent.set(dataPortion, newIndexBuf.length);
-          }
-          const checksum = this.useChecksum ? crc32(newContent) : 0;
-          const newHeader = new Uint8Array(8);
-          const view = new DataView(newHeader.buffer);
-          view.setUint32(0, newIndexBuf.length, true);
-          view.setUint32(4, checksum, true);
-          const newFile = new Uint8Array(8 + newContent.length);
-          newFile.set(newHeader, 0);
-          newFile.set(newContent, 8);
-          access.truncate(newFile.length);
-          access.write(newFile, { at: 0 });
-        } finally {
-          access.close();
-        }
-      } finally {
-        release();
-      }
+  Atomics.notify(ctrl, 0);
+}
+
+// Handle incoming messages
+async function handleMessage(msg) {
+  const { id, payload } = msg;
+  try {
+    const result = await processMessage(msg);
+    if (payload?.ctrl) {
+      sendAtomicsResponse(result, payload);
     } else {
-      const file = await fileHandle.getFile();
-      const oldData = new Uint8Array(await file.arrayBuffer());
-      if (oldData.length < 8) return true;
-      const oldIndexLen = new DataView(oldData.buffer).getUint32(0, true);
-      const dataStart = 8 + oldIndexLen;
-      const dataPortion = oldData.subarray(dataStart);
-      const newContent = new Uint8Array(newIndexBuf.length + dataPortion.length);
-      newContent.set(newIndexBuf, 0);
-      newContent.set(dataPortion, newIndexBuf.length);
-      const checksum = this.useChecksum ? crc32(newContent) : 0;
-      const newFile = new Uint8Array(8 + newContent.length);
-      const view = new DataView(newFile.buffer);
-      view.setUint32(0, newIndexBuf.length, true);
-      view.setUint32(4, checksum, true);
-      newFile.set(newContent, 8);
-      const writable = await fileHandle.createWritable();
-      await writable.write(newFile);
-      await writable.close();
+      // Use Transferable for data to avoid copying
+      if (result.data) {
+        const buffer = result.data.buffer;
+        self.postMessage({ id, result }, [buffer]);
+      } else {
+        self.postMessage({ id, result });
+      }
     }
-    return true;
+  } catch (e) {
+    const error = e instanceof Error ? e : new Error(String(e));
+    // Use error name if it's a specific DOM exception, otherwise use message
+    // (handleStat throws new Error('NotFoundError') where message contains the type)
+    const errorName = error.name || 'Error';
+    const errorCode = errorName !== 'Error' ? errorName : (error.message || 'Error');
+    if (payload?.ctrl) {
+      Atomics.store(payload.ctrl, 0, -1);
+      Atomics.notify(payload.ctrl, 0);
+    } else {
+      self.postMessage({ id, error: errorCode, code: errorCode });
+    }
   }
-  /**
-   * Check if pack file is being used (has entries)
-   */
-  async isEmpty() {
-    const index = await this.loadIndex();
-    return Object.keys(index).length === 0;
+}
+
+// Process queued messages after ready
+function processQueue() {
+  while (messageQueue.length > 0) {
+    const msg = messageQueue.shift();
+    handleMessage(msg);
+  }
+}
+
+// Handle messages directly - no serialization needed because:
+// - Tier 2: Client awaits response before sending next message
+// - Each OPFSFileSystem instance has its own worker
+self.onmessage = (event) => {
+  if (isReady) {
+    handleMessage(event.data);
+  } else {
+    messageQueue.push(event.data);
   }
 };
 
-// src/file-handle.ts
-function createFileHandle(resolvedPath, initialPosition, context) {
-  let position = initialPosition;
+// Signal ready after a timeout to ensure main thread handler is set
+setTimeout(() => {
+  isReady = true;
+  processQueue();
+  self.postMessage({ type: 'ready' });
+}, 10);
+`;
+function createStats(result) {
+  const isFile = result.type ? result.type === "file" : result.isFile ?? false;
+  const isDir = result.type ? result.type === "directory" : result.isDirectory ?? false;
+  const mtimeMs = result.mtimeMs ?? result.mtime ?? Date.now();
+  const size = result.size ?? 0;
+  const mode = result.mode ?? (isDir ? 16877 : 33188);
   return {
-    fd: Math.floor(Math.random() * 1e6),
-    async read(buffer, offset = 0, length = buffer.length, pos = null) {
-      const readPos = pos !== null ? pos : position;
-      const data = await context.readFile(resolvedPath);
-      const bytesToRead = Math.min(length, data.length - readPos);
-      buffer.set(data.subarray(readPos, readPos + bytesToRead), offset);
-      if (pos === null) position += bytesToRead;
-      return { bytesRead: bytesToRead, buffer };
-    },
-    async write(buffer, offset = 0, length = buffer.length, pos = null) {
-      const writePos = pos !== null ? pos : position;
-      let existingData = new Uint8Array(0);
-      try {
-        existingData = await context.readFile(resolvedPath);
-      } catch (e) {
-        if (e.code !== "ENOENT") throw e;
-      }
-      const dataToWrite = buffer.subarray(offset, offset + length);
-      const newSize = Math.max(existingData.length, writePos + length);
-      const newData = new Uint8Array(newSize);
-      newData.set(existingData, 0);
-      newData.set(dataToWrite, writePos);
-      await context.writeFile(resolvedPath, newData);
-      if (pos === null) position += length;
-      return { bytesWritten: length, buffer };
-    },
-    async close() {
-    },
-    async stat() {
-      return context.stat(resolvedPath);
-    },
-    async truncate(len = 0) {
-      return context.truncate(resolvedPath, len);
-    },
-    async sync() {
-    },
-    async datasync() {
-    },
-    async readFile(options) {
-      return context.readFile(resolvedPath, options);
-    },
-    async writeFile(data, options) {
-      return context.writeFile(resolvedPath, data, options);
-    },
-    async appendFile(data, options) {
-      return context.appendFile(resolvedPath, data, options);
-    },
-    [Symbol.asyncDispose]: async function() {
-    }
+    isFile: () => isFile,
+    isDirectory: () => isDir,
+    isBlockDevice: () => false,
+    isCharacterDevice: () => false,
+    isSymbolicLink: () => false,
+    isFIFO: () => false,
+    isSocket: () => false,
+    dev: 0,
+    ino: 0,
+    mode,
+    nlink: 1,
+    uid: 0,
+    gid: 0,
+    rdev: 0,
+    size,
+    blksize: 4096,
+    blocks: Math.ceil(size / 512),
+    atimeMs: mtimeMs,
+    mtimeMs,
+    ctimeMs: mtimeMs,
+    birthtimeMs: mtimeMs,
+    atime: new Date(mtimeMs),
+    mtime: new Date(mtimeMs),
+    ctime: new Date(mtimeMs),
+    birthtime: new Date(mtimeMs)
   };
 }
-
-// src/streams.ts
-function createReadStream(path, options, context) {
-  const { start = 0, end = Infinity, highWaterMark = 64 * 1024 } = options;
-  let position = start;
-  let closed = false;
-  let cachedData = null;
-  return new ReadableStream({
-    async pull(controller) {
-      if (closed) {
-        controller.close();
-        return;
-      }
-      try {
-        if (cachedData === null) {
-          cachedData = await context.readFile(path);
-        }
-        const endPos = Math.min(end, cachedData.length);
-        const chunk = cachedData.subarray(position, Math.min(position + highWaterMark, endPos));
-        if (chunk.length === 0 || position >= endPos) {
-          controller.close();
-          closed = true;
-          cachedData = null;
-          return;
-        }
-        position += chunk.length;
-        controller.enqueue(chunk);
-      } catch (err) {
-        controller.error(err);
-      }
-    },
-    cancel() {
-      closed = true;
-      cachedData = null;
-    }
-  });
+function createDirent(name, isDir) {
+  return {
+    name,
+    isFile: () => !isDir,
+    isDirectory: () => isDir,
+    isBlockDevice: () => false,
+    isCharacterDevice: () => false,
+    isSymbolicLink: () => false,
+    isFIFO: () => false,
+    isSocket: () => false
+  };
 }
-function createWriteStream(path, options, context) {
-  const { flags = "w", start = 0 } = options;
-  const chunks = [];
-  let position = start;
-  return new WritableStream({
-    async write(chunk) {
-      chunks.push({ data: chunk, position });
-      position += chunk.length;
-    },
-    async close() {
-      let existingData = new Uint8Array(0);
-      if (!flags.includes("w")) {
-        try {
-          existingData = await context.readFile(path);
-        } catch (e) {
-          if (e.code !== "ENOENT") throw e;
-        }
-      }
-      let maxSize = existingData.length;
-      for (const { data, position: position2 } of chunks) {
-        maxSize = Math.max(maxSize, position2 + data.length);
-      }
-      const finalData = new Uint8Array(maxSize);
-      if (!flags.includes("w")) {
-        finalData.set(existingData, 0);
-      }
-      for (const { data, position: position2 } of chunks) {
-        finalData.set(data, position2);
-      }
-      await context.writeFile(path, finalData);
-    }
-  });
+function generateId() {
+  return Math.random().toString(36).substring(2, 15);
 }
-
-// src/opfs-worker-proxy.ts
-var OPFSWorker = class {
+function encodeData(data, _encoding) {
+  if (typeof data === "string") {
+    return new TextEncoder().encode(data);
+  }
+  if (data instanceof Uint8Array) {
+    return data;
+  }
+  if (data instanceof ArrayBuffer) {
+    return new Uint8Array(data);
+  }
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  return new TextEncoder().encode(String(data ?? ""));
+}
+function decodeData(data, encoding) {
+  if (encoding === "utf8" || encoding === "utf-8") {
+    return new TextDecoder().decode(data);
+  }
+  return data;
+}
+var OPFSFileSystem = class _OPFSFileSystem {
   worker = null;
-  pendingRequests = /* @__PURE__ */ new Map();
-  nextId = 1;
-  readyPromise;
-  readyResolve;
-  /** File system constants */
-  constants = constants;
-  constructor(options = {}) {
-    this.readyPromise = new Promise((resolve) => {
-      this.readyResolve = resolve;
-    });
-    this.initWorker(options);
+  pending = /* @__PURE__ */ new Map();
+  initialized = false;
+  initPromise = null;
+  // File descriptor table for openSync/readSync/writeSync/closeSync
+  fdTable = /* @__PURE__ */ new Map();
+  nextFd = 3;
+  // Start at 3 (0=stdin, 1=stdout, 2=stderr)
+  // Stat cache - reduces FS traffic by 30-50% for git operations
+  statCache = /* @__PURE__ */ new Map();
+  constructor() {
+    this.initWorker();
   }
-  initWorker(options) {
-    const { workerUrl, workerOptions = { type: "module" } } = options;
-    if (workerUrl) {
-      this.worker = new Worker(workerUrl, workerOptions);
-    } else {
-      throw new Error(
-        'OPFSWorker requires a workerUrl option pointing to the worker script. Example: new OPFSWorker({ workerUrl: new URL("./opfs-worker.js", import.meta.url) })'
-      );
+  // Invalidate stat cache for a path (and parent for directory operations)
+  invalidateStat(filePath) {
+    const absPath = normalize(resolve(filePath));
+    this.statCache.delete(absPath);
+    const parent = dirname(absPath);
+    if (parent !== absPath) {
+      this.statCache.delete(parent);
     }
-    this.worker.onmessage = (event) => {
-      const { id, type, result, error } = event.data;
-      if (type === "ready") {
-        this.readyResolve();
-        return;
+  }
+  // Invalidate all stats under a directory (for recursive operations)
+  invalidateStatsUnder(dirPath) {
+    const prefix = normalize(resolve(dirPath));
+    for (const key of this.statCache.keys()) {
+      if (key === prefix || key.startsWith(prefix + "/")) {
+        this.statCache.delete(key);
       }
-      if (id !== void 0) {
-        const pending = this.pendingRequests.get(id);
-        if (pending) {
-          this.pendingRequests.delete(id);
-          if (error) {
-            const fsError = new FSError(error.message, error.code || "UNKNOWN");
-            pending.reject(fsError);
-          } else {
-            pending.resolve(result);
+    }
+  }
+  async initWorker() {
+    if (this.initialized) return;
+    if (this.initPromise) return this.initPromise;
+    this.initPromise = (async () => {
+      const blob = new Blob([KERNEL_SOURCE], { type: "application/javascript" });
+      this.worker = new Worker(URL.createObjectURL(blob));
+      const readyPromise = new Promise((resolve2) => {
+        this.worker.onmessage = (event) => {
+          const { id, result, error, code, type: msgType } = event.data;
+          if (msgType === "ready") {
+            resolve2();
+            return;
           }
-        }
-      }
-    };
-    this.worker.onerror = (event) => {
-      console.error("[OPFSWorker] Worker error:", event);
-    };
-  }
-  /**
-   * Wait for the worker to be ready
-   */
-  async ready() {
-    return this.readyPromise;
-  }
-  /**
-   * Terminate the worker
-   */
-  terminate() {
-    if (this.worker) {
-      this.worker.terminate();
-      this.worker = null;
-      for (const [, pending] of this.pendingRequests) {
-        pending.reject(new Error("Worker terminated"));
-      }
-      this.pendingRequests.clear();
-    }
-  }
-  call(method, args, transfer) {
-    return new Promise((resolve, reject) => {
-      if (!this.worker) {
-        reject(new Error("Worker not initialized or terminated"));
-        return;
-      }
-      const id = this.nextId++;
-      this.pendingRequests.set(id, {
-        resolve,
-        reject
-      });
-      const message = { id, method, args };
-      if (transfer && transfer.length > 0) {
-        this.worker.postMessage(message, transfer);
-      } else {
-        this.worker.postMessage(message);
-      }
-    });
-  }
-  // File operations
-  async readFile(path, options) {
-    const result = await this.call("readFile", [path, options]);
-    return result;
-  }
-  async writeFile(path, data, options) {
-    await this.call("writeFile", [path, data, options]);
-  }
-  async readFileBatch(paths) {
-    return this.call("readFileBatch", [paths]);
-  }
-  async writeFileBatch(entries) {
-    await this.call("writeFileBatch", [entries]);
-  }
-  async appendFile(path, data, options) {
-    await this.call("appendFile", [path, data, options]);
-  }
-  async copyFile(src, dest, mode) {
-    await this.call("copyFile", [src, dest, mode]);
-  }
-  async unlink(path) {
-    await this.call("unlink", [path]);
-  }
-  async truncate(path, len) {
-    await this.call("truncate", [path, len]);
-  }
-  // Directory operations
-  async mkdir(path) {
-    await this.call("mkdir", [path]);
-  }
-  async rmdir(path) {
-    await this.call("rmdir", [path]);
-  }
-  async readdir(path, options) {
-    const result = await this.call("readdir", [path, options]);
-    if (options?.withFileTypes && Array.isArray(result)) {
-      return result.map((item) => {
-        if (typeof item === "object" && "name" in item) {
-          const entry = item;
-          return {
-            name: entry.name,
-            isFile: () => entry._isFile ?? false,
-            isDirectory: () => entry._isDir ?? false,
-            isSymbolicLink: () => entry._isSymlink ?? false
-          };
-        }
-        return item;
-      });
-    }
-    return result;
-  }
-  async cp(src, dest, options) {
-    await this.call("cp", [src, dest, options]);
-  }
-  async rm(path, options) {
-    await this.call("rm", [path, options]);
-  }
-  // Stat operations
-  async stat(path) {
-    const result = await this.call("stat", [path]);
-    return this.deserializeStats(result);
-  }
-  async lstat(path) {
-    const result = await this.call("lstat", [path]);
-    return this.deserializeStats(result);
-  }
-  deserializeStats(data) {
-    const ctime = new Date(data.ctime);
-    const mtime = new Date(data.mtime);
-    return {
-      type: data.type,
-      size: data.size,
-      mode: data.mode,
-      ctime,
-      ctimeMs: data.ctimeMs,
-      mtime,
-      mtimeMs: data.mtimeMs,
-      target: data.target,
-      isFile: () => data.type === "file",
-      isDirectory: () => data.type === "dir",
-      isSymbolicLink: () => data.type === "symlink"
-    };
-  }
-  async exists(path) {
-    return this.call("exists", [path]);
-  }
-  async access(path, mode) {
-    await this.call("access", [path, mode]);
-  }
-  async statfs(path) {
-    return this.call("statfs", [path]);
-  }
-  async du(path) {
-    return this.call("du", [path]);
-  }
-  // Symlink operations
-  async symlink(target, path) {
-    await this.call("symlink", [target, path]);
-  }
-  async readlink(path) {
-    return this.call("readlink", [path]);
-  }
-  async symlinkBatch(links) {
-    await this.call("symlinkBatch", [links]);
-  }
-  async realpath(path) {
-    return this.call("realpath", [path]);
-  }
-  // Other operations
-  async rename(oldPath, newPath) {
-    await this.call("rename", [oldPath, newPath]);
-  }
-  async mkdtemp(prefix) {
-    return this.call("mkdtemp", [prefix]);
-  }
-  async chmod(path, mode) {
-    await this.call("chmod", [path, mode]);
-  }
-  async chown(path, uid, gid) {
-    await this.call("chown", [path, uid, gid]);
-  }
-  async utimes(path, atime, mtime) {
-    await this.call("utimes", [path, atime, mtime]);
-  }
-  async lutimes(path, atime, mtime) {
-    await this.call("lutimes", [path, atime, mtime]);
-  }
-  /**
-   * Reset internal caches to free memory
-   * Useful for long-running benchmarks or after bulk operations
-   */
-  async resetCache() {
-    await this.call("resetCache", []);
-  }
-  /**
-   * Force full garbage collection by reinitializing the OPFS instance in the worker
-   * This completely releases all handles and caches, preventing memory leaks in long-running operations
-   * More aggressive than resetCache() - use when resetCache() isn't sufficient
-   */
-  async gc() {
-    await this.call("gc", []);
-  }
-};
-
-// src/opfs-hybrid.ts
-var OPFSHybrid = class {
-  mainFs;
-  workerFs = null;
-  readBackend;
-  writeBackend;
-  workerUrl;
-  workerReady = null;
-  verbose;
-  constructor(options = {}) {
-    this.readBackend = options.read ?? "main";
-    this.writeBackend = options.write ?? "worker";
-    this.workerUrl = options.workerUrl;
-    this.verbose = options.verbose ?? false;
-    this.mainFs = new OPFS({ useSync: false, verbose: this.verbose });
-    if (this.readBackend === "worker" || this.writeBackend === "worker") {
-      if (!this.workerUrl) {
-        throw new Error("workerUrl is required when using worker backend");
-      }
-      this.workerFs = new OPFSWorker({ workerUrl: this.workerUrl });
-      this.workerReady = this.workerFs.ready();
-    }
-  }
-  /**
-   * Wait for all backends to be ready
-   */
-  async ready() {
-    if (this.workerReady) {
-      await this.workerReady;
-    }
-  }
-  /**
-   * Terminate worker if active
-   */
-  terminate() {
-    if (this.workerFs) {
-      this.workerFs.terminate();
-      this.workerFs = null;
-    }
-  }
-  getReadFs() {
-    if (this.readBackend === "worker" && this.workerFs) {
-      return this.workerFs;
-    }
-    return this.mainFs;
-  }
-  getWriteFs() {
-    if (this.writeBackend === "worker" && this.workerFs) {
-      return this.workerFs;
-    }
-    return this.mainFs;
-  }
-  // ============ Read Operations ============
-  async readFile(path, options) {
-    return this.getReadFs().readFile(path, options);
-  }
-  async readFileBatch(paths) {
-    return this.getReadFs().readFileBatch(paths);
-  }
-  async readdir(path, options) {
-    return this.getReadFs().readdir(path, options);
-  }
-  async stat(path) {
-    return this.getReadFs().stat(path);
-  }
-  async lstat(path) {
-    return this.getReadFs().lstat(path);
-  }
-  async exists(path) {
-    return this.getReadFs().exists(path);
-  }
-  async access(path, mode) {
-    return this.getReadFs().access(path, mode);
-  }
-  async readlink(path) {
-    return this.getReadFs().readlink(path);
-  }
-  async realpath(path) {
-    return this.getReadFs().realpath(path);
-  }
-  async statfs(path) {
-    return this.getReadFs().statfs(path);
-  }
-  async du(path) {
-    return this.getReadFs().du(path);
-  }
-  // ============ Write Operations ============
-  async writeFile(path, data, options) {
-    return this.getWriteFs().writeFile(path, data, options);
-  }
-  async writeFileBatch(entries) {
-    return this.getWriteFs().writeFileBatch(entries);
-  }
-  async appendFile(path, data, options) {
-    return this.getWriteFs().appendFile(path, data, options);
-  }
-  async mkdir(path) {
-    return this.getWriteFs().mkdir(path);
-  }
-  async rmdir(path) {
-    if (this.readBackend !== this.writeBackend && this.workerFs) {
-      await this.workerFs.rmdir(path);
-      this.mainFs.resetCache();
-    } else {
-      return this.getWriteFs().rmdir(path);
-    }
-  }
-  async unlink(path) {
-    return this.getWriteFs().unlink(path);
-  }
-  async truncate(path, len) {
-    return this.getWriteFs().truncate(path, len);
-  }
-  async symlink(target, path) {
-    if (this.readBackend !== this.writeBackend && this.workerFs) {
-      await this.workerFs.symlink(target, path);
-      this.mainFs.resetCache();
-    } else {
-      return this.getWriteFs().symlink(target, path);
-    }
-  }
-  async symlinkBatch(symlinks) {
-    if (this.readBackend !== this.writeBackend && this.workerFs) {
-      await this.workerFs.symlinkBatch(symlinks);
-      this.mainFs.resetCache();
-    } else {
-      return this.getWriteFs().symlinkBatch(symlinks);
-    }
-  }
-  async rename(oldPath, newPath) {
-    return this.getWriteFs().rename(oldPath, newPath);
-  }
-  async copyFile(src, dest, mode) {
-    return this.getWriteFs().copyFile(src, dest, mode);
-  }
-  async cp(src, dest, options) {
-    return this.getWriteFs().cp(src, dest, options);
-  }
-  async rm(path, options) {
-    return this.getWriteFs().rm(path, options);
-  }
-  async chmod(path, mode) {
-    return this.getWriteFs().chmod(path, mode);
-  }
-  async chown(path, uid, gid) {
-    return this.getWriteFs().chown(path, uid, gid);
-  }
-  async utimes(path, atime, mtime) {
-    return this.getWriteFs().utimes(path, atime, mtime);
-  }
-  async lutimes(path, atime, mtime) {
-    return this.getWriteFs().lutimes(path, atime, mtime);
-  }
-  async mkdtemp(prefix) {
-    return this.getWriteFs().mkdtemp(prefix);
-  }
-  /**
-   * Reset internal caches on both backends
-   */
-  async resetCache() {
-    this.mainFs.resetCache();
-    if (this.workerFs) {
-      await this.workerFs.resetCache();
-    }
-  }
-  /**
-   * Force full garbage collection on both backends
-   * More aggressive than resetCache() - reinitializes the worker's OPFS instance
-   */
-  async gc() {
-    this.mainFs.resetCache();
-    if (this.workerFs) {
-      await this.workerFs.gc();
-    }
-  }
-};
-
-// src/index.ts
-var OPFS = class {
-  useSync;
-  verbose;
-  handleManager;
-  symlinkManager;
-  packedStorage;
-  watchCallbacks = /* @__PURE__ */ new Map();
-  tmpCounter = 0;
-  /** Hybrid instance when workerUrl is provided */
-  hybrid = null;
-  /** File system constants */
-  constants = constants;
-  constructor(options = {}) {
-    const { useSync = true, verbose = false, useCompression = false, useChecksum = true, workerUrl, read, write } = options;
-    this.verbose = verbose;
-    if (workerUrl) {
-      this.hybrid = new OPFSHybrid({
-        workerUrl,
-        read: read ?? "main",
-        write: write ?? "worker",
-        verbose
-      });
-      this.useSync = false;
-      this.handleManager = new HandleManager();
-      this.symlinkManager = new SymlinkManager(this.handleManager, false);
-      this.packedStorage = new PackedStorage(this.handleManager, false, useCompression, useChecksum);
-    } else {
-      this.useSync = useSync && typeof FileSystemFileHandle !== "undefined" && "createSyncAccessHandle" in FileSystemFileHandle.prototype;
-      this.handleManager = new HandleManager();
-      this.symlinkManager = new SymlinkManager(this.handleManager, this.useSync);
-      this.packedStorage = new PackedStorage(this.handleManager, this.useSync, useCompression, useChecksum);
-    }
-  }
-  /**
-   * Wait for the filesystem to be ready (only needed for hybrid mode)
-   */
-  async ready() {
-    if (this.hybrid) {
-      await this.hybrid.ready();
-    }
-  }
-  /**
-   * Terminate any background workers (only needed for hybrid mode)
-   */
-  terminate() {
-    if (this.hybrid) {
-      this.hybrid.terminate();
-    }
-  }
-  log(method, ...args) {
-    if (this.verbose) {
-      console.log(`[OPFS] ${method}:`, ...args);
-    }
-  }
-  logError(method, err) {
-    if (this.verbose) {
-      console.error(`[OPFS] ${method} error:`, err);
-    }
-  }
-  /**
-   * Execute tasks with limited concurrency to avoid overwhelming the system
-   * @param items - Array of items to process
-   * @param maxConcurrent - Maximum number of concurrent operations (default: 10)
-   * @param taskFn - Function to execute for each item
-   */
-  async limitConcurrency(items, maxConcurrent, taskFn) {
-    if (items.length === 0) return;
-    if (items.length <= 2) {
-      for (const item of items) {
-        await taskFn(item);
-      }
-      return;
-    }
-    if (items.length <= maxConcurrent) {
-      await Promise.all(items.map(taskFn));
-      return;
-    }
-    const queue = [...items];
-    const workers = Array.from({ length: maxConcurrent }).map(async () => {
-      while (queue.length) {
-        const item = queue.shift();
-        if (item !== void 0) await taskFn(item);
-      }
-    });
-    await Promise.all(workers);
-  }
-  /**
-   * Read file contents
-   */
-  async readFile(path, options = {}) {
-    if (this.hybrid) {
-      return this.hybrid.readFile(path, options);
-    }
-    this.log("readFile", path, options);
-    try {
-      const normalizedPath = normalize(path);
-      const resolvedPath = await this.symlinkManager.resolve(normalizedPath);
-      let fileHandle = null;
-      try {
-        fileHandle = await this.handleManager.getPooledFileHandle(resolvedPath);
-      } catch {
-      }
-      if (fileHandle) {
-        let buffer;
-        if (this.useSync) {
-          const access = await fileHandle.createSyncAccessHandle();
-          try {
-            const size = access.getSize();
-            buffer = new Uint8Array(size);
-            access.read(buffer);
-          } finally {
-            access.close();
-          }
-        } else {
-          const file = await fileHandle.getFile();
-          buffer = new Uint8Array(await file.arrayBuffer());
-        }
-        return options.encoding ? new TextDecoder(options.encoding).decode(buffer) : buffer;
-      }
-      const packedData = await this.packedStorage.read(resolvedPath);
-      if (packedData) {
-        return options.encoding ? new TextDecoder(options.encoding).decode(packedData) : packedData;
-      }
-      throw createENOENT(path);
-    } catch (err) {
-      this.logError("readFile", err);
-      throw wrapError(err);
-    }
-  }
-  /**
-   * Read multiple files efficiently in a batch operation
-   * Uses packed storage batch read (single index load), falls back to individual files
-   * Returns results in the same order as input paths
-   */
-  async readFileBatch(paths) {
-    if (this.hybrid) {
-      return this.hybrid.readFileBatch(paths);
-    }
-    this.log("readFileBatch", `${paths.length} files`);
-    if (paths.length === 0) return [];
-    try {
-      const resolvedPaths = await Promise.all(
-        paths.map(async (path) => {
-          const normalizedPath = normalize(path);
-          return this.symlinkManager.resolve(normalizedPath);
-        })
-      );
-      const packedResults = await this.packedStorage.readBatch(resolvedPaths);
-      const results = new Array(paths.length);
-      const needsIndividualRead = [];
-      for (let i = 0; i < paths.length; i++) {
-        const packedData = packedResults.get(resolvedPaths[i]);
-        if (packedData) {
-          results[i] = { path: paths[i], data: packedData };
-        } else {
-          needsIndividualRead.push({ index: i, resolvedPath: resolvedPaths[i] });
-        }
-      }
-      if (needsIndividualRead.length > 0) {
-        await Promise.all(
-          needsIndividualRead.map(async ({ index, resolvedPath }) => {
-            try {
-              const fileHandle = await this.handleManager.getPooledFileHandle(resolvedPath);
-              if (!fileHandle) {
-                results[index] = { path: paths[index], data: null, error: createENOENT(paths[index]) };
-                return;
-              }
-              let buffer;
-              if (this.useSync) {
-                const access = await fileHandle.createSyncAccessHandle();
-                try {
-                  const size = access.getSize();
-                  buffer = new Uint8Array(size);
-                  access.read(buffer);
-                } finally {
-                  access.close();
-                }
+          const pending = this.pending.get(id);
+          if (pending) {
+            this.pending.delete(id);
+            if (error) {
+              const errCode = code || "Error";
+              if (errCode === "NotFoundError" || errCode === "NotAllowedError" || errCode === "TypeMismatchError" || errCode === "InvalidModificationError" || errCode === "QuotaExceededError") {
+                pending.reject(mapErrorCode(errCode, pending.type, pending.path));
               } else {
-                const file = await fileHandle.getFile();
-                buffer = new Uint8Array(await file.arrayBuffer());
+                pending.reject(new FSError(errCode, -1, `${error}: ${pending.type} '${pending.path}'`));
               }
-              results[index] = { path: paths[index], data: buffer };
-            } catch (err) {
-              results[index] = { path: paths[index], data: null, error: err };
+            } else if (result) {
+              pending.resolve(result);
             }
-          })
-        );
-      }
-      return results;
-    } catch (err) {
-      this.logError("readFileBatch", err);
-      throw wrapError(err);
-    }
+          }
+        };
+      });
+      await readyPromise;
+      this.initialized = true;
+    })();
+    return this.initPromise;
   }
-  /**
-   * Write data to a file
-   */
-  async writeFile(path, data, options = {}) {
-    if (this.hybrid) {
-      return this.hybrid.writeFile(path, data, options);
+  // Async call to worker - uses fast createSyncAccessHandle internally
+  async asyncCall(type, filePath, payload) {
+    await this.initWorker();
+    if (!this.worker) {
+      throw new Error("Worker not initialized");
     }
-    this.log("writeFile", path);
-    try {
-      const normalizedPath = normalize(path);
-      const resolvedPath = await this.symlinkManager.resolve(normalizedPath);
-      const { fileHandle } = await this.handleManager.getHandle(resolvedPath, { create: true });
-      const buffer = typeof data === "string" ? new TextEncoder().encode(data) : data;
-      if (this.useSync) {
-        const access = await fileHandle.createSyncAccessHandle();
-        try {
-          access.truncate(buffer.length);
-          access.write(buffer, { at: 0 });
-        } finally {
-          access.close();
-        }
+    const absPath = resolve(filePath);
+    const id = generateId();
+    return new Promise((resolve2, reject) => {
+      this.pending.set(id, { resolve: resolve2, reject, path: absPath, type });
+      const msg = {
+        id,
+        type,
+        path: absPath,
+        payload
+      };
+      if (payload?.data instanceof Uint8Array) {
+        const clone = new Uint8Array(payload.data);
+        const newPayload = { ...payload, data: clone };
+        this.worker.postMessage({ ...msg, payload: newPayload }, [clone.buffer]);
       } else {
-        const writable = await fileHandle.createWritable();
-        await writable.write(buffer);
-        await writable.close();
+        this.worker.postMessage(msg);
       }
-    } catch (err) {
-      this.logError("writeFile", err);
-      throw wrapError(err);
-    }
+    });
   }
+  // Kernel worker for Tier 1 sync operations (loaded from URL, not blob)
+  syncKernel = null;
+  syncKernelReady = false;
   /**
-   * Write multiple files efficiently in a batch operation
-   * Uses packed storage (single file) for maximum performance
+   * Initialize sync operations with a kernel worker loaded from URL.
+   * Required for Tier 1 (SharedArrayBuffer + Atomics) to work in nested Workers.
+   * @param kernelUrl URL to the kernel.js file (defaults to '/kernel.js')
    */
-  async writeFileBatch(entries) {
-    if (this.hybrid) {
-      return this.hybrid.writeFileBatch(entries);
-    }
-    this.log("writeFileBatch", `${entries.length} files`);
-    if (entries.length === 0) return;
-    try {
-      const encoder = new TextEncoder();
-      const packEntries = await Promise.all(
-        entries.map(async ({ path, data }) => {
-          const normalizedPath = normalize(path);
-          const resolvedPath = await this.symlinkManager.resolve(normalizedPath);
-          return {
-            path: resolvedPath,
-            data: typeof data === "string" ? encoder.encode(data) : data
-          };
-        })
-      );
-      await this.packedStorage.writeBatch(packEntries);
-    } catch (err) {
-      this.logError("writeFileBatch", err);
-      throw wrapError(err);
-    }
-  }
-  /**
-   * Create a directory
-   */
-  async mkdir(path) {
-    if (this.hybrid) {
-      return this.hybrid.mkdir(path);
-    }
-    this.log("mkdir", path);
-    try {
-      await this.handleManager.mkdir(path);
-    } catch (err) {
-      this.logError("mkdir", err);
-      throw wrapError(err);
-    }
-  }
-  /**
-   * Remove a directory
-   */
-  async rmdir(path) {
-    if (this.hybrid) {
-      return this.hybrid.rmdir(path);
-    }
-    this.log("rmdir", path);
-    try {
-      const normalizedPath = normalize(path);
-      this.handleManager.clearCache(normalizedPath);
-      if (isRoot(normalizedPath)) {
-        const root = await this.handleManager.getRoot();
-        const entries = [];
-        for await (const [name2] of root.entries()) {
-          entries.push(name2);
+  async initSync(kernelUrl = "/kernel.js") {
+    if (this.syncKernelReady) return;
+    this.syncKernel = new Worker(kernelUrl, { type: "module" });
+    await new Promise((resolve2, reject) => {
+      const timeout = setTimeout(() => reject(new Error("Kernel init timeout")), 1e4);
+      this.syncKernel.onmessage = (e) => {
+        if (e.data?.type === "ready") {
+          clearTimeout(timeout);
+          this.syncKernelReady = true;
+          resolve2();
         }
-        await this.limitConcurrency(
-          entries,
-          10,
-          (name2) => root.removeEntry(name2, { recursive: true })
-        );
-        this.symlinkManager.reset();
-        this.packedStorage.reset();
-        return;
-      }
-      const pathSegments = segments(normalizedPath);
-      const name = pathSegments.pop();
-      let dir = await this.handleManager.getRoot();
-      for (const part of pathSegments) {
-        dir = await dir.getDirectoryHandle(part);
-      }
-      try {
-        await dir.removeEntry(name, { recursive: true });
-      } catch {
-        throw createENOENT(path);
-      }
-    } catch (err) {
-      this.logError("rmdir", err);
-      throw wrapError(err);
-    }
+      };
+      this.syncKernel.onerror = (e) => {
+        clearTimeout(timeout);
+        reject(new Error(`Kernel error: ${e.message}`));
+      };
+    });
   }
-  /**
-   * Remove a file or symlink
-   */
-  async unlink(path) {
-    if (this.hybrid) {
-      return this.hybrid.unlink(path);
+  // Tier 1: SharedArrayBuffer + Atomics via kernel worker
+  // Data is transferred via SharedArrayBuffer (zero-copy)
+  // Synchronization via Atomics.wait/notify
+  // Buffer sizes for Tier 1 communication
+  static META_SIZE = 1024 * 64;
+  // 64KB for metadata/results
+  static DEFAULT_DATA_SIZE = 1024 * 1024 * 10;
+  // 10MB default buffer
+  static MAX_CHUNK_SIZE = 1024 * 1024 * 10;
+  // 10MB max per chunk
+  // Reusable SharedArrayBuffer pool to prevent memory leaks
+  // SharedArrayBuffers are expensive to allocate and don't get GC'd quickly
+  syncBufferPool = null;
+  getSyncBuffers(requiredDataSize) {
+    if (this.syncBufferPool && this.syncBufferPool.dataSize >= requiredDataSize) {
+      return {
+        ctrlBuffer: this.syncBufferPool.ctrl,
+        ctrl: new Int32Array(this.syncBufferPool.ctrl),
+        metaBuffer: this.syncBufferPool.meta,
+        dataBuffer: this.syncBufferPool.data
+      };
     }
-    this.log("unlink", path);
-    try {
-      const normalizedPath = normalize(path);
-      this.handleManager.clearCache(normalizedPath);
-      const isSymlink = await this.symlinkManager.isSymlink(normalizedPath);
-      if (isSymlink) {
-        await this.symlinkManager.unlink(normalizedPath);
-        return;
-      }
-      const inPack = await this.packedStorage.has(normalizedPath);
-      if (inPack) {
-        await this.packedStorage.remove(normalizedPath);
-        return;
-      }
-      const { dir, name, fileHandle } = await this.handleManager.getHandle(normalizedPath);
-      if (!fileHandle) throw createENOENT(path);
-      try {
-        await dir.removeEntry(name);
-      } catch {
-        throw createENOENT(path);
-      }
-    } catch (err) {
-      this.logError("unlink", err);
-      throw wrapError(err);
-    }
+    const dataSize = Math.max(
+      _OPFSFileSystem.DEFAULT_DATA_SIZE,
+      Math.min(requiredDataSize + 1024, 1024 * 1024 * 64)
+      // Up to 64MB
+    );
+    const ctrlBuffer = new SharedArrayBuffer(4);
+    const metaBuffer = new SharedArrayBuffer(_OPFSFileSystem.META_SIZE);
+    const dataBuffer = new SharedArrayBuffer(dataSize);
+    this.syncBufferPool = {
+      ctrl: ctrlBuffer,
+      meta: metaBuffer,
+      data: dataBuffer,
+      dataSize
+    };
+    return {
+      ctrlBuffer,
+      ctrl: new Int32Array(ctrlBuffer),
+      metaBuffer,
+      dataBuffer
+    };
   }
-  /**
-   * Read directory contents
-   */
-  async readdir(path, options) {
-    if (this.hybrid) {
-      return this.hybrid.readdir(path, options);
+  syncCallTier1(type, filePath, payload) {
+    if (!this.syncKernel || !this.syncKernelReady) {
+      throw new Error("Sync kernel not initialized. Call initSync() first.");
     }
-    this.log("readdir", path, options);
-    try {
-      const normalizedPath = normalize(path);
-      const resolvedPath = await this.symlinkManager.resolve(normalizedPath);
-      const dir = await this.handleManager.getDirectoryHandle(resolvedPath);
-      const withFileTypes = options?.withFileTypes === true;
-      const symlinksInDir = await this.symlinkManager.getSymlinksInDir(resolvedPath);
-      const hasSymlinks = symlinksInDir.length > 0;
-      const symlinkSet = hasSymlinks ? new Set(symlinksInDir) : null;
-      const entryNames = /* @__PURE__ */ new Set();
+    const absPath = normalize(resolve(filePath));
+    const data = payload?.data instanceof Uint8Array ? payload.data : null;
+    const dataSize = data?.length ?? 0;
+    if (type === "write" && data && dataSize > _OPFSFileSystem.MAX_CHUNK_SIZE) {
+      return this.syncCallTier1Chunked(absPath, data);
+    }
+    const { ctrlBuffer, ctrl, metaBuffer, dataBuffer } = this.getSyncBuffers(dataSize);
+    Atomics.store(ctrl, 0, 0);
+    let dataLength = 0;
+    if (data) {
+      const view = new Uint8Array(dataBuffer);
+      view.set(data);
+      dataLength = data.length;
+    }
+    this.syncKernel.postMessage({
+      type,
+      path: absPath,
+      ctrlBuffer,
+      metaBuffer,
+      dataBuffer,
+      dataLength,
+      payload: payload ? { ...payload, data: void 0 } : void 0
+    });
+    const waitResult = Atomics.wait(ctrl, 0, 0, 3e4);
+    if (waitResult === "timed-out") {
+      throw new Error("Operation timed out");
+    }
+    const status = Atomics.load(ctrl, 0);
+    if (status === -1) {
+      const metaView = new Uint8Array(metaBuffer);
+      let end = metaView.indexOf(0);
+      if (end === -1) end = _OPFSFileSystem.META_SIZE;
+      const errorMsg = new TextDecoder().decode(metaView.slice(0, end));
+      throw mapErrorCode(errorMsg || "Error", type, absPath);
+    }
+    if (status === -2) {
+      throw createENOENT(type, absPath);
+    }
+    if (type === "read") {
+      const bytesRead = status;
+      const bufferSize = dataBuffer.byteLength;
+      if (bytesRead === bufferSize) {
+        const stat = this.syncStatTier1(absPath);
+        if (stat && stat.size > bytesRead) {
+          return this.syncCallTier1ChunkedRead(absPath, stat.size);
+        }
+      }
+      const dataView = new Uint8Array(dataBuffer);
+      return { data: dataView.slice(0, bytesRead) };
+    }
+    if (type === "stat") {
+      const view = new DataView(metaBuffer);
+      const typeVal = view.getUint8(0);
+      return {
+        type: typeVal === 0 ? "file" : "directory",
+        mode: view.getUint32(4, true),
+        size: view.getFloat64(8, true),
+        mtimeMs: view.getFloat64(16, true)
+      };
+    }
+    if (type === "readdir") {
+      const view = new DataView(metaBuffer);
+      const bytes = new Uint8Array(metaBuffer);
+      const count = view.getUint32(0, true);
       const entries = [];
-      for await (const [name, handle] of dir.entries()) {
-        if (this.symlinkManager.isMetadataFile(name)) continue;
-        entryNames.add(name);
-        if (withFileTypes) {
-          const isSymlink = hasSymlinks && symlinkSet.has(name);
-          entries.push({
-            name,
-            isFile: () => !isSymlink && handle.kind === "file",
-            isDirectory: () => !isSymlink && handle.kind === "directory",
-            isSymbolicLink: () => isSymlink
-          });
-        } else {
-          entries.push(name);
-        }
+      let offset = 4;
+      for (let i = 0; i < count; i++) {
+        const len = view.getUint16(offset, true);
+        offset += 2;
+        const name = new TextDecoder().decode(bytes.slice(offset, offset + len));
+        entries.push(name);
+        offset += len;
       }
-      if (hasSymlinks) {
-        for (const name of symlinksInDir) {
-          if (!entryNames.has(name)) {
-            if (withFileTypes) {
-              entries.push({
-                name,
-                isFile: () => false,
-                isDirectory: () => false,
-                isSymbolicLink: () => true
-              });
-            } else {
-              entries.push(name);
-            }
-          }
-        }
-      }
-      return entries;
-    } catch (err) {
-      this.logError("readdir", err);
-      throw wrapError(err);
+      return { entries };
+    }
+    if (type === "exists") {
+      return { exists: status === 1 };
+    }
+    return { success: status === 1 };
+  }
+  // Mutex for async operations to prevent buffer reuse race conditions
+  // Multiple concurrent Atomics.waitAsync calls would share the same buffer pool,
+  // causing data corruption when operations complete out of order
+  asyncOperationPromise = Promise.resolve();
+  // Async version of syncCallTier1 using Atomics.waitAsync (works on main thread)
+  // This allows the main thread to use the fast SharedArrayBuffer path without blocking
+  // IMPORTANT: Operations are serialized to prevent buffer reuse race conditions
+  async syncCallTier1Async(type, filePath, payload) {
+    const previousOp = this.asyncOperationPromise;
+    let resolveCurrentOp;
+    this.asyncOperationPromise = new Promise((resolve2) => {
+      resolveCurrentOp = resolve2;
+    });
+    try {
+      await previousOp;
+      return await this.syncCallTier1AsyncImpl(type, filePath, payload);
+    } finally {
+      resolveCurrentOp();
     }
   }
-  /**
-   * Get file/directory statistics (follows symlinks)
-   */
-  async stat(path) {
-    if (this.hybrid) {
-      return this.hybrid.stat(path);
+  // Implementation of async Tier 1 call (called after serialization)
+  async syncCallTier1AsyncImpl(type, filePath, payload) {
+    if (!this.syncKernel || !this.syncKernelReady) {
+      throw new Error("Sync kernel not initialized. Call initSync() first.");
     }
-    this.log("stat", path);
-    try {
-      const normalizedPath = normalize(path);
-      const resolvedPath = await this.symlinkManager.resolve(normalizedPath);
-      const defaultDate = /* @__PURE__ */ new Date(0);
-      if (isRoot(resolvedPath)) {
-        return {
-          type: "dir",
-          size: 0,
-          mode: 16877,
-          ctime: defaultDate,
-          ctimeMs: 0,
-          mtime: defaultDate,
-          mtimeMs: 0,
-          isFile: () => false,
-          isDirectory: () => true,
-          isSymbolicLink: () => false
-        };
-      }
-      const pathSegments = segments(resolvedPath);
-      const name = pathSegments.pop();
-      let dir = await this.handleManager.getRoot();
-      for (const part of pathSegments) {
-        try {
-          dir = await dir.getDirectoryHandle(part);
-        } catch {
-          throw createENOENT(path);
+    const absPath = normalize(resolve(filePath));
+    const data = payload?.data instanceof Uint8Array ? payload.data : null;
+    const dataSize = data?.length ?? 0;
+    if (type === "write" && data && dataSize > _OPFSFileSystem.MAX_CHUNK_SIZE) {
+      return this.syncCallTier1ChunkedAsync(absPath, data);
+    }
+    const { ctrlBuffer, ctrl, metaBuffer, dataBuffer } = this.getSyncBuffers(dataSize);
+    Atomics.store(ctrl, 0, 0);
+    let dataLength = 0;
+    if (data) {
+      const view = new Uint8Array(dataBuffer);
+      view.set(data);
+      dataLength = data.length;
+    }
+    this.syncKernel.postMessage({
+      type,
+      path: absPath,
+      ctrlBuffer,
+      metaBuffer,
+      dataBuffer,
+      dataLength,
+      payload: payload ? { ...payload, data: void 0 } : void 0
+    });
+    const waitResult = await Atomics.waitAsync(ctrl, 0, 0, 3e4).value;
+    if (waitResult === "timed-out") {
+      throw new Error("Operation timed out");
+    }
+    const status = Atomics.load(ctrl, 0);
+    if (status === -1) {
+      const metaView = new Uint8Array(metaBuffer);
+      let end = metaView.indexOf(0);
+      if (end === -1) end = _OPFSFileSystem.META_SIZE;
+      const errorMsg = new TextDecoder().decode(metaView.slice(0, end));
+      throw mapErrorCode(errorMsg || "Error", type, absPath);
+    }
+    if (status === -2) {
+      throw createENOENT(type, absPath);
+    }
+    if (type === "read") {
+      const bytesRead = status;
+      const bufferSize = dataBuffer.byteLength;
+      if (bytesRead === bufferSize) {
+        const stat = await this.syncStatTier1Async(absPath);
+        if (stat && stat.size > bytesRead) {
+          return this.syncCallTier1ChunkedReadAsync(absPath, stat.size);
         }
       }
-      const [fileResult, dirResult] = await Promise.allSettled([
-        dir.getFileHandle(name),
-        dir.getDirectoryHandle(name)
-      ]);
-      if (fileResult.status === "fulfilled") {
-        const fileHandle = fileResult.value;
-        const file = await fileHandle.getFile();
-        const mtime = file.lastModified ? new Date(file.lastModified) : defaultDate;
-        return {
-          type: "file",
-          size: file.size,
-          mode: 33188,
-          ctime: mtime,
-          ctimeMs: mtime.getTime(),
-          mtime,
-          mtimeMs: mtime.getTime(),
-          isFile: () => true,
-          isDirectory: () => false,
-          isSymbolicLink: () => false
-        };
+      const dataView = new Uint8Array(dataBuffer);
+      return { data: dataView.slice(0, bytesRead) };
+    }
+    if (type === "stat") {
+      const view = new DataView(metaBuffer);
+      const typeVal = view.getUint8(0);
+      return {
+        type: typeVal === 0 ? "file" : "directory",
+        mode: view.getUint32(4, true),
+        size: view.getFloat64(8, true),
+        mtimeMs: view.getFloat64(16, true)
+      };
+    }
+    if (type === "readdir") {
+      const view = new DataView(metaBuffer);
+      const bytes = new Uint8Array(metaBuffer);
+      const count = view.getUint32(0, true);
+      const entries = [];
+      let offset = 4;
+      for (let i = 0; i < count; i++) {
+        const len = view.getUint16(offset, true);
+        offset += 2;
+        const name = new TextDecoder().decode(bytes.slice(offset, offset + len));
+        entries.push(name);
+        offset += len;
       }
-      if (dirResult.status === "fulfilled") {
-        return {
-          type: "dir",
-          size: 0,
-          mode: 16877,
-          ctime: defaultDate,
-          ctimeMs: 0,
-          mtime: defaultDate,
-          mtimeMs: 0,
-          isFile: () => false,
-          isDirectory: () => true,
-          isSymbolicLink: () => false
-        };
-      }
-      const packedSize = await this.packedStorage.getSize(resolvedPath);
-      if (packedSize !== null) {
-        return {
-          type: "file",
-          size: packedSize,
-          mode: 33188,
-          ctime: defaultDate,
-          ctimeMs: 0,
-          mtime: defaultDate,
-          mtimeMs: 0,
-          isFile: () => true,
-          isDirectory: () => false,
-          isSymbolicLink: () => false
-        };
-      }
-      throw createENOENT(path);
-    } catch (err) {
-      this.logError("stat", err);
-      throw wrapError(err);
+      return { entries };
+    }
+    if (type === "exists") {
+      return { exists: status === 1 };
+    }
+    return { success: status === 1 };
+  }
+  // Async stat helper for main thread
+  // NOTE: Called from within syncCallTier1AsyncImpl, so uses impl directly to avoid deadlock
+  async syncStatTier1Async(absPath) {
+    try {
+      const result = await this.syncCallTier1AsyncImpl("stat", absPath);
+      return { size: result.size };
+    } catch {
+      return null;
     }
   }
-  /**
-   * Get file/directory statistics (does not follow symlinks)
-   */
-  async lstat(path) {
-    if (this.hybrid) {
-      return this.hybrid.lstat(path);
-    }
-    this.log("lstat", path);
-    try {
-      const normalizedPath = normalize(path);
-      const isSymlink = await this.symlinkManager.isSymlink(normalizedPath);
-      if (isSymlink) {
-        const target = await this.symlinkManager.readlink(normalizedPath);
-        return {
-          type: "symlink",
-          target,
-          size: target.length,
-          mode: 41471,
-          ctime: /* @__PURE__ */ new Date(0),
-          ctimeMs: 0,
-          mtime: /* @__PURE__ */ new Date(0),
-          mtimeMs: 0,
-          isFile: () => false,
-          isDirectory: () => false,
-          isSymbolicLink: () => true
-        };
-      }
-      return this.stat(path);
-    } catch (err) {
-      this.logError("lstat", err);
-      throw wrapError(err);
-    }
-  }
-  /**
-   * Rename a file or directory
-   */
-  async rename(oldPath, newPath) {
-    if (this.hybrid) {
-      return this.hybrid.rename(oldPath, newPath);
-    }
-    this.log("rename", oldPath, newPath);
-    try {
-      const normalizedOld = normalize(oldPath);
-      const normalizedNew = normalize(newPath);
-      this.handleManager.clearCache(normalizedOld);
-      this.handleManager.clearCache(normalizedNew);
-      const renamed = await this.symlinkManager.rename(normalizedOld, normalizedNew);
-      if (renamed) return;
-      const stat = await this.stat(normalizedOld);
-      if (stat.isFile()) {
-        const [data] = await Promise.all([
-          this.readFile(normalizedOld),
-          this.handleManager.ensureParentDir(normalizedNew)
-        ]);
-        await this.writeFile(normalizedNew, data);
-        await this.unlink(normalizedOld);
-      } else if (stat.isDirectory()) {
-        await this.mkdir(normalizedNew);
-        const entries = await this.readdir(normalizedOld);
-        await this.limitConcurrency(
-          entries,
-          10,
-          (entry) => this.rename(`${normalizedOld}/${entry}`, `${normalizedNew}/${entry}`)
-        );
-        await this.rmdir(normalizedOld);
-      }
-    } catch (err) {
-      this.logError("rename", err);
-      throw wrapError(err);
-    }
-  }
-  /**
-   * Create a symbolic link
-   */
-  async symlink(target, path) {
-    if (this.hybrid) {
-      return this.hybrid.symlink(target, path);
-    }
-    this.log("symlink", target, path);
-    try {
-      const normalizedPath = normalize(path);
-      this.handleManager.clearCache(normalizedPath);
-      await this.symlinkManager.symlink(target, path, async () => {
-        const { fileHandle, dirHandle } = await this.handleManager.getHandle(normalizedPath);
-        if (fileHandle || dirHandle) {
-          throw createEEXIST(path);
-        }
+  // Async chunked write for main thread
+  async syncCallTier1ChunkedAsync(absPath, data) {
+    const totalSize = data.length;
+    let offset = 0;
+    while (offset < totalSize) {
+      const remaining = totalSize - offset;
+      const currentChunkSize = Math.min(remaining, _OPFSFileSystem.MAX_CHUNK_SIZE);
+      const chunk = data.subarray(offset, offset + currentChunkSize);
+      const { ctrlBuffer, ctrl, metaBuffer, dataBuffer } = this.getSyncBuffers(currentChunkSize);
+      Atomics.store(ctrl, 0, 0);
+      const view = new Uint8Array(dataBuffer);
+      view.set(chunk);
+      const isFirstChunk = offset === 0;
+      this.syncKernel.postMessage({
+        type: isFirstChunk ? "write" : "append",
+        path: absPath,
+        ctrlBuffer,
+        metaBuffer,
+        dataBuffer,
+        dataLength: currentChunkSize,
+        payload: { flush: false }
       });
-    } catch (err) {
-      this.logError("symlink", err);
-      throw wrapError(err);
-    }
-  }
-  /**
-   * Read symlink target
-   */
-  async readlink(path) {
-    if (this.hybrid) {
-      return this.hybrid.readlink(path);
-    }
-    this.log("readlink", path);
-    try {
-      return await this.symlinkManager.readlink(path);
-    } catch (err) {
-      this.logError("readlink", err);
-      throw wrapError(err);
-    }
-  }
-  /**
-   * Create multiple symlinks efficiently
-   */
-  async symlinkBatch(links) {
-    if (this.hybrid) {
-      return this.hybrid.symlinkBatch(links);
-    }
-    this.log("symlinkBatch", links.length, "links");
-    try {
-      for (const { path } of links) {
-        this.handleManager.clearCache(normalize(path));
+      const waitResult = await Atomics.waitAsync(ctrl, 0, 0, 3e4).value;
+      if (waitResult === "timed-out") {
+        throw new Error("Chunked write timed out");
       }
-      await this.symlinkManager.symlinkBatch(links, async (normalizedPath) => {
-        try {
-          const { fileHandle, dirHandle } = await this.handleManager.getHandle(normalizedPath);
-          if (fileHandle || dirHandle) {
-            throw createEEXIST(normalizedPath);
-          }
-        } catch (err) {
-          if (err.code === "ENOENT") return;
-          throw err;
-        }
+      const status = Atomics.load(ctrl, 0);
+      if (status === -1 || status === -2) {
+        throw createENOENT("write", absPath);
+      }
+      offset += currentChunkSize;
+    }
+    return { success: true };
+  }
+  // Async chunked read for main thread
+  async syncCallTier1ChunkedReadAsync(absPath, totalSize) {
+    const result = new Uint8Array(totalSize);
+    let offset = 0;
+    while (offset < totalSize) {
+      const remaining = totalSize - offset;
+      const currentChunkSize = Math.min(remaining, _OPFSFileSystem.MAX_CHUNK_SIZE);
+      const { ctrlBuffer, ctrl, metaBuffer, dataBuffer } = this.getSyncBuffers(currentChunkSize);
+      Atomics.store(ctrl, 0, 0);
+      this.syncKernel.postMessage({
+        type: "readChunk",
+        path: absPath,
+        ctrlBuffer,
+        metaBuffer,
+        dataBuffer,
+        dataLength: 0,
+        payload: { offset, length: currentChunkSize }
       });
-    } catch (err) {
-      this.logError("symlinkBatch", err);
-      throw wrapError(err);
+      const waitResult = await Atomics.waitAsync(ctrl, 0, 0, 3e4).value;
+      if (waitResult === "timed-out") {
+        throw new Error("Chunked read timed out");
+      }
+      const status = Atomics.load(ctrl, 0);
+      if (status === -1 || status === -2) {
+        throw createENOENT("read", absPath);
+      }
+      const bytesRead = status;
+      const dataView = new Uint8Array(dataBuffer);
+      result.set(dataView.subarray(0, bytesRead), offset);
+      offset += bytesRead;
+    }
+    return { data: result };
+  }
+  // Chunked write for files larger than MAX_CHUNK_SIZE
+  syncCallTier1Chunked(absPath, data) {
+    const totalSize = data.length;
+    const chunkSize = _OPFSFileSystem.MAX_CHUNK_SIZE;
+    const { ctrlBuffer, ctrl, metaBuffer, dataBuffer } = this.getSyncBuffers(chunkSize);
+    const dataView = new Uint8Array(dataBuffer);
+    let offset = 0;
+    while (offset < totalSize) {
+      const remaining = totalSize - offset;
+      const currentChunkSize = Math.min(chunkSize, remaining);
+      const chunk = data.subarray(offset, offset + currentChunkSize);
+      Atomics.store(ctrl, 0, 0);
+      dataView.set(chunk);
+      this.syncKernel.postMessage({
+        type: "write",
+        path: absPath,
+        ctrlBuffer,
+        metaBuffer,
+        dataBuffer,
+        dataLength: currentChunkSize,
+        payload: { offset }
+        // Kernel writes at this offset
+      });
+      const waitResult = Atomics.wait(ctrl, 0, 0, 6e4);
+      if (waitResult === "timed-out") {
+        throw new Error(`Chunked write timed out at offset ${offset}`);
+      }
+      const status = Atomics.load(ctrl, 0);
+      if (status === -1) {
+        const metaView = new Uint8Array(metaBuffer);
+        let end = metaView.indexOf(0);
+        if (end === -1) end = _OPFSFileSystem.META_SIZE;
+        const errorMsg = new TextDecoder().decode(metaView.slice(0, end));
+        throw mapErrorCode(errorMsg || "Error", "write", absPath);
+      }
+      if (status === -2) {
+        throw createENOENT("write", absPath);
+      }
+      offset += currentChunkSize;
+    }
+    return { success: true };
+  }
+  // Chunked read for files larger than buffer size
+  syncCallTier1ChunkedRead(absPath, totalSize) {
+    const chunkSize = _OPFSFileSystem.MAX_CHUNK_SIZE;
+    const result = new Uint8Array(totalSize);
+    const { ctrlBuffer, ctrl, metaBuffer, dataBuffer } = this.getSyncBuffers(chunkSize);
+    let offset = 0;
+    while (offset < totalSize) {
+      const remaining = totalSize - offset;
+      const currentChunkSize = Math.min(chunkSize, remaining);
+      Atomics.store(ctrl, 0, 0);
+      this.syncKernel.postMessage({
+        type: "read",
+        path: absPath,
+        ctrlBuffer,
+        metaBuffer,
+        dataBuffer,
+        dataLength: 0,
+        payload: { offset, len: currentChunkSize }
+      });
+      const waitResult = Atomics.wait(ctrl, 0, 0, 6e4);
+      if (waitResult === "timed-out") {
+        throw new Error(`Chunked read timed out at offset ${offset}`);
+      }
+      const status = Atomics.load(ctrl, 0);
+      if (status === -1) {
+        const metaView = new Uint8Array(metaBuffer);
+        let end = metaView.indexOf(0);
+        if (end === -1) end = _OPFSFileSystem.META_SIZE;
+        const errorMsg = new TextDecoder().decode(metaView.slice(0, end));
+        throw mapErrorCode(errorMsg || "Error", "read", absPath);
+      }
+      if (status === -2) {
+        throw createENOENT("read", absPath);
+      }
+      const bytesRead = status;
+      const dataView = new Uint8Array(dataBuffer, 0, bytesRead);
+      result.set(dataView, offset);
+      offset += bytesRead;
+      if (bytesRead < currentChunkSize) {
+        break;
+      }
+    }
+    return { data: result.subarray(0, offset) };
+  }
+  // Get file size via stat (used for chunked reads)
+  syncStatTier1(absPath) {
+    const { ctrlBuffer, ctrl, metaBuffer, dataBuffer } = this.getSyncBuffers(1024);
+    Atomics.store(ctrl, 0, 0);
+    this.syncKernel.postMessage({
+      type: "stat",
+      path: absPath,
+      ctrlBuffer,
+      metaBuffer,
+      dataBuffer,
+      dataLength: 0
+    });
+    const waitResult = Atomics.wait(ctrl, 0, 0, 1e4);
+    if (waitResult === "timed-out") {
+      return null;
+    }
+    const status = Atomics.load(ctrl, 0);
+    if (status <= 0) {
+      return null;
+    }
+    const view = new DataView(metaBuffer);
+    return { size: view.getFloat64(8, true) };
+  }
+  syncCall(type, filePath, payload) {
+    if (isWorkerContext && typeof SharedArrayBuffer !== "undefined" && this.syncKernelReady) {
+      return this.syncCallTier1(type, filePath, payload);
+    }
+    throw new Error(
+      `Sync operations require crossOriginIsolated environment (COOP/COEP headers) and initSync() to be called. Current state: crossOriginIsolated=${typeof crossOriginIsolated !== "undefined" ? crossOriginIsolated : "N/A"}, isWorkerContext=${isWorkerContext}, syncKernelReady=${this.syncKernelReady}. Use fs.promises.* for async operations that work everywhere.`
+    );
+  }
+  // --- Synchronous API (Node.js fs compatible) ---
+  readFileSync(filePath, options) {
+    const encoding = typeof options === "string" ? options : options?.encoding;
+    const result = this.syncCall("read", filePath);
+    if (!result.data) throw createENOENT("read", filePath);
+    return decodeData(result.data, encoding);
+  }
+  writeFileSync(filePath, data, options) {
+    const opts = typeof options === "string" ? { encoding: options } : options;
+    const encoded = encodeData(data, opts?.encoding);
+    this.syncCall("write", filePath, { data: encoded, flush: opts?.flush });
+    this.invalidateStat(filePath);
+  }
+  appendFileSync(filePath, data, options) {
+    typeof options === "string" ? options : options?.encoding;
+    const encoded = encodeData(data);
+    this.syncCall("append", filePath, { data: encoded });
+    this.invalidateStat(filePath);
+  }
+  existsSync(filePath) {
+    try {
+      const result = this.syncCall("exists", filePath);
+      return result.exists ?? false;
+    } catch {
+      return false;
     }
   }
-  /**
-   * Check file accessibility
-   */
-  async access(path, mode = constants.F_OK) {
-    if (this.hybrid) {
-      return this.hybrid.access(path, mode);
-    }
-    this.log("access", path, mode);
-    try {
-      const normalizedPath = normalize(path);
-      await this.stat(normalizedPath);
-    } catch (err) {
-      this.logError("access", err);
-      throw createEACCES(path);
+  mkdirSync(filePath, options) {
+    const recursive = typeof options === "object" ? options?.recursive : false;
+    this.syncCall("mkdir", filePath, { recursive });
+    this.invalidateStat(filePath);
+    return recursive ? filePath : void 0;
+  }
+  rmdirSync(filePath, options) {
+    this.syncCall("rmdir", filePath, { recursive: options?.recursive });
+    if (options?.recursive) {
+      this.invalidateStatsUnder(filePath);
+    } else {
+      this.invalidateStat(filePath);
     }
   }
-  /**
-   * Append data to a file
-   */
-  async appendFile(path, data, options = {}) {
-    if (this.hybrid) {
-      return this.hybrid.appendFile(path, data, options);
-    }
-    this.log("appendFile", path);
+  rmSync(filePath, options) {
     try {
-      const normalizedPath = normalize(path);
-      const resolvedPath = await this.symlinkManager.resolve(normalizedPath);
-      let existingData = new Uint8Array(0);
+      const result = this.syncCall("stat", filePath);
       try {
-        const result = await this.readFile(resolvedPath);
-        existingData = result instanceof Uint8Array ? result : new TextEncoder().encode(result);
-      } catch (err) {
-        if (err.code !== "ENOENT") throw err;
-      }
-      const newData = typeof data === "string" ? new TextEncoder().encode(data) : data;
-      const combined = new Uint8Array(existingData.length + newData.length);
-      combined.set(existingData, 0);
-      combined.set(newData, existingData.length);
-      await this.writeFile(resolvedPath, combined, options);
-    } catch (err) {
-      this.logError("appendFile", err);
-      throw wrapError(err);
-    }
-  }
-  /**
-   * Copy a file
-   */
-  async copyFile(src, dest, mode = 0) {
-    if (this.hybrid) {
-      return this.hybrid.copyFile(src, dest, mode);
-    }
-    this.log("copyFile", src, dest, mode);
-    try {
-      const normalizedSrc = normalize(src);
-      const normalizedDest = normalize(dest);
-      const resolvedSrc = await this.symlinkManager.resolve(normalizedSrc);
-      if (mode & constants.COPYFILE_EXCL) {
-        try {
-          await this.stat(normalizedDest);
-          throw createEEXIST(dest);
-        } catch (err) {
-          if (err.code !== "ENOENT") throw err;
-        }
-      }
-      const [data] = await Promise.all([
-        this.readFile(resolvedSrc),
-        this.handleManager.ensureParentDir(normalizedDest)
-      ]);
-      await this.writeFile(normalizedDest, data);
-    } catch (err) {
-      this.logError("copyFile", err);
-      throw wrapError(err);
-    }
-  }
-  /**
-   * Copy files/directories recursively
-   */
-  async cp(src, dest, options = {}) {
-    if (this.hybrid) {
-      return this.hybrid.cp(src, dest, options);
-    }
-    this.log("cp", src, dest, options);
-    try {
-      const normalizedSrc = normalize(src);
-      const normalizedDest = normalize(dest);
-      const { recursive = false, force = false, errorOnExist = false } = options;
-      const srcStat = await this.stat(normalizedSrc);
-      if (srcStat.isDirectory()) {
-        if (!recursive) {
-          throw createEISDIR(src);
-        }
-        let destExists = false;
-        try {
-          await this.stat(normalizedDest);
-          destExists = true;
-          if (errorOnExist && !force) {
-            throw createEEXIST(dest);
+        if (result.isDirectory || result.type === "directory") {
+          this.syncCall("rmdir", filePath, { recursive: options?.recursive });
+          if (options?.recursive) {
+            this.invalidateStatsUnder(filePath);
+          } else {
+            this.invalidateStat(filePath);
           }
-        } catch (err) {
-          if (err.code !== "ENOENT") throw err;
+        } else {
+          this.syncCall("unlink", filePath);
+          this.invalidateStat(filePath);
         }
-        if (!destExists) {
-          await this.mkdir(normalizedDest);
-        }
-        const entries = await this.readdir(normalizedSrc);
-        await this.limitConcurrency(
-          entries,
-          10,
-          (entry) => this.cp(`${normalizedSrc}/${entry}`, `${normalizedDest}/${entry}`, options)
-        );
-      } else {
-        if (errorOnExist) {
-          try {
-            await this.stat(normalizedDest);
-            throw createEEXIST(dest);
-          } catch (err) {
-            if (err.code !== "ENOENT") throw err;
-          }
-        }
-        await this.copyFile(normalizedSrc, normalizedDest);
+      } catch (e) {
+        if (!options?.force) throw e;
       }
-    } catch (err) {
-      this.logError("cp", err);
-      throw wrapError(err);
+    } catch (e) {
+      if (!options?.force) throw e;
     }
   }
-  /**
-   * Check if path exists
-   */
-  async exists(path) {
-    if (this.hybrid) {
-      return this.hybrid.exists(path);
+  unlinkSync(filePath) {
+    this.syncCall("unlink", filePath);
+    this.invalidateStat(filePath);
+  }
+  readdirSync(filePath, options) {
+    const result = this.syncCall("readdir", filePath);
+    const entries = result.entries || [];
+    const opts = typeof options === "object" ? options : { };
+    if (opts?.withFileTypes) {
+      return entries.map((name) => {
+        try {
+          const stat = this.syncCall("stat", join(filePath, name));
+          const isDir = stat.type === "directory" || stat.isDirectory === true;
+          return createDirent(name, isDir);
+        } catch {
+          return createDirent(name, false);
+        }
+      });
     }
-    this.log("exists", path);
+    return entries;
+  }
+  statSync(filePath) {
+    const absPath = normalize(resolve(filePath));
+    const cached = this.statCache.get(absPath);
+    if (cached) return cached;
+    const result = this.syncCall("stat", filePath);
+    if (result.type === void 0 && result.isFile === void 0 && result.isDirectory === void 0) {
+      throw createENOENT("stat", filePath);
+    }
+    const stats = createStats(result);
+    this.statCache.set(absPath, stats);
+    return stats;
+  }
+  lstatSync(filePath) {
+    const stats = this.statSync(filePath);
+    if (stats.isFile() && this.isSymlinkSync(filePath)) {
+      return this.createSymlinkStats(stats);
+    }
+    return stats;
+  }
+  /**
+   * Create stats object for a symlink file.
+   */
+  createSymlinkStats(baseStats) {
+    return {
+      ...baseStats,
+      isFile: () => false,
+      isSymbolicLink: () => true,
+      // Symlink mode: 0o120777 (41471 decimal)
+      mode: 41471
+    };
+  }
+  renameSync(oldPath, newPath) {
+    this.syncCall("rename", oldPath, { newPath });
+    this.invalidateStat(oldPath);
+    this.invalidateStat(newPath);
+  }
+  copyFileSync(src, dest) {
+    this.syncCall("copy", src, { newPath: dest });
+    this.invalidateStat(dest);
+  }
+  truncateSync(filePath, len = 0) {
+    this.syncCall("truncate", filePath, { len });
+    this.invalidateStat(filePath);
+  }
+  /**
+   * Flush all pending writes to storage.
+   * Use this after writes with { flush: false } to ensure data is persisted.
+   */
+  flushSync() {
+    this.syncCall("flush", "/");
+  }
+  /**
+   * Alias for flushSync() - matches Node.js fdatasync behavior
+   */
+  fdatasyncSync() {
+    this.flushSync();
+  }
+  /**
+   * Purge all kernel caches (sync handles, directory handles).
+   * Use between major operations to ensure clean state.
+   */
+  purgeSync() {
+    this.syncCall("purge", "/");
+    this.statCache.clear();
+  }
+  accessSync(filePath, _mode) {
+    const exists = this.existsSync(filePath);
+    if (!exists) {
+      throw createENOENT("access", filePath);
+    }
+  }
+  // --- Low-level File Descriptor API ---
+  // For efficient packfile access (read specific offsets without loading entire file)
+  openSync(filePath, flags = "r") {
+    const flagNum = typeof flags === "string" ? this.parseFlags(flags) : flags;
+    const isReadOnly = (flagNum & constants.O_WRONLY) === 0 && (flagNum & constants.O_RDWR) === 0;
+    if (isReadOnly && !this.existsSync(filePath)) {
+      throw createENOENT("open", filePath);
+    }
+    const fd = this.nextFd++;
+    this.fdTable.set(fd, {
+      path: normalize(resolve(filePath)),
+      flags: flagNum,
+      position: 0
+    });
+    return fd;
+  }
+  closeSync(fd) {
+    if (!this.fdTable.has(fd)) {
+      throw new FSError("EBADF", -9, `bad file descriptor: ${fd}`);
+    }
+    this.fdTable.delete(fd);
+  }
+  readSync(fd, buffer, offset, length, position) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) {
+      throw new FSError("EBADF", -9, `bad file descriptor: ${fd}`);
+    }
+    const readPos = position !== null ? position : entry.position;
+    const result = this.syncCall("read", entry.path, { offset: readPos, len: length });
+    if (!result.data) {
+      return 0;
+    }
+    const bytesRead = Math.min(result.data.length, length);
+    buffer.set(result.data.subarray(0, bytesRead), offset);
+    if (position === null) {
+      entry.position += bytesRead;
+    }
+    return bytesRead;
+  }
+  writeSync(fd, buffer, offset, length, position) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) {
+      throw new FSError("EBADF", -9, `bad file descriptor: ${fd}`);
+    }
+    const writePos = position !== null ? position : entry.position;
+    const data = buffer.subarray(offset, offset + length);
+    this.syncCall("write", entry.path, {
+      data,
+      offset: writePos,
+      truncate: false
+    });
+    this.invalidateStat(entry.path);
+    if (position === null) {
+      entry.position += length;
+    }
+    return length;
+  }
+  fstatSync(fd) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) {
+      throw new FSError("EBADF", -9, `bad file descriptor: ${fd}`);
+    }
+    return this.statSync(entry.path);
+  }
+  ftruncateSync(fd, len = 0) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) {
+      throw new FSError("EBADF", -9, `bad file descriptor: ${fd}`);
+    }
+    this.truncateSync(entry.path, len);
+  }
+  /**
+   * Resolve a path to an absolute path.
+   * OPFS doesn't support symlinks, so this just normalizes the path.
+   */
+  realpathSync(filePath) {
+    this.accessSync(filePath);
+    return normalize(resolve(filePath));
+  }
+  /**
+   * Change file mode (no-op in OPFS - permissions not supported).
+   */
+  chmodSync(_filePath, _mode) {
+  }
+  /**
+   * Change file owner (no-op in OPFS - ownership not supported).
+   */
+  chownSync(_filePath, _uid, _gid) {
+  }
+  /**
+   * Change file timestamps (no-op in OPFS - timestamps are read-only).
+   */
+  utimesSync(_filePath, _atime, _mtime) {
+  }
+  // Magic prefix for symlink files - must be unique enough to not appear in regular files
+  static SYMLINK_MAGIC = "OPFS_SYMLINK_V1:";
+  /**
+   * Create a symbolic link.
+   * Emulated by storing target path in a special file format.
+   */
+  symlinkSync(target, filePath, _type) {
+    const content = _OPFSFileSystem.SYMLINK_MAGIC + target;
+    this.writeFileSync(filePath, content);
+  }
+  /**
+   * Read a symbolic link target.
+   */
+  readlinkSync(filePath) {
+    const content = this.readFileSync(filePath, { encoding: "utf8" });
+    if (!content.startsWith(_OPFSFileSystem.SYMLINK_MAGIC)) {
+      throw new FSError("EINVAL", -22, `EINVAL: invalid argument, readlink '${filePath}'`, "readlink", filePath);
+    }
+    return content.slice(_OPFSFileSystem.SYMLINK_MAGIC.length);
+  }
+  /**
+   * Check if a file is a symlink (sync).
+   */
+  isSymlinkSync(filePath) {
     try {
-      await this.stat(normalize(path));
-      return true;
+      const content = this.readFileSync(filePath, { encoding: "utf8" });
+      return content.startsWith(_OPFSFileSystem.SYMLINK_MAGIC);
     } catch {
       return false;
     }
   }
   /**
-   * Resolve symlinks to get real path
+   * Check if a file is a symlink (async).
    */
-  async realpath(path) {
-    if (this.hybrid) {
-      return this.hybrid.realpath(path);
-    }
-    this.log("realpath", path);
-    const normalizedPath = normalize(path);
-    return this.symlinkManager.resolve(normalizedPath);
-  }
-  /**
-   * Remove files and directories
-   */
-  async rm(path, options = {}) {
-    if (this.hybrid) {
-      return this.hybrid.rm(path, options);
-    }
-    this.log("rm", path, options);
+  async isSymlinkAsync(filePath) {
     try {
-      const normalizedPath = normalize(path);
-      const { recursive = false, force = false } = options;
-      try {
-        const stat = await this.lstat(normalizedPath);
-        if (stat.isSymbolicLink()) {
-          await this.unlink(normalizedPath);
-        } else if (stat.isDirectory()) {
-          if (!recursive) {
-            throw createEISDIR(path);
-          }
-          await this.rmdir(normalizedPath);
-        } else {
-          await this.unlink(normalizedPath);
-        }
-      } catch (err) {
-        if (err.code === "ENOENT" && force) {
-          return;
-        }
-        throw err;
-      }
-    } catch (err) {
-      this.logError("rm", err);
-      throw wrapError(err);
+      const content = await this.promises.readFile(filePath, { encoding: "utf8" });
+      return content.startsWith(_OPFSFileSystem.SYMLINK_MAGIC);
+    } catch {
+      return false;
     }
   }
   /**
-   * Truncate file to specified length
+   * Create a hard link.
+   * Emulated by copying the file (true hard links not supported in OPFS).
    */
-  async truncate(path, len = 0) {
-    if (this.hybrid) {
-      return this.hybrid.truncate(path, len);
+  linkSync(existingPath, newPath) {
+    this.copyFileSync(existingPath, newPath);
+  }
+  parseFlags(flags) {
+    switch (flags) {
+      case "r":
+        return constants.O_RDONLY;
+      case "r+":
+        return constants.O_RDWR;
+      case "w":
+        return constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC;
+      case "w+":
+        return constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC;
+      case "a":
+        return constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND;
+      case "a+":
+        return constants.O_RDWR | constants.O_CREAT | constants.O_APPEND;
+      default:
+        return constants.O_RDONLY;
     }
-    this.log("truncate", path, len);
-    try {
-      const normalizedPath = normalize(path);
-      const resolvedPath = await this.symlinkManager.resolve(normalizedPath);
-      this.handleManager.clearCache(resolvedPath);
-      const { fileHandle } = await this.handleManager.getHandle(resolvedPath);
-      if (!fileHandle) throw createENOENT(path);
-      if (this.useSync) {
-        const access = await fileHandle.createSyncAccessHandle();
-        try {
-          access.truncate(len);
-        } finally {
-          access.close();
-        }
+  }
+  // --- Async Promises API ---
+  // When Tier 1 sync kernel is available, use it for better performance (wrapped in Promise)
+  // Otherwise fall back to async worker
+  // Helper: Use sync kernel if available (in worker context), otherwise async worker
+  async fastCall(type, filePath, payload) {
+    if (this.syncKernelReady) {
+      if (isWorkerContext) {
+        return Promise.resolve(this.syncCallTier1(type, filePath, payload));
       } else {
-        const file = await fileHandle.getFile();
-        const data = new Uint8Array(await file.arrayBuffer());
-        const finalData = new Uint8Array(len);
-        const copyLen = Math.min(len, data.length);
-        if (copyLen > 0) {
-          finalData.set(data.subarray(0, copyLen), 0);
+        return this.syncCallTier1Async(type, filePath, payload);
+      }
+    }
+    return this.asyncCall(type, filePath, payload);
+  }
+  promises = {
+    readFile: async (filePath, options) => {
+      if (!filePath) {
+        throw createENOENT("read", filePath || "");
+      }
+      const encoding = typeof options === "string" ? options : options?.encoding;
+      if (this.syncKernelReady) {
+        if (isWorkerContext) {
+          const result2 = this.syncCallTier1("read", filePath);
+          if (!result2.data) throw createENOENT("read", filePath);
+          return decodeData(result2.data, encoding);
+        } else {
+          const result2 = await this.syncCallTier1Async("read", filePath);
+          if (!result2.data) throw createENOENT("read", filePath);
+          return decodeData(result2.data, encoding);
         }
-        const writable = await fileHandle.createWritable();
-        await writable.write(finalData);
-        await writable.close();
       }
-    } catch (err) {
-      this.logError("truncate", err);
-      throw wrapError(err);
-    }
-  }
-  /**
-   * Create a unique temporary directory
-   */
-  async mkdtemp(prefix) {
-    if (this.hybrid) {
-      return this.hybrid.mkdtemp(prefix);
-    }
-    this.log("mkdtemp", prefix);
-    try {
-      const normalizedPrefix = normalize(prefix);
-      const suffix = `${Date.now()}-${++this.tmpCounter}-${Math.random().toString(36).slice(2, 8)}`;
-      const path = `${normalizedPrefix}${suffix}`;
-      await this.mkdir(path);
-      return path;
-    } catch (err) {
-      this.logError("mkdtemp", err);
-      throw wrapError(err);
-    }
-  }
-  /**
-   * Change file mode (no-op for OPFS compatibility)
-   */
-  async chmod(path, mode) {
-    if (this.hybrid) {
-      return this.hybrid.chmod(path, mode);
-    }
-    this.log("chmod", path, mode);
-    await this.stat(normalize(path));
-  }
-  /**
-   * Change file owner (no-op for OPFS compatibility)
-   */
-  async chown(path, uid, gid) {
-    if (this.hybrid) {
-      return this.hybrid.chown(path, uid, gid);
-    }
-    this.log("chown", path, uid, gid);
-    await this.stat(normalize(path));
-  }
-  /**
-   * Update file timestamps (no-op for OPFS compatibility)
-   */
-  async utimes(path, atime, mtime) {
-    if (this.hybrid) {
-      return this.hybrid.utimes(path, atime, mtime);
-    }
-    this.log("utimes", path, atime, mtime);
-    await this.stat(normalize(path));
-  }
-  /**
-   * Update symlink timestamps (no-op)
-   */
-  async lutimes(path, atime, mtime) {
-    if (this.hybrid) {
-      return this.hybrid.lutimes(path, atime, mtime);
-    }
-    this.log("lutimes", path, atime, mtime);
-    await this.lstat(normalize(path));
-  }
-  /**
-   * Open file and return FileHandle
-   */
-  async open(path, flags = "r", mode = 438) {
-    this.log("open", path, flags, mode);
-    try {
-      const normalizedPath = normalize(path);
-      const flagStr = flagsToString(flags);
-      const shouldCreate = flagStr.includes("w") || flagStr.includes("a") || flagStr.includes("+");
-      const shouldTruncate = flagStr.includes("w");
-      const shouldAppend = flagStr.includes("a");
-      if (shouldCreate) {
-        await this.handleManager.ensureParentDir(normalizedPath);
+      const result = await this.asyncCall("read", filePath);
+      if (!result.data) throw createENOENT("read", filePath);
+      return decodeData(result.data, encoding);
+    },
+    writeFile: async (filePath, data, options) => {
+      const opts = typeof options === "string" ? { encoding: options } : options;
+      const encoded = encodeData(data, opts?.encoding);
+      await this.fastCall("write", filePath, { data: encoded, flush: opts?.flush });
+      this.invalidateStat(filePath);
+    },
+    appendFile: async (filePath, data, options) => {
+      const opts = typeof options === "string" ? { encoding: options } : options;
+      const encoded = encodeData(data, opts?.encoding);
+      await this.fastCall("append", filePath, { data: encoded, flush: opts?.flush });
+      this.invalidateStat(filePath);
+    },
+    mkdir: async (filePath, options) => {
+      const recursive = typeof options === "object" ? options?.recursive : false;
+      await this.fastCall("mkdir", filePath, { recursive });
+      return recursive ? filePath : void 0;
+    },
+    rmdir: async (filePath, options) => {
+      await this.fastCall("rmdir", filePath, { recursive: options?.recursive });
+    },
+    rm: async (filePath, options) => {
+      try {
+        const result = await this.fastCall("stat", filePath);
+        try {
+          if (result.isDirectory || result.type === "directory") {
+            await this.fastCall("rmdir", filePath, { recursive: options?.recursive });
+            if (options?.recursive) {
+              this.invalidateStatsUnder(filePath);
+            } else {
+              this.invalidateStat(filePath);
+            }
+          } else {
+            await this.fastCall("unlink", filePath);
+            this.invalidateStat(filePath);
+          }
+        } catch (e) {
+          if (!options?.force) throw e;
+        }
+      } catch (e) {
+        if (!options?.force) throw e;
       }
-      const resolvedPath = await this.symlinkManager.resolve(normalizedPath);
-      const { fileHandle } = await this.handleManager.getHandle(resolvedPath, { create: shouldCreate });
-      if (!fileHandle && !shouldCreate) {
-        throw createENOENT(path);
-      }
-      if (shouldTruncate && fileHandle) {
-        await this.truncate(resolvedPath, 0);
-      }
-      const initialPosition = shouldAppend ? (await this.stat(resolvedPath)).size : 0;
-      return createFileHandle(resolvedPath, initialPosition, {
-        readFile: (p, o) => this.readFile(p, o),
-        writeFile: (p, d) => this.writeFile(p, d),
-        stat: (p) => this.stat(p),
-        truncate: (p, l) => this.truncate(p, l),
-        appendFile: (p, d, o) => this.appendFile(p, d, o)
-      });
-    } catch (err) {
-      this.logError("open", err);
-      throw wrapError(err);
-    }
-  }
-  /**
-   * Open directory for iteration
-   */
-  async opendir(path) {
-    this.log("opendir", path);
-    try {
-      const normalizedPath = normalize(path);
-      const entries = await this.readdir(normalizedPath, { withFileTypes: true });
-      let index = 0;
-      return {
-        path: normalizedPath,
-        async read() {
-          if (index >= entries.length) return null;
-          return entries[index++];
-        },
-        async close() {
-          index = entries.length;
-        },
-        async *[Symbol.asyncIterator]() {
-          for (const entry of entries) {
-            yield entry;
+    },
+    unlink: async (filePath) => {
+      await this.fastCall("unlink", filePath);
+    },
+    readdir: async (filePath, options) => {
+      const result = await this.fastCall("readdir", filePath);
+      const entries = result.entries || [];
+      const opts = typeof options === "object" ? options : { };
+      if (opts?.withFileTypes) {
+        const dirents = [];
+        for (const name of entries) {
+          try {
+            const stat = await this.fastCall("stat", join(filePath, name));
+            const isDir = stat.type === "directory" || stat.isDirectory === true;
+            dirents.push(createDirent(name, isDir));
+          } catch {
+            dirents.push(createDirent(name, false));
           }
         }
-      };
-    } catch (err) {
-      this.logError("opendir", err);
-      throw wrapError(err);
+        return dirents;
+      }
+      return entries;
+    },
+    stat: async (filePath) => {
+      const result = await this.fastCall("stat", filePath);
+      return createStats(result);
+    },
+    access: async (filePath, _mode) => {
+      const result = await this.fastCall("exists", filePath);
+      if (!result.exists) {
+        throw createENOENT("access", filePath);
+      }
+    },
+    rename: async (oldFilePath, newFilePath) => {
+      await this.fastCall("rename", oldFilePath, { newPath: resolve(newFilePath) });
+    },
+    copyFile: async (srcPath, destPath) => {
+      await this.fastCall("copy", srcPath, { newPath: resolve(destPath) });
+    },
+    truncate: async (filePath, len = 0) => {
+      await this.fastCall("truncate", filePath, { len });
+      this.invalidateStat(filePath);
+    },
+    lstat: async (filePath) => {
+      const result = await this.fastCall("stat", filePath);
+      const stats = createStats(result);
+      if (stats.isFile()) {
+        const isSymlink = await this.isSymlinkAsync(filePath);
+        if (isSymlink) {
+          return this.createSymlinkStats(stats);
+        }
+      }
+      return stats;
+    },
+    realpath: async (filePath) => {
+      await this.promises.access(filePath);
+      return normalize(resolve(filePath));
+    },
+    exists: async (filePath) => {
+      try {
+        const result = await this.fastCall("exists", filePath);
+        return result.exists ?? false;
+      } catch {
+        return false;
+      }
+    },
+    chmod: async (_filePath, _mode) => {
+    },
+    chown: async (_filePath, _uid, _gid) => {
+    },
+    utimes: async (_filePath, _atime, _mtime) => {
+    },
+    symlink: async (target, filePath, _type) => {
+      const content = _OPFSFileSystem.SYMLINK_MAGIC + target;
+      await this.promises.writeFile(filePath, content);
+    },
+    readlink: async (filePath) => {
+      const content = await this.promises.readFile(filePath, { encoding: "utf8" });
+      if (!content.startsWith(_OPFSFileSystem.SYMLINK_MAGIC)) {
+        throw new FSError("EINVAL", -22, `EINVAL: invalid argument, readlink '${filePath}'`, "readlink", filePath);
+      }
+      return content.slice(_OPFSFileSystem.SYMLINK_MAGIC.length);
+    },
+    link: async (existingPath, newPath) => {
+      await this.promises.copyFile(existingPath, newPath);
+    },
+    open: async (filePath, flags = "r", _mode) => {
+      const flagNum = typeof flags === "string" ? this.parseFlags(flags) : flags;
+      const isReadOnly = (flagNum & constants.O_WRONLY) === 0 && (flagNum & constants.O_RDWR) === 0;
+      if (isReadOnly) {
+        const exists = await this.promises.exists(filePath);
+        if (!exists) {
+          throw createENOENT("open", filePath);
+        }
+      }
+      const fd = this.nextFd++;
+      this.fdTable.set(fd, {
+        path: normalize(resolve(filePath)),
+        flags: flagNum,
+        position: 0
+      });
+      return this.createFileHandle(fd, filePath);
+    },
+    opendir: async (dirPath) => {
+      return this.createDir(dirPath);
+    },
+    mkdtemp: async (prefix) => {
+      const suffix = Math.random().toString(36).substring(2, 8);
+      const tmpDir = `${prefix}${suffix}`;
+      await this.promises.mkdir(tmpDir, { recursive: true });
+      return tmpDir;
+    },
+    watch: (filePath, options) => {
+      return this.createAsyncWatcher(filePath, options);
+    },
+    /**
+     * Flush all pending writes to storage.
+     * Use after writes with { flush: false } to ensure data is persisted.
+     */
+    flush: async () => {
+      await this.fastCall("flush", "/");
+    },
+    /**
+     * Purge all kernel caches.
+     * Use between major operations to ensure clean state.
+     */
+    purge: async () => {
+      await this.fastCall("purge", "/");
+      this.statCache.clear();
     }
+  };
+  /**
+   * Async flush - use after promises.writeFile with { flush: false }
+   */
+  async flush() {
+    await this.fastCall("flush", "/");
   }
   /**
-   * Watch for file changes
+   * Async purge - clears all kernel caches
    */
-  watch(path, options = {}) {
-    this.log("watch", path, options);
-    const normalizedPath = normalize(path);
-    const { recursive = false, signal } = options;
-    const callbacks = /* @__PURE__ */ new Set();
-    const id = /* @__PURE__ */ Symbol("watcher");
-    this.watchCallbacks.set(id, { path: normalizedPath, callbacks, recursive });
-    if (signal) {
-      signal.addEventListener("abort", () => {
-        this.watchCallbacks.delete(id);
-      });
-    }
-    const self = this;
+  async purge() {
+    await this.fastCall("purge", "/");
+    this.statCache.clear();
+  }
+  // Constants
+  constants = constants;
+  // --- FileHandle Implementation ---
+  createFileHandle(fd, filePath) {
+    const self2 = this;
+    const absPath = normalize(resolve(filePath));
     return {
-      close() {
-        self.watchCallbacks.delete(id);
+      fd,
+      async read(buffer, offset = 0, length, position = null) {
+        const len = length ?? buffer.length - offset;
+        const entry = self2.fdTable.get(fd);
+        if (!entry) throw new FSError("EBADF", -9, `bad file descriptor: ${fd}`);
+        const readPos = position !== null ? position : entry.position;
+        const result = await self2.fastCall("read", absPath, { offset: readPos, len });
+        if (!result.data) {
+          return { bytesRead: 0, buffer };
+        }
+        const bytesRead = Math.min(result.data.length, len);
+        buffer.set(result.data.subarray(0, bytesRead), offset);
+        if (position === null) {
+          entry.position += bytesRead;
+        }
+        return { bytesRead, buffer };
       },
-      ref() {
-        return this;
+      async write(buffer, offset = 0, length, position = null) {
+        const len = length ?? buffer.length - offset;
+        const entry = self2.fdTable.get(fd);
+        if (!entry) throw new FSError("EBADF", -9, `bad file descriptor: ${fd}`);
+        const writePos = position !== null ? position : entry.position;
+        const data = buffer.subarray(offset, offset + len);
+        await self2.fastCall("write", absPath, { data, offset: writePos, truncate: false });
+        self2.invalidateStat(absPath);
+        if (position === null) {
+          entry.position += len;
+        }
+        return { bytesWritten: len, buffer };
       },
-      unref() {
-        return this;
+      async readFile(options) {
+        return self2.promises.readFile(absPath, options);
+      },
+      async writeFile(data, options) {
+        return self2.promises.writeFile(absPath, data, options);
+      },
+      async truncate(len = 0) {
+        await self2.fastCall("truncate", absPath, { len });
+        self2.invalidateStat(absPath);
+      },
+      async stat() {
+        return self2.promises.stat(absPath);
+      },
+      async sync() {
+        await self2.fastCall("flush", "/");
+      },
+      async datasync() {
+        await self2.fastCall("flush", "/");
+      },
+      async close() {
+        self2.fdTable.delete(fd);
+      }
+    };
+  }
+  // --- Dir Implementation ---
+  createDir(dirPath) {
+    const self2 = this;
+    const absPath = normalize(resolve(dirPath));
+    let entries = null;
+    let index = 0;
+    let closed = false;
+    const loadEntries = async () => {
+      if (entries === null) {
+        const result = await self2.fastCall("readdir", absPath);
+        entries = result.entries || [];
+      }
+    };
+    const dir = {
+      path: absPath,
+      async read() {
+        if (closed) throw new FSError("EBADF", -9, "Directory handle was closed");
+        await loadEntries();
+        if (index >= entries.length) return null;
+        const name = entries[index++];
+        try {
+          const stat = await self2.fastCall("stat", join(absPath, name));
+          const isDir = stat.type === "directory" || stat.isDirectory === true;
+          return createDirent(name, isDir);
+        } catch {
+          return createDirent(name, false);
+        }
+      },
+      async close() {
+        closed = true;
+        entries = null;
       },
       [Symbol.asyncIterator]() {
-        const queue = [];
-        let resolver = null;
-        callbacks.add((eventType, filename) => {
-          const event = { eventType, filename };
-          if (resolver) {
-            resolver({ value: event, done: false });
-            resolver = null;
-          } else {
-            queue.push(event);
-          }
-        });
-        return {
-          next() {
-            if (queue.length > 0) {
-              return Promise.resolve({ value: queue.shift(), done: false });
+        const iterator = {
+          next: async () => {
+            const dirent = await dir.read();
+            if (dirent === null) {
+              return { done: true, value: void 0 };
             }
-            return new Promise((resolve) => {
-              resolver = resolve;
-            });
+            return { done: false, value: dirent };
           },
-          return() {
-            return Promise.resolve({ done: true, value: void 0 });
+          [Symbol.asyncIterator]() {
+            return this;
           }
         };
+        return iterator;
+      }
+    };
+    return dir;
+  }
+  // --- Watch Implementation (Native FileSystemObserver with polling fallback) ---
+  watchedFiles = /* @__PURE__ */ new Map();
+  // Check if native FileSystemObserver is available
+  static hasNativeObserver = typeof globalThis.FileSystemObserver !== "undefined";
+  // Get OPFS directory handle for a path
+  async getDirectoryHandle(dirPath, create = false) {
+    const parts = dirPath.split("/").filter(Boolean);
+    let current = await navigator.storage.getDirectory();
+    for (const part of parts) {
+      current = await current.getDirectoryHandle(part, { create });
+    }
+    return current;
+  }
+  // Get OPFS file handle for a path
+  async getFileHandle(filePath, create = false) {
+    const parts = filePath.split("/").filter(Boolean);
+    const fileName = parts.pop();
+    if (!fileName) throw new Error("Invalid file path");
+    let current = await navigator.storage.getDirectory();
+    for (const part of parts) {
+      current = await current.getDirectoryHandle(part, { create });
+    }
+    return current.getFileHandle(fileName, { create });
+  }
+  // Convert FileSystemObserver change type to Node.js event type
+  mapChangeType(type) {
+    switch (type) {
+      case "appeared":
+      case "disappeared":
+      case "moved":
+        return "rename";
+      case "modified":
+        return "change";
+      default:
+        return "change";
+    }
+  }
+  createAsyncWatcher(filePath, options) {
+    const absPath = normalize(resolve(filePath));
+    if (_OPFSFileSystem.hasNativeObserver) {
+      return this.createNativeAsyncWatcher(absPath, options);
+    }
+    return this.createPollingAsyncWatcher(absPath, options);
+  }
+  createNativeAsyncWatcher(absPath, options) {
+    const self2 = this;
+    return {
+      [Symbol.asyncIterator]() {
+        const eventQueue = [];
+        let resolveNext = null;
+        let observer = null;
+        let aborted = false;
+        let initialized = false;
+        if (options?.signal) {
+          options.signal.addEventListener("abort", () => {
+            aborted = true;
+            observer?.disconnect();
+            if (resolveNext) {
+              resolveNext({ done: true, value: void 0 });
+              resolveNext = null;
+            }
+          });
+        }
+        const callback = (records) => {
+          for (const record of records) {
+            if (record.type === "errored" || record.type === "unknown") continue;
+            const filename = record.relativePathComponents.length > 0 ? record.relativePathComponents[record.relativePathComponents.length - 1] : basename(absPath);
+            const event = {
+              eventType: self2.mapChangeType(record.type),
+              filename
+            };
+            if (resolveNext) {
+              resolveNext({ done: false, value: event });
+              resolveNext = null;
+            } else {
+              eventQueue.push(event);
+            }
+          }
+        };
+        const init = async () => {
+          if (initialized) return;
+          initialized = true;
+          try {
+            observer = new globalThis.FileSystemObserver(callback);
+            const stat = await self2.promises.stat(absPath);
+            const handle = stat.isDirectory() ? await self2.getDirectoryHandle(absPath) : await self2.getFileHandle(absPath);
+            await observer.observe(handle, { recursive: options?.recursive });
+          } catch (e) {
+            aborted = true;
+          }
+        };
+        const iterator = {
+          async next() {
+            if (aborted) {
+              return { done: true, value: void 0 };
+            }
+            await init();
+            if (aborted) {
+              return { done: true, value: void 0 };
+            }
+            if (eventQueue.length > 0) {
+              return { done: false, value: eventQueue.shift() };
+            }
+            return new Promise((resolve2) => {
+              resolveNext = resolve2;
+            });
+          },
+          [Symbol.asyncIterator]() {
+            return this;
+          }
+        };
+        return iterator;
+      }
+    };
+  }
+  createPollingAsyncWatcher(absPath, options) {
+    const self2 = this;
+    const interval = 1e3;
+    return {
+      [Symbol.asyncIterator]() {
+        let lastMtimeMs = null;
+        let lastEntries = null;
+        let aborted = false;
+        let pollTimeout = null;
+        if (options?.signal) {
+          options.signal.addEventListener("abort", () => {
+            aborted = true;
+            if (pollTimeout) clearTimeout(pollTimeout);
+          });
+        }
+        const checkForChanges = async () => {
+          if (aborted) return null;
+          try {
+            const stat = await self2.promises.stat(absPath);
+            if (stat.isDirectory()) {
+              const entries = await self2.promises.readdir(absPath);
+              const currentEntries = new Set(entries);
+              if (lastEntries === null) {
+                lastEntries = currentEntries;
+                return null;
+              }
+              for (const entry of currentEntries) {
+                if (!lastEntries.has(entry)) {
+                  lastEntries = currentEntries;
+                  return { eventType: "rename", filename: entry };
+                }
+              }
+              for (const entry of lastEntries) {
+                if (!currentEntries.has(entry)) {
+                  lastEntries = currentEntries;
+                  return { eventType: "rename", filename: entry };
+                }
+              }
+              lastEntries = currentEntries;
+            } else {
+              if (lastMtimeMs === null) {
+                lastMtimeMs = stat.mtimeMs;
+                return null;
+              }
+              if (stat.mtimeMs !== lastMtimeMs) {
+                lastMtimeMs = stat.mtimeMs;
+                return { eventType: "change", filename: basename(absPath) };
+              }
+            }
+          } catch {
+            if (lastMtimeMs !== null || lastEntries !== null) {
+              lastMtimeMs = null;
+              lastEntries = null;
+              return { eventType: "rename", filename: basename(absPath) };
+            }
+          }
+          return null;
+        };
+        const iterator = {
+          async next() {
+            if (aborted) {
+              return { done: true, value: void 0 };
+            }
+            while (!aborted) {
+              const event = await checkForChanges();
+              if (event) {
+                return { done: false, value: event };
+              }
+              await new Promise((resolve2) => {
+                pollTimeout = setTimeout(resolve2, interval);
+              });
+            }
+            return { done: true, value: void 0 };
+          },
+          [Symbol.asyncIterator]() {
+            return this;
+          }
+        };
+        return iterator;
       }
     };
   }
   /**
-   * Create read stream
+   * Watch a file or directory for changes.
+   * Uses native FileSystemObserver when available, falls back to polling.
    */
-  createReadStream(path, options = {}) {
-    this.log("createReadStream", path, options);
-    const normalizedPath = normalize(path);
-    return createReadStream(normalizedPath, options, {
-      readFile: (p) => this.readFile(p)
-    });
-  }
-  /**
-   * Create write stream
-   */
-  createWriteStream(path, options = {}) {
-    this.log("createWriteStream", path, options);
-    const normalizedPath = normalize(path);
-    return createWriteStream(normalizedPath, options, {
-      readFile: (p) => this.readFile(p),
-      writeFile: (p, d) => this.writeFile(p, d)
-    });
-  }
-  /**
-   * Get file statistics (alias for stat)
-   */
-  async backFile(path) {
-    this.log("backFile", path);
-    try {
-      return await this.stat(normalize(path));
-    } catch (err) {
-      if (err.code === "ENOENT") throw err;
-      throw createENOENT(path);
+  watch(filePath, options = {}, listener) {
+    const absPath = normalize(resolve(filePath));
+    const opts = typeof options === "function" ? {} : options;
+    const cb = typeof options === "function" ? options : listener;
+    if (_OPFSFileSystem.hasNativeObserver) {
+      return this.createNativeWatcher(absPath, opts, cb);
     }
+    return this.createPollingWatcher(absPath, cb);
   }
-  /**
-   * Get disk usage for a path
-   */
-  async du(path) {
-    if (this.hybrid) {
-      return this.hybrid.du(path);
-    }
-    this.log("du", path);
-    const normalizedPath = normalize(path);
-    const stat = await this.stat(normalizedPath);
-    return { path: normalizedPath, size: stat.size };
-  }
-  /**
-   * Get filesystem statistics (similar to Node.js fs.statfs)
-   * Uses the Storage API to get quota and usage information
-   * Note: Values are estimates for the entire origin, not per-path
-   */
-  async statfs(path) {
-    if (this.hybrid) {
-      return this.hybrid.statfs(path);
-    }
-    this.log("statfs", path);
-    try {
-      if (path) {
-        await this.stat(normalize(path));
+  createNativeWatcher(absPath, opts, cb) {
+    const self2 = this;
+    let observer = null;
+    let closed = false;
+    const callback = (records) => {
+      if (closed) return;
+      for (const record of records) {
+        if (record.type === "errored" || record.type === "unknown") continue;
+        const filename = record.relativePathComponents.length > 0 ? record.relativePathComponents[record.relativePathComponents.length - 1] : basename(absPath);
+        cb?.(self2.mapChangeType(record.type), filename);
       }
-      if (typeof navigator === "undefined" || !navigator.storage?.estimate) {
-        throw new Error("Storage API not available");
+    };
+    (async () => {
+      if (closed) return;
+      try {
+        observer = new globalThis.FileSystemObserver(callback);
+        const stat = await self2.promises.stat(absPath);
+        const handle = stat.isDirectory() ? await self2.getDirectoryHandle(absPath) : await self2.getFileHandle(absPath);
+        await observer.observe(handle, { recursive: opts.recursive });
+      } catch {
       }
-      const estimate = await navigator.storage.estimate();
-      const usage = estimate.usage ?? 0;
-      const quota = estimate.quota ?? 0;
-      const bsize = 4096;
-      return {
-        type: 0,
-        bsize,
-        blocks: Math.floor(quota / bsize),
-        bfree: Math.floor((quota - usage) / bsize),
-        bavail: Math.floor((quota - usage) / bsize),
-        files: 0,
-        ffree: 0,
-        usage,
-        quota
+    })();
+    const watcher = {
+      close: () => {
+        closed = true;
+        observer?.disconnect();
+      },
+      ref: () => watcher,
+      unref: () => watcher
+    };
+    return watcher;
+  }
+  createPollingWatcher(absPath, cb) {
+    const interval = 1e3;
+    let lastMtimeMs = null;
+    let lastEntries = null;
+    let closed = false;
+    const poll = async () => {
+      if (closed) return;
+      try {
+        const stat = await this.promises.stat(absPath);
+        if (stat.isDirectory()) {
+          const entries = await this.promises.readdir(absPath);
+          const currentEntries = new Set(entries);
+          if (lastEntries !== null) {
+            for (const entry of currentEntries) {
+              if (!lastEntries.has(entry)) {
+                cb?.("rename", entry);
+              }
+            }
+            for (const entry of lastEntries) {
+              if (!currentEntries.has(entry)) {
+                cb?.("rename", entry);
+              }
+            }
+          }
+          lastEntries = currentEntries;
+        } else {
+          if (lastMtimeMs !== null && stat.mtimeMs !== lastMtimeMs) {
+            cb?.("change", basename(absPath));
+          }
+          lastMtimeMs = stat.mtimeMs;
+        }
+      } catch {
+        if (lastMtimeMs !== null || lastEntries !== null) {
+          cb?.("rename", basename(absPath));
+          lastMtimeMs = null;
+          lastEntries = null;
+        }
+      }
+    };
+    const intervalId = setInterval(poll, interval);
+    poll();
+    const watcher = {
+      close: () => {
+        closed = true;
+        clearInterval(intervalId);
+      },
+      ref: () => watcher,
+      unref: () => watcher
+    };
+    return watcher;
+  }
+  /**
+   * Watch a file for changes using native FileSystemObserver or stat polling.
+   */
+  watchFile(filePath, options = {}, listener) {
+    const absPath = normalize(resolve(filePath));
+    const opts = typeof options === "function" ? {} : options;
+    const cb = typeof options === "function" ? options : listener;
+    const interval = opts.interval ?? 5007;
+    let lastStat = null;
+    let observer;
+    const poll = async () => {
+      try {
+        const stat = await this.promises.stat(absPath);
+        if (lastStat !== null) {
+          if (stat.mtimeMs !== lastStat.mtimeMs || stat.size !== lastStat.size) {
+            cb?.(stat, lastStat);
+          }
+        }
+        lastStat = stat;
+      } catch {
+        const emptyStat = createStats({ type: "file", size: 0, mtimeMs: 0, mode: 0 });
+        if (lastStat !== null) {
+          cb?.(emptyStat, lastStat);
+        }
+        lastStat = emptyStat;
+      }
+    };
+    if (_OPFSFileSystem.hasNativeObserver && cb) {
+      const self2 = this;
+      const observerCallback = async () => {
+        try {
+          const stat = await self2.promises.stat(absPath);
+          if (lastStat !== null && (stat.mtimeMs !== lastStat.mtimeMs || stat.size !== lastStat.size)) {
+            cb(stat, lastStat);
+          }
+          lastStat = stat;
+        } catch {
+          const emptyStat = createStats({ type: "file", size: 0, mtimeMs: 0, mode: 0 });
+          if (lastStat !== null) {
+            cb(emptyStat, lastStat);
+          }
+          lastStat = emptyStat;
+        }
       };
-    } catch (err) {
-      this.logError("statfs", err);
-      throw wrapError(err);
+      (async () => {
+        try {
+          lastStat = await self2.promises.stat(absPath);
+          observer = new globalThis.FileSystemObserver(observerCallback);
+          const handle = await self2.getFileHandle(absPath);
+          await observer.observe(handle);
+        } catch {
+          if (!this.watchedFiles.get(absPath)?.interval) {
+            const entry = this.watchedFiles.get(absPath);
+            if (entry) {
+              entry.interval = setInterval(poll, interval);
+            }
+          }
+        }
+      })();
+      if (!this.watchedFiles.has(absPath)) {
+        this.watchedFiles.set(absPath, {
+          observer,
+          listeners: /* @__PURE__ */ new Set(),
+          lastStat: null
+        });
+      }
+      this.watchedFiles.get(absPath).listeners.add(cb);
+    } else {
+      if (!this.watchedFiles.has(absPath)) {
+        this.watchedFiles.set(absPath, {
+          interval: setInterval(poll, interval),
+          listeners: /* @__PURE__ */ new Set(),
+          lastStat: null
+        });
+      }
+      if (cb) this.watchedFiles.get(absPath).listeners.add(cb);
+      poll();
     }
+    const watcher = {
+      ref: () => watcher,
+      unref: () => watcher
+    };
+    return watcher;
   }
   /**
-   * Reset internal caches
-   * Useful when external processes modify the filesystem
+   * Stop watching a file.
    */
-  resetCache() {
-    if (this.hybrid) {
-      this.hybrid.resetCache();
-      return;
+  unwatchFile(filePath, listener) {
+    const absPath = normalize(resolve(filePath));
+    const entry = this.watchedFiles.get(absPath);
+    if (entry) {
+      if (listener) {
+        entry.listeners.delete(listener);
+        if (entry.listeners.size === 0) {
+          if (entry.interval) clearInterval(entry.interval);
+          if (entry.observer) entry.observer.disconnect();
+          this.watchedFiles.delete(absPath);
+        }
+      } else {
+        if (entry.interval) clearInterval(entry.interval);
+        if (entry.observer) entry.observer.disconnect();
+        this.watchedFiles.delete(absPath);
+      }
     }
-    this.symlinkManager.reset();
-    this.packedStorage.reset();
-    this.handleManager.clearCache();
+  }
+  // --- Stream Implementation ---
+  /**
+   * Create a readable stream for a file.
+   */
+  createReadStream(filePath, options) {
+    const opts = typeof options === "string" ? { } : options ?? {};
+    const absPath = normalize(resolve(filePath));
+    const start = opts.start ?? 0;
+    const end = opts.end;
+    const highWaterMark = opts.highWaterMark ?? 64 * 1024;
+    let position = start;
+    let closed = false;
+    const self2 = this;
+    return new ReadableStream({
+      async pull(controller) {
+        if (closed) {
+          controller.close();
+          return;
+        }
+        try {
+          const maxRead = end !== void 0 ? Math.min(highWaterMark, end - position + 1) : highWaterMark;
+          if (maxRead <= 0) {
+            controller.close();
+            closed = true;
+            return;
+          }
+          const result = await self2.fastCall("read", absPath, { offset: position, len: maxRead });
+          if (!result.data || result.data.length === 0) {
+            controller.close();
+            closed = true;
+            return;
+          }
+          controller.enqueue(result.data);
+          position += result.data.length;
+          if (end !== void 0 && position > end) {
+            controller.close();
+            closed = true;
+          }
+        } catch (e) {
+          controller.error(e);
+          closed = true;
+        }
+      },
+      cancel() {
+        closed = true;
+      }
+    });
   }
   /**
-   * Force full garbage collection
-   * Releases all handles and caches, reinitializes the worker in hybrid mode
-   * Use this for long-running operations to prevent memory leaks
+   * Create a writable stream for a file.
    */
-  async gc() {
-    if (this.hybrid) {
-      await this.hybrid.gc();
-      return;
-    }
-    this.symlinkManager.reset();
-    await this.packedStorage.clear();
-    this.handleManager.clearCache();
+  createWriteStream(filePath, options) {
+    const opts = typeof options === "string" ? { } : options ?? {};
+    const absPath = normalize(resolve(filePath));
+    const start = opts.start ?? 0;
+    const shouldFlush = opts.flush !== false;
+    let position = start;
+    let initialized = false;
+    const self2 = this;
+    return new WritableStream({
+      async write(chunk) {
+        if (!initialized && start === 0) {
+          await self2.fastCall("write", absPath, { data: chunk, offset: 0, flush: false });
+          position = chunk.length;
+          initialized = true;
+        } else {
+          await self2.fastCall("write", absPath, { data: chunk, offset: position, truncate: false, flush: false });
+          position += chunk.length;
+          initialized = true;
+        }
+        self2.invalidateStat(absPath);
+      },
+      async close() {
+        if (shouldFlush) {
+          await self2.fastCall("flush", "/");
+        }
+      },
+      async abort() {
+      }
+    });
+  }
+  // --- Sync methods for opendir and mkdtemp ---
+  /**
+   * Open a directory for iteration (sync).
+   */
+  opendirSync(dirPath) {
+    return this.createDir(dirPath);
+  }
+  /**
+   * Create a unique temporary directory (sync).
+   */
+  mkdtempSync(prefix) {
+    const suffix = Math.random().toString(36).substring(2, 8);
+    const tmpDir = `${prefix}${suffix}`;
+    this.mkdirSync(tmpDir, { recursive: true });
+    return tmpDir;
   }
 };
 
-export { OPFSHybrid, constants, OPFS as default };
+// src/index.ts
+var fs = new OPFSFileSystem();
+var index_default = fs;
+
+export { FSError, OPFSFileSystem, constants, createEACCES, createEEXIST, createEINVAL, createEISDIR, createENOENT, createENOTDIR, createENOTEMPTY, index_default as default, fs, mapErrorCode, path_exports as path };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map

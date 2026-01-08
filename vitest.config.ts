@@ -1,15 +1,18 @@
-import { defineConfig } from 'vitest/config'
-import { resolve } from 'path'
+import { defineConfig } from 'vitest/config';
+import { playwright } from '@vitest/browser-playwright';
 
 export default defineConfig({
   test: {
-    environment: 'happy-dom',
+    include: ['tests/**/*.test.ts'],
+    exclude: ['tests/benchmark/**'],
     globals: true,
-    setupFiles: ['./test/setup.ts']
+    browser: {
+      enabled: true,
+      provider: playwright(),
+      headless: true,
+      instances: [
+        { browser: 'chromium' },
+      ],
+    },
   },
-  resolve: {
-    alias: {
-      '@componentor/opfs-fs': resolve(__dirname, './dist/index.js')
-    }
-  }
-})
+});
