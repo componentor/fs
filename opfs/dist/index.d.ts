@@ -85,6 +85,16 @@ interface FileSystemPromises {
     access(path: string, mode?: number): Promise<void>;
     rename(oldPath: string, newPath: string): Promise<void>;
     copyFile(src: string, dest: string, mode?: number): Promise<void>;
+    /**
+     * Flush all pending writes to storage.
+     * Use after writes with { flush: false } to ensure data is persisted.
+     */
+    flush(): Promise<void>;
+    /**
+     * Purge all kernel caches.
+     * Use between major operations to ensure clean state.
+     */
+    purge(): Promise<void>;
 }
 type PathLike = string;
 
@@ -122,7 +132,9 @@ declare class OPFSFileSystem {
     private syncBufferPool;
     private getSyncBuffers;
     private syncCallTier1;
+    private asyncOperationPromise;
     private syncCallTier1Async;
+    private syncCallTier1AsyncImpl;
     private syncStatTier1Async;
     private syncCallTier1ChunkedAsync;
     private syncCallTier1ChunkedReadAsync;
@@ -153,6 +165,11 @@ declare class OPFSFileSystem {
      * Alias for flushSync() - matches Node.js fdatasync behavior
      */
     fdatasyncSync(): void;
+    /**
+     * Purge all kernel caches (sync handles, directory handles).
+     * Use between major operations to ensure clean state.
+     */
+    purgeSync(): void;
     accessSync(filePath: string, _mode?: number): void;
     openSync(filePath: string, flags?: string | number): number;
     closeSync(fd: number): void;
@@ -162,6 +179,14 @@ declare class OPFSFileSystem {
     private parseFlags;
     private fastCall;
     promises: FileSystemPromises;
+    /**
+     * Async flush - use after promises.writeFile with { flush: false }
+     */
+    flush(): Promise<void>;
+    /**
+     * Async purge - clears all kernel caches
+     */
+    purge(): Promise<void>;
     constants: {
         readonly F_OK: 0;
         readonly R_OK: 4;

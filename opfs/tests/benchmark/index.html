@@ -731,6 +731,9 @@
       // OPFS Tier 1 Promises (Main thread with Atomics.waitAsync)
       // With initSync() called, fs.promises uses sync kernel via Atomics.waitAsync
       log(`Testing OPFS Tier 1 Promises git clone (Atomics.waitAsync)...`, 'info');
+      // Clean up any leftover from previous runs and purge caches for clean state
+      try { await fs.promises.rm('/git-bench-opfs', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.purge(); } catch {}
       const opfsGitFs = createOpfsGitFs(fs);
       await fs.promises.mkdir('/git-bench-opfs', { recursive: true });
       const startT1P = performance.now();
@@ -753,12 +756,16 @@
         results.tier1Promises = null;
       }
 
-      // Cleanup Tier 1 Promises repo
+      // Cleanup Tier 1 Promises repo and purge caches
       try { await fs.promises.rm('/git-bench-opfs', { recursive: true, force: true }); } catch {}
+      try { await fs.promises.purge(); } catch {}
 
       // OPFS Tier 2 (Async worker without sync kernel)
       // fsTier2 doesn't have initSync() called, so it uses the async worker path
       log(`Testing OPFS Tier 2 git clone (async worker)...`, 'info');
+      // Clean up any leftover from previous runs and purge caches for clean state
+      try { await fsTier2.promises.rm('/git-bench-opfs-t2', { recursive: true, force: true }); } catch {}
+      try { await fsTier2.promises.purge(); } catch {}
       const opfsGitFsTier2 = createOpfsGitFs(fsTier2);
       await fsTier2.promises.mkdir('/git-bench-opfs-t2', { recursive: true });
       const startT2 = performance.now();
@@ -781,8 +788,9 @@
         results.tier2 = null;
       }
 
-      // Cleanup Tier 2 repo
+      // Cleanup Tier 2 repo and purge caches
       try { await fsTier2.promises.rm('/git-bench-opfs-t2', { recursive: true, force: true }); } catch {}
+      try { await fsTier2.promises.purge(); } catch {}
 
       // Tier 1 Sync not applicable (git requires async)
       results.tier1 = null;

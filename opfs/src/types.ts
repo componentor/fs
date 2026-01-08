@@ -96,6 +96,16 @@ export interface FileSystemPromises {
   access(path: string, mode?: number): Promise<void>;
   rename(oldPath: string, newPath: string): Promise<void>;
   copyFile(src: string, dest: string, mode?: number): Promise<void>;
+  /**
+   * Flush all pending writes to storage.
+   * Use after writes with { flush: false } to ensure data is persisted.
+   */
+  flush(): Promise<void>;
+  /**
+   * Purge all kernel caches.
+   * Use between major operations to ensure clean state.
+   */
+  purge(): Promise<void>;
 }
 
 export type KernelOperation =

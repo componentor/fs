@@ -72,13 +72,35 @@ function closeAllSyncHandlesUnder(pathPrefix: string): void {
   for (const [path, handle] of syncHandleCache) {
     if (path === pathPrefix || path.startsWith(pathPrefix + '/')) {
       try {
+        // Flush before closing to ensure data is persisted
+        handle.flush();
         handle.close();
       } catch {
-        // Ignore close errors
+        // Ignore errors (handle may already be closed)
       }
       syncHandleCache.delete(path);
     }
   }
+}
+
+// Completely purge all caches - use before major cleanup operations
+function purgeAllCaches(): void {
+  // Flush and close all sync handles
+  for (const handle of syncHandleCache.values()) {
+    try {
+      handle.flush();
+      handle.close();
+    } catch {
+      // Ignore errors
+    }
+  }
+  syncHandleCache.clear();
+
+  // Clear directory cache
+  dirCache.clear();
+
+  // Clear root cache
+  cachedRoot = null;
 }
 
 // Flush all cached sync handles to ensure data is persisted
@@ -630,8 +652,8 @@ async function handleCopy(
   return 1;
 }
 
-// Operations that don't need locking (don't use createSyncAccessHandle)
-const LOCKLESS_OPS = new Set(['stat', 'exists', 'readdir', 'mkdir', 'flush']);
+// Operations that don't need per-file locking
+const LOCKLESS_OPS = new Set(['stat', 'exists', 'readdir', 'mkdir', 'flush', 'purge']);
 
 // Process incoming messages with SharedArrayBuffer-based communication
 async function processMessage(msg: KernelMessage): Promise<void> {
@@ -670,6 +692,10 @@ async function processMessage(msg: KernelMessage): Promise<void> {
         return handleCopy(filePath, payload);
       case 'flush':
         flushAllSyncHandles();
+        return 1;
+      case 'purge':
+        // Completely clear all caches - use between major operations
+        purgeAllCaches();
         return 1;
       default:
         throw new Error(`Unknown operation: ${type}`);
@@ -722,6 +748,9 @@ async function processMessage(msg: KernelMessage): Promise<void> {
 }
 
 // Main message handler
+// Note: Serialization is NOT needed here because:
+// - Tier 1 Sync: Client blocks on Atomics.wait, so only one message at a time
+// - Tier 1 Async: Client serializes via asyncOperationPromise before sending
 self.onmessage = (event: MessageEvent<KernelMessage>) => {
   processMessage(event.data);
 };

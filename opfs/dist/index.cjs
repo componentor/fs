@@ -466,6 +466,22 @@ function closeHandlesUnder(prefix) {
   }
 }
 
+// Clear directory cache entries for a path and all descendants
+function clearDirCacheUnder(filePath) {
+  // Convert to cache key format (no leading slash)
+  const prefix = parsePath(filePath).join('/');
+  if (!prefix) {
+    // Root directory - clear everything
+    dirCache.clear();
+    return;
+  }
+  for (const key of dirCache.keys()) {
+    if (key === prefix || key.startsWith(prefix + '/')) {
+      dirCache.delete(key);
+    }
+  }
+}
+
 async function getRoot() {
   if (!cachedRoot) {
     cachedRoot = await navigator.storage.getDirectory();
@@ -534,7 +550,8 @@ async function handleWrite(filePath, payload) {
     const offset = payload.offset ?? 0;
     if (offset === 0) access.truncate(0);
     access.write(payload.data, { at: offset });
-    access.flush();
+    // Only flush if explicitly requested (default: true for safety)
+    if (payload?.flush !== false) access.flush();
   }
   return { success: true };
 }
@@ -544,7 +561,7 @@ async function handleAppend(filePath, payload) {
   if (payload?.data) {
     const size = access.getSize();
     access.write(payload.data, { at: size });
-    access.flush();
+    if (payload?.flush !== false) access.flush();
   }
   return { success: true };
 }
@@ -605,7 +622,8 @@ async function handleMkdir(filePath, payload) {
 }
 
 async function handleRmdir(filePath, payload) {
-  closeHandlesUnder(filePath); // Close all cached handles under this directory
+  closeHandlesUnder(filePath); // Close all cached file handles under this directory
+  clearDirCacheUnder(filePath); // Clear stale directory cache entries
   const { parent, name } = await getParentAndName(filePath);
   if (payload?.recursive) {
     await parent.removeEntry(name, { recursive: true });
@@ -647,6 +665,7 @@ async function handleRename(oldPath, payload) {
   // Close cached handles for old path (file will be deleted)
   closeSyncHandle(oldPath);
   closeHandlesUnder(oldPath); // For directory renames
+  clearDirCacheUnder(oldPath); // Clear stale directory cache entries
 
   const oldParts = parsePath(oldPath);
   const newParts = parsePath(newPath);
@@ -719,6 +738,17 @@ function handleFlush() {
   return { success: true };
 }
 
+function handlePurge() {
+  // Flush and close all cached sync handles
+  for (const [, handle] of syncHandleCache) {
+    try { handle.flush(); handle.close(); } catch {}
+  }
+  syncHandleCache.clear();
+  dirCache.clear();
+  cachedRoot = null;
+  return { success: true };
+}
+
 async function processMessage(msg) {
   const { type, path, payload } = msg;
   switch (type) {
@@ -735,6 +765,7 @@ async function processMessage(msg) {
     case 'rename': return handleRename(path, payload);
     case 'copy': return handleCopy(path, payload);
     case 'flush': return handleFlush();
+    case 'purge': return handlePurge();
     default: throw new Error('Unknown operation: ' + type);
   }
 }
@@ -800,26 +831,20 @@ async function handleMessage(msg) {
   }
 }
 
-// Serialize message processing to prevent race conditions with sync handle cache
-// Without this, concurrent operations could race for createSyncAccessHandle
-let processingPromise = Promise.resolve();
-
-function queueMessage(msg) {
-  processingPromise = processingPromise.then(() => handleMessage(msg)).catch(() => {});
-}
-
 // Process queued messages after ready
 function processQueue() {
   while (messageQueue.length > 0) {
     const msg = messageQueue.shift();
-    queueMessage(msg);
+    handleMessage(msg);
   }
 }
 
-// Queue messages until ready, then process sequentially
+// Handle messages directly - no serialization needed because:
+// - Tier 2: Client awaits response before sending next message
+// - Each OPFSFileSystem instance has its own worker
 self.onmessage = (event) => {
   if (isReady) {
-    queueMessage(event.data);
+    handleMessage(event.data);
   } else {
     messageQueue.push(event.data);
   }
@@ -885,7 +910,16 @@ function encodeData(data, _encoding) {
   if (typeof data === "string") {
     return new TextEncoder().encode(data);
   }
-  return data;
+  if (data instanceof Uint8Array) {
+    return data;
+  }
+  if (data instanceof ArrayBuffer) {
+    return new Uint8Array(data);
+  }
+  if (ArrayBuffer.isView(data)) {
+    return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  }
+  return new TextEncoder().encode(String(data ?? ""));
 }
 function decodeData(data, encoding) {
   if (encoding === "utf8" || encoding === "utf-8") {
@@ -1137,9 +1171,28 @@ var OPFSFileSystem = class _OPFSFileSystem {
     }
     return { success: status === 1 };
   }
+  // Mutex for async operations to prevent buffer reuse race conditions
+  // Multiple concurrent Atomics.waitAsync calls would share the same buffer pool,
+  // causing data corruption when operations complete out of order
+  asyncOperationPromise = Promise.resolve();
   // Async version of syncCallTier1 using Atomics.waitAsync (works on main thread)
   // This allows the main thread to use the fast SharedArrayBuffer path without blocking
+  // IMPORTANT: Operations are serialized to prevent buffer reuse race conditions
   async syncCallTier1Async(type, filePath, payload) {
+    const previousOp = this.asyncOperationPromise;
+    let resolveCurrentOp;
+    this.asyncOperationPromise = new Promise((resolve2) => {
+      resolveCurrentOp = resolve2;
+    });
+    try {
+      await previousOp;
+      return await this.syncCallTier1AsyncImpl(type, filePath, payload);
+    } finally {
+      resolveCurrentOp();
+    }
+  }
+  // Implementation of async Tier 1 call (called after serialization)
+  async syncCallTier1AsyncImpl(type, filePath, payload) {
     if (!this.syncKernel || !this.syncKernelReady) {
       throw new Error("Sync kernel not initialized. Call initSync() first.");
     }
@@ -1224,9 +1277,10 @@ var OPFSFileSystem = class _OPFSFileSystem {
     return { success: status === 1 };
   }
   // Async stat helper for main thread
+  // NOTE: Called from within syncCallTier1AsyncImpl, so uses impl directly to avoid deadlock
   async syncStatTier1Async(absPath) {
     try {
-      const result = await this.syncCallTier1Async("stat", absPath);
+      const result = await this.syncCallTier1AsyncImpl("stat", absPath);
       return { size: result.size };
     } catch {
       return null;
@@ -1541,6 +1595,14 @@ var OPFSFileSystem = class _OPFSFileSystem {
   fdatasyncSync() {
     this.flushSync();
   }
+  /**
+   * Purge all kernel caches (sync handles, directory handles).
+   * Use between major operations to ensure clean state.
+   */
+  purgeSync() {
+    this.syncCall("purge", "/");
+    this.statCache.clear();
+  }
   accessSync(filePath, _mode) {
     const exists = this.existsSync(filePath);
     if (!exists) {
@@ -1665,14 +1727,16 @@ var OPFSFileSystem = class _OPFSFileSystem {
       return decodeData(result.data, encoding);
     },
     writeFile: async (filePath, data, options) => {
-      typeof options === "string" ? options : options?.encoding;
-      const encoded = encodeData(data);
-      await this.fastCall("write", filePath, { data: encoded });
+      const opts = typeof options === "string" ? { encoding: options } : options;
+      const encoded = encodeData(data, opts?.encoding);
+      await this.fastCall("write", filePath, { data: encoded, flush: opts?.flush });
+      this.invalidateStat(filePath);
     },
     appendFile: async (filePath, data, options) => {
-      typeof options === "string" ? options : options?.encoding;
-      const encoded = encodeData(data);
-      await this.fastCall("append", filePath, { data: encoded });
+      const opts = typeof options === "string" ? { encoding: options } : options;
+      const encoded = encodeData(data, opts?.encoding);
+      await this.fastCall("append", filePath, { data: encoded, flush: opts?.flush });
+      this.invalidateStat(filePath);
     },
     mkdir: async (filePath, options) => {
       const recursive = typeof options === "object" ? options?.recursive : false;
@@ -1688,8 +1752,14 @@ var OPFSFileSystem = class _OPFSFileSystem {
         try {
           if (result.isDirectory || result.type === "directory") {
             await this.fastCall("rmdir", filePath, { recursive: options?.recursive });
+            if (options?.recursive) {
+              this.invalidateStatsUnder(filePath);
+            } else {
+              this.invalidateStat(filePath);
+            }
           } else {
             await this.fastCall("unlink", filePath);
+            this.invalidateStat(filePath);
           }
         } catch (e) {
           if (!options?.force) throw e;
@@ -1735,8 +1805,36 @@ var OPFSFileSystem = class _OPFSFileSystem {
     },
     copyFile: async (srcPath, destPath) => {
       await this.fastCall("copy", srcPath, { newPath: resolve(destPath) });
+    },
+    /**
+     * Flush all pending writes to storage.
+     * Use after writes with { flush: false } to ensure data is persisted.
+     */
+    flush: async () => {
+      await this.fastCall("flush", "/");
+    },
+    /**
+     * Purge all kernel caches.
+     * Use between major operations to ensure clean state.
+     */
+    purge: async () => {
+      await this.fastCall("purge", "/");
+      this.statCache.clear();
     }
   };
+  /**
+   * Async flush - use after promises.writeFile with { flush: false }
+   */
+  async flush() {
+    await this.fastCall("flush", "/");
+  }
+  /**
+   * Async purge - clears all kernel caches
+   */
+  async purge() {
+    await this.fastCall("purge", "/");
+    this.statCache.clear();
+  }
   // Constants
   constants = constants;
 };

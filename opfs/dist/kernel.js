@@ -38,12 +38,25 @@ function closeAllSyncHandlesUnder(pathPrefix) {
   for (const [path, handle] of syncHandleCache) {
     if (path === pathPrefix || path.startsWith(pathPrefix + "/")) {
       try {
+        handle.flush();
         handle.close();
       } catch {
       }
       syncHandleCache.delete(path);
     }
   }
+}
+function purgeAllCaches() {
+  for (const handle of syncHandleCache.values()) {
+    try {
+      handle.flush();
+      handle.close();
+    } catch {
+    }
+  }
+  syncHandleCache.clear();
+  dirCache.clear();
+  cachedRoot = null;
 }
 function flushAllSyncHandles() {
   for (const handle of syncHandleCache.values()) {
@@ -405,7 +418,7 @@ async function handleCopy(srcPath, payload) {
   await streamCopyFile(srcFh, dstPath);
   return 1;
 }
-var LOCKLESS_OPS = /* @__PURE__ */ new Set(["stat", "exists", "readdir", "mkdir", "flush"]);
+var LOCKLESS_OPS = /* @__PURE__ */ new Set(["stat", "exists", "readdir", "mkdir", "flush", "purge"]);
 async function processMessage(msg) {
   const { type, path: filePath, ctrlBuffer, metaBuffer, dataBuffer, dataLength, payload } = msg;
   const ctrl = new Int32Array(ctrlBuffer);
@@ -438,6 +451,9 @@ async function processMessage(msg) {
         return handleCopy(filePath, payload);
       case "flush":
         flushAllSyncHandles();
+        return 1;
+      case "purge":
+        purgeAllCaches();
         return 1;
       default:
         throw new Error(`Unknown operation: ${type}`);
