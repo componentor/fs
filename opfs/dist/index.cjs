@@ -1949,7 +1949,20 @@ var OPFSFileSystem = class _OPFSFileSystem {
       await this.promises.copyFile(existingPath, newPath);
     },
     open: async (filePath, flags = "r", _mode) => {
-      const fd = this.openSync(filePath, flags);
+      const flagNum = typeof flags === "string" ? this.parseFlags(flags) : flags;
+      const isReadOnly = (flagNum & constants.O_WRONLY) === 0 && (flagNum & constants.O_RDWR) === 0;
+      if (isReadOnly) {
+        const exists = await this.promises.exists(filePath);
+        if (!exists) {
+          throw createENOENT("open", filePath);
+        }
+      }
+      const fd = this.nextFd++;
+      this.fdTable.set(fd, {
+        path: normalize(resolve(filePath)),
+        flags: flagNum,
+        position: 0
+      });
       return this.createFileHandle(fd, filePath);
     },
     opendir: async (dirPath) => {

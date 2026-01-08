@@ -1945,7 +1945,23 @@ export class OPFSFileSystem {
     },
 
     open: async (filePath: string, flags: string | number = 'r', _mode?: number): Promise<FileHandle> => {
-      const fd = this.openSync(filePath, flags);
+      // Use async existence check instead of sync to work in main thread
+      const flagNum = typeof flags === 'string' ? this.parseFlags(flags) : flags;
+      const isReadOnly = (flagNum & constants.O_WRONLY) === 0 && (flagNum & constants.O_RDWR) === 0;
+
+      if (isReadOnly) {
+        const exists = await this.promises.exists(filePath);
+        if (!exists) {
+          throw createENOENT('open', filePath);
+        }
+      }
+
+      const fd = this.nextFd++;
+      this.fdTable.set(fd, {
+        path: path.normalize(path.resolve(filePath)),
+        flags: flagNum,
+        position: 0,
+      });
       return this.createFileHandle(fd, filePath);
     },
 
