@@ -82,9 +82,59 @@ interface FileSystemPromises {
     unlink(path: string): Promise<void>;
     readdir(path: string, options?: ReaddirOptions | Encoding | null): Promise<string[] | Dirent[]>;
     stat(path: string, options?: StatOptions): Promise<Stats>;
+    lstat(path: string, options?: StatOptions): Promise<Stats>;
     access(path: string, mode?: number): Promise<void>;
     rename(oldPath: string, newPath: string): Promise<void>;
     copyFile(src: string, dest: string, mode?: number): Promise<void>;
+    truncate(path: string, len?: number): Promise<void>;
+    realpath(path: string): Promise<string>;
+    /**
+     * Check if a path exists.
+     * Note: This is not in Node.js fs.promises but is commonly needed.
+     */
+    exists(path: string): Promise<boolean>;
+    /**
+     * Change file mode (no-op in OPFS - permissions not supported).
+     */
+    chmod(path: string, mode: number): Promise<void>;
+    /**
+     * Change file owner (no-op in OPFS - ownership not supported).
+     */
+    chown(path: string, uid: number, gid: number): Promise<void>;
+    /**
+     * Change file timestamps (no-op in OPFS - timestamps are read-only).
+     */
+    utimes(path: string, atime: Date | number, mtime: Date | number): Promise<void>;
+    /**
+     * Create a symbolic link.
+     * Emulated by storing target path in a special file format.
+     */
+    symlink(target: string, path: string, type?: string): Promise<void>;
+    /**
+     * Read a symbolic link target.
+     */
+    readlink(path: string): Promise<string>;
+    /**
+     * Create a hard link.
+     * Emulated by copying the file (true hard links not supported in OPFS).
+     */
+    link(existingPath: string, newPath: string): Promise<void>;
+    /**
+     * Open a file and return a FileHandle.
+     */
+    open(path: string, flags?: string | number, mode?: number): Promise<FileHandle>;
+    /**
+     * Open a directory for iteration.
+     */
+    opendir(path: string): Promise<Dir>;
+    /**
+     * Create a unique temporary directory.
+     */
+    mkdtemp(prefix: string): Promise<string>;
+    /**
+     * Watch a file or directory for changes.
+     */
+    watch(path: string, options?: WatchOptions): AsyncIterable<WatchEventType>;
     /**
      * Flush all pending writes to storage.
      * Use after writes with { flush: false } to ensure data is persisted.
@@ -97,6 +147,97 @@ interface FileSystemPromises {
     purge(): Promise<void>;
 }
 type PathLike = string;
+interface ReadStreamOptions {
+    flags?: string;
+    encoding?: Encoding | null;
+    fd?: number | null;
+    mode?: number;
+    autoClose?: boolean;
+    emitClose?: boolean;
+    start?: number;
+    end?: number;
+    highWaterMark?: number;
+}
+interface WriteStreamOptions {
+    flags?: string;
+    encoding?: Encoding;
+    fd?: number | null;
+    mode?: number;
+    autoClose?: boolean;
+    emitClose?: boolean;
+    start?: number;
+    highWaterMark?: number;
+    flush?: boolean;
+}
+interface WatchOptions {
+    persistent?: boolean;
+    recursive?: boolean;
+    encoding?: Encoding;
+    signal?: AbortSignal;
+}
+interface WatchFileOptions {
+    persistent?: boolean;
+    interval?: number;
+}
+interface WatchEventType {
+    eventType: 'rename' | 'change';
+    filename: string | null;
+}
+interface FileHandle {
+    fd: number;
+    read(buffer: Uint8Array, offset?: number, length?: number, position?: number | null): Promise<{
+        bytesRead: number;
+        buffer: Uint8Array;
+    }>;
+    write(buffer: Uint8Array, offset?: number, length?: number, position?: number | null): Promise<{
+        bytesWritten: number;
+        buffer: Uint8Array;
+    }>;
+    readFile(options?: ReadOptions | Encoding | null): Promise<Uint8Array | string>;
+    writeFile(data: Uint8Array | string, options?: WriteOptions | Encoding): Promise<void>;
+    truncate(len?: number): Promise<void>;
+    stat(): Promise<Stats>;
+    sync(): Promise<void>;
+    datasync(): Promise<void>;
+    close(): Promise<void>;
+}
+interface Dir {
+    path: string;
+    read(): Promise<Dirent | null>;
+    close(): Promise<void>;
+    [Symbol.asyncIterator](): AsyncIterableIterator<Dirent>;
+}
+interface FSWatcher {
+    close(): void;
+    ref(): this;
+    unref(): this;
+}
+interface StatWatcher {
+    ref(): this;
+    unref(): this;
+}
+type WatchListener = (eventType: 'rename' | 'change', filename: string | null) => void;
+type WatchFileListener = (curr: Stats, prev: Stats) => void;
+interface FileSystemChangeRecord {
+    changedHandle: FileSystemHandle | null;
+    relativePathComponents: string[];
+    relativePathMovedFrom: string[] | null;
+    root: FileSystemHandle;
+    type: 'appeared' | 'disappeared' | 'modified' | 'moved' | 'errored' | 'unknown';
+}
+type FileSystemObserverCallback = (records: FileSystemChangeRecord[], observer: FileSystemObserverInterface) => void;
+interface FileSystemObserverInterface {
+    observe(handle: FileSystemHandle, options?: {
+        recursive?: boolean;
+    }): Promise<void>;
+    disconnect(): void;
+}
+declare global {
+    interface Window {
+        FileSystemObserver?: new (callback: FileSystemObserverCallback) => FileSystemObserverInterface;
+    }
+    var FileSystemObserver: (new (callback: FileSystemObserverCallback) => FileSystemObserverInterface) | undefined;
+}
 
 /**
  * OPFS FileSystem - Node.js fs-compatible API
@@ -153,6 +294,10 @@ declare class OPFSFileSystem {
     readdirSync(filePath: string, options?: ReaddirOptions | Encoding | null): string[] | Dirent[];
     statSync(filePath: string): Stats;
     lstatSync(filePath: string): Stats;
+    /**
+     * Create stats object for a symlink file.
+     */
+    private createSymlinkStats;
     renameSync(oldPath: string, newPath: string): void;
     copyFileSync(src: string, dest: string): void;
     truncateSync(filePath: string, len?: number): void;
@@ -176,6 +321,47 @@ declare class OPFSFileSystem {
     readSync(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null): number;
     writeSync(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null): number;
     fstatSync(fd: number): Stats;
+    ftruncateSync(fd: number, len?: number): void;
+    /**
+     * Resolve a path to an absolute path.
+     * OPFS doesn't support symlinks, so this just normalizes the path.
+     */
+    realpathSync(filePath: string): string;
+    /**
+     * Change file mode (no-op in OPFS - permissions not supported).
+     */
+    chmodSync(_filePath: string, _mode: number): void;
+    /**
+     * Change file owner (no-op in OPFS - ownership not supported).
+     */
+    chownSync(_filePath: string, _uid: number, _gid: number): void;
+    /**
+     * Change file timestamps (no-op in OPFS - timestamps are read-only).
+     */
+    utimesSync(_filePath: string, _atime: Date | number, _mtime: Date | number): void;
+    private static readonly SYMLINK_MAGIC;
+    /**
+     * Create a symbolic link.
+     * Emulated by storing target path in a special file format.
+     */
+    symlinkSync(target: string, filePath: string, _type?: string): void;
+    /**
+     * Read a symbolic link target.
+     */
+    readlinkSync(filePath: string): string;
+    /**
+     * Check if a file is a symlink (sync).
+     */
+    private isSymlinkSync;
+    /**
+     * Check if a file is a symlink (async).
+     */
+    private isSymlinkAsync;
+    /**
+     * Create a hard link.
+     * Emulated by copying the file (true hard links not supported in OPFS).
+     */
+    linkSync(existingPath: string, newPath: string): void;
     private parseFlags;
     private fastCall;
     promises: FileSystemPromises;
@@ -224,6 +410,47 @@ declare class OPFSFileSystem {
         readonly S_IWOTH: 2;
         readonly S_IXOTH: 1;
     };
+    private createFileHandle;
+    private createDir;
+    private watchedFiles;
+    private static readonly hasNativeObserver;
+    private getDirectoryHandle;
+    private getFileHandle;
+    private mapChangeType;
+    private createAsyncWatcher;
+    private createNativeAsyncWatcher;
+    private createPollingAsyncWatcher;
+    /**
+     * Watch a file or directory for changes.
+     * Uses native FileSystemObserver when available, falls back to polling.
+     */
+    watch(filePath: string, options?: WatchOptions | WatchListener, listener?: WatchListener): FSWatcher;
+    private createNativeWatcher;
+    private createPollingWatcher;
+    /**
+     * Watch a file for changes using native FileSystemObserver or stat polling.
+     */
+    watchFile(filePath: string, options?: WatchFileOptions | WatchFileListener, listener?: WatchFileListener): StatWatcher;
+    /**
+     * Stop watching a file.
+     */
+    unwatchFile(filePath: string, listener?: WatchFileListener): void;
+    /**
+     * Create a readable stream for a file.
+     */
+    createReadStream(filePath: string, options?: ReadStreamOptions | string): ReadableStream<Uint8Array>;
+    /**
+     * Create a writable stream for a file.
+     */
+    createWriteStream(filePath: string, options?: WriteStreamOptions | string): WritableStream<Uint8Array>;
+    /**
+     * Open a directory for iteration (sync).
+     */
+    opendirSync(dirPath: string): Dir;
+    /**
+     * Create a unique temporary directory (sync).
+     */
+    mkdtempSync(prefix: string): string;
 }
 
 /**

@@ -35,6 +35,8 @@ export const ErrorCodes = {
   EMFILE: -24,
   ENOSPC: -28,
   EPERM: -1,
+  ENOSYS: -38,
+  ELOOP: -40,
 } as const;
 
 export function createENOENT(syscall: string, path: string): FSError {
@@ -102,6 +104,26 @@ export function createEINVAL(syscall: string, path: string): FSError {
     'EINVAL',
     ErrorCodes.EINVAL,
     `EINVAL: invalid argument, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
+}
+
+export function createENOSYS(syscall: string, path: string): FSError {
+  return new FSError(
+    'ENOSYS',
+    ErrorCodes.ENOSYS,
+    `ENOSYS: function not implemented, ${syscall} '${path}'`,
+    syscall,
+    path
+  );
+}
+
+export function createELOOP(syscall: string, path: string): FSError {
+  return new FSError(
+    'ELOOP',
+    ErrorCodes.ELOOP,
+    `ELOOP: too many symbolic links encountered, ${syscall} '${path}'`,
     syscall,
     path
   );

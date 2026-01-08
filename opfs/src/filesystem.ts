@@ -25,6 +25,20 @@ import type {
   FileSystemPromises,
   KernelResponse,
   KernelResult,
+  ReadStreamOptions,
+  WriteStreamOptions,
+  WatchOptions,
+  WatchFileOptions,
+  WatchEventType,
+  FileHandle,
+  Dir,
+  FSWatcher,
+  StatWatcher,
+  WatchListener,
+  WatchFileListener,
+  FileSystemChangeRecord,
+  FileSystemObserverCallback,
+  FileSystemObserverInterface,
 } from './types.js';
 
 // Detect if we're running in a Worker context (where Atomics.wait and createSyncAccessHandle work)
@@ -1437,7 +1451,25 @@ export class OPFSFileSystem {
   }
 
   lstatSync(filePath: string): Stats {
-    return this.statSync(filePath);
+    const stats = this.statSync(filePath);
+    // Check if it's a symlink and update the stats accordingly
+    if (stats.isFile() && this.isSymlinkSync(filePath)) {
+      return this.createSymlinkStats(stats);
+    }
+    return stats;
+  }
+
+  /**
+   * Create stats object for a symlink file.
+   */
+  private createSymlinkStats(baseStats: Stats): Stats {
+    return {
+      ...baseStats,
+      isFile: () => false,
+      isSymbolicLink: () => true,
+      // Symlink mode: 0o120777 (41471 decimal)
+      mode: 41471,
+    };
   }
 
   renameSync(oldPath: string, newPath: string): void {
@@ -1585,6 +1617,101 @@ export class OPFSFileSystem {
       throw new FSError('EBADF', -9, `bad file descriptor: ${fd}`);
     }
     return this.statSync(entry.path);
+  }
+
+  ftruncateSync(fd: number, len = 0): void {
+    const entry = this.fdTable.get(fd);
+    if (!entry) {
+      throw new FSError('EBADF', -9, `bad file descriptor: ${fd}`);
+    }
+    this.truncateSync(entry.path, len);
+  }
+
+  /**
+   * Resolve a path to an absolute path.
+   * OPFS doesn't support symlinks, so this just normalizes the path.
+   */
+  realpathSync(filePath: string): string {
+    // Verify the path exists
+    this.accessSync(filePath);
+    return path.normalize(path.resolve(filePath));
+  }
+
+  /**
+   * Change file mode (no-op in OPFS - permissions not supported).
+   */
+  chmodSync(_filePath: string, _mode: number): void {
+    // No-op: OPFS doesn't support file permissions
+  }
+
+  /**
+   * Change file owner (no-op in OPFS - ownership not supported).
+   */
+  chownSync(_filePath: string, _uid: number, _gid: number): void {
+    // No-op: OPFS doesn't support file ownership
+  }
+
+  /**
+   * Change file timestamps (no-op in OPFS - timestamps are read-only).
+   */
+  utimesSync(_filePath: string, _atime: Date | number, _mtime: Date | number): void {
+    // No-op: OPFS doesn't support modifying timestamps
+  }
+
+  // Magic prefix for symlink files - must be unique enough to not appear in regular files
+  private static readonly SYMLINK_MAGIC = 'OPFS_SYMLINK_V1:';
+
+  /**
+   * Create a symbolic link.
+   * Emulated by storing target path in a special file format.
+   */
+  symlinkSync(target: string, filePath: string, _type?: string): void {
+    const content = OPFSFileSystem.SYMLINK_MAGIC + target;
+    this.writeFileSync(filePath, content);
+  }
+
+  /**
+   * Read a symbolic link target.
+   */
+  readlinkSync(filePath: string): string {
+    const content = this.readFileSync(filePath, { encoding: 'utf8' }) as string;
+    if (!content.startsWith(OPFSFileSystem.SYMLINK_MAGIC)) {
+      throw new FSError('EINVAL', -22, `EINVAL: invalid argument, readlink '${filePath}'`, 'readlink', filePath);
+    }
+    return content.slice(OPFSFileSystem.SYMLINK_MAGIC.length);
+  }
+
+  /**
+   * Check if a file is a symlink (sync).
+   */
+  private isSymlinkSync(filePath: string): boolean {
+    try {
+      const content = this.readFileSync(filePath, { encoding: 'utf8' }) as string;
+      return content.startsWith(OPFSFileSystem.SYMLINK_MAGIC);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check if a file is a symlink (async).
+   */
+  private async isSymlinkAsync(filePath: string): Promise<boolean> {
+    try {
+      const content = await this.promises.readFile(filePath, { encoding: 'utf8' }) as string;
+      return content.startsWith(OPFSFileSystem.SYMLINK_MAGIC);
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Create a hard link.
+   * Emulated by copying the file (true hard links not supported in OPFS).
+   */
+  linkSync(existingPath: string, newPath: string): void {
+    // For symlinks, copy the symlink file itself (not the target)
+    this.copyFileSync(existingPath, newPath);
   }
 
   private parseFlags(flags: string): number {
@@ -1754,6 +1881,89 @@ export class OPFSFileSystem {
       await this.fastCall('copy', srcPath, { newPath: path.resolve(destPath) });
     },
 
+    truncate: async (filePath: string, len = 0) => {
+      await this.fastCall('truncate', filePath, { len });
+      this.invalidateStat(filePath);
+    },
+
+    lstat: async (filePath: string) => {
+      const result = await this.fastCall('stat', filePath);
+      const stats = createStats(result);
+      // Check if it's a symlink
+      if (stats.isFile()) {
+        const isSymlink = await this.isSymlinkAsync(filePath);
+        if (isSymlink) {
+          return this.createSymlinkStats(stats);
+        }
+      }
+      return stats;
+    },
+
+    realpath: async (filePath: string) => {
+      // Verify the path exists
+      await this.promises.access(filePath);
+      return path.normalize(path.resolve(filePath));
+    },
+
+    exists: async (filePath: string) => {
+      try {
+        const result = await this.fastCall('exists', filePath);
+        return result.exists ?? false;
+      } catch {
+        return false;
+      }
+    },
+
+    chmod: async (_filePath: string, _mode: number) => {
+      // No-op: OPFS doesn't support file permissions
+    },
+
+    chown: async (_filePath: string, _uid: number, _gid: number) => {
+      // No-op: OPFS doesn't support file ownership
+    },
+
+    utimes: async (_filePath: string, _atime: Date | number, _mtime: Date | number) => {
+      // No-op: OPFS doesn't support modifying timestamps
+    },
+
+    symlink: async (target: string, filePath: string, _type?: string) => {
+      const content = OPFSFileSystem.SYMLINK_MAGIC + target;
+      await this.promises.writeFile(filePath, content);
+    },
+
+    readlink: async (filePath: string): Promise<string> => {
+      const content = await this.promises.readFile(filePath, { encoding: 'utf8' }) as string;
+      if (!content.startsWith(OPFSFileSystem.SYMLINK_MAGIC)) {
+        throw new FSError('EINVAL', -22, `EINVAL: invalid argument, readlink '${filePath}'`, 'readlink', filePath);
+      }
+      return content.slice(OPFSFileSystem.SYMLINK_MAGIC.length);
+    },
+
+    link: async (existingPath: string, newPath: string) => {
+      // Emulate hard link by copying the file
+      await this.promises.copyFile(existingPath, newPath);
+    },
+
+    open: async (filePath: string, flags: string | number = 'r', _mode?: number): Promise<FileHandle> => {
+      const fd = this.openSync(filePath, flags);
+      return this.createFileHandle(fd, filePath);
+    },
+
+    opendir: async (dirPath: string): Promise<Dir> => {
+      return this.createDir(dirPath);
+    },
+
+    mkdtemp: async (prefix: string): Promise<string> => {
+      const suffix = Math.random().toString(36).substring(2, 8);
+      const tmpDir = `${prefix}${suffix}`;
+      await this.promises.mkdir(tmpDir, { recursive: true });
+      return tmpDir;
+    },
+
+    watch: (filePath: string, options?: WatchOptions): AsyncIterable<WatchEventType> => {
+      return this.createAsyncWatcher(filePath, options);
+    },
+
     /**
      * Flush all pending writes to storage.
      * Use after writes with { flush: false } to ensure data is persisted.
@@ -1789,4 +1999,758 @@ export class OPFSFileSystem {
 
   // Constants
   constants = constants;
+
+  // --- FileHandle Implementation ---
+
+  private createFileHandle(fd: number, filePath: string): FileHandle {
+    const self = this;
+    const absPath = path.normalize(path.resolve(filePath));
+
+    return {
+      fd,
+
+      async read(buffer: Uint8Array, offset = 0, length?: number, position: number | null = null): Promise<{ bytesRead: number; buffer: Uint8Array }> {
+        const len = length ?? buffer.length - offset;
+        const entry = self.fdTable.get(fd);
+        if (!entry) throw new FSError('EBADF', -9, `bad file descriptor: ${fd}`);
+
+        const readPos = position !== null ? position : entry.position;
+        const result = await self.fastCall('read', absPath, { offset: readPos, len });
+
+        if (!result.data) {
+          return { bytesRead: 0, buffer };
+        }
+
+        const bytesRead = Math.min(result.data.length, len);
+        buffer.set(result.data.subarray(0, bytesRead), offset);
+
+        if (position === null) {
+          entry.position += bytesRead;
+        }
+
+        return { bytesRead, buffer };
+      },
+
+      async write(buffer: Uint8Array, offset = 0, length?: number, position: number | null = null): Promise<{ bytesWritten: number; buffer: Uint8Array }> {
+        const len = length ?? buffer.length - offset;
+        const entry = self.fdTable.get(fd);
+        if (!entry) throw new FSError('EBADF', -9, `bad file descriptor: ${fd}`);
+
+        const writePos = position !== null ? position : entry.position;
+        const data = buffer.subarray(offset, offset + len);
+
+        await self.fastCall('write', absPath, { data, offset: writePos, truncate: false });
+        self.invalidateStat(absPath);
+
+        if (position === null) {
+          entry.position += len;
+        }
+
+        return { bytesWritten: len, buffer };
+      },
+
+      async readFile(options?: ReadOptions | Encoding | null): Promise<Uint8Array | string> {
+        return self.promises.readFile(absPath, options);
+      },
+
+      async writeFile(data: Uint8Array | string, options?: WriteOptions | Encoding): Promise<void> {
+        return self.promises.writeFile(absPath, data, options);
+      },
+
+      async truncate(len = 0): Promise<void> {
+        await self.fastCall('truncate', absPath, { len });
+        self.invalidateStat(absPath);
+      },
+
+      async stat(): Promise<Stats> {
+        return self.promises.stat(absPath);
+      },
+
+      async sync(): Promise<void> {
+        await self.fastCall('flush', '/');
+      },
+
+      async datasync(): Promise<void> {
+        await self.fastCall('flush', '/');
+      },
+
+      async close(): Promise<void> {
+        self.fdTable.delete(fd);
+      },
+    };
+  }
+
+  // --- Dir Implementation ---
+
+  private createDir(dirPath: string): Dir {
+    const self = this;
+    const absPath = path.normalize(path.resolve(dirPath));
+    let entries: string[] | null = null;
+    let index = 0;
+    let closed = false;
+
+    const loadEntries = async () => {
+      if (entries === null) {
+        const result = await self.fastCall('readdir', absPath);
+        entries = result.entries || [];
+      }
+    };
+
+    const dir: Dir = {
+      path: absPath,
+
+      async read(): Promise<Dirent | null> {
+        if (closed) throw new FSError('EBADF', -9, 'Directory handle was closed');
+        await loadEntries();
+        if (index >= entries!.length) return null;
+
+        const name = entries![index++];
+        try {
+          const stat = await self.fastCall('stat', path.join(absPath, name));
+          const isDir = stat.type === 'directory' || stat.isDirectory === true;
+          return createDirent(name, isDir);
+        } catch {
+          return createDirent(name, false);
+        }
+      },
+
+      async close(): Promise<void> {
+        closed = true;
+        entries = null;
+      },
+
+      [Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
+        const iterator: AsyncIterableIterator<Dirent> = {
+          next: async (): Promise<IteratorResult<Dirent>> => {
+            const dirent = await dir.read();
+            if (dirent === null) {
+              return { done: true, value: undefined };
+            }
+            return { done: false, value: dirent };
+          },
+          [Symbol.asyncIterator]() {
+            return this;
+          },
+        };
+        return iterator;
+      },
+    };
+
+    return dir;
+  }
+
+  // --- Watch Implementation (Native FileSystemObserver with polling fallback) ---
+
+  private watchedFiles = new Map<string, { interval?: ReturnType<typeof setInterval>; observer?: FileSystemObserverInterface; listeners: Set<WatchFileListener>; lastStat: Stats | null }>();
+
+  // Check if native FileSystemObserver is available
+  private static readonly hasNativeObserver = typeof globalThis.FileSystemObserver !== 'undefined';
+
+  // Get OPFS directory handle for a path
+  private async getDirectoryHandle(dirPath: string, create = false): Promise<FileSystemDirectoryHandle> {
+    const parts = dirPath.split('/').filter(Boolean);
+    let current = await navigator.storage.getDirectory();
+    for (const part of parts) {
+      current = await current.getDirectoryHandle(part, { create });
+    }
+    return current;
+  }
+
+  // Get OPFS file handle for a path
+  private async getFileHandle(filePath: string, create = false): Promise<FileSystemFileHandle> {
+    const parts = filePath.split('/').filter(Boolean);
+    const fileName = parts.pop();
+    if (!fileName) throw new Error('Invalid file path');
+
+    let current = await navigator.storage.getDirectory();
+    for (const part of parts) {
+      current = await current.getDirectoryHandle(part, { create });
+    }
+    return current.getFileHandle(fileName, { create });
+  }
+
+  // Convert FileSystemObserver change type to Node.js event type
+  private mapChangeType(type: FileSystemChangeRecord['type']): 'rename' | 'change' {
+    switch (type) {
+      case 'appeared':
+      case 'disappeared':
+      case 'moved':
+        return 'rename';
+      case 'modified':
+        return 'change';
+      default:
+        return 'change';
+    }
+  }
+
+  private createAsyncWatcher(filePath: string, options?: WatchOptions): AsyncIterable<WatchEventType> {
+    const absPath = path.normalize(path.resolve(filePath));
+
+    // Use native FileSystemObserver if available
+    if (OPFSFileSystem.hasNativeObserver) {
+      return this.createNativeAsyncWatcher(absPath, options);
+    }
+
+    // Fallback to polling
+    return this.createPollingAsyncWatcher(absPath, options);
+  }
+
+  private createNativeAsyncWatcher(absPath: string, options?: WatchOptions): AsyncIterable<WatchEventType> {
+    const self = this;
+
+    return {
+      [Symbol.asyncIterator](): AsyncIterableIterator<WatchEventType> {
+        const eventQueue: WatchEventType[] = [];
+        let resolveNext: ((value: IteratorResult<WatchEventType>) => void) | null = null;
+        let observer: FileSystemObserverInterface | null = null;
+        let aborted = false;
+        let initialized = false;
+
+        // Handle abort signal
+        if (options?.signal) {
+          options.signal.addEventListener('abort', () => {
+            aborted = true;
+            observer?.disconnect();
+            if (resolveNext) {
+              resolveNext({ done: true, value: undefined });
+              resolveNext = null;
+            }
+          });
+        }
+
+        const callback: FileSystemObserverCallback = (records) => {
+          for (const record of records) {
+            if (record.type === 'errored' || record.type === 'unknown') continue;
+
+            const filename = record.relativePathComponents.length > 0
+              ? record.relativePathComponents[record.relativePathComponents.length - 1]
+              : path.basename(absPath);
+
+            const event: WatchEventType = {
+              eventType: self.mapChangeType(record.type),
+              filename,
+            };
+
+            if (resolveNext) {
+              resolveNext({ done: false, value: event });
+              resolveNext = null;
+            } else {
+              eventQueue.push(event);
+            }
+          }
+        };
+
+        const init = async () => {
+          if (initialized) return;
+          initialized = true;
+
+          try {
+            observer = new globalThis.FileSystemObserver!(callback);
+            const stat = await self.promises.stat(absPath);
+            const handle = stat.isDirectory()
+              ? await self.getDirectoryHandle(absPath)
+              : await self.getFileHandle(absPath);
+            await observer.observe(handle, { recursive: options?.recursive });
+          } catch (e) {
+            // If native observer fails, we should return done
+            aborted = true;
+          }
+        };
+
+        const iterator: AsyncIterableIterator<WatchEventType> = {
+          async next(): Promise<IteratorResult<WatchEventType>> {
+            if (aborted) {
+              return { done: true, value: undefined };
+            }
+
+            await init();
+
+            if (aborted) {
+              return { done: true, value: undefined };
+            }
+
+            // Return queued event if available
+            if (eventQueue.length > 0) {
+              return { done: false, value: eventQueue.shift()! };
+            }
+
+            // Wait for next event
+            return new Promise(resolve => {
+              resolveNext = resolve;
+            });
+          },
+          [Symbol.asyncIterator]() {
+            return this;
+          },
+        };
+        return iterator;
+      },
+    };
+  }
+
+  private createPollingAsyncWatcher(absPath: string, options?: WatchOptions): AsyncIterable<WatchEventType> {
+    const self = this;
+    const interval = 1000;
+
+    return {
+      [Symbol.asyncIterator](): AsyncIterableIterator<WatchEventType> {
+        let lastMtimeMs: number | null = null;
+        let lastEntries: Set<string> | null = null;
+        let aborted = false;
+        let pollTimeout: ReturnType<typeof setTimeout> | null = null;
+
+        if (options?.signal) {
+          options.signal.addEventListener('abort', () => {
+            aborted = true;
+            if (pollTimeout) clearTimeout(pollTimeout);
+          });
+        }
+
+        const checkForChanges = async (): Promise<WatchEventType | null> => {
+          if (aborted) return null;
+
+          try {
+            const stat = await self.promises.stat(absPath);
+
+            if (stat.isDirectory()) {
+              const entries = await self.promises.readdir(absPath) as string[];
+              const currentEntries = new Set(entries);
+
+              if (lastEntries === null) {
+                lastEntries = currentEntries;
+                return null;
+              }
+
+              for (const entry of currentEntries) {
+                if (!lastEntries.has(entry)) {
+                  lastEntries = currentEntries;
+                  return { eventType: 'rename', filename: entry };
+                }
+              }
+
+              for (const entry of lastEntries) {
+                if (!currentEntries.has(entry)) {
+                  lastEntries = currentEntries;
+                  return { eventType: 'rename', filename: entry };
+                }
+              }
+
+              lastEntries = currentEntries;
+            } else {
+              if (lastMtimeMs === null) {
+                lastMtimeMs = stat.mtimeMs;
+                return null;
+              }
+
+              if (stat.mtimeMs !== lastMtimeMs) {
+                lastMtimeMs = stat.mtimeMs;
+                return { eventType: 'change', filename: path.basename(absPath) };
+              }
+            }
+          } catch {
+            if (lastMtimeMs !== null || lastEntries !== null) {
+              lastMtimeMs = null;
+              lastEntries = null;
+              return { eventType: 'rename', filename: path.basename(absPath) };
+            }
+          }
+
+          return null;
+        };
+
+        const iterator: AsyncIterableIterator<WatchEventType> = {
+          async next(): Promise<IteratorResult<WatchEventType>> {
+            if (aborted) {
+              return { done: true, value: undefined };
+            }
+
+            while (!aborted) {
+              const event = await checkForChanges();
+              if (event) {
+                return { done: false, value: event };
+              }
+
+              await new Promise<void>(resolve => {
+                pollTimeout = setTimeout(resolve, interval);
+              });
+            }
+
+            return { done: true, value: undefined };
+          },
+          [Symbol.asyncIterator]() {
+            return this;
+          },
+        };
+        return iterator;
+      },
+    };
+  }
+
+  /**
+   * Watch a file or directory for changes.
+   * Uses native FileSystemObserver when available, falls back to polling.
+   */
+  watch(filePath: string, options: WatchOptions | WatchListener = {}, listener?: WatchListener): FSWatcher {
+    const absPath = path.normalize(path.resolve(filePath));
+    const opts = typeof options === 'function' ? {} : options;
+    const cb = typeof options === 'function' ? options : listener;
+
+    // Use native FileSystemObserver if available
+    if (OPFSFileSystem.hasNativeObserver) {
+      return this.createNativeWatcher(absPath, opts, cb);
+    }
+
+    // Fallback to polling
+    return this.createPollingWatcher(absPath, cb);
+  }
+
+  private createNativeWatcher(absPath: string, opts: WatchOptions, cb?: WatchListener): FSWatcher {
+    const self = this;
+    let observer: FileSystemObserverInterface | null = null;
+    let closed = false;
+
+    const callback: FileSystemObserverCallback = (records) => {
+      if (closed) return;
+
+      for (const record of records) {
+        if (record.type === 'errored' || record.type === 'unknown') continue;
+
+        const filename = record.relativePathComponents.length > 0
+          ? record.relativePathComponents[record.relativePathComponents.length - 1]
+          : path.basename(absPath);
+
+        cb?.(self.mapChangeType(record.type), filename);
+      }
+    };
+
+    // Initialize observer asynchronously
+    (async () => {
+      if (closed) return;
+      try {
+        observer = new globalThis.FileSystemObserver!(callback);
+        const stat = await self.promises.stat(absPath);
+        const handle = stat.isDirectory()
+          ? await self.getDirectoryHandle(absPath)
+          : await self.getFileHandle(absPath);
+        await observer.observe(handle, { recursive: opts.recursive });
+      } catch {
+        // Silently fail - watcher will just not work
+      }
+    })();
+
+    const watcher: FSWatcher = {
+      close: () => {
+        closed = true;
+        observer?.disconnect();
+      },
+      ref: () => watcher,
+      unref: () => watcher,
+    };
+
+    return watcher;
+  }
+
+  private createPollingWatcher(absPath: string, cb?: WatchListener): FSWatcher {
+    const interval = 1000;
+    let lastMtimeMs: number | null = null;
+    let lastEntries: Set<string> | null = null;
+    let closed = false;
+
+    const poll = async () => {
+      if (closed) return;
+
+      try {
+        const stat = await this.promises.stat(absPath);
+
+        if (stat.isDirectory()) {
+          const entries = await this.promises.readdir(absPath) as string[];
+          const currentEntries = new Set(entries);
+
+          if (lastEntries !== null) {
+            for (const entry of currentEntries) {
+              if (!lastEntries.has(entry)) {
+                cb?.('rename', entry);
+              }
+            }
+            for (const entry of lastEntries) {
+              if (!currentEntries.has(entry)) {
+                cb?.('rename', entry);
+              }
+            }
+          }
+          lastEntries = currentEntries;
+        } else {
+          if (lastMtimeMs !== null && stat.mtimeMs !== lastMtimeMs) {
+            cb?.('change', path.basename(absPath));
+          }
+          lastMtimeMs = stat.mtimeMs;
+        }
+      } catch {
+        if (lastMtimeMs !== null || lastEntries !== null) {
+          cb?.('rename', path.basename(absPath));
+          lastMtimeMs = null;
+          lastEntries = null;
+        }
+      }
+    };
+
+    const intervalId = setInterval(poll, interval);
+    poll();
+
+    const watcher: FSWatcher = {
+      close: () => {
+        closed = true;
+        clearInterval(intervalId);
+      },
+      ref: () => watcher,
+      unref: () => watcher,
+    };
+
+    return watcher;
+  }
+
+  /**
+   * Watch a file for changes using native FileSystemObserver or stat polling.
+   */
+  watchFile(filePath: string, options: WatchFileOptions | WatchFileListener = {}, listener?: WatchFileListener): StatWatcher {
+    const absPath = path.normalize(path.resolve(filePath));
+    const opts = typeof options === 'function' ? {} : options;
+    const cb = typeof options === 'function' ? options : listener;
+    const interval = opts.interval ?? 5007;
+
+    let lastStat: Stats | null = null;
+    let closed = false;
+    let observer: FileSystemObserverInterface | undefined;
+
+    // Polling function used as fallback or primary
+    const poll = async () => {
+      if (closed) return;
+
+      try {
+        const stat = await this.promises.stat(absPath);
+        if (lastStat !== null) {
+          if (stat.mtimeMs !== lastStat.mtimeMs || stat.size !== lastStat.size) {
+            cb?.(stat, lastStat);
+          }
+        }
+        lastStat = stat;
+      } catch {
+        const emptyStat = createStats({ type: 'file', size: 0, mtimeMs: 0, mode: 0 });
+        if (lastStat !== null) {
+          cb?.(emptyStat, lastStat);
+        }
+        lastStat = emptyStat;
+      }
+    };
+
+    // Try native observer first, fall back to polling
+    if (OPFSFileSystem.hasNativeObserver && cb) {
+      const self = this;
+
+      const observerCallback: FileSystemObserverCallback = async () => {
+        if (closed) return;
+        try {
+          const stat = await self.promises.stat(absPath);
+          if (lastStat !== null && (stat.mtimeMs !== lastStat.mtimeMs || stat.size !== lastStat.size)) {
+            cb(stat, lastStat);
+          }
+          lastStat = stat;
+        } catch {
+          const emptyStat = createStats({ type: 'file', size: 0, mtimeMs: 0, mode: 0 });
+          if (lastStat !== null) {
+            cb(emptyStat, lastStat);
+          }
+          lastStat = emptyStat;
+        }
+      };
+
+      (async () => {
+        if (closed) return;
+        try {
+          // Get initial stat
+          lastStat = await self.promises.stat(absPath);
+
+          observer = new globalThis.FileSystemObserver!(observerCallback);
+          const handle = await self.getFileHandle(absPath);
+          await observer.observe(handle);
+        } catch {
+          // Native observer failed, fall back to polling
+          if (!closed && !this.watchedFiles.get(absPath)?.interval) {
+            const entry = this.watchedFiles.get(absPath);
+            if (entry) {
+              entry.interval = setInterval(poll, interval);
+            }
+          }
+        }
+      })();
+
+      if (!this.watchedFiles.has(absPath)) {
+        this.watchedFiles.set(absPath, {
+          observer,
+          listeners: new Set(),
+          lastStat: null,
+        });
+      }
+      this.watchedFiles.get(absPath)!.listeners.add(cb);
+    } else {
+      // Polling fallback (no native observer available)
+      if (!this.watchedFiles.has(absPath)) {
+        this.watchedFiles.set(absPath, {
+          interval: setInterval(poll, interval),
+          listeners: new Set(),
+          lastStat: null,
+        });
+      }
+      if (cb) this.watchedFiles.get(absPath)!.listeners.add(cb);
+
+      poll();
+    }
+
+    const watcher: StatWatcher = {
+      ref: () => watcher,
+      unref: () => watcher,
+    };
+
+    return watcher;
+  }
+
+  /**
+   * Stop watching a file.
+   */
+  unwatchFile(filePath: string, listener?: WatchFileListener): void {
+    const absPath = path.normalize(path.resolve(filePath));
+    const entry = this.watchedFiles.get(absPath);
+
+    if (entry) {
+      if (listener) {
+        entry.listeners.delete(listener);
+        if (entry.listeners.size === 0) {
+          if (entry.interval) clearInterval(entry.interval);
+          if (entry.observer) entry.observer.disconnect();
+          this.watchedFiles.delete(absPath);
+        }
+      } else {
+        if (entry.interval) clearInterval(entry.interval);
+        if (entry.observer) entry.observer.disconnect();
+        this.watchedFiles.delete(absPath);
+      }
+    }
+  }
+
+  // --- Stream Implementation ---
+
+  /**
+   * Create a readable stream for a file.
+   */
+  createReadStream(filePath: string, options?: ReadStreamOptions | string): ReadableStream<Uint8Array> {
+    const opts = typeof options === 'string' ? { encoding: options as Encoding } : options ?? {};
+    const absPath = path.normalize(path.resolve(filePath));
+    const start = opts.start ?? 0;
+    const end = opts.end;
+    const highWaterMark = opts.highWaterMark ?? 64 * 1024;
+
+    let position = start;
+    let closed = false;
+    const self = this;
+
+    return new ReadableStream<Uint8Array>({
+      async pull(controller) {
+        if (closed) {
+          controller.close();
+          return;
+        }
+
+        try {
+          const maxRead = end !== undefined ? Math.min(highWaterMark, end - position + 1) : highWaterMark;
+          if (maxRead <= 0) {
+            controller.close();
+            closed = true;
+            return;
+          }
+
+          const result = await self.fastCall('read', absPath, { offset: position, len: maxRead });
+
+          if (!result.data || result.data.length === 0) {
+            controller.close();
+            closed = true;
+            return;
+          }
+
+          controller.enqueue(result.data);
+          position += result.data.length;
+
+          if (end !== undefined && position > end) {
+            controller.close();
+            closed = true;
+          }
+        } catch (e) {
+          controller.error(e);
+          closed = true;
+        }
+      },
+
+      cancel() {
+        closed = true;
+      },
+    });
+  }
+
+  /**
+   * Create a writable stream for a file.
+   */
+  createWriteStream(filePath: string, options?: WriteStreamOptions | string): WritableStream<Uint8Array> {
+    const opts = typeof options === 'string' ? { encoding: options as Encoding } : options ?? {};
+    const absPath = path.normalize(path.resolve(filePath));
+    const start = opts.start ?? 0;
+    const shouldFlush = opts.flush !== false;
+
+    let position = start;
+    let initialized = false;
+    const self = this;
+
+    return new WritableStream<Uint8Array>({
+      async write(chunk) {
+        // Truncate on first write if starting from beginning
+        if (!initialized && start === 0) {
+          await self.fastCall('write', absPath, { data: chunk, offset: 0, flush: false });
+          position = chunk.length;
+          initialized = true;
+        } else {
+          await self.fastCall('write', absPath, { data: chunk, offset: position, truncate: false, flush: false });
+          position += chunk.length;
+          initialized = true;
+        }
+        self.invalidateStat(absPath);
+      },
+
+      async close() {
+        if (shouldFlush) {
+          await self.fastCall('flush', '/');
+        }
+      },
+
+      async abort() {
+        // Nothing to clean up
+      },
+    });
+  }
+
+  // --- Sync methods for opendir and mkdtemp ---
+
+  /**
+   * Open a directory for iteration (sync).
+   */
+  opendirSync(dirPath: string): Dir {
+    return this.createDir(dirPath);
+  }
+
+  /**
+   * Create a unique temporary directory (sync).
+   */
+  mkdtempSync(prefix: string): string {
+    const suffix = Math.random().toString(36).substring(2, 8);
+    const tmpDir = `${prefix}${suffix}`;
+    this.mkdirSync(tmpDir, { recursive: true });
+    return tmpDir;
+  }
 }

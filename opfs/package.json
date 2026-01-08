@@ -30,6 +30,7 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@componentor/fs": "^1.2.8",
     "@isomorphic-git/lightning-fs": "^4.6.0",
     "@playwright/test": "^1.40.0",
     "@vitest/browser": "^1.0.0",
