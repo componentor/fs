@@ -1,0 +1,50 @@
+{
+  "name": "opfs-fs",
+  "version": "1.0.0",
+  "description": "Battle-tested OPFS-based Node.js fs polyfill with sync and async APIs",
+  "license": "MIT",
+  "author": "",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./sw": "./dist/service-worker.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "vitest",
+    "test:browser": "vitest --browser.enabled --browser.name=chromium --browser.provider=playwright",
+    "benchmark": "npm run build && playwright test",
+    "benchmark:server": "node tests/benchmark/server.js",
+    "benchmark:open": "npm run build && node tests/benchmark/server.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@isomorphic-git/lightning-fs": "^4.6.0",
+    "@playwright/test": "^1.40.0",
+    "@vitest/browser": "^1.0.0",
+    "playwright": "^1.40.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.0.0"
+  },
+  "keywords": [
+    "opfs",
+    "filesystem",
+    "fs",
+    "polyfill",
+    "browser",
+    "sync",
+    "async"
+  ]
+}

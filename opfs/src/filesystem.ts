@@ -1,0 +1,1429 @@
+/**
+ * OPFS FileSystem - Node.js fs-compatible API
+ * Supports two performance tiers:
+ * - Tier 1 (Sync): SharedArrayBuffer + Atomics - requires crossOriginIsolated (COOP/COEP headers)
+ * - Tier 2 (Async): Promises API using Worker kernel - always available
+ */
+
+import * as path from './path.js';
+import { constants } from './constants.js';
+import {
+  FSError,
+  createENOENT,
+  mapErrorCode,
+} from './errors.js';
+import type {
+  Stats,
+  Dirent,
+  ReadOptions,
+  WriteOptions,
+  MkdirOptions,
+  RmdirOptions,
+  RmOptions,
+  ReaddirOptions,
+  Encoding,
+  FileSystemPromises,
+  KernelResponse,
+  KernelResult,
+} from './types.js';
+
+// Detect if we're running in a Worker context (where Atomics.wait and createSyncAccessHandle work)
+const isWorkerContext = typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope;
+
+// Worker kernel source - inlined for zero-config deployment
+// Uses direct Worker postMessage for simple communication
+// Includes sync handle caching for performance (same as sync kernel)
+const KERNEL_SOURCE = `
+const LOCK_NAME = 'opfs_fs_lock';
+let messageQueue = [];
+let isReady = false;
+let cachedRoot = null;
+const dirCache = new Map();
+
+// Sync handle cache - MAJOR performance optimization
+const syncHandleCache = new Map();
+const MAX_HANDLES = 100;
+
+async function getSyncHandle(filePath, create) {
+  const cached = syncHandleCache.get(filePath);
+  if (cached) return cached;
+
+  // Evict oldest handles if cache is full
+  if (syncHandleCache.size >= MAX_HANDLES) {
+    const keys = Array.from(syncHandleCache.keys()).slice(0, 10);
+    for (const key of keys) {
+      const h = syncHandleCache.get(key);
+      if (h) { try { h.close(); } catch {} syncHandleCache.delete(key); }
+    }
+  }
+
+  const fh = await getFileHandle(filePath, create);
+  const access = await fh.createSyncAccessHandle();
+  syncHandleCache.set(filePath, access);
+  return access;
+}
+
+function closeSyncHandle(filePath) {
+  const h = syncHandleCache.get(filePath);
+  if (h) { try { h.close(); } catch {} syncHandleCache.delete(filePath); }
+}
+
+function closeHandlesUnder(prefix) {
+  for (const [p, h] of syncHandleCache) {
+    if (p === prefix || p.startsWith(prefix + '/')) {
+      try { h.close(); } catch {}
+      syncHandleCache.delete(p);
+    }
+  }
+}
+
+async function getRoot() {
+  if (!cachedRoot) {
+    cachedRoot = await navigator.storage.getDirectory();
+  }
+  return cachedRoot;
+}
+
+function parsePath(filePath) {
+  return filePath.split('/').filter(Boolean);
+}
+
+async function getDirectoryHandle(parts, create = false) {
+  if (parts.length === 0) return getRoot();
+
+  const cacheKey = parts.join('/');
+  if (dirCache.has(cacheKey)) {
+    return dirCache.get(cacheKey);
+  }
+
+  let curr = await getRoot();
+  let pathSoFar = '';
+
+  for (const part of parts) {
+    pathSoFar += (pathSoFar ? '/' : '') + part;
+
+    if (dirCache.has(pathSoFar)) {
+      curr = dirCache.get(pathSoFar);
+    } else {
+      curr = await curr.getDirectoryHandle(part, { create });
+      dirCache.set(pathSoFar, curr);
+    }
+  }
+
+  return curr;
+}
+
+async function getFileHandle(filePath, create = false) {
+  const parts = parsePath(filePath);
+  const fileName = parts.pop();
+  if (!fileName) throw new Error('Invalid file path');
+  const dir = parts.length > 0 ? await getDirectoryHandle(parts, create) : await getRoot();
+  return await dir.getFileHandle(fileName, { create });
+}
+
+async function getParentAndName(filePath) {
+  const parts = parsePath(filePath);
+  const name = parts.pop();
+  if (!name) throw new Error('Invalid path');
+  const parent = parts.length > 0 ? await getDirectoryHandle(parts, false) : await getRoot();
+  return { parent, name };
+}
+
+async function handleRead(filePath, payload) {
+  const access = await getSyncHandle(filePath, false);
+  const size = access.getSize();
+  const offset = payload?.offset || 0;
+  const len = payload?.len || (size - offset);
+  const buf = new Uint8Array(len);
+  const bytesRead = access.read(buf, { at: offset });
+  return { data: buf.slice(0, bytesRead) };
+}
+
+async function handleWrite(filePath, payload) {
+  const access = await getSyncHandle(filePath, true);
+  if (payload?.data) {
+    const offset = payload.offset ?? 0;
+    if (offset === 0) access.truncate(0);
+    access.write(payload.data, { at: offset });
+    access.flush();
+  }
+  return { success: true };
+}
+
+async function handleAppend(filePath, payload) {
+  const access = await getSyncHandle(filePath, true);
+  if (payload?.data) {
+    const size = access.getSize();
+    access.write(payload.data, { at: size });
+    access.flush();
+  }
+  return { success: true };
+}
+
+async function handleTruncate(filePath, payload) {
+  const access = await getSyncHandle(filePath, false);
+  access.truncate(payload?.len ?? 0);
+  access.flush();
+  return { success: true };
+  }
+}
+
+async function handleStat(filePath) {
+  const parts = parsePath(filePath);
+  // Node.js compatible stat shape: mode 33188 = file (0o100644), 16877 = dir (0o40755)
+  if (parts.length === 0) {
+    return { size: 0, mtimeMs: Date.now(), mode: 16877, type: 'directory' };
+  }
+  const name = parts.pop();
+  const parent = parts.length > 0 ? await getDirectoryHandle(parts, false) : await getRoot();
+  try {
+    const fh = await parent.getFileHandle(name);
+    // Use getFile() for metadata - faster than createSyncAccessHandle
+    const file = await fh.getFile();
+    return { size: file.size, mtimeMs: file.lastModified, mode: 33188, type: 'file' };
+  } catch {
+    try {
+      await parent.getDirectoryHandle(name);
+      return { size: 0, mtimeMs: Date.now(), mode: 16877, type: 'directory' };
+    } catch {
+      throw new Error('NotFoundError');
+    }
+  }
+}
+
+async function handleExists(filePath) {
+  try {
+    await handleStat(filePath);
+    return { exists: true };
+  } catch {
+    return { exists: false };
+  }
+}
+
+async function handleMkdir(filePath, payload) {
+  const parts = parsePath(filePath);
+  if (payload?.recursive) {
+    let curr = await getRoot();
+    for (const part of parts) {
+      curr = await curr.getDirectoryHandle(part, { create: true });
+    }
+  } else {
+    const name = parts.pop();
+    if (!name) throw new Error('Invalid path');
+    const parent = parts.length > 0 ? await getDirectoryHandle(parts, false) : await getRoot();
+    await parent.getDirectoryHandle(name, { create: true });
+  }
+  return { success: true };
+}
+
+async function handleRmdir(filePath, payload) {
+  const { parent, name } = await getParentAndName(filePath);
+  if (payload?.recursive) {
+    await parent.removeEntry(name, { recursive: true });
+  } else {
+    const dir = await parent.getDirectoryHandle(name);
+    const entries = dir.entries();
+    const first = await entries.next();
+    if (!first.done) throw new Error('InvalidModificationError');
+    await parent.removeEntry(name);
+  }
+  return { success: true };
+}
+
+async function handleUnlink(filePath) {
+  const { parent, name } = await getParentAndName(filePath);
+  await parent.removeEntry(name);
+  return { success: true };
+}
+
+async function handleReaddir(filePath) {
+  const parts = parsePath(filePath);
+  const dir = parts.length > 0 ? await getDirectoryHandle(parts, false) : await getRoot();
+  const entries = [];
+  for await (const [name] of dir.entries()) {
+    entries.push(name);
+  }
+  return { entries };
+}
+
+async function handleRename(oldPath, payload) {
+  if (!payload?.newPath) throw new Error('newPath required');
+  const newPath = payload.newPath;
+  const oldParts = parsePath(oldPath);
+  const newParts = parsePath(newPath);
+  const oldName = oldParts.pop();
+  const newName = newParts.pop();
+  const oldParent = oldParts.length > 0 ? await getDirectoryHandle(oldParts, false) : await getRoot();
+  const newParent = newParts.length > 0 ? await getDirectoryHandle(newParts, true) : await getRoot();
+
+  try {
+    const fh = await oldParent.getFileHandle(oldName);
+    const file = await fh.getFile();
+    const data = new Uint8Array(await file.arrayBuffer());
+    const newFh = await newParent.getFileHandle(newName, { create: true });
+    const access = await newFh.createSyncAccessHandle();
+    try {
+      access.truncate(0);
+      access.write(data, { at: 0 });
+      access.flush();
+    } finally {
+      access.close();
+    }
+    await oldParent.removeEntry(oldName);
+    return { success: true };
+  } catch {
+    const oldDir = await oldParent.getDirectoryHandle(oldName);
+    async function copyDir(src, dst) {
+      for await (const [name, handle] of src.entries()) {
+        if (handle.kind === 'file') {
+          const srcFile = await handle.getFile();
+          const data = new Uint8Array(await srcFile.arrayBuffer());
+          const dstFile = await dst.getFileHandle(name, { create: true });
+          const access = await dstFile.createSyncAccessHandle();
+          try { access.truncate(0); access.write(data, { at: 0 }); access.flush(); }
+          finally { access.close(); }
+        } else {
+          const newSubDir = await dst.getDirectoryHandle(name, { create: true });
+          await copyDir(handle, newSubDir);
+        }
+      }
+    }
+    const newDir = await newParent.getDirectoryHandle(newName, { create: true });
+    await copyDir(oldDir, newDir);
+    await oldParent.removeEntry(oldName, { recursive: true });
+    return { success: true };
+  }
+}
+
+async function handleCopy(srcPath, payload) {
+  if (!payload?.newPath) throw new Error('newPath required');
+  const dstPath = payload.newPath;
+  const srcParts = parsePath(srcPath);
+  const dstParts = parsePath(dstPath);
+  const srcName = srcParts.pop();
+  const dstName = dstParts.pop();
+  const srcParent = srcParts.length > 0 ? await getDirectoryHandle(srcParts, false) : await getRoot();
+  const dstParent = dstParts.length > 0 ? await getDirectoryHandle(dstParts, true) : await getRoot();
+  const srcFh = await srcParent.getFileHandle(srcName);
+  const srcFile = await srcFh.getFile();
+  const data = new Uint8Array(await srcFile.arrayBuffer());
+  const dstFh = await dstParent.getFileHandle(dstName, { create: true });
+  const access = await dstFh.createSyncAccessHandle();
+  try { access.truncate(0); access.write(data, { at: 0 }); access.flush(); }
+  finally { access.close(); }
+  return { success: true };
+}
+
+async function processMessage(msg) {
+  const { type, path, payload } = msg;
+  switch (type) {
+    case 'read': return handleRead(path, payload);
+    case 'write': return handleWrite(path, payload);
+    case 'append': return handleAppend(path, payload);
+    case 'truncate': return handleTruncate(path, payload);
+    case 'stat': return handleStat(path);
+    case 'exists': return handleExists(path);
+    case 'mkdir': return handleMkdir(path, payload);
+    case 'rmdir': return handleRmdir(path, payload);
+    case 'unlink': return handleUnlink(path);
+    case 'readdir': return handleReaddir(path);
+    case 'rename': return handleRename(path, payload);
+    case 'copy': return handleCopy(path, payload);
+    default: throw new Error('Unknown operation: ' + type);
+  }
+}
+
+function sendAtomicsResponse(result, payload) {
+  const ctrl = payload.ctrl;
+  if (result.data && payload.dataBuffer) {
+    const view = new Uint8Array(payload.dataBuffer);
+    view.set(result.data);
+    Atomics.store(ctrl, 0, result.data.length);
+  } else if (result.entries && payload.resultBuffer) {
+    const json = JSON.stringify(result);
+    const encoded = new TextEncoder().encode(json);
+    const view = new Uint8Array(payload.resultBuffer);
+    view.set(encoded);
+    Atomics.store(ctrl, 0, encoded.length);
+  } else if (result.success) {
+    Atomics.store(ctrl, 0, 1);
+  } else if (result.exists !== undefined) {
+    Atomics.store(ctrl, 0, result.exists ? 1 : 0);
+  } else if (result.isFile !== undefined) {
+    if (payload.resultBuffer) {
+      const json = JSON.stringify(result);
+      const encoded = new TextEncoder().encode(json);
+      const view = new Uint8Array(payload.resultBuffer);
+      view.set(encoded);
+      Atomics.store(ctrl, 0, encoded.length);
+    } else {
+      Atomics.store(ctrl, 0, result.size || 0);
+    }
+  }
+  Atomics.notify(ctrl, 0);
+}
+
+// Handle incoming messages
+async function handleMessage(msg) {
+  const { id, payload } = msg;
+  try {
+    const result = await processMessage(msg);
+    if (payload?.ctrl) {
+      sendAtomicsResponse(result, payload);
+    } else {
+      // Use Transferable for data to avoid copying
+      if (result.data) {
+        const buffer = result.data.buffer;
+        self.postMessage({ id, result }, [buffer]);
+      } else {
+        self.postMessage({ id, result });
+      }
+    }
+  } catch (e) {
+    const error = e instanceof Error ? e : new Error(String(e));
+    const errorName = error.name || 'Error';
+    if (payload?.ctrl) {
+      Atomics.store(payload.ctrl, 0, -1);
+      Atomics.notify(payload.ctrl, 0);
+    } else {
+      self.postMessage({ id, error: errorName, code: errorName });
+    }
+  }
+}
+
+// Process queued messages after lock is acquired
+function processQueue() {
+  while (messageQueue.length > 0) {
+    const msg = messageQueue.shift();
+    handleMessage(msg);
+  }
+}
+
+// Queue messages until ready
+self.onmessage = (event) => {
+  if (isReady) {
+    handleMessage(event.data);
+  } else {
+    messageQueue.push(event.data);
+  }
+};
+
+// Signal ready after a timeout to ensure main thread handler is set
+setTimeout(() => {
+  isReady = true;
+  self.postMessage({ type: 'ready' });
+}, 10);
+`;
+
+// --- Direct OPFS API helpers (for fast reads) ---
+
+let cachedRoot: FileSystemDirectoryHandle | null = null;
+const dirCache = new Map<string, FileSystemDirectoryHandle>();
+
+async function getRoot(): Promise<FileSystemDirectoryHandle> {
+  if (!cachedRoot) {
+    cachedRoot = await navigator.storage.getDirectory();
+  }
+  return cachedRoot;
+}
+
+function parsePath(filePath: string): string[] {
+  return filePath.split('/').filter(Boolean);
+}
+
+async function getDirectoryHandle(
+  parts: string[],
+  create = false
+): Promise<FileSystemDirectoryHandle> {
+  if (parts.length === 0) return getRoot();
+
+  // Check cache for full path first
+  const cacheKey = parts.join('/');
+  const cached = dirCache.get(cacheKey);
+  if (cached) return cached;
+
+  let curr = await getRoot();
+  let pathSoFar = '';
+
+  for (const part of parts) {
+    pathSoFar += (pathSoFar ? '/' : '') + part;
+
+    const cachedDir = dirCache.get(pathSoFar);
+    if (cachedDir) {
+      curr = cachedDir;
+    } else {
+      curr = await curr.getDirectoryHandle(part, { create });
+      dirCache.set(pathSoFar, curr);
+    }
+  }
+
+  return curr;
+}
+
+async function getFileHandle(
+  filePath: string,
+  create = false
+): Promise<FileSystemFileHandle> {
+  const parts = parsePath(filePath);
+  const fileName = parts.pop();
+  if (!fileName) throw new Error('Invalid file path');
+  const dir = parts.length > 0 ? await getDirectoryHandle(parts, create) : await getRoot();
+  return await dir.getFileHandle(fileName, { create });
+}
+
+// --- Helper functions ---
+
+function createStats(result: KernelResult): Stats {
+  // Support both new format (type, mtimeMs) and legacy format (isFile, isDirectory, mtime)
+  const isFile = result.type ? result.type === 'file' : (result.isFile ?? false);
+  const isDir = result.type ? result.type === 'directory' : (result.isDirectory ?? false);
+  const mtimeMs = result.mtimeMs ?? result.mtime ?? Date.now();
+  const size = result.size ?? 0;
+  const mode = result.mode ?? (isDir ? 16877 : 33188);
+
+  return {
+    isFile: () => isFile,
+    isDirectory: () => isDir,
+    isBlockDevice: () => false,
+    isCharacterDevice: () => false,
+    isSymbolicLink: () => false,
+    isFIFO: () => false,
+    isSocket: () => false,
+    dev: 0,
+    ino: 0,
+    mode,
+    nlink: 1,
+    uid: 0,
+    gid: 0,
+    rdev: 0,
+    size,
+    blksize: 4096,
+    blocks: Math.ceil(size / 512),
+    atimeMs: mtimeMs,
+    mtimeMs,
+    ctimeMs: mtimeMs,
+    birthtimeMs: mtimeMs,
+    atime: new Date(mtimeMs),
+    mtime: new Date(mtimeMs),
+    ctime: new Date(mtimeMs),
+    birthtime: new Date(mtimeMs),
+  };
+}
+
+function createDirent(name: string, isDir: boolean): Dirent {
+  return {
+    name,
+    isFile: () => !isDir,
+    isDirectory: () => isDir,
+    isBlockDevice: () => false,
+    isCharacterDevice: () => false,
+    isSymbolicLink: () => false,
+    isFIFO: () => false,
+    isSocket: () => false,
+  };
+}
+
+function generateId(): string {
+  return Math.random().toString(36).substring(2, 15);
+}
+
+function encodeData(data: Uint8Array | string, _encoding?: Encoding): Uint8Array {
+  if (typeof data === 'string') {
+    return new TextEncoder().encode(data);
+  }
+  return data;
+}
+
+function decodeData(data: Uint8Array, encoding?: Encoding | null): Uint8Array | string {
+  if (encoding === 'utf8' || encoding === 'utf-8') {
+    return new TextDecoder().decode(data);
+  }
+  return data;
+}
+
+// File descriptor entry for low-level read/write operations
+interface FileDescriptor {
+  path: string;
+  flags: number;
+  position: number;
+}
+
+export class OPFSFileSystem {
+  private worker: Worker | null = null;
+  private pending = new Map<string, { resolve: (v: KernelResult) => void; reject: (e: Error) => void }>();
+  private initialized = false;
+  private initPromise: Promise<void> | null = null;
+
+  // File descriptor table for openSync/readSync/writeSync/closeSync
+  private fdTable = new Map<number, FileDescriptor>();
+  private nextFd = 3; // Start at 3 (0=stdin, 1=stdout, 2=stderr)
+
+  // Stat cache - reduces FS traffic by 30-50% for git operations
+  private statCache = new Map<string, Stats>();
+
+  constructor() {
+    // Auto-initialize worker for fast async operations
+    this.initWorker();
+  }
+
+  // Invalidate stat cache for a path (and parent for directory operations)
+  private invalidateStat(filePath: string): void {
+    const absPath = path.normalize(path.resolve(filePath));
+    this.statCache.delete(absPath);
+    // Also invalidate parent directory (for readdir caching if added later)
+    const parent = path.dirname(absPath);
+    if (parent !== absPath) {
+      this.statCache.delete(parent);
+    }
+  }
+
+  // Invalidate all stats under a directory (for recursive operations)
+  private invalidateStatsUnder(dirPath: string): void {
+    const prefix = path.normalize(path.resolve(dirPath));
+    for (const key of this.statCache.keys()) {
+      if (key === prefix || key.startsWith(prefix + '/')) {
+        this.statCache.delete(key);
+      }
+    }
+  }
+
+  private async initWorker(): Promise<void> {
+    if (this.initialized) return;
+    if (this.initPromise) return this.initPromise;
+
+    this.initPromise = (async () => {
+      const blob = new Blob([KERNEL_SOURCE], { type: 'application/javascript' });
+      this.worker = new Worker(URL.createObjectURL(blob));
+
+      // Set up message handler FIRST, before worker can send 'ready'
+      const readyPromise = new Promise<void>((resolve) => {
+        this.worker!.onmessage = (event: MessageEvent<KernelResponse>) => {
+          const { id, result, error, code, type: msgType } = event.data;
+
+          // Handle ready signal
+          if (msgType === 'ready') {
+            resolve();
+            return;
+          }
+
+          const pending = this.pending.get(id);
+          if (pending) {
+            this.pending.delete(id);
+            if (error) {
+              pending.reject(new FSError(code || 'Error', -1, error));
+            } else if (result) {
+              pending.resolve(result);
+            }
+          }
+        };
+      });
+
+      await readyPromise;
+      this.initialized = true;
+    })();
+
+    return this.initPromise;
+  }
+
+  // Async call to worker - uses fast createSyncAccessHandle internally
+  private async asyncCall(
+    type: string,
+    filePath: string,
+    payload?: Record<string, unknown>
+  ): Promise<KernelResult> {
+    await this.initWorker();
+
+    if (!this.worker) {
+      throw new Error('Worker not initialized');
+    }
+
+    const absPath = path.resolve(filePath);
+    const id = generateId();
+
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+
+      const msg = {
+        id,
+        type,
+        path: absPath,
+        payload,
+      };
+
+      // Transfer ArrayBuffer if payload contains data (for writes)
+      if (payload?.data instanceof Uint8Array) {
+        // Clone the data since we're transferring - caller might still need original
+        const clone = new Uint8Array(payload.data);
+        const newPayload = { ...payload, data: clone };
+        this.worker!.postMessage({ ...msg, payload: newPayload }, [clone.buffer]);
+      } else {
+        this.worker!.postMessage(msg);
+      }
+    });
+  }
+
+  // Kernel worker for Tier 1 sync operations (loaded from URL, not blob)
+  private syncKernel: Worker | null = null;
+  private syncKernelReady = false;
+
+  /**
+   * Initialize sync operations with a kernel worker loaded from URL.
+   * Required for Tier 1 (SharedArrayBuffer + Atomics) to work in nested Workers.
+   * @param kernelUrl URL to the kernel.js file (defaults to '/kernel.js')
+   */
+  async initSync(kernelUrl = '/kernel.js'): Promise<void> {
+    if (this.syncKernelReady) return;
+
+    this.syncKernel = new Worker(kernelUrl, { type: 'module' });
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('Kernel init timeout')), 10000);
+      this.syncKernel!.onmessage = (e) => {
+        if (e.data?.type === 'ready') {
+          clearTimeout(timeout);
+          this.syncKernelReady = true;
+          resolve();
+        }
+      };
+      this.syncKernel!.onerror = (e) => {
+        clearTimeout(timeout);
+        reject(new Error(`Kernel error: ${e.message}`));
+      };
+    });
+  }
+
+  // Tier 1: SharedArrayBuffer + Atomics via kernel worker
+  // Data is transferred via SharedArrayBuffer (zero-copy)
+  // Synchronization via Atomics.wait/notify
+
+  // Buffer sizes for Tier 1 communication
+  private static readonly META_SIZE = 1024 * 64; // 64KB for metadata/results
+  private static readonly DEFAULT_DATA_SIZE = 1024 * 1024 * 10; // 10MB default buffer
+  private static readonly MAX_CHUNK_SIZE = 1024 * 1024 * 10; // 10MB max per chunk
+
+  // Reusable SharedArrayBuffer pool to prevent memory leaks
+  // SharedArrayBuffers are expensive to allocate and don't get GC'd quickly
+  private syncBufferPool: {
+    ctrl: SharedArrayBuffer;
+    meta: SharedArrayBuffer;
+    data: SharedArrayBuffer;
+    dataSize: number;
+  } | null = null;
+
+  private getSyncBuffers(requiredDataSize: number): {
+    ctrlBuffer: SharedArrayBuffer;
+    ctrl: Int32Array;
+    metaBuffer: SharedArrayBuffer;
+    dataBuffer: SharedArrayBuffer;
+  } {
+    // Reuse existing buffers if they're large enough
+    if (this.syncBufferPool && this.syncBufferPool.dataSize >= requiredDataSize) {
+      return {
+        ctrlBuffer: this.syncBufferPool.ctrl,
+        ctrl: new Int32Array(this.syncBufferPool.ctrl),
+        metaBuffer: this.syncBufferPool.meta,
+        dataBuffer: this.syncBufferPool.data,
+      };
+    }
+
+    // Allocate new buffers (or larger ones if needed)
+    const dataSize = Math.max(
+      OPFSFileSystem.DEFAULT_DATA_SIZE,
+      Math.min(requiredDataSize + 1024, 1024 * 1024 * 64) // Up to 64MB
+    );
+
+    const ctrlBuffer = new SharedArrayBuffer(4);
+    const metaBuffer = new SharedArrayBuffer(OPFSFileSystem.META_SIZE);
+    const dataBuffer = new SharedArrayBuffer(dataSize);
+
+    // Store in pool for reuse
+    this.syncBufferPool = {
+      ctrl: ctrlBuffer,
+      meta: metaBuffer,
+      data: dataBuffer,
+      dataSize,
+    };
+
+    return {
+      ctrlBuffer,
+      ctrl: new Int32Array(ctrlBuffer),
+      metaBuffer,
+      dataBuffer,
+    };
+  }
+
+  private syncCallTier1(
+    type: string,
+    filePath: string,
+    payload?: Record<string, unknown>
+  ): KernelResult {
+    if (!this.syncKernel || !this.syncKernelReady) {
+      throw new Error('Sync kernel not initialized. Call initSync() first.');
+    }
+
+    // Path normalization: resolve and normalize to ensure consistent paths
+    // e.g., /foo/bar, foo/bar/, and /foo//bar all become /foo/bar
+    const absPath = path.normalize(path.resolve(filePath));
+
+    const data = payload?.data instanceof Uint8Array ? payload.data : null;
+    const dataSize = data?.length ?? 0;
+
+    // For large writes, use chunked approach
+    if (type === 'write' && data && dataSize > OPFSFileSystem.MAX_CHUNK_SIZE) {
+      return this.syncCallTier1Chunked(absPath, data);
+    }
+
+    // Get reusable SharedArrayBuffers from pool (prevents memory leaks)
+    const { ctrlBuffer, ctrl, metaBuffer, dataBuffer } = this.getSyncBuffers(dataSize);
+
+    // Initialize control signal to "waiting"
+    Atomics.store(ctrl, 0, 0);
+
+    // For write operations, copy data to SharedArrayBuffer
+    let dataLength = 0;
+    if (data) {
+      const view = new Uint8Array(dataBuffer);
+      view.set(data);
+      dataLength = data.length;
+    }
+
+    // Send command to kernel with SharedArrayBuffers
+    this.syncKernel.postMessage({
+      type,
+      path: absPath,
+      ctrlBuffer,
+      metaBuffer,
+      dataBuffer,
+      dataLength,
+      payload: payload ? { ...payload, data: undefined } : undefined,
+    });
+
+    // Block until kernel signals completion
+    const waitResult = Atomics.wait(ctrl, 0, 0, 30000);
+    if (waitResult === 'timed-out') {
+      throw new Error('Operation timed out');
+    }
+
+    const status = Atomics.load(ctrl, 0);
+
+    // Status codes:
+    // > 0: success, value indicates data length or result
+    // -1: error (error message in metaBuffer)
+    // -2: not found
+
+    if (status === -1) {
+      const metaView = new Uint8Array(metaBuffer);
+      let end = metaView.indexOf(0);
+      if (end === -1) end = OPFSFileSystem.META_SIZE;
+      const errorMsg = new TextDecoder().decode(metaView.slice(0, end));
+      throw mapErrorCode(errorMsg || 'Error', type, absPath);
+    }
+
+    if (status === -2) {
+      throw createENOENT(type, absPath);
+    }
+
+    // Parse result based on operation type
+    if (type === 'read') {
+      const bytesRead = status;
+      const bufferSize = dataBuffer.byteLength;
+
+      // If we filled the buffer completely, there might be more data
+      // Use stat to check total size and switch to chunked read if needed
+      if (bytesRead === bufferSize) {
+        const stat = this.syncStatTier1(absPath);
+        if (stat && stat.size > bytesRead) {
+          // File is larger than buffer, use chunked read from the beginning
+          return this.syncCallTier1ChunkedRead(absPath, stat.size);
+        }
+      }
+
+      const dataView = new Uint8Array(dataBuffer);
+      return { data: dataView.slice(0, bytesRead) };
+    }
+
+    if (type === 'stat') {
+      // Binary stat: [type:u8] [pad:3] [mode:u32] [size:f64] [mtimeMs:f64]
+      const view = new DataView(metaBuffer);
+      const typeVal = view.getUint8(0);
+      return {
+        type: typeVal === 0 ? 'file' : 'directory',
+        mode: view.getUint32(4, true),
+        size: view.getFloat64(8, true),
+        mtimeMs: view.getFloat64(16, true),
+      };
+    }
+
+    if (type === 'readdir') {
+      // Binary readdir: [count:u32] [len:u16 + utf8]...
+      const view = new DataView(metaBuffer);
+      const bytes = new Uint8Array(metaBuffer);
+      const count = view.getUint32(0, true);
+      const entries: string[] = [];
+      let offset = 4;
+      for (let i = 0; i < count; i++) {
+        const len = view.getUint16(offset, true);
+        offset += 2;
+        const name = new TextDecoder().decode(bytes.subarray(offset, offset + len));
+        entries.push(name);
+        offset += len;
+      }
+      return { entries };
+    }
+
+    if (type === 'exists') {
+      return { exists: status === 1 };
+    }
+
+    return { success: status === 1 };
+  }
+
+  // Chunked write for files larger than MAX_CHUNK_SIZE
+  private syncCallTier1Chunked(
+    absPath: string,
+    data: Uint8Array
+  ): KernelResult {
+    const totalSize = data.length;
+    const chunkSize = OPFSFileSystem.MAX_CHUNK_SIZE;
+
+    // Reuse buffers from pool (prevents memory leaks)
+    const { ctrlBuffer, ctrl, metaBuffer, dataBuffer } = this.getSyncBuffers(chunkSize);
+    const dataView = new Uint8Array(dataBuffer);
+
+    let offset = 0;
+    while (offset < totalSize) {
+      const remaining = totalSize - offset;
+      const currentChunkSize = Math.min(chunkSize, remaining);
+      const chunk = data.subarray(offset, offset + currentChunkSize);
+
+      // Reset control signal
+      Atomics.store(ctrl, 0, 0);
+
+      // Copy chunk to SharedArrayBuffer
+      dataView.set(chunk);
+
+      // First chunk: truncate file (offset 0), subsequent chunks: append at offset
+      this.syncKernel!.postMessage({
+        type: 'write',
+        path: absPath,
+        ctrlBuffer,
+        metaBuffer,
+        dataBuffer,
+        dataLength: currentChunkSize,
+        payload: { offset }, // Kernel writes at this offset
+      });
+
+      // Wait for completion
+      const waitResult = Atomics.wait(ctrl, 0, 0, 60000); // Longer timeout for large chunks
+      if (waitResult === 'timed-out') {
+        throw new Error(`Chunked write timed out at offset ${offset}`);
+      }
+
+      const status = Atomics.load(ctrl, 0);
+      if (status === -1) {
+        const metaView = new Uint8Array(metaBuffer);
+        let end = metaView.indexOf(0);
+        if (end === -1) end = OPFSFileSystem.META_SIZE;
+        const errorMsg = new TextDecoder().decode(metaView.slice(0, end));
+        throw mapErrorCode(errorMsg || 'Error', 'write', absPath);
+      }
+      if (status === -2) {
+        throw createENOENT('write', absPath);
+      }
+
+      offset += currentChunkSize;
+    }
+
+    return { success: true };
+  }
+
+  // Chunked read for files larger than buffer size
+  private syncCallTier1ChunkedRead(
+    absPath: string,
+    totalSize: number
+  ): KernelResult {
+    const chunkSize = OPFSFileSystem.MAX_CHUNK_SIZE;
+
+    // Allocate result buffer on main thread
+    const result = new Uint8Array(totalSize);
+
+    // Reuse buffers from pool (prevents memory leaks)
+    const { ctrlBuffer, ctrl, metaBuffer, dataBuffer } = this.getSyncBuffers(chunkSize);
+
+    let offset = 0;
+    while (offset < totalSize) {
+      const remaining = totalSize - offset;
+      const currentChunkSize = Math.min(chunkSize, remaining);
+
+      // Reset control signal
+      Atomics.store(ctrl, 0, 0);
+
+      // Request chunk from kernel
+      this.syncKernel!.postMessage({
+        type: 'read',
+        path: absPath,
+        ctrlBuffer,
+        metaBuffer,
+        dataBuffer,
+        dataLength: 0,
+        payload: { offset, len: currentChunkSize },
+      });
+
+      // Wait for completion
+      const waitResult = Atomics.wait(ctrl, 0, 0, 60000);
+      if (waitResult === 'timed-out') {
+        throw new Error(`Chunked read timed out at offset ${offset}`);
+      }
+
+      const status = Atomics.load(ctrl, 0);
+      if (status === -1) {
+        const metaView = new Uint8Array(metaBuffer);
+        let end = metaView.indexOf(0);
+        if (end === -1) end = OPFSFileSystem.META_SIZE;
+        const errorMsg = new TextDecoder().decode(metaView.slice(0, end));
+        throw mapErrorCode(errorMsg || 'Error', 'read', absPath);
+      }
+      if (status === -2) {
+        throw createENOENT('read', absPath);
+      }
+
+      // Copy chunk from SharedArrayBuffer to result
+      const bytesRead = status;
+      const dataView = new Uint8Array(dataBuffer, 0, bytesRead);
+      result.set(dataView, offset);
+
+      offset += bytesRead;
+
+      // If we read less than requested, we've reached EOF
+      if (bytesRead < currentChunkSize) {
+        break;
+      }
+    }
+
+    return { data: result.subarray(0, offset) };
+  }
+
+  // Get file size via stat (used for chunked reads)
+  private syncStatTier1(absPath: string): { size: number } | null {
+    // Reuse buffers from pool (prevents memory leaks)
+    const { ctrlBuffer, ctrl, metaBuffer, dataBuffer } = this.getSyncBuffers(1024);
+
+    Atomics.store(ctrl, 0, 0);
+
+    this.syncKernel!.postMessage({
+      type: 'stat',
+      path: absPath,
+      ctrlBuffer,
+      metaBuffer,
+      dataBuffer,
+      dataLength: 0,
+    });
+
+    const waitResult = Atomics.wait(ctrl, 0, 0, 10000);
+    if (waitResult === 'timed-out') {
+      return null;
+    }
+
+    const status = Atomics.load(ctrl, 0);
+    if (status <= 0) {
+      return null;
+    }
+
+    // Binary stat: [type:u8] [pad:3] [mode:u32] [size:f64] [mtimeMs:f64]
+    const view = new DataView(metaBuffer);
+    return { size: view.getFloat64(8, true) };
+  }
+
+  private syncCall(
+    type: string,
+    filePath: string,
+    payload?: Record<string, unknown>
+  ): KernelResult {
+    // Sync operations require SharedArrayBuffer + Atomics
+    // This requires crossOriginIsolated (COOP/COEP headers) and initSync() to be called
+    if (
+      isWorkerContext &&
+      typeof SharedArrayBuffer !== 'undefined' &&
+      this.syncKernelReady
+    ) {
+      return this.syncCallTier1(type, filePath, payload);
+    }
+
+    // No sync tier available - throw helpful error
+    throw new Error(
+      `Sync operations require crossOriginIsolated environment (COOP/COEP headers) and initSync() to be called. ` +
+      `Current state: crossOriginIsolated=${typeof crossOriginIsolated !== 'undefined' ? crossOriginIsolated : 'N/A'}, ` +
+      `isWorkerContext=${isWorkerContext}, syncKernelReady=${this.syncKernelReady}. ` +
+      `Use fs.promises.* for async operations that work everywhere.`
+    );
+  }
+
+  // --- Synchronous API (Node.js fs compatible) ---
+
+  readFileSync(filePath: string, options?: ReadOptions | Encoding | null): Uint8Array | string {
+    const encoding = typeof options === 'string' ? options : options?.encoding;
+    const result = this.syncCall('read', filePath);
+    if (!result.data) throw createENOENT('read', filePath);
+    return decodeData(result.data, encoding);
+  }
+
+  writeFileSync(filePath: string, data: Uint8Array | string, options?: WriteOptions | Encoding): void {
+    const opts = typeof options === 'string' ? { encoding: options } : options;
+    const encoded = encodeData(data, opts?.encoding);
+    // Pass flush option (defaults to true in kernel for safety)
+    this.syncCall('write', filePath, { data: encoded, flush: opts?.flush });
+    this.invalidateStat(filePath);
+  }
+
+  appendFileSync(filePath: string, data: Uint8Array | string, options?: WriteOptions | Encoding): void {
+    const encoding = typeof options === 'string' ? options : options?.encoding;
+    const encoded = encodeData(data, encoding);
+    this.syncCall('append', filePath, { data: encoded });
+    this.invalidateStat(filePath);
+  }
+
+  existsSync(filePath: string): boolean {
+    try {
+      const result = this.syncCall('exists', filePath);
+      return result.exists ?? false;
+    } catch {
+      return false;
+    }
+  }
+
+  mkdirSync(filePath: string, options?: MkdirOptions | number): string | undefined {
+    const recursive = typeof options === 'object' ? options?.recursive : false;
+    this.syncCall('mkdir', filePath, { recursive });
+    this.invalidateStat(filePath);
+    return recursive ? filePath : undefined;
+  }
+
+  rmdirSync(filePath: string, options?: RmdirOptions): void {
+    this.syncCall('rmdir', filePath, { recursive: options?.recursive });
+    if (options?.recursive) {
+      this.invalidateStatsUnder(filePath);
+    } else {
+      this.invalidateStat(filePath);
+    }
+  }
+
+  rmSync(filePath: string, options?: RmOptions): void {
+    try {
+      const result = this.syncCall('stat', filePath);
+      if (result.isDirectory || result.type === 'directory') {
+        this.syncCall('rmdir', filePath, { recursive: options?.recursive });
+        if (options?.recursive) {
+          this.invalidateStatsUnder(filePath);
+        } else {
+          this.invalidateStat(filePath);
+        }
+      } else {
+        this.syncCall('unlink', filePath);
+        this.invalidateStat(filePath);
+      }
+    } catch (e) {
+      if (!options?.force) throw e;
+    }
+  }
+
+  unlinkSync(filePath: string): void {
+    this.syncCall('unlink', filePath);
+    this.invalidateStat(filePath);
+  }
+
+  readdirSync(filePath: string, options?: ReaddirOptions | Encoding | null): string[] | Dirent[] {
+    const result = this.syncCall('readdir', filePath);
+    const entries = result.entries || [];
+
+    const opts = typeof options === 'object' ? options : { encoding: options };
+
+    if (opts?.withFileTypes) {
+      return entries.map((name) => {
+        try {
+          const stat = this.syncCall('stat', path.join(filePath, name));
+          return createDirent(name, stat.isDirectory ?? false);
+        } catch {
+          return createDirent(name, false);
+        }
+      });
+    }
+
+    return entries;
+  }
+
+  statSync(filePath: string): Stats {
+    const absPath = path.normalize(path.resolve(filePath));
+
+    // Check cache first
+    const cached = this.statCache.get(absPath);
+    if (cached) return cached;
+
+    const result = this.syncCall('stat', filePath);
+    // Check for both new format (type) and legacy format (isFile/isDirectory)
+    if (result.type === undefined && result.isFile === undefined && result.isDirectory === undefined) {
+      throw createENOENT('stat', filePath);
+    }
+    const stats = createStats(result);
+
+    // Cache the result
+    this.statCache.set(absPath, stats);
+    return stats;
+  }
+
+  lstatSync(filePath: string): Stats {
+    return this.statSync(filePath);
+  }
+
+  renameSync(oldPath: string, newPath: string): void {
+    this.syncCall('rename', oldPath, { newPath });
+    this.invalidateStat(oldPath);
+    this.invalidateStat(newPath);
+  }
+
+  copyFileSync(src: string, dest: string): void {
+    this.syncCall('copy', src, { newPath: dest });
+    this.invalidateStat(dest);
+  }
+
+  truncateSync(filePath: string, len = 0): void {
+    this.syncCall('truncate', filePath, { len });
+    this.invalidateStat(filePath);
+  }
+
+  /**
+   * Flush all pending writes to storage.
+   * Use this after writes with { flush: false } to ensure data is persisted.
+   */
+  flushSync(): void {
+    this.syncCall('flush', '/');
+  }
+
+  /**
+   * Alias for flushSync() - matches Node.js fdatasync behavior
+   */
+  fdatasyncSync(): void {
+    this.flushSync();
+  }
+
+  accessSync(filePath: string, _mode?: number): void {
+    const exists = this.existsSync(filePath);
+    if (!exists) {
+      throw createENOENT('access', filePath);
+    }
+  }
+
+  // --- Low-level File Descriptor API ---
+  // For efficient packfile access (read specific offsets without loading entire file)
+
+  openSync(filePath: string, flags: string | number = 'r'): number {
+    // Verify file exists for read modes
+    const flagNum = typeof flags === 'string' ? this.parseFlags(flags) : flags;
+    const isReadOnly = (flagNum & constants.O_WRONLY) === 0 && (flagNum & constants.O_RDWR) === 0;
+
+    if (isReadOnly && !this.existsSync(filePath)) {
+      throw createENOENT('open', filePath);
+    }
+
+    const fd = this.nextFd++;
+    this.fdTable.set(fd, {
+      path: path.normalize(path.resolve(filePath)),
+      flags: flagNum,
+      position: 0,
+    });
+    return fd;
+  }
+
+  closeSync(fd: number): void {
+    if (!this.fdTable.has(fd)) {
+      throw new FSError('EBADF', -9, `bad file descriptor: ${fd}`);
+    }
+    this.fdTable.delete(fd);
+  }
+
+  readSync(
+    fd: number,
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number | null
+  ): number {
+    const entry = this.fdTable.get(fd);
+    if (!entry) {
+      throw new FSError('EBADF', -9, `bad file descriptor: ${fd}`);
+    }
+
+    const readPos = position !== null ? position : entry.position;
+    const result = this.syncCall('read', entry.path, { offset: readPos, len: length });
+
+    if (!result.data) {
+      return 0; // EOF or error
+    }
+
+    // Copy data into the provided buffer at the specified offset
+    const bytesRead = Math.min(result.data.length, length);
+    buffer.set(result.data.subarray(0, bytesRead), offset);
+
+    // Update position if not using explicit position
+    if (position === null) {
+      entry.position += bytesRead;
+    }
+
+    return bytesRead;
+  }
+
+  writeSync(
+    fd: number,
+    buffer: Uint8Array,
+    offset: number,
+    length: number,
+    position: number | null
+  ): number {
+    const entry = this.fdTable.get(fd);
+    if (!entry) {
+      throw new FSError('EBADF', -9, `bad file descriptor: ${fd}`);
+    }
+
+    const writePos = position !== null ? position : entry.position;
+    const data = buffer.subarray(offset, offset + length);
+
+    // Use truncate: false to avoid truncating on positional writes
+    this.syncCall('write', entry.path, {
+      data,
+      offset: writePos,
+      truncate: false,
+    });
+
+    // Invalidate stat cache after write
+    this.invalidateStat(entry.path);
+
+    // Update position if not using explicit position
+    if (position === null) {
+      entry.position += length;
+    }
+
+    return length;
+  }
+
+  fstatSync(fd: number): Stats {
+    const entry = this.fdTable.get(fd);
+    if (!entry) {
+      throw new FSError('EBADF', -9, `bad file descriptor: ${fd}`);
+    }
+    return this.statSync(entry.path);
+  }
+
+  private parseFlags(flags: string): number {
+    switch (flags) {
+      case 'r': return constants.O_RDONLY;
+      case 'r+': return constants.O_RDWR;
+      case 'w': return constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC;
+      case 'w+': return constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC;
+      case 'a': return constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND;
+      case 'a+': return constants.O_RDWR | constants.O_CREAT | constants.O_APPEND;
+      default: return constants.O_RDONLY;
+    }
+  }
+
+  // --- Async Promises API ---
+  // Reads use direct OPFS for minimal overhead
+  // Writes use Worker with createSyncAccessHandle for speed
+
+  promises: FileSystemPromises = {
+    readFile: async (filePath: string, options?: ReadOptions | Encoding | null) => {
+      const encoding = typeof options === 'string' ? options : options?.encoding;
+      const absPath = path.resolve(filePath);
+
+      try {
+        const fh = await getFileHandle(absPath);
+        const file = await fh.getFile();
+        const data = new Uint8Array(await file.arrayBuffer());
+        return decodeData(data, encoding);
+      } catch (e) {
+        throw mapErrorCode((e as Error).name, 'read', absPath);
+      }
+    },
+
+    writeFile: async (filePath: string, data: Uint8Array | string, options?: WriteOptions | Encoding) => {
+      const encoding = typeof options === 'string' ? options : options?.encoding;
+      const encoded = encodeData(data, encoding);
+      await this.asyncCall('write', filePath, { data: encoded });
+    },
+
+    appendFile: async (filePath: string, data: Uint8Array | string, options?: WriteOptions | Encoding) => {
+      const encoding = typeof options === 'string' ? options : options?.encoding;
+      const encoded = encodeData(data, encoding);
+      await this.asyncCall('append', filePath, { data: encoded });
+    },
+
+    mkdir: async (filePath: string, options?: MkdirOptions | number) => {
+      const recursive = typeof options === 'object' ? options?.recursive : false;
+      await this.asyncCall('mkdir', filePath, { recursive });
+      return recursive ? filePath : undefined;
+    },
+
+    rmdir: async (filePath: string, options?: RmdirOptions) => {
+      await this.asyncCall('rmdir', filePath, { recursive: options?.recursive });
+    },
+
+    rm: async (filePath: string, options?: RmOptions) => {
+      try {
+        const result = await this.asyncCall('stat', filePath);
+        if (result.isDirectory) {
+          await this.asyncCall('rmdir', filePath, { recursive: options?.recursive });
+        } else {
+          await this.asyncCall('unlink', filePath);
+        }
+      } catch (e) {
+        if (!options?.force) throw e;
+      }
+    },
+
+    unlink: async (filePath: string) => {
+      await this.asyncCall('unlink', filePath);
+    },
+
+    readdir: async (filePath: string, options?: ReaddirOptions | Encoding | null) => {
+      const result = await this.asyncCall('readdir', filePath);
+      const entries = result.entries || [];
+      const opts = typeof options === 'object' ? options : { encoding: options };
+
+      if (opts?.withFileTypes) {
+        const dirents: Dirent[] = [];
+        for (const name of entries) {
+          try {
+            const stat = await this.asyncCall('stat', path.join(filePath, name));
+            dirents.push(createDirent(name, stat.isDirectory ?? false));
+          } catch {
+            dirents.push(createDirent(name, false));
+          }
+        }
+        return dirents;
+      }
+
+      return entries;
+    },
+
+    stat: async (filePath: string) => {
+      const result = await this.asyncCall('stat', filePath);
+      return createStats(result);
+    },
+
+    access: async (filePath: string, _mode?: number) => {
+      const result = await this.asyncCall('exists', filePath);
+      if (!result.exists) {
+        throw createENOENT('access', filePath);
+      }
+    },
+
+    rename: async (oldFilePath: string, newFilePath: string) => {
+      await this.asyncCall('rename', oldFilePath, { newPath: path.resolve(newFilePath) });
+    },
+
+    copyFile: async (srcPath: string, destPath: string) => {
+      await this.asyncCall('copy', srcPath, { newPath: path.resolve(destPath) });
+    },
+  };
+
+  // Constants
+  constants = constants;
+}
