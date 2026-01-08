@@ -444,7 +444,7 @@ function scheduleIdleCleanup() {
     idleCleanupTimer = null;
     const now = Date.now();
     for (const [p, lastAccess] of syncHandleLastAccess) {
-      if (now - lastAccess > HANDLE_IDLE_TIMEOUT) {
+      if (now - lastAccess >= HANDLE_IDLE_TIMEOUT) {
         const h = syncHandleCache.get(p);
         if (h) { try { h.flush(); h.close(); } catch {} syncHandleCache.delete(p); }
         syncHandleLastAccess.delete(p);

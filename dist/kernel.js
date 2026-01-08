@@ -12,7 +12,7 @@ function scheduleIdleCleanup() {
     idleCleanupTimer = null;
     const now = Date.now();
     for (const [path, lastAccess] of syncHandleLastAccess) {
-      if (now - lastAccess > HANDLE_IDLE_TIMEOUT) {
+      if (now - lastAccess >= HANDLE_IDLE_TIMEOUT) {
         const handle = syncHandleCache.get(path);
         if (handle) {
           try {

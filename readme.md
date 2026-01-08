@@ -446,6 +446,11 @@ Another tab or operation has the file open. The library uses `navigator.locks` t
 
 ## Changelog
 
+### v2.0.5 (2025)
+
+**Bug Fixes:**
+- Fixed idle timeout condition (`>` to `>=`) - handles now release at exactly 2s instead of ~4s
+
 ### v2.0.4 (2025)
 
 **Bug Fixes:**
