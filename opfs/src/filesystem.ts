@@ -165,7 +165,6 @@ async function handleTruncate(filePath, payload) {
   access.truncate(payload?.len ?? 0);
   access.flush();
   return { success: true };
-  }
 }
 
 async function handleStat(filePath) {
@@ -217,6 +216,7 @@ async function handleMkdir(filePath, payload) {
 }
 
 async function handleRmdir(filePath, payload) {
+  closeHandlesUnder(filePath); // Close all cached handles under this directory
   const { parent, name } = await getParentAndName(filePath);
   if (payload?.recursive) {
     await parent.removeEntry(name, { recursive: true });
@@ -231,6 +231,7 @@ async function handleRmdir(filePath, payload) {
 }
 
 async function handleUnlink(filePath) {
+  closeSyncHandle(filePath); // Close cached handle before deleting
   const { parent, name } = await getParentAndName(filePath);
   await parent.removeEntry(name);
   return { success: true };
@@ -249,6 +250,11 @@ async function handleReaddir(filePath) {
 async function handleRename(oldPath, payload) {
   if (!payload?.newPath) throw new Error('newPath required');
   const newPath = payload.newPath;
+
+  // Close cached handles for old path (file will be deleted)
+  closeSyncHandle(oldPath);
+  closeHandlesUnder(oldPath); // For directory renames
+
   const oldParts = parsePath(oldPath);
   const newParts = parsePath(newPath);
   const oldName = oldParts.pop();
@@ -260,36 +266,35 @@ async function handleRename(oldPath, payload) {
     const fh = await oldParent.getFileHandle(oldName);
     const file = await fh.getFile();
     const data = new Uint8Array(await file.arrayBuffer());
-    const newFh = await newParent.getFileHandle(newName, { create: true });
-    const access = await newFh.createSyncAccessHandle();
-    try {
-      access.truncate(0);
-      access.write(data, { at: 0 });
-      access.flush();
-    } finally {
-      access.close();
-    }
+
+    // Use cached handle for new file
+    const access = await getSyncHandle(newPath, true);
+    access.truncate(0);
+    access.write(data, { at: 0 });
+    access.flush();
+
     await oldParent.removeEntry(oldName);
     return { success: true };
   } catch {
     const oldDir = await oldParent.getDirectoryHandle(oldName);
-    async function copyDir(src, dst) {
+    async function copyDir(src, dst, dstPath) {
       for await (const [name, handle] of src.entries()) {
         if (handle.kind === 'file') {
           const srcFile = await handle.getFile();
           const data = new Uint8Array(await srcFile.arrayBuffer());
-          const dstFile = await dst.getFileHandle(name, { create: true });
-          const access = await dstFile.createSyncAccessHandle();
-          try { access.truncate(0); access.write(data, { at: 0 }); access.flush(); }
-          finally { access.close(); }
+          const filePath = dstPath + '/' + name;
+          const access = await getSyncHandle(filePath, true);
+          access.truncate(0);
+          access.write(data, { at: 0 });
+          access.flush();
         } else {
           const newSubDir = await dst.getDirectoryHandle(name, { create: true });
-          await copyDir(handle, newSubDir);
+          await copyDir(handle, newSubDir, dstPath + '/' + name);
         }
       }
     }
     const newDir = await newParent.getDirectoryHandle(newName, { create: true });
-    await copyDir(oldDir, newDir);
+    await copyDir(oldDir, newDir, newPath);
     await oldParent.removeEntry(oldName, { recursive: true });
     return { success: true };
   }
@@ -299,18 +304,25 @@ async function handleCopy(srcPath, payload) {
   if (!payload?.newPath) throw new Error('newPath required');
   const dstPath = payload.newPath;
   const srcParts = parsePath(srcPath);
-  const dstParts = parsePath(dstPath);
   const srcName = srcParts.pop();
-  const dstName = dstParts.pop();
   const srcParent = srcParts.length > 0 ? await getDirectoryHandle(srcParts, false) : await getRoot();
-  const dstParent = dstParts.length > 0 ? await getDirectoryHandle(dstParts, true) : await getRoot();
   const srcFh = await srcParent.getFileHandle(srcName);
   const srcFile = await srcFh.getFile();
   const data = new Uint8Array(await srcFile.arrayBuffer());
-  const dstFh = await dstParent.getFileHandle(dstName, { create: true });
-  const access = await dstFh.createSyncAccessHandle();
-  try { access.truncate(0); access.write(data, { at: 0 }); access.flush(); }
-  finally { access.close(); }
+
+  // Use cached handle for destination
+  const access = await getSyncHandle(dstPath, true);
+  access.truncate(0);
+  access.write(data, { at: 0 });
+  access.flush();
+  return { success: true };
+}
+
+function handleFlush() {
+  // Flush all cached sync handles
+  for (const [, handle] of syncHandleCache) {
+    try { handle.flush(); } catch {}
+  }
   return { success: true };
 }
 
@@ -329,6 +341,7 @@ async function processMessage(msg) {
     case 'readdir': return handleReaddir(path);
     case 'rename': return handleRename(path, payload);
     case 'copy': return handleCopy(path, payload);
+    case 'flush': return handleFlush();
     default: throw new Error('Unknown operation: ' + type);
   }
 }
