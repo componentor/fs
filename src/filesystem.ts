@@ -195,6 +195,47 @@ async function handleRead(filePath, payload) {
   return { data: buf.slice(0, bytesRead) };
 }
 
+// Non-blocking read using getFile() - does NOT lock the file
+// Use this for HMR scenarios where external tools need to modify files
+async function handleReadAsync(filePath, payload) {
+  const parts = parsePath(filePath);
+  const fileName = parts.pop();
+  if (!fileName) throw new Error('Invalid file path');
+  const dir = parts.length > 0 ? await getDirectoryHandle(parts, false) : await getRoot();
+  const fh = await dir.getFileHandle(fileName);
+  const file = await fh.getFile();
+
+  const offset = payload?.offset || 0;
+  const len = payload?.len || (file.size - offset);
+
+  if (offset === 0 && len === file.size) {
+    // Fast path: read entire file
+    const buf = new Uint8Array(await file.arrayBuffer());
+    return { data: buf };
+  }
+
+  // Partial read using slice
+  const slice = file.slice(offset, offset + len);
+  const buf = new Uint8Array(await slice.arrayBuffer());
+  return { data: buf };
+}
+
+// Force release a file handle - allows external tools to modify the file
+function handleReleaseHandle(filePath) {
+  closeSyncHandle(filePath);
+  return { success: true };
+}
+
+// Force release ALL file handles - use before HMR notifications
+function handleReleaseAllHandles() {
+  for (const [p, h] of syncHandleCache) {
+    try { h.close(); } catch {}
+  }
+  syncHandleCache.clear();
+  syncHandleLastAccess.clear();
+  return { success: true };
+}
+
 async function handleWrite(filePath, payload) {
   const access = await getSyncHandle(filePath, true);
   if (payload?.data) {
@@ -404,6 +445,7 @@ async function processMessage(msg) {
   const { type, path, payload } = msg;
   switch (type) {
     case 'read': return handleRead(path, payload);
+    case 'readAsync': return handleReadAsync(path, payload);
     case 'write': return handleWrite(path, payload);
     case 'append': return handleAppend(path, payload);
     case 'truncate': return handleTruncate(path, payload);
@@ -417,6 +459,8 @@ async function processMessage(msg) {
     case 'copy': return handleCopy(path, payload);
     case 'flush': return handleFlush();
     case 'purge': return handlePurge();
+    case 'releaseHandle': return handleReleaseHandle(path);
+    case 'releaseAllHandles': return handleReleaseAllHandles();
     default: throw new Error('Unknown operation: ' + type);
   }
 }
@@ -2039,6 +2083,24 @@ export class OPFSFileSystem {
     this.statCache.clear();
   }
 
+  /**
+   * Release all cached file handles.
+   * Call this before expecting external tools (OPFS Explorer, browser console, etc.)
+   * to modify files. This allows external access without waiting for the idle timeout.
+   * Unlike purge(), this only releases file handles without clearing directory caches.
+   */
+  async releaseAllHandles(): Promise<void> {
+    await this.fastCall('releaseAllHandles', '/');
+  }
+
+  /**
+   * Release a specific file's handle.
+   * Use this when you know a specific file needs to be externally modified.
+   */
+  async releaseHandle(filePath: string): Promise<void> {
+    await this.fastCall('releaseHandle', filePath);
+  }
+
   // Constants
   constants = constants;
 
@@ -2451,8 +2513,12 @@ export class OPFSFileSystem {
     let observer: FileSystemObserverInterface | null = null;
     let closed = false;
 
-    const callback: FileSystemObserverCallback = (records) => {
+    const callback: FileSystemObserverCallback = async (records) => {
       if (closed) return;
+
+      // Release all file handles before notifying callbacks
+      // This allows external tools to immediately access/modify files after changes
+      await self.releaseAllHandles();
 
       for (const record of records) {
         if (record.type === 'errored' || record.type === 'unknown') continue;
@@ -2509,26 +2575,42 @@ export class OPFSFileSystem {
           const currentEntries = new Set(entries);
 
           if (lastEntries !== null) {
+            // Check for changes
+            let hasChanges = false;
+            const added: string[] = [];
+            const removed: string[] = [];
             for (const entry of currentEntries) {
               if (!lastEntries.has(entry)) {
-                cb?.('rename', entry);
+                added.push(entry);
+                hasChanges = true;
               }
             }
             for (const entry of lastEntries) {
               if (!currentEntries.has(entry)) {
-                cb?.('rename', entry);
+                removed.push(entry);
+                hasChanges = true;
               }
+            }
+            // Release handles before notifying callbacks
+            if (hasChanges) {
+              await this.releaseAllHandles();
+              for (const entry of added) cb?.('rename', entry);
+              for (const entry of removed) cb?.('rename', entry);
             }
           }
           lastEntries = currentEntries;
         } else {
           if (lastMtimeMs !== null && stat.mtimeMs !== lastMtimeMs) {
+            // Release handles before notifying callbacks
+            await this.releaseAllHandles();
             cb?.('change', path.basename(absPath));
           }
           lastMtimeMs = stat.mtimeMs;
         }
       } catch {
         if (lastMtimeMs !== null || lastEntries !== null) {
+          // Release handles before notifying callbacks
+          await this.releaseAllHandles();
           cb?.('rename', path.basename(absPath));
           lastMtimeMs = null;
           lastEntries = null;
@@ -2572,6 +2654,8 @@ export class OPFSFileSystem {
         const stat = await this.promises.stat(absPath);
         if (lastStat !== null) {
           if (stat.mtimeMs !== lastStat.mtimeMs || stat.size !== lastStat.size) {
+            // Release handles before notifying callbacks
+            await this.releaseAllHandles();
             cb?.(stat, lastStat);
           }
         }
@@ -2579,6 +2663,8 @@ export class OPFSFileSystem {
       } catch {
         const emptyStat = createStats({ type: 'file', size: 0, mtimeMs: 0, mode: 0 });
         if (lastStat !== null) {
+          // Release handles before notifying callbacks
+          await this.releaseAllHandles();
           cb?.(emptyStat, lastStat);
         }
         lastStat = emptyStat;
@@ -2591,6 +2677,8 @@ export class OPFSFileSystem {
 
       const observerCallback: FileSystemObserverCallback = async () => {
         if (closed) return;
+        // Release handles before notifying callbacks
+        await self.releaseAllHandles();
         try {
           const stat = await self.promises.stat(absPath);
           if (lastStat !== null && (stat.mtimeMs !== lastStat.mtimeMs || stat.size !== lastStat.size)) {

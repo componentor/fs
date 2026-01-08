@@ -373,6 +373,18 @@ declare class OPFSFileSystem {
      * Async purge - clears all kernel caches
      */
     purge(): Promise<void>;
+    /**
+     * Release all cached file handles.
+     * Call this before expecting external tools (OPFS Explorer, browser console, etc.)
+     * to modify files. This allows external access without waiting for the idle timeout.
+     * Unlike purge(), this only releases file handles without clearing directory caches.
+     */
+    releaseAllHandles(): Promise<void>;
+    /**
+     * Release a specific file's handle.
+     * Use this when you know a specific file needs to be externally modified.
+     */
+    releaseHandle(filePath: string): Promise<void>;
     constants: {
         readonly F_OK: 0;
         readonly R_OK: 4;
