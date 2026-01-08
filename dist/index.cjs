@@ -431,31 +431,56 @@ let cachedRoot = null;
 const dirCache = new Map();
 
 // Sync handle cache - MAJOR performance optimization
+// Handles auto-release after idle timeout to allow external tools to access files
 const syncHandleCache = new Map();
+const syncHandleLastAccess = new Map();
 const MAX_HANDLES = 100;
+const HANDLE_IDLE_TIMEOUT = 2000;
+let idleCleanupTimer = null;
+
+function scheduleIdleCleanup() {
+  if (idleCleanupTimer) return;
+  idleCleanupTimer = setTimeout(() => {
+    idleCleanupTimer = null;
+    const now = Date.now();
+    for (const [p, lastAccess] of syncHandleLastAccess) {
+      if (now - lastAccess > HANDLE_IDLE_TIMEOUT) {
+        const h = syncHandleCache.get(p);
+        if (h) { try { h.flush(); h.close(); } catch {} syncHandleCache.delete(p); }
+        syncHandleLastAccess.delete(p);
+      }
+    }
+    if (syncHandleCache.size > 0) scheduleIdleCleanup();
+  }, HANDLE_IDLE_TIMEOUT);
+}
 
 async function getSyncHandle(filePath, create) {
   const cached = syncHandleCache.get(filePath);
-  if (cached) return cached;
+  if (cached) {
+    syncHandleLastAccess.set(filePath, Date.now());
+    return cached;
+  }
 
   // Evict oldest handles if cache is full
   if (syncHandleCache.size >= MAX_HANDLES) {
     const keys = Array.from(syncHandleCache.keys()).slice(0, 10);
     for (const key of keys) {
       const h = syncHandleCache.get(key);
-      if (h) { try { h.close(); } catch {} syncHandleCache.delete(key); }
+      if (h) { try { h.close(); } catch {} syncHandleCache.delete(key); syncHandleLastAccess.delete(key); }
     }
   }
 
   const fh = await getFileHandle(filePath, create);
   const access = await fh.createSyncAccessHandle();
   syncHandleCache.set(filePath, access);
+  syncHandleLastAccess.set(filePath, Date.now());
+  scheduleIdleCleanup();
   return access;
 }
 
 function closeSyncHandle(filePath) {
   const h = syncHandleCache.get(filePath);
-  if (h) { try { h.close(); } catch {} syncHandleCache.delete(filePath); }
+  if (h) { try { h.close(); } catch {} syncHandleCache.delete(filePath); syncHandleLastAccess.delete(filePath); }
 }
 
 function closeHandlesUnder(prefix) {
@@ -463,6 +488,7 @@ function closeHandlesUnder(prefix) {
     if (p === prefix || p.startsWith(prefix + '/')) {
       try { h.close(); } catch {}
       syncHandleCache.delete(p);
+      syncHandleLastAccess.delete(p);
     }
   }
 }

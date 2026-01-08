@@ -4,7 +4,7 @@ var dirCache = /* @__PURE__ */ new Map();
 var syncHandleCache = /* @__PURE__ */ new Map();
 var syncHandleLastAccess = /* @__PURE__ */ new Map();
 var MAX_SYNC_HANDLES = 100;
-var HANDLE_IDLE_TIMEOUT = 5e3;
+var HANDLE_IDLE_TIMEOUT = 2e3;
 var idleCleanupTimer = null;
 function scheduleIdleCleanup() {
   if (idleCleanupTimer) return;

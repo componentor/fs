@@ -32,7 +32,7 @@ const dirCache = new Map<string, FileSystemDirectoryHandle>();
 const syncHandleCache = new Map<string, FileSystemSyncAccessHandle>();
 const syncHandleLastAccess = new Map<string, number>();
 const MAX_SYNC_HANDLES = 100; // Limit cache size to prevent memory issues
-const HANDLE_IDLE_TIMEOUT = 5000; // Release handles after 5 seconds of inactivity
+const HANDLE_IDLE_TIMEOUT = 2000; // Release handles after 2 seconds of inactivity
 let idleCleanupTimer: ReturnType<typeof setTimeout> | null = null;
 
 // Periodically close idle handles to allow external access
@@ -63,6 +63,7 @@ function scheduleIdleCleanup(): void {
     }
   }, HANDLE_IDLE_TIMEOUT);
 }
+
 
 async function getSyncAccessHandle(
   filePath: string,

@@ -734,6 +734,44 @@ describe.skipIf(!isBrowser)('OPFSFileSystem Advanced APIs', () => {
       const result = await fs.promises.readFile(filePath, 'utf8');
       expect(result).toBe('purge test');
     });
+
+    it('should auto-release handles after idle timeout', async () => {
+      const filePath = `${testDir}/idle-release-test.txt`;
+
+      // Write a file (this caches the sync handle in the kernel)
+      await fs.promises.writeFile(filePath, 'initial content');
+
+      // Read the file to ensure handle is cached
+      const content1 = await fs.promises.readFile(filePath, 'utf8');
+      expect(content1).toBe('initial content');
+
+      // Wait for idle timeout (2 seconds) + buffer
+      await new Promise(resolve => setTimeout(resolve, 6000));
+
+      // After idle timeout, handles should be released
+      // Write again - this should work without "handle already open" error
+      await fs.promises.writeFile(filePath, 'updated content');
+
+      // Verify the write worked
+      const content2 = await fs.promises.readFile(filePath, 'utf8');
+      expect(content2).toBe('updated content');
+    }, 10000); // 10 second timeout for this test
+
+    it('should allow multiple operations on same file within idle window', async () => {
+      const filePath = `${testDir}/multi-op-test.txt`;
+
+      // Multiple rapid operations should reuse cached handle
+      await fs.promises.writeFile(filePath, 'op1');
+      await fs.promises.writeFile(filePath, 'op2');
+      await fs.promises.writeFile(filePath, 'op3');
+
+      const content = await fs.promises.readFile(filePath, 'utf8');
+      expect(content).toBe('op3');
+
+      // Stat should also work
+      const stat = await fs.promises.stat(filePath);
+      expect(stat.isFile()).toBe(true);
+    });
   });
 
   // ==================== WATCH (NON-PROMISE) TESTS ====================
