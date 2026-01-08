@@ -156,15 +156,6 @@ async function handleStat(filePath, metaBuffer) {
     view.setFloat64(16, Date.now(), true);
     return STAT_SIZE;
   }
-  const cachedHandle = syncHandleCache.get(filePath);
-  if (cachedHandle) {
-    const size = cachedHandle.getSize();
-    view.setUint8(0, 0);
-    view.setUint32(4, 33188, true);
-    view.setFloat64(8, size, true);
-    view.setFloat64(16, Date.now(), true);
-    return STAT_SIZE;
-  }
   const name = parts.pop();
   const parent = parts.length > 0 ? await getDirectoryHandle(parts, false) : await getRoot();
   try {

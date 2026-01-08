@@ -263,23 +263,12 @@ async function handleStat(
     return STAT_SIZE;
   }
 
-  // Fast path: if sync handle is cached, we know it's a file
-  const cachedHandle = syncHandleCache.get(filePath);
-  if (cachedHandle) {
-    const size = cachedHandle.getSize();
-    view.setUint8(0, 0); // file
-    view.setUint32(4, 33188, true);
-    view.setFloat64(8, size, true);
-    // Note: can't get mtime from sync handle, use current time as approximation
-    view.setFloat64(16, Date.now(), true);
-    return STAT_SIZE;
-  }
-
   const name = parts.pop()!;
   const parent = parts.length > 0 ? await getDirectoryHandle(parts, false) : await getRoot();
 
   try {
     const fh = await parent.getFileHandle(name);
+    // Always get File object for accurate mtime - OPFS updates lastModified on writes
     const file = await fh.getFile();
     view.setUint8(0, 0); // file
     view.setUint32(4, 33188, true);

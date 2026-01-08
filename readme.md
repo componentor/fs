@@ -446,6 +446,13 @@ Another tab or operation has the file open. The library uses `navigator.locks` t
 
 ## Changelog
 
+### v2.0.1 (2025)
+
+**Bug Fixes:**
+- Fixed mtime not updating correctly when files are modified
+- `stat()` now always returns accurate `lastModified` from OPFS instead of approximation
+- Ensures git status and other mtime-dependent operations work correctly
+
 ### v2.0.0 (2025)
 
 **Major rewrite with sync API support and performance tiers.**
