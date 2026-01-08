@@ -446,6 +446,13 @@ Another tab or operation has the file open. The library uses `navigator.locks` t
 
 ## Changelog
 
+### v2.0.2 (2025)
+
+**Improvements:**
+- Sync access handles now auto-release after 5 seconds of inactivity
+- Allows external tools (like OPFS Chrome extension) to access files when idle
+- Maintains full performance during active operations
+
 ### v2.0.1 (2025)
 
 **Bug Fixes:**

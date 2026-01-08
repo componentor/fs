@@ -27,16 +27,53 @@ let cachedRoot: FileSystemDirectoryHandle | null = null;
 const dirCache = new Map<string, FileSystemDirectoryHandle>();
 
 // Sync access handle cache - MAJOR performance optimization (2-5x speedup)
-// Handles are kept open and reused, only closed on file deletion/rename/shutdown
+// Handles are cached during active use but auto-released after idle timeout
+// This allows external tools (like OPFS Chrome extension) to access files when idle
 const syncHandleCache = new Map<string, FileSystemSyncAccessHandle>();
+const syncHandleLastAccess = new Map<string, number>();
 const MAX_SYNC_HANDLES = 100; // Limit cache size to prevent memory issues
+const HANDLE_IDLE_TIMEOUT = 5000; // Release handles after 5 seconds of inactivity
+let idleCleanupTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Periodically close idle handles to allow external access
+function scheduleIdleCleanup(): void {
+  if (idleCleanupTimer) return; // Already scheduled
+
+  idleCleanupTimer = setTimeout(() => {
+    idleCleanupTimer = null;
+    const now = Date.now();
+
+    for (const [path, lastAccess] of syncHandleLastAccess) {
+      if (now - lastAccess > HANDLE_IDLE_TIMEOUT) {
+        const handle = syncHandleCache.get(path);
+        if (handle) {
+          try {
+            handle.flush();
+            handle.close();
+          } catch { /* ignore */ }
+          syncHandleCache.delete(path);
+        }
+        syncHandleLastAccess.delete(path);
+      }
+    }
+
+    // Reschedule if there are still cached handles
+    if (syncHandleCache.size > 0) {
+      scheduleIdleCleanup();
+    }
+  }, HANDLE_IDLE_TIMEOUT);
+}
 
 async function getSyncAccessHandle(
   filePath: string,
   create: boolean
 ): Promise<FileSystemSyncAccessHandle> {
   const cached = syncHandleCache.get(filePath);
-  if (cached) return cached;
+  if (cached) {
+    // Update last access time
+    syncHandleLastAccess.set(filePath, Date.now());
+    return cached;
+  }
 
   // Evict oldest handles if cache is full to prevent memory issues
   if (syncHandleCache.size >= MAX_SYNC_HANDLES) {
@@ -46,6 +83,7 @@ async function getSyncAccessHandle(
       if (handle) {
         try { handle.close(); } catch { /* ignore */ }
         syncHandleCache.delete(key);
+        syncHandleLastAccess.delete(key);
       }
     }
   }
@@ -53,6 +91,11 @@ async function getSyncAccessHandle(
   const fh = await getFileHandle(filePath, create);
   const access = await fh.createSyncAccessHandle();
   syncHandleCache.set(filePath, access);
+  syncHandleLastAccess.set(filePath, Date.now());
+
+  // Schedule cleanup for idle handles
+  scheduleIdleCleanup();
+
   return access;
 }
 
@@ -65,6 +108,7 @@ function closeSyncHandle(filePath: string): void {
       // Ignore close errors (handle may already be closed)
     }
     syncHandleCache.delete(filePath);
+    syncHandleLastAccess.delete(filePath);
   }
 }
 
@@ -79,12 +123,19 @@ function closeAllSyncHandlesUnder(pathPrefix: string): void {
         // Ignore errors (handle may already be closed)
       }
       syncHandleCache.delete(path);
+      syncHandleLastAccess.delete(path);
     }
   }
 }
 
 // Completely purge all caches - use before major cleanup operations
 function purgeAllCaches(): void {
+  // Cancel any scheduled idle cleanup
+  if (idleCleanupTimer) {
+    clearTimeout(idleCleanupTimer);
+    idleCleanupTimer = null;
+  }
+
   // Flush and close all sync handles
   for (const handle of syncHandleCache.values()) {
     try {
@@ -95,6 +146,7 @@ function purgeAllCaches(): void {
     }
   }
   syncHandleCache.clear();
+  syncHandleLastAccess.clear();
 
   // Clear directory cache
   dirCache.clear();

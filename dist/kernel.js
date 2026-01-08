@@ -2,10 +2,40 @@
 var cachedRoot = null;
 var dirCache = /* @__PURE__ */ new Map();
 var syncHandleCache = /* @__PURE__ */ new Map();
+var syncHandleLastAccess = /* @__PURE__ */ new Map();
 var MAX_SYNC_HANDLES = 100;
+var HANDLE_IDLE_TIMEOUT = 5e3;
+var idleCleanupTimer = null;
+function scheduleIdleCleanup() {
+  if (idleCleanupTimer) return;
+  idleCleanupTimer = setTimeout(() => {
+    idleCleanupTimer = null;
+    const now = Date.now();
+    for (const [path, lastAccess] of syncHandleLastAccess) {
+      if (now - lastAccess > HANDLE_IDLE_TIMEOUT) {
+        const handle = syncHandleCache.get(path);
+        if (handle) {
+          try {
+            handle.flush();
+            handle.close();
+          } catch {
+          }
+          syncHandleCache.delete(path);
+        }
+        syncHandleLastAccess.delete(path);
+      }
+    }
+    if (syncHandleCache.size > 0) {
+      scheduleIdleCleanup();
+    }
+  }, HANDLE_IDLE_TIMEOUT);
+}
 async function getSyncAccessHandle(filePath, create) {
   const cached = syncHandleCache.get(filePath);
-  if (cached) return cached;
+  if (cached) {
+    syncHandleLastAccess.set(filePath, Date.now());
+    return cached;
+  }
   if (syncHandleCache.size >= MAX_SYNC_HANDLES) {
     const keysToDelete = Array.from(syncHandleCache.keys()).slice(0, 10);
     for (const key of keysToDelete) {
@@ -16,12 +46,15 @@ async function getSyncAccessHandle(filePath, create) {
         } catch {
         }
         syncHandleCache.delete(key);
+        syncHandleLastAccess.delete(key);
       }
     }
   }
   const fh = await getFileHandle(filePath, create);
   const access = await fh.createSyncAccessHandle();
   syncHandleCache.set(filePath, access);
+  syncHandleLastAccess.set(filePath, Date.now());
+  scheduleIdleCleanup();
   return access;
 }
 function closeSyncHandle(filePath) {
@@ -32,6 +65,7 @@ function closeSyncHandle(filePath) {
     } catch {
     }
     syncHandleCache.delete(filePath);
+    syncHandleLastAccess.delete(filePath);
   }
 }
 function closeAllSyncHandlesUnder(pathPrefix) {
@@ -43,10 +77,15 @@ function closeAllSyncHandlesUnder(pathPrefix) {
       } catch {
       }
       syncHandleCache.delete(path);
+      syncHandleLastAccess.delete(path);
     }
   }
 }
 function purgeAllCaches() {
+  if (idleCleanupTimer) {
+    clearTimeout(idleCleanupTimer);
+    idleCleanupTimer = null;
+  }
   for (const handle of syncHandleCache.values()) {
     try {
       handle.flush();
@@ -55,6 +94,7 @@ function purgeAllCaches() {
     }
   }
   syncHandleCache.clear();
+  syncHandleLastAccess.clear();
   dirCache.clear();
   cachedRoot = null;
 }
