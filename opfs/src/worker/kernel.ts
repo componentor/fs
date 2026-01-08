@@ -351,7 +351,10 @@ async function handleRmdir(
     const entries = dir.entries();
     const first = await entries.next();
     if (!first.done) {
-      throw new Error('Directory not empty');
+      // Use InvalidModificationError so it maps to ENOTEMPTY
+      const e = new Error('InvalidModificationError');
+      e.name = 'InvalidModificationError';
+      throw e;
     }
     await parent.removeEntry(name);
     // Only invalidate the specific directory
@@ -641,6 +644,7 @@ async function processMessage(msg: KernelMessage): Promise<void> {
   const executeOperation = async (): Promise<number> => {
     switch (type) {
       case 'read':
+      case 'readChunk':  // Alias for chunked reads (same handler, different offset/len)
         return handleRead(filePath, dataBuffer, payload);
       case 'write':
         return handleWrite(filePath, dataBuffer, dataLength || 0, payload);
@@ -679,15 +683,29 @@ async function processMessage(msg: KernelMessage): Promise<void> {
       Atomics.store(ctrl, 0, result);
     } catch (e: unknown) {
       const error = e instanceof Error ? e : new Error(String(e));
+      const errorName = error.name || '';
       const errorMsg = error.message || 'Unknown error';
 
-      if (errorMsg.includes('NotFoundError') || errorMsg.includes('not found')) {
+      // Check both error name and message for not-found conditions
+      // DOM exceptions have name='NotFoundError' and message like "could not be found"
+      const isNotFound = errorName === 'NotFoundError' ||
+        errorMsg.includes('NotFoundError') ||
+        errorMsg.includes('not found') ||
+        errorMsg.includes('could not be found');
+
+      if (isNotFound) {
         Atomics.store(ctrl, 0, -2);
       } else {
-        // Write error message to metaBuffer
-        const encoded = new TextEncoder().encode(errorMsg);
+        // Write error name to metaBuffer for proper error mapping
+        // Use error name if it's a known DOM exception, otherwise use message
+        const errorInfo = errorName && errorName !== 'Error' ? errorName : errorMsg;
+        const encoded = new TextEncoder().encode(errorInfo);
         const view = new Uint8Array(metaBuffer);
         view.set(encoded);
+        // Add null terminator to prevent reading stale data from reused buffer
+        if (encoded.length < metaBuffer.byteLength) {
+          view[encoded.length] = 0;
+        }
         Atomics.store(ctrl, 0, -1);
       }
     }

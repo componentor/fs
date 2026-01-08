@@ -20,6 +20,6 @@
     "noImplicitReturns": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src/**/*", "src/fs-api.d.ts"],
+  "include": ["src/**/*", "src/fs-api.d.ts", "src/atomics.d.ts"],
   "exclude": ["node_modules", "dist", "tests"]
 }

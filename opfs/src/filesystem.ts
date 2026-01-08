@@ -224,7 +224,11 @@ async function handleRmdir(filePath, payload) {
     const dir = await parent.getDirectoryHandle(name);
     const entries = dir.entries();
     const first = await entries.next();
-    if (!first.done) throw new Error('InvalidModificationError');
+    if (!first.done) {
+      const e = new Error('InvalidModificationError');
+      e.name = 'InvalidModificationError';
+      throw e;
+    }
     await parent.removeEntry(name);
   }
   return { success: true };
@@ -394,28 +398,39 @@ async function handleMessage(msg) {
     }
   } catch (e) {
     const error = e instanceof Error ? e : new Error(String(e));
+    // Use error name if it's a specific DOM exception, otherwise use message
+    // (handleStat throws new Error('NotFoundError') where message contains the type)
     const errorName = error.name || 'Error';
+    const errorCode = errorName !== 'Error' ? errorName : (error.message || 'Error');
     if (payload?.ctrl) {
       Atomics.store(payload.ctrl, 0, -1);
       Atomics.notify(payload.ctrl, 0);
     } else {
-      self.postMessage({ id, error: errorName, code: errorName });
+      self.postMessage({ id, error: errorCode, code: errorCode });
     }
   }
 }
 
-// Process queued messages after lock is acquired
+// Serialize message processing to prevent race conditions with sync handle cache
+// Without this, concurrent operations could race for createSyncAccessHandle
+let processingPromise = Promise.resolve();
+
+function queueMessage(msg) {
+  processingPromise = processingPromise.then(() => handleMessage(msg)).catch(() => {});
+}
+
+// Process queued messages after ready
 function processQueue() {
   while (messageQueue.length > 0) {
     const msg = messageQueue.shift();
-    handleMessage(msg);
+    queueMessage(msg);
   }
 }
 
-// Queue messages until ready
+// Queue messages until ready, then process sequentially
 self.onmessage = (event) => {
   if (isReady) {
-    handleMessage(event.data);
+    queueMessage(event.data);
   } else {
     messageQueue.push(event.data);
   }
@@ -424,65 +439,10 @@ self.onmessage = (event) => {
 // Signal ready after a timeout to ensure main thread handler is set
 setTimeout(() => {
   isReady = true;
+  processQueue();
   self.postMessage({ type: 'ready' });
 }, 10);
 `;
-
-// --- Direct OPFS API helpers (for fast reads) ---
-
-let cachedRoot: FileSystemDirectoryHandle | null = null;
-const dirCache = new Map<string, FileSystemDirectoryHandle>();
-
-async function getRoot(): Promise<FileSystemDirectoryHandle> {
-  if (!cachedRoot) {
-    cachedRoot = await navigator.storage.getDirectory();
-  }
-  return cachedRoot;
-}
-
-function parsePath(filePath: string): string[] {
-  return filePath.split('/').filter(Boolean);
-}
-
-async function getDirectoryHandle(
-  parts: string[],
-  create = false
-): Promise<FileSystemDirectoryHandle> {
-  if (parts.length === 0) return getRoot();
-
-  // Check cache for full path first
-  const cacheKey = parts.join('/');
-  const cached = dirCache.get(cacheKey);
-  if (cached) return cached;
-
-  let curr = await getRoot();
-  let pathSoFar = '';
-
-  for (const part of parts) {
-    pathSoFar += (pathSoFar ? '/' : '') + part;
-
-    const cachedDir = dirCache.get(pathSoFar);
-    if (cachedDir) {
-      curr = cachedDir;
-    } else {
-      curr = await curr.getDirectoryHandle(part, { create });
-      dirCache.set(pathSoFar, curr);
-    }
-  }
-
-  return curr;
-}
-
-async function getFileHandle(
-  filePath: string,
-  create = false
-): Promise<FileSystemFileHandle> {
-  const parts = parsePath(filePath);
-  const fileName = parts.pop();
-  if (!fileName) throw new Error('Invalid file path');
-  const dir = parts.length > 0 ? await getDirectoryHandle(parts, create) : await getRoot();
-  return await dir.getFileHandle(fileName, { create });
-}
 
 // --- Helper functions ---
 
@@ -563,7 +523,7 @@ interface FileDescriptor {
 
 export class OPFSFileSystem {
   private worker: Worker | null = null;
-  private pending = new Map<string, { resolve: (v: KernelResult) => void; reject: (e: Error) => void }>();
+  private pending = new Map<string, { resolve: (v: KernelResult) => void; reject: (e: Error) => void; path: string; type: string }>();
   private initialized = false;
   private initPromise: Promise<void> | null = null;
 
@@ -623,7 +583,16 @@ export class OPFSFileSystem {
           if (pending) {
             this.pending.delete(id);
             if (error) {
-              pending.reject(new FSError(code || 'Error', -1, error));
+              // Map DOM exception names to Node.js-style error codes
+              // Use stored path from pending request (more reliable than extracting from error)
+              const errCode = code || 'Error';
+              if (errCode === 'NotFoundError' || errCode === 'NotAllowedError' ||
+                  errCode === 'TypeMismatchError' || errCode === 'InvalidModificationError' ||
+                  errCode === 'QuotaExceededError') {
+                pending.reject(mapErrorCode(errCode, pending.type, pending.path));
+              } else {
+                pending.reject(new FSError(errCode, -1, `${error}: ${pending.type} '${pending.path}'`));
+              }
             } else if (result) {
               pending.resolve(result);
             }
@@ -654,7 +623,7 @@ export class OPFSFileSystem {
     const id = generateId();
 
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
+      this.pending.set(id, { resolve, reject, path: absPath, type });
 
       const msg = {
         id,
@@ -877,7 +846,8 @@ export class OPFSFileSystem {
       for (let i = 0; i < count; i++) {
         const len = view.getUint16(offset, true);
         offset += 2;
-        const name = new TextDecoder().decode(bytes.subarray(offset, offset + len));
+        // Use slice() instead of subarray() to copy from SharedArrayBuffer (TextDecoder requires regular ArrayBuffer)
+        const name = new TextDecoder().decode(bytes.slice(offset, offset + len));
         entries.push(name);
         offset += len;
       }
@@ -889,6 +859,218 @@ export class OPFSFileSystem {
     }
 
     return { success: status === 1 };
+  }
+
+  // Async version of syncCallTier1 using Atomics.waitAsync (works on main thread)
+  // This allows the main thread to use the fast SharedArrayBuffer path without blocking
+  private async syncCallTier1Async(
+    type: string,
+    filePath: string,
+    payload?: Record<string, unknown>
+  ): Promise<KernelResult> {
+    if (!this.syncKernel || !this.syncKernelReady) {
+      throw new Error('Sync kernel not initialized. Call initSync() first.');
+    }
+
+    const absPath = path.normalize(path.resolve(filePath));
+    const data = payload?.data instanceof Uint8Array ? payload.data : null;
+    const dataSize = data?.length ?? 0;
+
+    // For large writes, use chunked approach (async version)
+    if (type === 'write' && data && dataSize > OPFSFileSystem.MAX_CHUNK_SIZE) {
+      return this.syncCallTier1ChunkedAsync(absPath, data);
+    }
+
+    const { ctrlBuffer, ctrl, metaBuffer, dataBuffer } = this.getSyncBuffers(dataSize);
+
+    Atomics.store(ctrl, 0, 0);
+
+    let dataLength = 0;
+    if (data) {
+      const view = new Uint8Array(dataBuffer);
+      view.set(data);
+      dataLength = data.length;
+    }
+
+    this.syncKernel.postMessage({
+      type,
+      path: absPath,
+      ctrlBuffer,
+      metaBuffer,
+      dataBuffer,
+      dataLength,
+      payload: payload ? { ...payload, data: undefined } : undefined,
+    });
+
+    // Use Atomics.waitAsync for non-blocking wait (works on main thread)
+    const waitResult = await Atomics.waitAsync(ctrl, 0, 0, 30000).value;
+    if (waitResult === 'timed-out') {
+      throw new Error('Operation timed out');
+    }
+
+    const status = Atomics.load(ctrl, 0);
+
+    if (status === -1) {
+      const metaView = new Uint8Array(metaBuffer);
+      let end = metaView.indexOf(0);
+      if (end === -1) end = OPFSFileSystem.META_SIZE;
+      const errorMsg = new TextDecoder().decode(metaView.slice(0, end));
+      throw mapErrorCode(errorMsg || 'Error', type, absPath);
+    }
+
+    if (status === -2) {
+      throw createENOENT(type, absPath);
+    }
+
+    // Parse result based on operation type
+    if (type === 'read') {
+      const bytesRead = status;
+      const bufferSize = dataBuffer.byteLength;
+
+      if (bytesRead === bufferSize) {
+        const stat = await this.syncStatTier1Async(absPath);
+        if (stat && stat.size > bytesRead) {
+          return this.syncCallTier1ChunkedReadAsync(absPath, stat.size);
+        }
+      }
+
+      const dataView = new Uint8Array(dataBuffer);
+      return { data: dataView.slice(0, bytesRead) };
+    }
+
+    if (type === 'stat') {
+      const view = new DataView(metaBuffer);
+      const typeVal = view.getUint8(0);
+      return {
+        type: typeVal === 0 ? 'file' : 'directory',
+        mode: view.getUint32(4, true),
+        size: view.getFloat64(8, true),
+        mtimeMs: view.getFloat64(16, true),
+      };
+    }
+
+    if (type === 'readdir') {
+      const view = new DataView(metaBuffer);
+      const bytes = new Uint8Array(metaBuffer);
+      const count = view.getUint32(0, true);
+      const entries: string[] = [];
+      let offset = 4;
+      for (let i = 0; i < count; i++) {
+        const len = view.getUint16(offset, true);
+        offset += 2;
+        // Use slice() instead of subarray() to copy from SharedArrayBuffer (TextDecoder requires regular ArrayBuffer)
+        const name = new TextDecoder().decode(bytes.slice(offset, offset + len));
+        entries.push(name);
+        offset += len;
+      }
+      return { entries };
+    }
+
+    if (type === 'exists') {
+      return { exists: status === 1 };
+    }
+
+    return { success: status === 1 };
+  }
+
+  // Async stat helper for main thread
+  private async syncStatTier1Async(absPath: string): Promise<{ size: number } | null> {
+    try {
+      const result = await this.syncCallTier1Async('stat', absPath);
+      return { size: result.size as number };
+    } catch {
+      return null;
+    }
+  }
+
+  // Async chunked write for main thread
+  private async syncCallTier1ChunkedAsync(
+    absPath: string,
+    data: Uint8Array
+  ): Promise<KernelResult> {
+    const totalSize = data.length;
+    let offset = 0;
+
+    while (offset < totalSize) {
+      const remaining = totalSize - offset;
+      const currentChunkSize = Math.min(remaining, OPFSFileSystem.MAX_CHUNK_SIZE);
+      const chunk = data.subarray(offset, offset + currentChunkSize);
+
+      const { ctrlBuffer, ctrl, metaBuffer, dataBuffer } = this.getSyncBuffers(currentChunkSize);
+      Atomics.store(ctrl, 0, 0);
+
+      const view = new Uint8Array(dataBuffer);
+      view.set(chunk);
+
+      const isFirstChunk = offset === 0;
+      this.syncKernel!.postMessage({
+        type: isFirstChunk ? 'write' : 'append',
+        path: absPath,
+        ctrlBuffer,
+        metaBuffer,
+        dataBuffer,
+        dataLength: currentChunkSize,
+        payload: { flush: false },
+      });
+
+      const waitResult = await Atomics.waitAsync(ctrl, 0, 0, 30000).value;
+      if (waitResult === 'timed-out') {
+        throw new Error('Chunked write timed out');
+      }
+
+      const status = Atomics.load(ctrl, 0);
+      if (status === -1 || status === -2) {
+        throw createENOENT('write', absPath);
+      }
+
+      offset += currentChunkSize;
+    }
+
+    return { success: true };
+  }
+
+  // Async chunked read for main thread
+  private async syncCallTier1ChunkedReadAsync(
+    absPath: string,
+    totalSize: number
+  ): Promise<KernelResult> {
+    const result = new Uint8Array(totalSize);
+    let offset = 0;
+
+    while (offset < totalSize) {
+      const remaining = totalSize - offset;
+      const currentChunkSize = Math.min(remaining, OPFSFileSystem.MAX_CHUNK_SIZE);
+
+      const { ctrlBuffer, ctrl, metaBuffer, dataBuffer } = this.getSyncBuffers(currentChunkSize);
+      Atomics.store(ctrl, 0, 0);
+
+      this.syncKernel!.postMessage({
+        type: 'readChunk',
+        path: absPath,
+        ctrlBuffer,
+        metaBuffer,
+        dataBuffer,
+        dataLength: 0,
+        payload: { offset, length: currentChunkSize },
+      });
+
+      const waitResult = await Atomics.waitAsync(ctrl, 0, 0, 30000).value;
+      if (waitResult === 'timed-out') {
+        throw new Error('Chunked read timed out');
+      }
+
+      const status = Atomics.load(ctrl, 0);
+      if (status === -1 || status === -2) {
+        throw createENOENT('read', absPath);
+      }
+
+      const bytesRead = status;
+      const dataView = new Uint8Array(dataBuffer);
+      result.set(dataView.subarray(0, bytesRead), offset);
+      offset += bytesRead;
+    }
+
+    return { data: result };
   }
 
   // Chunked write for files larger than MAX_CHUNK_SIZE
@@ -1123,18 +1305,24 @@ export class OPFSFileSystem {
   rmSync(filePath: string, options?: RmOptions): void {
     try {
       const result = this.syncCall('stat', filePath);
-      if (result.isDirectory || result.type === 'directory') {
-        this.syncCall('rmdir', filePath, { recursive: options?.recursive });
-        if (options?.recursive) {
-          this.invalidateStatsUnder(filePath);
+      try {
+        if (result.isDirectory || result.type === 'directory') {
+          this.syncCall('rmdir', filePath, { recursive: options?.recursive });
+          if (options?.recursive) {
+            this.invalidateStatsUnder(filePath);
+          } else {
+            this.invalidateStat(filePath);
+          }
         } else {
+          this.syncCall('unlink', filePath);
           this.invalidateStat(filePath);
         }
-      } else {
-        this.syncCall('unlink', filePath);
-        this.invalidateStat(filePath);
+      } catch (e) {
+        // Handle errors from rmdir/unlink with force option
+        if (!options?.force) throw e;
       }
     } catch (e) {
+      // Handle errors from stat with force option
       if (!options?.force) throw e;
     }
   }
@@ -1154,7 +1342,9 @@ export class OPFSFileSystem {
       return entries.map((name) => {
         try {
           const stat = this.syncCall('stat', path.join(filePath, name));
-          return createDirent(name, stat.isDirectory ?? false);
+          // Check type first (from kernel result), fall back to isDirectory boolean
+          const isDir = stat.type === 'directory' || stat.isDirectory === true;
+          return createDirent(name, isDir);
         } catch {
           return createDirent(name, false);
         }
@@ -1338,65 +1528,111 @@ export class OPFSFileSystem {
   }
 
   // --- Async Promises API ---
-  // Reads use direct OPFS for minimal overhead
-  // Writes use Worker with createSyncAccessHandle for speed
+  // When Tier 1 sync kernel is available, use it for better performance (wrapped in Promise)
+  // Otherwise fall back to async worker
+
+  // Helper: Use sync kernel if available (in worker context), otherwise async worker
+  private async fastCall(
+    type: string,
+    filePath: string,
+    payload?: Record<string, unknown>
+  ): Promise<KernelResult> {
+    // Use sync kernel when available for best performance
+    // Benefits of sync kernel:
+    // 1. SharedArrayBuffer zero-copy data transfer
+    // 2. Optimized sync handle caching
+    // 3. No postMessage serialization overhead
+    if (this.syncKernelReady) {
+      if (isWorkerContext) {
+        // In Worker: use blocking Atomics.wait (fastest)
+        return Promise.resolve(this.syncCallTier1(type, filePath, payload));
+      } else {
+        // Main thread: use Atomics.waitAsync (non-blocking but still fast)
+        return this.syncCallTier1Async(type, filePath, payload);
+      }
+    }
+    // Fallback to async worker
+    return this.asyncCall(type, filePath, payload);
+  }
 
   promises: FileSystemPromises = {
     readFile: async (filePath: string, options?: ReadOptions | Encoding | null) => {
-      const encoding = typeof options === 'string' ? options : options?.encoding;
-      const absPath = path.resolve(filePath);
-
-      try {
-        const fh = await getFileHandle(absPath);
-        const file = await fh.getFile();
-        const data = new Uint8Array(await file.arrayBuffer());
-        return decodeData(data, encoding);
-      } catch (e) {
-        throw mapErrorCode((e as Error).name, 'read', absPath);
+      // Validate path - isomorphic-git sometimes calls with no args
+      if (!filePath) {
+        throw createENOENT('read', filePath || '');
       }
+      const encoding = typeof options === 'string' ? options : options?.encoding;
+
+      // Use sync kernel if available (faster than async worker)
+      if (this.syncKernelReady) {
+        if (isWorkerContext) {
+          // Worker: blocking wait (fastest)
+          const result = this.syncCallTier1('read', filePath);
+          if (!result.data) throw createENOENT('read', filePath);
+          return decodeData(result.data, encoding);
+        } else {
+          // Main thread: use Atomics.waitAsync (non-blocking)
+          const result = await this.syncCallTier1Async('read', filePath);
+          if (!result.data) throw createENOENT('read', filePath);
+          return decodeData(result.data, encoding);
+        }
+      }
+
+      // Fallback to async worker (no sync kernel) - ensures consistent read/write path
+      // Using asyncCall ensures reads go through same worker as writes,
+      // which is important for file locking and cache consistency
+      const result = await this.asyncCall('read', filePath);
+      if (!result.data) throw createENOENT('read', filePath);
+      return decodeData(result.data, encoding);
     },
 
     writeFile: async (filePath: string, data: Uint8Array | string, options?: WriteOptions | Encoding) => {
       const encoding = typeof options === 'string' ? options : options?.encoding;
       const encoded = encodeData(data, encoding);
-      await this.asyncCall('write', filePath, { data: encoded });
+      await this.fastCall('write', filePath, { data: encoded });
     },
 
     appendFile: async (filePath: string, data: Uint8Array | string, options?: WriteOptions | Encoding) => {
       const encoding = typeof options === 'string' ? options : options?.encoding;
       const encoded = encodeData(data, encoding);
-      await this.asyncCall('append', filePath, { data: encoded });
+      await this.fastCall('append', filePath, { data: encoded });
     },
 
     mkdir: async (filePath: string, options?: MkdirOptions | number) => {
       const recursive = typeof options === 'object' ? options?.recursive : false;
-      await this.asyncCall('mkdir', filePath, { recursive });
+      await this.fastCall('mkdir', filePath, { recursive });
       return recursive ? filePath : undefined;
     },
 
     rmdir: async (filePath: string, options?: RmdirOptions) => {
-      await this.asyncCall('rmdir', filePath, { recursive: options?.recursive });
+      await this.fastCall('rmdir', filePath, { recursive: options?.recursive });
     },
 
     rm: async (filePath: string, options?: RmOptions) => {
       try {
-        const result = await this.asyncCall('stat', filePath);
-        if (result.isDirectory) {
-          await this.asyncCall('rmdir', filePath, { recursive: options?.recursive });
-        } else {
-          await this.asyncCall('unlink', filePath);
+        const result = await this.fastCall('stat', filePath);
+        try {
+          if (result.isDirectory || result.type === 'directory') {
+            await this.fastCall('rmdir', filePath, { recursive: options?.recursive });
+          } else {
+            await this.fastCall('unlink', filePath);
+          }
+        } catch (e) {
+          // Handle errors from rmdir/unlink with force option
+          if (!options?.force) throw e;
         }
       } catch (e) {
+        // Handle errors from stat with force option
         if (!options?.force) throw e;
       }
     },
 
     unlink: async (filePath: string) => {
-      await this.asyncCall('unlink', filePath);
+      await this.fastCall('unlink', filePath);
     },
 
     readdir: async (filePath: string, options?: ReaddirOptions | Encoding | null) => {
-      const result = await this.asyncCall('readdir', filePath);
+      const result = await this.fastCall('readdir', filePath);
       const entries = result.entries || [];
       const opts = typeof options === 'object' ? options : { encoding: options };
 
@@ -1404,8 +1640,10 @@ export class OPFSFileSystem {
         const dirents: Dirent[] = [];
         for (const name of entries) {
           try {
-            const stat = await this.asyncCall('stat', path.join(filePath, name));
-            dirents.push(createDirent(name, stat.isDirectory ?? false));
+            const stat = await this.fastCall('stat', path.join(filePath, name));
+            // Check type first (from kernel result), fall back to isDirectory boolean
+            const isDir = stat.type === 'directory' || stat.isDirectory === true;
+            dirents.push(createDirent(name, isDir));
           } catch {
             dirents.push(createDirent(name, false));
           }
@@ -1417,23 +1655,23 @@ export class OPFSFileSystem {
     },
 
     stat: async (filePath: string) => {
-      const result = await this.asyncCall('stat', filePath);
+      const result = await this.fastCall('stat', filePath);
       return createStats(result);
     },
 
     access: async (filePath: string, _mode?: number) => {
-      const result = await this.asyncCall('exists', filePath);
+      const result = await this.fastCall('exists', filePath);
       if (!result.exists) {
         throw createENOENT('access', filePath);
       }
     },
 
     rename: async (oldFilePath: string, newFilePath: string) => {
-      await this.asyncCall('rename', oldFilePath, { newPath: path.resolve(newFilePath) });
+      await this.fastCall('rename', oldFilePath, { newPath: path.resolve(newFilePath) });
     },
 
     copyFile: async (srcPath: string, destPath: string) => {
-      await this.asyncCall('copy', srcPath, { newPath: path.resolve(destPath) });
+      await this.fastCall('copy', srcPath, { newPath: path.resolve(destPath) });
     },
   };
 

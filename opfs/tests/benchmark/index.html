@@ -146,14 +146,17 @@
     <button id="btn-run-large" onclick="runBenchmark('large')">Large File Test</button>
     <button id="btn-run-batch-write" onclick="runBenchmark('batch-write')">Batch Write</button>
     <button id="btn-run-batch-read" onclick="runBenchmark('batch-read')">Batch Read</button>
+    <button id="btn-run-git-clone" onclick="runBenchmark('git-clone')" style="background:#6f42c1">Git Clone</button>
+    <button id="btn-run-git-status" onclick="runBenchmark('git-status')" style="background:#6f42c1">Git Status</button>
   </div>
 
   <div id="status" class="status" style="display:none;"></div>
 
   <div class="legend">
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #ffc107, #ff9800);"></div> LightningFS (IndexedDB)</div>
-    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #28a745, #20c997);"></div> OPFS Tier 1 (Worker + Atomics)</div>
-    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #007bff, #00d4ff);"></div> OPFS Tier 2 (Promises)</div>
+    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #28a745, #20c997);"></div> OPFS Tier 1 Sync (Worker + Atomics)</div>
+    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #17a2b8, #20c997);"></div> OPFS Tier 1 Promises (Worker + fastCall)</div>
+    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #007bff, #00d4ff);"></div> OPFS Tier 2 (Main Thread Promises)</div>
   </div>
 
   <h2>Results</h2>
@@ -186,9 +189,15 @@
     };
 
     // Import libraries
-    let fs, LightningFS;
+    let fs, fsTier2, LightningFS, git, http;
     let tier1WorkerReady = false;
     let tier1Worker = null;
+
+    // Small test repo URL - using GitHub's official example repository
+    // This is tiny (just a README) and guaranteed to be public
+    const TEST_REPO_URL = 'https://github.com/octocat/Hello-World';
+    const CORS_PROXY = 'https://cors.isomorphic-git.org';
+    // Note: CORS proxy is required for browser-based git operations
 
     async function initTier1Worker() {
       if (tier1Worker) return tier1WorkerReady;
@@ -295,20 +304,138 @@
       log('Loading OPFS-FS...', 'info');
       const opfsModule = await import('/index.js');
       fs = opfsModule.fs;
-      log('OPFS-FS loaded', 'success');
+
+      // Create a second instance for Tier 2 testing (no sync kernel)
+      const OPFSFileSystem = opfsModule.OPFSFileSystem;
+      fsTier2 = new OPFSFileSystem();
+      log('OPFS-FS loaded (fs + fsTier2 for async-only testing)', 'success');
 
       log('Loading LightningFS...', 'info');
       const lfsModule = await import('https://esm.sh/@isomorphic-git/lightning-fs@4.6.0');
       LightningFS = lfsModule.default;
       log('LightningFS loaded', 'success');
 
-      // Initialize Tier 1 worker
+      log('Loading isomorphic-git...', 'info');
+      const gitModule = await import('https://esm.sh/isomorphic-git@1.27.1');
+      git = gitModule.default;
+      http = (await import('https://esm.sh/isomorphic-git@1.27.1/http/web')).default;
+      log('isomorphic-git loaded', 'success');
+
+      // Initialize Tier 1 (sync kernel with SharedArrayBuffer)
       if (crossOriginIsolated) {
         log('Initializing Tier 1 worker (Atomics)...', 'info');
         await initTier1Worker();
+
+        // Also init sync kernel for main thread (uses Atomics.waitAsync)
+        // Only for the primary fs instance - fsTier2 stays without sync kernel
+        log('Initializing sync kernel for main thread...', 'info');
+        try {
+          await fs.initSync('/kernel.js');
+          log('Sync kernel ready (main thread can use Atomics.waitAsync)', 'success');
+          log('fsTier2 will use async worker path (Tier 2)', 'info');
+        } catch (e) {
+          log('Sync kernel init failed: ' + e.message, 'error');
+        }
       } else {
         log('Tier 1 unavailable (not crossOriginIsolated)', 'info');
       }
+    }
+
+    // Create fs wrapper for OPFS (isomorphic-git expects specific format)
+    // Converts OPFS errors to Node.js-style errors that isomorphic-git expects
+    // @param fsInstance - optional fs instance (defaults to main fs with sync kernel)
+    function createOpfsGitFs(fsInstance = fs) {
+      // Helper to convert errors to Node.js format
+      const wrapError = (err, method, args) => {
+        // Only log unexpected errors (ENOENT and ENOTDIR are expected during git operations)
+        // isomorphic-git probes paths with readdir to detect files vs directories
+        if (err.code !== 'ENOENT' && err.name !== 'NotFoundError' &&
+            err.code !== 'ENOTDIR' && err.name !== 'TypeMismatchError') {
+          console.log(`[opfs-git] ${method} error:`, err, 'args:', args);
+        }
+        if (err.name === 'NotFoundError' || err.code === 'ENOENT') {
+          const e = new Error(err.message || 'ENOENT: no such file or directory');
+          e.code = 'ENOENT';
+          return e;
+        }
+        if (err.name === 'NotAllowedError' || err.code === 'EACCES') {
+          const e = new Error(err.message || 'EACCES: permission denied');
+          e.code = 'EACCES';
+          return e;
+        }
+        if (err.name === 'TypeMismatchError' || err.code === 'ENOTDIR') {
+          const e = new Error(err.message || 'ENOTDIR: not a directory');
+          e.code = 'ENOTDIR';
+          return e;
+        }
+        // Preserve error code if it exists
+        if (err.code) {
+          const e = new Error(err.message);
+          e.code = err.code;
+          return e;
+        }
+        return err;
+      };
+
+      // Helper to wrap async functions with error conversion
+      const wrap = (fn, name) => async (...args) => {
+        try {
+          const result = await fn(...args);
+          return result;
+        } catch (err) {
+          throw wrapError(err, name, args);
+        }
+      };
+
+      return {
+        promises: {
+          readFile: wrap(async (filepath, options) => {
+            const result = await fsInstance.promises.readFile(filepath, options);
+            return result;
+          }, 'readFile'),
+          writeFile: wrap((filepath, data, options) => fsInstance.promises.writeFile(filepath, data, options), 'writeFile'),
+          unlink: wrap((filepath) => fsInstance.promises.unlink(filepath), 'unlink'),
+          readdir: wrap((filepath, options) => fsInstance.promises.readdir(filepath, options), 'readdir'),
+          mkdir: wrap((filepath, options) => fsInstance.promises.mkdir(filepath, options), 'mkdir'),
+          rmdir: wrap((filepath, options) => fsInstance.promises.rmdir(filepath, options), 'rmdir'),
+          stat: wrap(async (filepath) => {
+            const stat = await fsInstance.promises.stat(filepath);
+            // Ensure stat has the methods isomorphic-git expects
+            return {
+              ...stat,
+              isFile: () => stat.isFile ? stat.isFile() : stat.type === 'file',
+              isDirectory: () => stat.isDirectory ? stat.isDirectory() : stat.type === 'directory',
+              isSymbolicLink: () => false,
+              mode: stat.mode || 0o100644,
+              size: stat.size || 0,
+              mtimeMs: stat.mtimeMs || Date.now(),
+            };
+          }, 'stat'),
+          lstat: wrap(async (filepath) => {
+            const stat = await fsInstance.promises.stat(filepath);
+            return {
+              ...stat,
+              isFile: () => stat.isFile ? stat.isFile() : stat.type === 'file',
+              isDirectory: () => stat.isDirectory ? stat.isDirectory() : stat.type === 'directory',
+              isSymbolicLink: () => false,
+              mode: stat.mode || 0o100644,
+              size: stat.size || 0,
+              mtimeMs: stat.mtimeMs || Date.now(),
+            };
+          }, 'lstat'),
+          readlink: async () => {
+            const e = new Error('ENOENT: readlink not supported');
+            e.code = 'ENOENT';
+            throw e;
+          },
+          symlink: async () => {
+            const e = new Error('ENOENT: symlink not supported');
+            e.code = 'ENOENT';
+            throw e;
+          },
+          chmod: async () => { /* no-op */ },
+        },
+      };
     }
 
     // Benchmark functions
@@ -326,8 +453,8 @@
       results.lightning = performance.now() - startL;
       log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
 
-      // OPFS Tier 2 (Promises - always available)
-      log(`Testing OPFS Tier 2 (Promises)...`, 'info');
+      // OPFS Tier 2 (Main Thread Promises)
+      log(`Testing OPFS Tier 2 (Main Thread Promises)...`, 'info');
       await fs.promises.mkdir('/bench-t2', { recursive: true });
       const startT2 = performance.now();
       for (let i = 0; i < iterations; i++) {
@@ -337,13 +464,22 @@
       await fs.promises.rm('/bench-t2', { recursive: true, force: true });
       log(`OPFS Tier 2: ${results.tier2.toFixed(2)}ms`, 'success');
 
-      // OPFS Tier 1 (Worker + Atomics)
-      log(`Testing OPFS Tier 1 (Atomics)...`, 'info');
+      // OPFS Tier 1 Sync (Worker + Atomics)
+      log(`Testing OPFS Tier 1 Sync (Atomics)...`, 'info');
       results.tier1 = await runTier1Benchmark('write', iterations, fileSize);
       if (results.tier1 !== null) {
-        log(`OPFS Tier 1: ${results.tier1.toFixed(2)}ms`, 'success');
+        log(`OPFS Tier 1 Sync: ${results.tier1.toFixed(2)}ms`, 'success');
       } else {
-        log(`OPFS Tier 1: N/A`, 'info');
+        log(`OPFS Tier 1 Sync: N/A`, 'info');
+      }
+
+      // OPFS Tier 1 Promises (Worker + fastCall)
+      log(`Testing OPFS Tier 1 Promises (Worker)...`, 'info');
+      results.tier1Promises = await runTier1Benchmark('promises-write', iterations, fileSize);
+      if (results.tier1Promises !== null) {
+        log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
+      } else {
+        log(`OPFS Tier 1 Promises: N/A`, 'info');
       }
 
       return { ...results, iterations, fileSize, operation: 'write' };
@@ -386,13 +522,22 @@
       // Cleanup OPFS
       await fs.promises.rm('/bench-read', { recursive: true, force: true });
 
-      // OPFS Tier 1 (Worker + Atomics)
-      log(`Testing OPFS Tier 1 (Atomics)...`, 'info');
+      // OPFS Tier 1 Sync (Worker + Atomics)
+      log(`Testing OPFS Tier 1 Sync (Atomics)...`, 'info');
       results.tier1 = await runTier1Benchmark('read', iterations, fileSize);
       if (results.tier1 !== null) {
-        log(`OPFS Tier 1: ${results.tier1.toFixed(2)}ms`, 'success');
+        log(`OPFS Tier 1 Sync: ${results.tier1.toFixed(2)}ms`, 'success');
       } else {
-        log(`OPFS Tier 1: N/A`, 'info');
+        log(`OPFS Tier 1 Sync: N/A`, 'info');
+      }
+
+      // OPFS Tier 1 Promises (Worker + fastCall)
+      log(`Testing OPFS Tier 1 Promises (Worker)...`, 'info');
+      results.tier1Promises = await runTier1Benchmark('promises-read', iterations, fileSize);
+      if (results.tier1Promises !== null) {
+        log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
+      } else {
+        log(`OPFS Tier 1 Promises: N/A`, 'info');
       }
 
       return { ...results, iterations, fileSize, operation: 'read' };
@@ -424,13 +569,22 @@
       await fs.promises.rm('/bench-large', { recursive: true, force: true });
       log(`OPFS Tier 2: ${results.tier2.toFixed(2)}ms`, 'success');
 
-      // OPFS Tier 1 (Worker + Atomics) - uses SharedArrayBuffer, no JSON overhead
-      log(`Testing OPFS Tier 1 (Atomics) for large files...`, 'info');
+      // OPFS Tier 1 Sync (Worker + Atomics) - uses SharedArrayBuffer, no JSON overhead
+      log(`Testing OPFS Tier 1 Sync (Atomics) for large files...`, 'info');
       results.tier1 = await runTier1Benchmark('write', iterations, fileSize);
       if (results.tier1 !== null) {
-        log(`OPFS Tier 1: ${results.tier1.toFixed(2)}ms`, 'success');
+        log(`OPFS Tier 1 Sync: ${results.tier1.toFixed(2)}ms`, 'success');
       } else {
-        log(`OPFS Tier 1: N/A`, 'info');
+        log(`OPFS Tier 1 Sync: N/A`, 'info');
+      }
+
+      // OPFS Tier 1 Promises (Worker + fastCall) for large files
+      log(`Testing OPFS Tier 1 Promises for large files...`, 'info');
+      results.tier1Promises = await runTier1Benchmark('promises-write', iterations, fileSize);
+      if (results.tier1Promises !== null) {
+        log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
+      } else {
+        log(`OPFS Tier 1 Promises: N/A`, 'info');
       }
 
       return { ...results, iterations, fileSize, fileSizeMB, operation: 'large-write' };
@@ -462,13 +616,22 @@
       await fs.promises.rm('/bench-batch-t2', { recursive: true, force: true });
       log(`OPFS Tier 2: ${results.tier2.toFixed(2)}ms`, 'success');
 
-      // OPFS Tier 1 (Worker + Atomics with flush: false)
-      log(`Testing OPFS Tier 1 (Atomics) batch write...`, 'info');
+      // OPFS Tier 1 Sync (Worker + Atomics with flush: false)
+      log(`Testing OPFS Tier 1 Sync (Atomics) batch write...`, 'info');
       results.tier1 = await runTier1Benchmark('batch-write', iterations, fileSize);
       if (results.tier1 !== null) {
-        log(`OPFS Tier 1: ${results.tier1.toFixed(2)}ms`, 'success');
+        log(`OPFS Tier 1 Sync: ${results.tier1.toFixed(2)}ms`, 'success');
       } else {
-        log(`OPFS Tier 1: N/A`, 'info');
+        log(`OPFS Tier 1 Sync: N/A`, 'info');
+      }
+
+      // OPFS Tier 1 Promises (Worker + fastCall)
+      log(`Testing OPFS Tier 1 Promises batch write...`, 'info');
+      results.tier1Promises = await runTier1Benchmark('promises-batch-write', iterations, fileSize);
+      if (results.tier1Promises !== null) {
+        log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
+      } else {
+        log(`OPFS Tier 1 Promises: N/A`, 'info');
       }
 
       return { ...results, iterations, fileSize, operation: 'batch-write' };
@@ -512,31 +675,241 @@
       // Cleanup OPFS
       await fs.promises.rm('/bench-batch-read', { recursive: true, force: true });
 
-      // OPFS Tier 1 (Worker + Atomics)
-      log(`Testing OPFS Tier 1 (Atomics) batch read...`, 'info');
+      // OPFS Tier 1 Sync (Worker + Atomics)
+      log(`Testing OPFS Tier 1 Sync (Atomics) batch read...`, 'info');
       results.tier1 = await runTier1Benchmark('batch-read', iterations, fileSize);
       if (results.tier1 !== null) {
-        log(`OPFS Tier 1: ${results.tier1.toFixed(2)}ms`, 'success');
+        log(`OPFS Tier 1 Sync: ${results.tier1.toFixed(2)}ms`, 'success');
       } else {
-        log(`OPFS Tier 1: N/A`, 'info');
+        log(`OPFS Tier 1 Sync: N/A`, 'info');
+      }
+
+      // OPFS Tier 1 Promises (Worker + fastCall)
+      log(`Testing OPFS Tier 1 Promises batch read...`, 'info');
+      results.tier1Promises = await runTier1Benchmark('promises-batch-read', iterations, fileSize);
+      if (results.tier1Promises !== null) {
+        log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
+      } else {
+        log(`OPFS Tier 1 Promises: N/A`, 'info');
       }
 
       return { ...results, iterations, fileSize, operation: 'batch-read' };
+    }
+
+    // Git Clone benchmark - clones a small repo
+    async function benchmarkGitClone() {
+      const results = {};
+      const repoUrl = TEST_REPO_URL;
+      const corsProxy = CORS_PROXY;
+
+      // Cleanup any existing repos
+      try { await fs.promises.rm('/git-bench-opfs', { recursive: true, force: true }); } catch {}
+      try { await fsTier2.promises.rm('/git-bench-opfs-t2', { recursive: true, force: true }); } catch {}
+
+      // LightningFS
+      log(`Testing LightningFS git clone (${repoUrl})...`, 'info');
+      const lfs = new LightningFS(`git-clone-${Date.now()}`);
+      const startL = performance.now();
+      try {
+        await git.clone({
+          fs: lfs,
+          http,
+          dir: '/repo',
+          url: repoUrl,
+          corsProxy,
+          singleBranch: true,
+          depth: 1,
+        });
+        results.lightning = performance.now() - startL;
+        log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
+      } catch (e) {
+        log(`LightningFS git clone failed: ${e.message} (code: ${e.code})`, 'error');
+        console.error('LightningFS clone error:', e);
+        results.lightning = null;
+      }
+
+      // OPFS Tier 1 Promises (Main thread with Atomics.waitAsync)
+      // With initSync() called, fs.promises uses sync kernel via Atomics.waitAsync
+      log(`Testing OPFS Tier 1 Promises git clone (Atomics.waitAsync)...`, 'info');
+      const opfsGitFs = createOpfsGitFs(fs);
+      await fs.promises.mkdir('/git-bench-opfs', { recursive: true });
+      const startT1P = performance.now();
+      try {
+        await git.clone({
+          fs: opfsGitFs,
+          http,
+          dir: '/git-bench-opfs',
+          url: repoUrl,
+          corsProxy,
+          singleBranch: true,
+          depth: 1,
+          onMessage: (msg) => log(`[git T1P] ${msg}`, 'info'),
+        });
+        results.tier1Promises = performance.now() - startT1P;
+        log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
+      } catch (e) {
+        log(`OPFS Tier 1 Promises git clone failed: ${e.message} (code: ${e.code}, name: ${e.name})`, 'error');
+        console.error('OPFS Tier 1 Promises clone error:', e);
+        results.tier1Promises = null;
+      }
+
+      // Cleanup Tier 1 Promises repo
+      try { await fs.promises.rm('/git-bench-opfs', { recursive: true, force: true }); } catch {}
+
+      // OPFS Tier 2 (Async worker without sync kernel)
+      // fsTier2 doesn't have initSync() called, so it uses the async worker path
+      log(`Testing OPFS Tier 2 git clone (async worker)...`, 'info');
+      const opfsGitFsTier2 = createOpfsGitFs(fsTier2);
+      await fsTier2.promises.mkdir('/git-bench-opfs-t2', { recursive: true });
+      const startT2 = performance.now();
+      try {
+        await git.clone({
+          fs: opfsGitFsTier2,
+          http,
+          dir: '/git-bench-opfs-t2',
+          url: repoUrl,
+          corsProxy,
+          singleBranch: true,
+          depth: 1,
+          onMessage: (msg) => log(`[git T2] ${msg}`, 'info'),
+        });
+        results.tier2 = performance.now() - startT2;
+        log(`OPFS Tier 2: ${results.tier2.toFixed(2)}ms`, 'success');
+      } catch (e) {
+        log(`OPFS Tier 2 git clone failed: ${e.message} (code: ${e.code}, name: ${e.name})`, 'error');
+        console.error('OPFS Tier 2 clone error:', e);
+        results.tier2 = null;
+      }
+
+      // Cleanup Tier 2 repo
+      try { await fsTier2.promises.rm('/git-bench-opfs-t2', { recursive: true, force: true }); } catch {}
+
+      // Tier 1 Sync not applicable (git requires async)
+      results.tier1 = null;
+
+      return { ...results, iterations: 1, fileSize: 0, operation: 'git-clone' };
+    }
+
+    // Git Status benchmark - runs git status on a cloned repo multiple times
+    async function benchmarkGitStatus(iterations = 10) {
+      const results = {};
+      const repoUrl = TEST_REPO_URL;
+      const corsProxy = CORS_PROXY;
+
+      // Setup: Clone repo for each fs
+      log('Setting up repos for git status benchmark...', 'info');
+
+      // LightningFS setup
+      const lfs = new LightningFS(`git-status-${Date.now()}`);
+      try {
+        await git.clone({
+          fs: lfs,
+          http,
+          dir: '/repo',
+          url: repoUrl,
+          corsProxy,
+          singleBranch: true,
+          depth: 1,
+        });
+      } catch (e) {
+        log(`LightningFS clone for status failed: ${e.message}`, 'error');
+        return { lightning: null, tier1: null, tier1Promises: null, tier2: null, iterations, fileSize: 0, operation: 'git-status' };
+      }
+
+      // OPFS Tier 1 Promises setup
+      const opfsGitFs = createOpfsGitFs(fs);
+      try { await fs.promises.rm('/git-status-opfs', { recursive: true, force: true }); } catch {}
+      await fs.promises.mkdir('/git-status-opfs', { recursive: true });
+      try {
+        await git.clone({
+          fs: opfsGitFs,
+          http,
+          dir: '/git-status-opfs',
+          url: repoUrl,
+          corsProxy,
+          singleBranch: true,
+          depth: 1,
+        });
+      } catch (e) {
+        log(`OPFS Tier 1 Promises clone for status failed: ${e.message}`, 'error');
+        return { lightning: null, tier1: null, tier1Promises: null, tier2: null, iterations, fileSize: 0, operation: 'git-status' };
+      }
+
+      // OPFS Tier 2 setup
+      const opfsGitFsTier2 = createOpfsGitFs(fsTier2);
+      try { await fsTier2.promises.rm('/git-status-opfs-t2', { recursive: true, force: true }); } catch {}
+      await fsTier2.promises.mkdir('/git-status-opfs-t2', { recursive: true });
+      try {
+        await git.clone({
+          fs: opfsGitFsTier2,
+          http,
+          dir: '/git-status-opfs-t2',
+          url: repoUrl,
+          corsProxy,
+          singleBranch: true,
+          depth: 1,
+        });
+      } catch (e) {
+        log(`OPFS Tier 2 clone for status failed: ${e.message}`, 'error');
+        // Continue with other tests even if this fails
+      }
+
+      // LightningFS status benchmark
+      log(`Testing LightningFS git status (${iterations}x)...`, 'info');
+      const startL = performance.now();
+      for (let i = 0; i < iterations; i++) {
+        await git.statusMatrix({ fs: lfs, dir: '/repo' });
+      }
+      results.lightning = performance.now() - startL;
+      log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
+
+      // OPFS Tier 1 Promises status benchmark (Main thread with Atomics.waitAsync)
+      log(`Testing OPFS Tier 1 Promises git status (${iterations}x)...`, 'info');
+      const startT1P = performance.now();
+      for (let i = 0; i < iterations; i++) {
+        await git.statusMatrix({ fs: opfsGitFs, dir: '/git-status-opfs' });
+      }
+      results.tier1Promises = performance.now() - startT1P;
+      log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
+
+      // OPFS Tier 2 status benchmark (async worker without sync kernel)
+      log(`Testing OPFS Tier 2 git status (${iterations}x)...`, 'info');
+      try {
+        const startT2 = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          await git.statusMatrix({ fs: opfsGitFsTier2, dir: '/git-status-opfs-t2' });
+        }
+        results.tier2 = performance.now() - startT2;
+        log(`OPFS Tier 2: ${results.tier2.toFixed(2)}ms`, 'success');
+      } catch (e) {
+        log(`OPFS Tier 2 git status failed: ${e.message}`, 'error');
+        results.tier2 = null;
+      }
+
+      // Cleanup
+      try { await fs.promises.rm('/git-status-opfs', { recursive: true, force: true }); } catch {}
+      try { await fsTier2.promises.rm('/git-status-opfs-t2', { recursive: true, force: true }); } catch {}
+
+      // Tier 1 Sync not applicable (git requires async)
+      results.tier1 = null;
+
+      return { ...results, iterations, fileSize: 0, operation: 'git-status' };
     }
 
     function renderResults(allResults) {
       const container = document.getElementById('results');
 
       let html = '<table><thead><tr>';
-      html += '<th>Test</th><th>LightningFS</th><th>OPFS Tier 1</th><th>OPFS Tier 2</th><th>Best</th>';
+      html += '<th>Test</th><th>LightningFS</th><th>Tier 1 Sync</th><th>Tier 1 Promises</th><th>Tier 2</th><th>Best</th>';
       html += '</tr></thead><tbody>';
 
       for (const result of allResults) {
         const values = [
           { name: 'LightningFS', ms: result.lightning, class: 'lightning' },
-          { name: 'Tier 1', ms: result.tier1, class: 'tier1' },
+          { name: 'Tier 1 Sync', ms: result.tier1, class: 'tier1' },
+          { name: 'Tier 1 Promises', ms: result.tier1Promises, class: 'tier1' },
           { name: 'Tier 2', ms: result.tier2, class: 'tier2' },
-        ].filter(v => v.ms !== null);
+        ].filter(v => v.ms !== null && v.ms !== undefined);
 
         const minMs = Math.min(...values.map(v => v.ms));
         const maxMs = Math.max(...values.map(v => v.ms));
@@ -552,52 +925,81 @@
           ? `Batch Write ${result.iterations} x ${result.fileSize}B`
           : result.operation === 'batch-read'
           ? `Batch Read ${result.iterations} x ${result.fileSize}B`
+          : result.operation === 'git-clone'
+          ? `Git Clone (shallow)`
+          : result.operation === 'git-status'
+          ? `Git Status ${result.iterations}x`
           : `Unknown`;
 
         html += '<tr>';
         html += `<td><strong>${testName}</strong></td>`;
 
         // LightningFS
-        const lPct = (result.lightning / maxMs * 100).toFixed(0);
-        const lOps = (result.iterations / result.lightning * 1000).toFixed(0);
-        html += `<td class="${result.lightning === minMs ? 'winner' : ''}">`;
-        html += `<div class="bar-container"><div class="bar lightning" style="width: ${lPct}%"></div></div>`;
-        html += `${result.lightning.toFixed(1)}ms (${lOps} ops/s)</td>`;
+        if (result.lightning !== null && result.lightning !== undefined) {
+          const lPct = (result.lightning / maxMs * 100).toFixed(0);
+          const lOps = result.iterations > 0 ? (result.iterations / result.lightning * 1000).toFixed(0) : '-';
+          html += `<td class="${result.lightning === minMs ? 'winner' : ''}">`;
+          html += `<div class="bar-container"><div class="bar lightning" style="width: ${lPct}%"></div></div>`;
+          html += `${result.lightning.toFixed(1)}ms${lOps !== '-' ? ` (${lOps} ops/s)` : ''}</td>`;
+        } else {
+          html += '<td style="color:#999">N/A</td>';
+        }
 
-        // Tier 1
-        if (result.tier1 !== null) {
+        // Tier 1 Sync
+        if (result.tier1 !== null && result.tier1 !== undefined) {
           const t1Pct = (result.tier1 / maxMs * 100).toFixed(0);
-          const t1Ops = (result.iterations / result.tier1 * 1000).toFixed(0);
+          const t1Ops = result.iterations > 0 ? (result.iterations / result.tier1 * 1000).toFixed(0) : '-';
           html += `<td class="${result.tier1 === minMs ? 'winner' : ''}">`;
           html += `<div class="bar-container"><div class="bar tier1" style="width: ${t1Pct}%"></div></div>`;
-          html += `${result.tier1.toFixed(1)}ms (${t1Ops} ops/s)</td>`;
+          html += `${result.tier1.toFixed(1)}ms${t1Ops !== '-' ? ` (${t1Ops} ops/s)` : ''}</td>`;
+        } else {
+          html += '<td style="color:#999">N/A</td>';
+        }
+
+        // Tier 1 Promises
+        if (result.tier1Promises !== null && result.tier1Promises !== undefined) {
+          const t1pPct = (result.tier1Promises / maxMs * 100).toFixed(0);
+          const t1pOps = result.iterations > 0 ? (result.iterations / result.tier1Promises * 1000).toFixed(0) : '-';
+          html += `<td class="${result.tier1Promises === minMs ? 'winner' : ''}" style="background: ${result.tier1Promises === minMs ? '#d4edda' : ''}">`;
+          html += `<div class="bar-container"><div class="bar" style="width: ${t1pPct}%; background: linear-gradient(90deg, #17a2b8, #20c997);"></div></div>`;
+          html += `${result.tier1Promises.toFixed(1)}ms${t1pOps !== '-' ? ` (${t1pOps} ops/s)` : ''}</td>`;
         } else {
           html += '<td style="color:#999">N/A</td>';
         }
 
         // Tier 2
-        const t2Pct = (result.tier2 / maxMs * 100).toFixed(0);
-        const t2Ops = (result.iterations / result.tier2 * 1000).toFixed(0);
-        html += `<td class="${result.tier2 === minMs ? 'winner' : ''}">`;
-        html += `<div class="bar-container"><div class="bar tier2" style="width: ${t2Pct}%"></div></div>`;
-        html += `${result.tier2.toFixed(1)}ms (${t2Ops} ops/s)</td>`;
+        if (result.tier2 !== null && result.tier2 !== undefined) {
+          const t2Pct = (result.tier2 / maxMs * 100).toFixed(0);
+          const t2Ops = result.iterations > 0 ? (result.iterations / result.tier2 * 1000).toFixed(0) : '-';
+          html += `<td class="${result.tier2 === minMs ? 'winner' : ''}">`;
+          html += `<div class="bar-container"><div class="bar tier2" style="width: ${t2Pct}%"></div></div>`;
+          html += `${result.tier2.toFixed(1)}ms${t2Ops !== '-' ? ` (${t2Ops} ops/s)` : ''}</td>`;
+        } else {
+          html += '<td style="color:#999">N/A</td>';
+        }
 
         // Winner
-        const speedup = (result.lightning / minMs).toFixed(2);
-        html += `<td><strong>${winner.name}</strong><br><span style="color:${speedup >= 1 ? 'green' : 'red'}">${speedup}x vs LFS</span></td>`;
+        if (winner && result.lightning) {
+          const speedup = (result.lightning / minMs).toFixed(2);
+          html += `<td><strong>${winner.name}</strong><br><span style="color:${speedup >= 1 ? 'green' : 'red'}">${speedup}x vs LFS</span></td>`;
+        } else if (winner) {
+          html += `<td><strong>${winner.name}</strong></td>`;
+        } else {
+          html += '<td>-</td>';
+        }
         html += '</tr>';
       }
 
       html += '</tbody></table>';
 
       // Summary
-      const validResults = allResults.filter(r => r.tier2 > 0 || (r.tier1 !== null && r.tier1 > 0));
+      const validResults = allResults.filter(r => r.tier2 > 0 || (r.tier1 !== null && r.tier1 > 0) || (r.tier1Promises !== null && r.tier1Promises > 0));
       const avgSpeedup = validResults.length > 0
         ? validResults.reduce((acc, r) => {
-            const best = Math.min(r.tier1 || Infinity, r.tier2 || Infinity);
-            if (!isFinite(best) || best <= 0) return acc;
+            const best = Math.min(r.tier1 || Infinity, r.tier1Promises || Infinity, r.tier2 || Infinity);
+            if (!isFinite(best) || best <= 0 || !r.lightning) return acc;
             return acc + (r.lightning / best);
-          }, 0) / validResults.length
+          }, 0) / validResults.filter(r => r.lightning > 0).length
         : 0;
 
       html += `<div class="summary">`;
@@ -632,6 +1034,12 @@
         } else if (type === 'batch-read') {
           setStatus('Running batch read benchmark...', 'running');
           result = await benchmarkBatchRead(500, 256);
+        } else if (type === 'git-clone') {
+          setStatus('Running git clone benchmark...', 'running');
+          result = await benchmarkGitClone();
+        } else if (type === 'git-status') {
+          setStatus('Running git status benchmark...', 'running');
+          result = await benchmarkGitStatus(10);
         }
 
         window.allResults.push(result);

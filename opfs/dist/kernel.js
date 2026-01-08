@@ -229,7 +229,9 @@ async function handleRmdir(filePath, payload) {
     const entries = dir.entries();
     const first = await entries.next();
     if (!first.done) {
-      throw new Error("Directory not empty");
+      const e = new Error("InvalidModificationError");
+      e.name = "InvalidModificationError";
+      throw e;
     }
     await parent.removeEntry(name);
     dirCache.delete(pathPrefix);
@@ -410,6 +412,7 @@ async function processMessage(msg) {
   const executeOperation = async () => {
     switch (type) {
       case "read":
+      case "readChunk":
         return handleRead(filePath, dataBuffer, payload);
       case "write":
         return handleWrite(filePath, dataBuffer, dataLength || 0, payload);
@@ -446,13 +449,19 @@ async function processMessage(msg) {
       Atomics.store(ctrl, 0, result);
     } catch (e) {
       const error = e instanceof Error ? e : new Error(String(e));
+      const errorName = error.name || "";
       const errorMsg = error.message || "Unknown error";
-      if (errorMsg.includes("NotFoundError") || errorMsg.includes("not found")) {
+      const isNotFound = errorName === "NotFoundError" || errorMsg.includes("NotFoundError") || errorMsg.includes("not found") || errorMsg.includes("could not be found");
+      if (isNotFound) {
         Atomics.store(ctrl, 0, -2);
       } else {
-        const encoded = new TextEncoder().encode(errorMsg);
+        const errorInfo = errorName && errorName !== "Error" ? errorName : errorMsg;
+        const encoded = new TextEncoder().encode(errorInfo);
         const view = new Uint8Array(metaBuffer);
         view.set(encoded);
+        if (encoded.length < metaBuffer.byteLength) {
+          view[encoded.length] = 0;
+        }
         Atomics.store(ctrl, 0, -1);
       }
     }

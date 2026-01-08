@@ -122,6 +122,10 @@ declare class OPFSFileSystem {
     private syncBufferPool;
     private getSyncBuffers;
     private syncCallTier1;
+    private syncCallTier1Async;
+    private syncStatTier1Async;
+    private syncCallTier1ChunkedAsync;
+    private syncCallTier1ChunkedReadAsync;
     private syncCallTier1Chunked;
     private syncCallTier1ChunkedRead;
     private syncStatTier1;
@@ -156,6 +160,7 @@ declare class OPFSFileSystem {
     writeSync(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null): number;
     fstatSync(fd: number): Stats;
     private parseFlags;
+    private fastCall;
     promises: FileSystemPromises;
     constants: {
         readonly F_OK: 0;

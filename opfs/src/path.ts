@@ -70,7 +70,8 @@ export function resolve(...paths: string[]): string {
   for (let i = paths.length - 1; i >= -1 && !resolvedAbsolute; i--) {
     const path = i >= 0 ? paths[i] : '/';
 
-    if (path.length === 0) continue;
+    // Handle undefined, null, or empty paths
+    if (path == null || path.length === 0) continue;
 
     resolvedPath = resolvedPath ? path + '/' + resolvedPath : path;
     resolvedAbsolute = path.charCodeAt(0) === 47; // '/'
