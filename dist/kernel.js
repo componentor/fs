@@ -10,12 +10,14 @@ function trace(...args) {
 }
 var releaseTimer = null;
 var LEGACY_RELEASE_DELAY = 100;
+var UNSAFE_RELEASE_DELAY = 500;
 function scheduleHandleRelease() {
-  if (unsafeModeSupported) return;
   if (releaseTimer) return;
+  const delay = unsafeModeSupported ? UNSAFE_RELEASE_DELAY : LEGACY_RELEASE_DELAY;
   releaseTimer = setTimeout(() => {
     releaseTimer = null;
     const count = syncHandleCache.size;
+    if (count === 0) return;
     for (const handle of syncHandleCache.values()) {
       try {
         handle.flush();
@@ -24,8 +26,8 @@ function scheduleHandleRelease() {
       }
     }
     syncHandleCache.clear();
-    trace(`Released ${count} handles (legacy mode debounce)`);
-  }, LEGACY_RELEASE_DELAY);
+    trace(`Released ${count} handles (${unsafeModeSupported ? "unsafe" : "legacy"} mode, ${delay}ms delay)`);
+  }, delay);
 }
 async function getSyncAccessHandle(filePath, create) {
   const cached = syncHandleCache.get(filePath);
@@ -535,8 +537,22 @@ async function processMessage(msg) {
     await navigator.locks.request(`opfs:${filePath}`, runAndSignal);
   }
 }
+var messageQueue = [];
+var MAX_CONCURRENT = 8;
+var activeOperations = 0;
+function processQueue() {
+  while (messageQueue.length > 0 && activeOperations < MAX_CONCURRENT) {
+    const msg = messageQueue.shift();
+    activeOperations++;
+    processMessage(msg).finally(() => {
+      activeOperations--;
+      processQueue();
+    });
+  }
+}
 self.onmessage = (event) => {
-  processMessage(event.data);
+  messageQueue.push(event.data);
+  processQueue();
 };
 self.postMessage({ type: "ready" });
 //# sourceMappingURL=kernel.js.map

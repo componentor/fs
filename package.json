@@ -1,6 +1,6 @@
 {
   "name": "@componentor/fs",
-  "version": "2.0.8",
+  "version": "2.0.9",
   "description": "Battle-tested OPFS-based Node.js fs polyfill with sync and async APIs",
   "license": "MIT",
   "author": "Componentor",

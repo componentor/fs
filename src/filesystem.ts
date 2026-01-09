@@ -69,22 +69,30 @@ function trace(...args) {
   if (debugTrace) console.log('[OPFS-T2]', ...args);
 }
 
-// Minimal timer for legacy mode only
+// Handle release timing
+// - Legacy mode (readwrite): 100ms delay (handles block, release ASAP)
+// - Unsafe mode (readwrite-unsafe): 500ms delay (handles don't block each other,
+//   but DO block external tools using default mode like OPFS Explorer)
 let releaseTimer = null;
 const LEGACY_RELEASE_DELAY = 100;
+const UNSAFE_RELEASE_DELAY = 500;
 
 function scheduleHandleRelease() {
-  if (unsafeModeSupported) return; // No release needed for readwrite-unsafe
   if (releaseTimer) return; // Already scheduled
+
+  const delay = unsafeModeSupported ? UNSAFE_RELEASE_DELAY : LEGACY_RELEASE_DELAY;
+
   releaseTimer = setTimeout(() => {
     releaseTimer = null;
     const count = syncHandleCache.size;
+    if (count === 0) return;
+
     for (const h of syncHandleCache.values()) {
       try { h.flush(); h.close(); } catch {}
     }
     syncHandleCache.clear();
-    trace('Released ' + count + ' handles (legacy mode debounce)');
-  }, LEGACY_RELEASE_DELAY);
+    trace('Released ' + count + ' handles (' + (unsafeModeSupported ? 'unsafe' : 'legacy') + ' mode, ' + delay + 'ms delay)');
+  }, delay);
 }
 
 async function getSyncHandle(filePath, create) {
@@ -566,22 +574,27 @@ async function handleMessage(msg) {
   }
 }
 
-// Process queued messages after ready
-function processQueue() {
-  while (messageQueue.length > 0) {
+// Process queued messages with concurrency limit
+// Allows multiple operations to run in parallel but prevents overwhelming the worker
+const MAX_CONCURRENT = 8;
+let activeOperations = 0;
+
+async function processQueue() {
+  while (messageQueue.length > 0 && activeOperations < MAX_CONCURRENT) {
     const msg = messageQueue.shift();
-    handleMessage(msg);
+    activeOperations++;
+    handleMessage(msg).finally(() => {
+      activeOperations--;
+      processQueue(); // Process next queued message
+    });
   }
 }
 
-// Handle messages directly - no serialization needed because:
-// - Tier 2: Client awaits response before sending next message
-// - Each OPFSFileSystem instance has its own worker
+// Queue messages and process with controlled concurrency
 self.onmessage = (event) => {
+  messageQueue.push(event.data);
   if (isReady) {
-    handleMessage(event.data);
-  } else {
-    messageQueue.push(event.data);
+    processQueue();
   }
 };
 

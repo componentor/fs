@@ -154,10 +154,10 @@
 
   <div class="legend">
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #ffc107, #ff9800);"></div> LightningFS (IndexedDB)</div>
-    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #e83e8c, #ff6b9d);"></div> @componentor/fs v1.2.8 (Legacy)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #28a745, #20c997);"></div> OPFS Tier 1 Sync (Worker + Atomics)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #17a2b8, #20c997);"></div> OPFS Tier 1 Promises (Worker + fastCall)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #007bff, #00d4ff);"></div> OPFS Tier 2 (Main Thread Promises)</div>
+    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #e83e8c, #ff6b9d);"></div> @componentor/fs v1.2.8 (Legacy)</div>
   </div>
 
   <h2>Results</h2>
@@ -1038,16 +1038,16 @@
       const container = document.getElementById('results');
 
       let html = '<table><thead><tr>';
-      html += '<th>Test</th><th>LightningFS</th><th>@componentor/fs</th><th>Tier 1 Sync</th><th>Tier 1 Promises</th><th>Tier 2</th><th>Best</th>';
+      html += '<th>Test</th><th>LightningFS</th><th>Tier 1 Sync</th><th>Tier 1 Promises</th><th>Tier 2</th><th>Legacy</th><th>Best</th>';
       html += '</tr></thead><tbody>';
 
       for (const result of allResults) {
         const values = [
           { name: 'LightningFS', ms: result.lightning, class: 'lightning' },
-          { name: '@componentor/fs', ms: result.componentor, class: 'componentor' },
           { name: 'Tier 1 Sync', ms: result.tier1, class: 'tier1' },
           { name: 'Tier 1 Promises', ms: result.tier1Promises, class: 'tier1' },
           { name: 'Tier 2', ms: result.tier2, class: 'tier2' },
+          { name: 'Legacy', ms: result.componentor, class: 'componentor' },
         ].filter(v => v.ms !== null && v.ms !== undefined);
 
         const minMs = Math.min(...values.map(v => v.ms));

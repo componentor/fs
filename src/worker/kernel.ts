@@ -42,26 +42,31 @@ function trace(...args: unknown[]): void {
   if (debugTrace) console.log('[OPFS-T1]', ...args);
 }
 
-// Minimal timer for legacy mode only (readwrite-unsafe doesn't need timed release)
+// Handle release timing
+// - Legacy mode (readwrite): 100ms delay (handles block, release ASAP)
+// - Unsafe mode (readwrite-unsafe): 500ms delay (handles don't block each other,
+//   but DO block external tools using default mode like OPFS Explorer)
 let releaseTimer: ReturnType<typeof setTimeout> | null = null;
-const LEGACY_RELEASE_DELAY = 100;  // 100ms for legacy readwrite
+const LEGACY_RELEASE_DELAY = 100;   // 100ms for legacy readwrite
+const UNSAFE_RELEASE_DELAY = 500;   // 500ms for readwrite-unsafe (allows external tools)
 
-// Lightweight release scheduling - only for legacy mode
+// Lightweight release scheduling
 function scheduleHandleRelease(): void {
-  // readwrite-unsafe mode: no release needed (handles don't block)
-  if (unsafeModeSupported) return;
-
-  // Legacy mode: debounced release
   if (releaseTimer) return; // Already scheduled
+
+  const delay = unsafeModeSupported ? UNSAFE_RELEASE_DELAY : LEGACY_RELEASE_DELAY;
+
   releaseTimer = setTimeout(() => {
     releaseTimer = null;
     const count = syncHandleCache.size;
+    if (count === 0) return;
+
     for (const handle of syncHandleCache.values()) {
       try { handle.flush(); handle.close(); } catch { /* ignore */ }
     }
     syncHandleCache.clear();
-    trace(`Released ${count} handles (legacy mode debounce)`);
-  }, LEGACY_RELEASE_DELAY);
+    trace(`Released ${count} handles (${unsafeModeSupported ? 'unsafe' : 'legacy'} mode, ${delay}ms delay)`);
+  }, delay);
 }
 
 async function getSyncAccessHandle(
@@ -783,12 +788,29 @@ async function processMessage(msg: KernelMessage): Promise<void> {
   }
 }
 
+// Message queue with concurrency limit
+// Allows multiple operations to run in parallel but prevents overwhelming the worker
+const messageQueue: KernelMessage[] = [];
+const MAX_CONCURRENT = 8;
+let activeOperations = 0;
+
+function processQueue(): void {
+  while (messageQueue.length > 0 && activeOperations < MAX_CONCURRENT) {
+    const msg = messageQueue.shift()!;
+    activeOperations++;
+    processMessage(msg).finally(() => {
+      activeOperations--;
+      processQueue(); // Process next queued message
+    });
+  }
+}
+
 // Main message handler
-// Note: Serialization is NOT needed here because:
-// - Tier 1 Sync: Client blocks on Atomics.wait, so only one message at a time
-// - Tier 1 Async: Client serializes via asyncOperationPromise before sending
+// Messages are queued and processed with controlled concurrency to prevent
+// overwhelming the worker while still allowing parallelism for throughput.
 self.onmessage = (event: MessageEvent<KernelMessage>) => {
-  processMessage(event.data);
+  messageQueue.push(event.data);
+  processQueue();
 };
 
 // Signal ready
