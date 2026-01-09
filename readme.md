@@ -446,20 +446,16 @@ Another tab or operation has the file open. The library uses `navigator.locks` t
 
 ## Changelog
 
-### v2.0.5 (2025)
+### v2.0.7 (2025)
 
-**Bug Fixes:**
-- Fixed idle timeout condition (`>` to `>=`) - handles now release at exactly 2s instead of ~4s
-
-### v2.0.4 (2025)
-
-**Bug Fixes:**
-- Handle idle timeout now works for both Tier 1 and Tier 2
-- Previously only Tier 1 kernel had idle release; Tier 2 kernel now also releases handles after 2s
-
-### v2.0.3 (2025)
-- Reduced handle idle timeout from 5s to 2s for faster external tool access
-- Added tests verifying handles are properly released after idle timeout
+**Smart Handle Caching with `readwrite-unsafe`:**
+- Uses `readwrite-unsafe` mode (Chrome 121+) - no exclusive locks
+- Browser extensions can access files while handles are cached
+- Access-time based cleanup: handles released after 30s of inactivity
+- Accessing a cached handle renews its timeout (stays cached during active use)
+- Active operation protection: handles in use are never released
+- LRU eviction when cache exceeds 100 handles
+- Falls back to 100ms debounced release on older browsers
 
 ### v2.0.2 (2025)
 
