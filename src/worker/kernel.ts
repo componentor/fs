@@ -788,29 +788,14 @@ async function processMessage(msg: KernelMessage): Promise<void> {
   }
 }
 
-// Message queue with concurrency limit
-// Allows multiple operations to run in parallel but prevents overwhelming the worker
-const messageQueue: KernelMessage[] = [];
-const MAX_CONCURRENT = 8;
-let activeOperations = 0;
-
-function processQueue(): void {
-  while (messageQueue.length > 0 && activeOperations < MAX_CONCURRENT) {
-    const msg = messageQueue.shift()!;
-    activeOperations++;
-    processMessage(msg).finally(() => {
-      activeOperations--;
-      processQueue(); // Process next queued message
-    });
-  }
-}
-
 // Main message handler
-// Messages are queued and processed with controlled concurrency to prevent
-// overwhelming the worker while still allowing parallelism for throughput.
+// Process messages concurrently - each operation proceeds independently
+// This is better than serialization because:
+// 1. If one operation hangs, others can still complete
+// 2. Small files don't get blocked behind large files
+// 3. navigator.locks API handles per-file serialization where needed
 self.onmessage = (event: MessageEvent<KernelMessage>) => {
-  messageQueue.push(event.data);
-  processQueue();
+  processMessage(event.data);
 };
 
 // Signal ready

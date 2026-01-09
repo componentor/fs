@@ -946,23 +946,19 @@ async function handleMessage(msg) {
   }
 }
 
-// Process queued messages with concurrency limit
-// Allows multiple operations to run in parallel but prevents overwhelming the worker
-const MAX_CONCURRENT = 8;
-let activeOperations = 0;
-
-async function processQueue() {
-  while (messageQueue.length > 0 && activeOperations < MAX_CONCURRENT) {
+// Process queued messages after ready
+function processQueue() {
+  while (messageQueue.length > 0) {
     const msg = messageQueue.shift();
-    activeOperations++;
-    handleMessage(msg).finally(() => {
-      activeOperations--;
-      processQueue(); // Process next queued message
-    });
+    handleMessage(msg); // Process concurrently - don't wait
   }
 }
 
-// Queue messages and process with controlled concurrency
+// Handle messages concurrently - each operation proceeds independently
+// This is better than a queue with concurrency limit because:
+// 1. If one operation hangs, others can still complete
+// 2. Small files don't get blocked behind large files
+// 3. The Web Locks API already handles per-file serialization
 self.onmessage = (event) => {
   messageQueue.push(event.data);
   if (isReady) {

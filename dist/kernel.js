@@ -537,22 +537,8 @@ async function processMessage(msg) {
     await navigator.locks.request(`opfs:${filePath}`, runAndSignal);
   }
 }
-var messageQueue = [];
-var MAX_CONCURRENT = 8;
-var activeOperations = 0;
-function processQueue() {
-  while (messageQueue.length > 0 && activeOperations < MAX_CONCURRENT) {
-    const msg = messageQueue.shift();
-    activeOperations++;
-    processMessage(msg).finally(() => {
-      activeOperations--;
-      processQueue();
-    });
-  }
-}
 self.onmessage = (event) => {
-  messageQueue.push(event.data);
-  processQueue();
+  processMessage(event.data);
 };
 self.postMessage({ type: "ready" });
 //# sourceMappingURL=kernel.js.map
