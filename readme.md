@@ -448,14 +448,12 @@ Another tab or operation has the file open. The library uses `navigator.locks` t
 
 ### v2.0.7 (2025)
 
-**Smart Handle Caching with `readwrite-unsafe`:**
+**High-Performance Handle Caching with `readwrite-unsafe`:**
 - Uses `readwrite-unsafe` mode (Chrome 121+) - no exclusive locks
+- Zero per-operation overhead: cache lookup is a single Map.get()
 - Browser extensions can access files while handles are cached
-- Access-time based cleanup: handles released after 30s of inactivity
-- Accessing a cached handle renews its timeout (stays cached during active use)
-- Active operation protection: handles in use are never released
 - LRU eviction when cache exceeds 100 handles
-- Falls back to 100ms debounced release on older browsers
+- Falls back to 100ms debounced release on older browsers (handles block)
 
 ### v2.0.2 (2025)
 

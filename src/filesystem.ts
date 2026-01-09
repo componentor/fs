@@ -58,111 +58,67 @@ const dirCache = new Map();
 // Uses readwrite-unsafe mode when available (no exclusive lock, allows external access)
 // Falls back to readwrite with debounced release for older browsers
 const syncHandleCache = new Map();
-const syncHandleLastAccess = new Map();
-const syncHandleActiveOps = new Map(); // Track active operations per handle
 const MAX_HANDLES = 100;
 
 // Track if readwrite-unsafe mode is supported (detected on first use)
 let unsafeModeSupported = null;
 
-// Handle release timing:
-// - readwrite-unsafe: 30s idle timeout (no blocking, just memory management)
-// - readwrite (fallback): 100ms debounce (need to release locks quickly)
+// Debug tracing - set via 'setDebug' message
+let debugTrace = false;
+function trace(...args) {
+  if (debugTrace) console.log('[OPFS-T2]', ...args);
+}
+
+// Minimal timer for legacy mode only
 let releaseTimer = null;
-const UNSAFE_IDLE_TIMEOUT = 30000;
 const LEGACY_RELEASE_DELAY = 100;
 
-// Track active operations to prevent releasing handles in use
-function beginHandleOp(path) {
-  syncHandleActiveOps.set(path, (syncHandleActiveOps.get(path) || 0) + 1);
-}
-
-function endHandleOp(path) {
-  const count = syncHandleActiveOps.get(path) || 0;
-  if (count <= 1) {
-    syncHandleActiveOps.delete(path);
-  } else {
-    syncHandleActiveOps.set(path, count - 1);
-  }
-}
-
-function isHandleInUse(path) {
-  return (syncHandleActiveOps.get(path) || 0) > 0;
-}
-
 function scheduleHandleRelease() {
-  if (releaseTimer) {
-    clearTimeout(releaseTimer);
-  }
-
-  if (unsafeModeSupported) {
-    // readwrite-unsafe: clean up handles idle for 30s
-    releaseTimer = setTimeout(() => {
-      releaseTimer = null;
-      const now = Date.now();
-      for (const [path, lastAccess] of syncHandleLastAccess) {
-        // Skip handles that are currently in use
-        if (isHandleInUse(path)) continue;
-        if (now - lastAccess >= UNSAFE_IDLE_TIMEOUT) {
-          const h = syncHandleCache.get(path);
-          if (h) { try { h.flush(); h.close(); } catch {} }
-          syncHandleCache.delete(path);
-          syncHandleLastAccess.delete(path);
-        }
-      }
-      // Reschedule if there are still handles
-      if (syncHandleCache.size > 0) {
-        scheduleHandleRelease();
-      }
-    }, UNSAFE_IDLE_TIMEOUT);
-  } else {
-    // Legacy readwrite: release all handles after 100ms idle
-    releaseTimer = setTimeout(() => {
-      releaseTimer = null;
-      if (syncHandleCache.size > 0) {
-        for (const [path, h] of syncHandleCache) {
-          // Skip handles that are currently in use
-          if (isHandleInUse(path)) continue;
-          try { h.flush(); h.close(); } catch {}
-          syncHandleCache.delete(path);
-          syncHandleLastAccess.delete(path);
-        }
-      }
-    }, LEGACY_RELEASE_DELAY);
-  }
+  if (unsafeModeSupported) return; // No release needed for readwrite-unsafe
+  if (releaseTimer) return; // Already scheduled
+  releaseTimer = setTimeout(() => {
+    releaseTimer = null;
+    const count = syncHandleCache.size;
+    for (const h of syncHandleCache.values()) {
+      try { h.flush(); h.close(); } catch {}
+    }
+    syncHandleCache.clear();
+    trace('Released ' + count + ' handles (legacy mode debounce)');
+  }, LEGACY_RELEASE_DELAY);
 }
 
 async function getSyncHandle(filePath, create) {
   const cached = syncHandleCache.get(filePath);
   if (cached) {
-    // Renew last access time
-    syncHandleLastAccess.set(filePath, Date.now());
+    trace('Handle cache HIT: ' + filePath);
     return cached;
   }
 
   // Evict oldest handles if cache is full
   if (syncHandleCache.size >= MAX_HANDLES) {
     const keys = Array.from(syncHandleCache.keys()).slice(0, 10);
+    trace('LRU evicting ' + keys.length + ' handles');
     for (const key of keys) {
       const h = syncHandleCache.get(key);
-      if (h) { try { h.close(); } catch {} syncHandleCache.delete(key); syncHandleLastAccess.delete(key); }
+      if (h) { try { h.close(); } catch {} syncHandleCache.delete(key); }
     }
   }
 
   const fh = await getFileHandle(filePath, create);
 
   // Try readwrite-unsafe mode first (no exclusive lock, Chrome 121+)
-  // Falls back to readwrite if not supported
   let access;
   if (unsafeModeSupported === null) {
     // First time - detect support
     try {
       access = await fh.createSyncAccessHandle({ mode: 'readwrite-unsafe' });
       unsafeModeSupported = true;
+      trace('readwrite-unsafe mode SUPPORTED - handles won\\'t block');
     } catch {
       // Not supported, use default mode
       access = await fh.createSyncAccessHandle();
       unsafeModeSupported = false;
+      trace('readwrite-unsafe mode NOT supported - using legacy mode');
     }
   } else if (unsafeModeSupported) {
     access = await fh.createSyncAccessHandle({ mode: 'readwrite-unsafe' });
@@ -171,13 +127,17 @@ async function getSyncHandle(filePath, create) {
   }
 
   syncHandleCache.set(filePath, access);
-  syncHandleLastAccess.set(filePath, Date.now());
+  trace('Handle ACQUIRED: ' + filePath + ' (cache size: ' + syncHandleCache.size + ')');
   return access;
 }
 
 function closeSyncHandle(filePath) {
   const h = syncHandleCache.get(filePath);
-  if (h) { try { h.close(); } catch {} syncHandleCache.delete(filePath); syncHandleLastAccess.delete(filePath); }
+  if (h) {
+    try { h.close(); } catch {}
+    syncHandleCache.delete(filePath);
+    trace('Handle RELEASED: ' + filePath);
+  }
 }
 
 function closeHandlesUnder(prefix) {
@@ -185,7 +145,6 @@ function closeHandlesUnder(prefix) {
     if (p === prefix || p.startsWith(prefix + '/')) {
       try { h.close(); } catch {}
       syncHandleCache.delete(p);
-      syncHandleLastAccess.delete(p);
     }
   }
 }
@@ -260,17 +219,12 @@ async function getParentAndName(filePath) {
 
 async function handleRead(filePath, payload) {
   const access = await getSyncHandle(filePath, false);
-  beginHandleOp(filePath);
-  try {
-    const size = access.getSize();
-    const offset = payload?.offset || 0;
-    const len = payload?.len || (size - offset);
-    const buf = new Uint8Array(len);
-    const bytesRead = access.read(buf, { at: offset });
-    return { data: buf.slice(0, bytesRead) };
-  } finally {
-    endHandleOp(filePath);
-  }
+  const size = access.getSize();
+  const offset = payload?.offset || 0;
+  const len = payload?.len || (size - offset);
+  const buf = new Uint8Array(len);
+  const bytesRead = access.read(buf, { at: offset });
+  return { data: buf.slice(0, bytesRead) };
 }
 
 // Non-blocking read using getFile() - does NOT lock the file
@@ -306,57 +260,39 @@ function handleReleaseHandle(filePath) {
 
 // Force release ALL file handles - use before HMR notifications
 function handleReleaseAllHandles() {
-  for (const [p, h] of syncHandleCache) {
+  for (const h of syncHandleCache.values()) {
     try { h.close(); } catch {}
   }
   syncHandleCache.clear();
-  syncHandleLastAccess.clear();
-  syncHandleActiveOps.clear();
   return { success: true };
 }
 
 async function handleWrite(filePath, payload) {
   const access = await getSyncHandle(filePath, true);
-  beginHandleOp(filePath);
-  try {
-    if (payload?.data) {
-      const offset = payload.offset ?? 0;
-      if (offset === 0) access.truncate(0);
-      access.write(payload.data, { at: offset });
-      // Only flush if explicitly requested (default: true for safety)
-      if (payload?.flush !== false) access.flush();
-    }
-    return { success: true };
-  } finally {
-    endHandleOp(filePath);
+  if (payload?.data) {
+    const offset = payload.offset ?? 0;
+    if (offset === 0) access.truncate(0);
+    access.write(payload.data, { at: offset });
+    if (payload?.flush !== false) access.flush();
   }
+  return { success: true };
 }
 
 async function handleAppend(filePath, payload) {
   const access = await getSyncHandle(filePath, true);
-  beginHandleOp(filePath);
-  try {
-    if (payload?.data) {
-      const size = access.getSize();
-      access.write(payload.data, { at: size });
-      if (payload?.flush !== false) access.flush();
-    }
-    return { success: true };
-  } finally {
-    endHandleOp(filePath);
+  if (payload?.data) {
+    const size = access.getSize();
+    access.write(payload.data, { at: size });
+    if (payload?.flush !== false) access.flush();
   }
+  return { success: true };
 }
 
 async function handleTruncate(filePath, payload) {
   const access = await getSyncHandle(filePath, false);
-  beginHandleOp(filePath);
-  try {
-    access.truncate(payload?.len ?? 0);
-    access.flush();
-    return { success: true };
-  } finally {
-    endHandleOp(filePath);
-  }
+  access.truncate(payload?.len ?? 0);
+  access.flush();
+  return { success: true };
 }
 
 async function handleStat(filePath) {
@@ -525,18 +461,14 @@ function handleFlush() {
 }
 
 function handlePurge() {
-  // Cancel any pending release timer
   if (releaseTimer) {
     clearTimeout(releaseTimer);
     releaseTimer = null;
   }
-  // Flush and close all cached sync handles
-  for (const [, handle] of syncHandleCache) {
+  for (const handle of syncHandleCache.values()) {
     try { handle.flush(); handle.close(); } catch {}
   }
   syncHandleCache.clear();
-  syncHandleLastAccess.clear();
-  syncHandleActiveOps.clear();
   dirCache.clear();
   cachedRoot = null;
   return { success: true };
@@ -562,6 +494,10 @@ async function processMessage(msg) {
     case 'purge': return handlePurge();
     case 'releaseHandle': return handleReleaseHandle(path);
     case 'releaseAllHandles': return handleReleaseAllHandles();
+    case 'setDebug':
+      debugTrace = !!payload?.enabled;
+      trace('Debug tracing ' + (debugTrace ? 'ENABLED' : 'DISABLED') + ', unsafeMode: ' + unsafeModeSupported);
+      return { success: true, debugTrace, unsafeModeSupported, cacheSize: syncHandleCache.size };
     default: throw new Error('Unknown operation: ' + type);
   }
 }
@@ -1684,6 +1620,26 @@ export class OPFSFileSystem {
   purgeSync(): void {
     this.syncCall('purge', '/');
     this.statCache.clear();
+  }
+
+  /**
+   * Enable or disable debug tracing for handle operations.
+   * When enabled, logs handle cache hits, acquisitions, releases, and mode information.
+   * @param enabled - Whether to enable debug tracing
+   * @returns Debug state information including unsafeModeSupported and cache size
+   */
+  setDebugSync(enabled: boolean): { debugTrace: boolean; unsafeModeSupported: boolean; cacheSize: number } {
+    return this.syncCall('setDebug', '/', { enabled }) as unknown as { debugTrace: boolean; unsafeModeSupported: boolean; cacheSize: number };
+  }
+
+  /**
+   * Enable or disable debug tracing for handle operations (async version).
+   * When enabled, logs handle cache hits, acquisitions, releases, and mode information.
+   * @param enabled - Whether to enable debug tracing
+   * @returns Debug state information including unsafeModeSupported and cache size
+   */
+  async setDebug(enabled: boolean): Promise<{ debugTrace: boolean; unsafeModeSupported: boolean; cacheSize: number }> {
+    return this.asyncCall('setDebug', '/', { enabled }) as unknown as Promise<{ debugTrace: boolean; unsafeModeSupported: boolean; cacheSize: number }>;
   }
 
   accessSync(filePath: string, _mode?: number): void {

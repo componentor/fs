@@ -315,6 +315,28 @@ declare class OPFSFileSystem {
      * Use between major operations to ensure clean state.
      */
     purgeSync(): void;
+    /**
+     * Enable or disable debug tracing for handle operations.
+     * When enabled, logs handle cache hits, acquisitions, releases, and mode information.
+     * @param enabled - Whether to enable debug tracing
+     * @returns Debug state information including unsafeModeSupported and cache size
+     */
+    setDebugSync(enabled: boolean): {
+        debugTrace: boolean;
+        unsafeModeSupported: boolean;
+        cacheSize: number;
+    };
+    /**
+     * Enable or disable debug tracing for handle operations (async version).
+     * When enabled, logs handle cache hits, acquisitions, releases, and mode information.
+     * @param enabled - Whether to enable debug tracing
+     * @returns Debug state information including unsafeModeSupported and cache size
+     */
+    setDebug(enabled: boolean): Promise<{
+        debugTrace: boolean;
+        unsafeModeSupported: boolean;
+        cacheSize: number;
+    }>;
     accessSync(filePath: string, _mode?: number): void;
     openSync(filePath: string, flags?: string | number): number;
     closeSync(fd: number): void;

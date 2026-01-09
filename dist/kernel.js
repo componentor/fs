@@ -2,80 +2,40 @@
 var cachedRoot = null;
 var dirCache = /* @__PURE__ */ new Map();
 var syncHandleCache = /* @__PURE__ */ new Map();
-var syncHandleLastAccess = /* @__PURE__ */ new Map();
-var syncHandleActiveOps = /* @__PURE__ */ new Map();
 var MAX_SYNC_HANDLES = 100;
 var unsafeModeSupported = null;
+var debugTrace = false;
+function trace(...args) {
+  if (debugTrace) console.log("[OPFS-T1]", ...args);
+}
 var releaseTimer = null;
-var UNSAFE_IDLE_TIMEOUT = 3e4;
 var LEGACY_RELEASE_DELAY = 100;
-function beginHandleOp(path) {
-  syncHandleActiveOps.set(path, (syncHandleActiveOps.get(path) || 0) + 1);
-}
-function endHandleOp(path) {
-  const count = syncHandleActiveOps.get(path) || 0;
-  if (count <= 1) {
-    syncHandleActiveOps.delete(path);
-  } else {
-    syncHandleActiveOps.set(path, count - 1);
-  }
-}
-function isHandleInUse(path) {
-  return (syncHandleActiveOps.get(path) || 0) > 0;
-}
 function scheduleHandleRelease() {
-  if (releaseTimer) {
-    clearTimeout(releaseTimer);
-  }
-  if (unsafeModeSupported) {
-    releaseTimer = setTimeout(() => {
-      releaseTimer = null;
-      const now = Date.now();
-      for (const [path, lastAccess] of syncHandleLastAccess) {
-        if (isHandleInUse(path)) continue;
-        if (now - lastAccess >= UNSAFE_IDLE_TIMEOUT) {
-          const handle = syncHandleCache.get(path);
-          if (handle) {
-            try {
-              handle.flush();
-              handle.close();
-            } catch {
-            }
-          }
-          syncHandleCache.delete(path);
-          syncHandleLastAccess.delete(path);
-        }
+  if (unsafeModeSupported) return;
+  if (releaseTimer) return;
+  releaseTimer = setTimeout(() => {
+    releaseTimer = null;
+    const count = syncHandleCache.size;
+    for (const handle of syncHandleCache.values()) {
+      try {
+        handle.flush();
+        handle.close();
+      } catch {
       }
-      if (syncHandleCache.size > 0) {
-        scheduleHandleRelease();
-      }
-    }, UNSAFE_IDLE_TIMEOUT);
-  } else {
-    releaseTimer = setTimeout(() => {
-      releaseTimer = null;
-      if (syncHandleCache.size > 0) {
-        for (const [path, handle] of syncHandleCache) {
-          if (isHandleInUse(path)) continue;
-          try {
-            handle.flush();
-            handle.close();
-          } catch {
-          }
-          syncHandleCache.delete(path);
-          syncHandleLastAccess.delete(path);
-        }
-      }
-    }, LEGACY_RELEASE_DELAY);
-  }
+    }
+    syncHandleCache.clear();
+    trace(`Released ${count} handles (legacy mode debounce)`);
+  }, LEGACY_RELEASE_DELAY);
 }
 async function getSyncAccessHandle(filePath, create) {
   const cached = syncHandleCache.get(filePath);
   if (cached) {
-    syncHandleLastAccess.set(filePath, Date.now());
+    trace(`Handle cache HIT: ${filePath}`);
     return cached;
   }
   if (syncHandleCache.size >= MAX_SYNC_HANDLES) {
     const keysToDelete = Array.from(syncHandleCache.keys()).slice(0, 10);
+    trace(`LRU evicting ${keysToDelete.length} handles`);
     for (const key of keysToDelete) {
       const handle = syncHandleCache.get(key);
       if (handle) {
@@ -84,7 +44,6 @@ async function getSyncAccessHandle(filePath, create) {
         } catch {
         }
         syncHandleCache.delete(key);
-        syncHandleLastAccess.delete(key);
       }
     }
   }
@@ -94,9 +53,11 @@ async function getSyncAccessHandle(filePath, create) {
     try {
       access = await fh.createSyncAccessHandle({ mode: "readwrite-unsafe" });
       unsafeModeSupported = true;
+      trace(`readwrite-unsafe mode SUPPORTED - handles won't block`);
     } catch {
       access = await fh.createSyncAccessHandle();
       unsafeModeSupported = false;
+      trace(`readwrite-unsafe mode NOT supported - using legacy mode`);
     }
   } else if (unsafeModeSupported) {
     access = await fh.createSyncAccessHandle({ mode: "readwrite-unsafe" });
@@ -104,7 +65,7 @@ async function getSyncAccessHandle(filePath, create) {
     access = await fh.createSyncAccessHandle();
   }
   syncHandleCache.set(filePath, access);
-  syncHandleLastAccess.set(filePath, Date.now());
+  trace(`Handle ACQUIRED: ${filePath} (cache size: ${syncHandleCache.size})`);
   return access;
 }
 function closeSyncHandle(filePath) {
@@ -115,7 +76,7 @@ function closeSyncHandle(filePath) {
     } catch {
     }
     syncHandleCache.delete(filePath);
-    syncHandleLastAccess.delete(filePath);
+    trace(`Handle RELEASED: ${filePath}`);
   }
 }
 function closeAllSyncHandlesUnder(pathPrefix) {
@@ -127,7 +88,6 @@ function closeAllSyncHandlesUnder(pathPrefix) {
       } catch {
       }
       syncHandleCache.delete(path);
-      syncHandleLastAccess.delete(path);
     }
   }
 }
@@ -144,8 +104,6 @@ function purgeAllCaches() {
     }
   }
   syncHandleCache.clear();
-  syncHandleLastAccess.clear();
-  syncHandleActiveOps.clear();
   dirCache.clear();
   cachedRoot = null;
 }
@@ -201,60 +159,38 @@ async function getParentAndName(filePath) {
 }
 async function handleRead(filePath, dataBuffer, payload) {
   const access = await getSyncAccessHandle(filePath, false);
-  beginHandleOp(filePath);
-  try {
-    const size = access.getSize();
-    const offset = payload?.offset || 0;
-    const len = payload?.len || size - offset;
-    const view = new Uint8Array(dataBuffer, 0, Math.min(len, dataBuffer.byteLength));
-    const bytesRead = access.read(view, { at: offset });
-    return bytesRead;
-  } finally {
-    endHandleOp(filePath);
-  }
+  const size = access.getSize();
+  const offset = payload?.offset || 0;
+  const len = payload?.len || size - offset;
+  const view = new Uint8Array(dataBuffer, 0, Math.min(len, dataBuffer.byteLength));
+  return access.read(view, { at: offset });
 }
 async function handleWrite(filePath, dataBuffer, dataLength, payload) {
   const access = await getSyncAccessHandle(filePath, true);
-  beginHandleOp(filePath);
-  try {
-    const offset = payload?.offset ?? 0;
-    const shouldTruncate = payload?.truncate ?? offset === 0;
-    if (shouldTruncate) {
-      access.truncate(0);
-    }
-    const data = new Uint8Array(dataBuffer, 0, dataLength);
-    access.write(data, { at: offset });
-    if (payload?.flush !== false) {
-      access.flush();
-    }
-    return 1;
-  } finally {
-    endHandleOp(filePath);
+  const offset = payload?.offset ?? 0;
+  if (payload?.truncate ?? offset === 0) {
+    access.truncate(0);
   }
+  const data = new Uint8Array(dataBuffer, 0, dataLength);
+  access.write(data, { at: offset });
+  if (payload?.flush !== false) {
+    access.flush();
+  }
+  return 1;
 }
 async function handleAppend(filePath, dataBuffer, dataLength) {
   const access = await getSyncAccessHandle(filePath, true);
-  beginHandleOp(filePath);
-  try {
-    const size = access.getSize();
-    const data = new Uint8Array(dataBuffer, 0, dataLength);
-    access.write(data, { at: size });
-    access.flush();
-    return 1;
-  } finally {
-    endHandleOp(filePath);
-  }
+  const size = access.getSize();
+  const data = new Uint8Array(dataBuffer, 0, dataLength);
+  access.write(data, { at: size });
+  access.flush();
+  return 1;
 }
 async function handleTruncate(filePath, payload) {
   const access = await getSyncAccessHandle(filePath, false);
-  beginHandleOp(filePath);
-  try {
-    access.truncate(payload?.len ?? 0);
-    access.flush();
-    return 1;
-  } finally {
-    endHandleOp(filePath);
-  }
+  access.truncate(payload?.len ?? 0);
+  access.flush();
+  return 1;
 }
 var STAT_SIZE = 24;
 async function handleStat(filePath, metaBuffer) {
@@ -557,6 +493,12 @@ async function processMessage(msg) {
       case "purge":
         purgeAllCaches();
         return 1;
+      case "setDebug":
+        debugTrace = !!payload?.enabled;
+        trace(`Debug tracing ${debugTrace ? "ENABLED" : "DISABLED"}, unsafeMode: ${unsafeModeSupported}`);
+        return 1;
+      case "getDebugInfo":
+        return syncHandleCache.size;
       default:
         throw new Error(`Unknown operation: ${type}`);
     }
