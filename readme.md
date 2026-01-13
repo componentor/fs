@@ -250,6 +250,35 @@ fs.promises.flush(): Promise<void>   // Flush pending writes
 fs.promises.purge(): Promise<void>   // Clear all caches
 ```
 
+### Streams API
+
+```typescript
+// Create a readable stream (Web Streams API)
+fs.createReadStream(path: string, options?: {
+  start?: number,       // Byte offset to start reading
+  end?: number,         // Byte offset to stop reading
+  highWaterMark?: number // Chunk size (default: 64KB)
+}): ReadableStream<Uint8Array>
+
+// Create a writable stream (Web Streams API)
+fs.createWriteStream(path: string, options?: {
+  start?: number,       // Byte offset to start writing
+  flush?: boolean       // Flush on close (default: true)
+}): WritableStream<Uint8Array>
+
+// Example: Stream a file
+const stream = fs.createReadStream('/large-file.bin');
+for await (const chunk of stream) {
+  console.log('Read chunk:', chunk.length, 'bytes');
+}
+
+// Example: Write with streams
+const writable = fs.createWriteStream('/output.bin');
+const writer = writable.getWriter();
+await writer.write(new Uint8Array([1, 2, 3]));
+await writer.close();
+```
+
 ### Path Utilities
 
 ```typescript
@@ -323,36 +352,36 @@ await git.commit({
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      Main Thread                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │   Sync API  │  │  Async API  │  │    Path Utilities   │ │
-│  │ readFileSync│  │  promises.  │  │ join, dirname, etc. │ │
-│  │writeFileSync│  │  readFile   │  └─────────────────────┘ │
-│  └──────┬──────┘  └──────┬──────┘                          │
-│         │                │                                   │
+│                      Main Thread                            │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐  │
+│  │   Sync API  │  │  Async API  │  │    Path Utilities   │  │
+│  │ readFileSync│  │  promises.  │  │ join, dirname, etc. │  │
+│  │writeFileSync│  │  readFile   │  └─────────────────────┘  │
+│  └──────┬──────┘  └──────┬──────┘                           │
+│         │                │                                  │
 │         │ Atomics.wait   │ postMessage                      │
 │         │ (Tier 1)       │ (Tier 2)                         │
 └─────────┼────────────────┼──────────────────────────────────┘
           │                │
           ▼                ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                      Web Worker                              │
+│                      Web Worker                             │
 │  ┌────────────────────────────────────────────────────────┐ │
 │  │                   OPFS Kernel                          │ │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐  │ │
-│  │  │ Sync Handle  │  │  Directory   │  │  navigator  │  │ │
-│  │  │    Cache     │  │    Cache     │  │    .locks   │  │ │
-│  │  │  (100 max)   │  │              │  │ (cross-tab) │  │ │
-│  │  └──────────────┘  └──────────────┘  └─────────────┘  │ │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌─────────────┐   │ │
+│  │  │ Sync Handle  │  │  Directory   │  │  navigator  │   │ │
+│  │  │    Cache     │  │    Cache     │  │    .locks   │   │ │
+│  │  │  (100 max)   │  │              │  │ (cross-tab) │   │ │
+│  │  └──────────────┘  └──────────────┘  └─────────────┘   │ │
 │  └────────────────────────────────────────────────────────┘ │
-│                            │                                 │
-└────────────────────────────┼─────────────────────────────────┘
+│                            │                                │
+└────────────────────────────┼────────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                         OPFS                                 │
-│            Origin Private File System                        │
-│              (Browser Storage API)                           │
+│                         OPFS                                │
+│            Origin Private File System                       │
+│              (Browser Storage API)                          │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -378,7 +407,7 @@ await git.commit({
 | `open` / `FileHandle` | ✅ | ✅ | ❌ | ❌ |
 | `opendir` / `Dir` | ✅ | ✅ | ❌ | ❌ |
 | `mkdtemp` | ✅ | ✅ | ❌ | ❌ |
-| Streams | ✅ | ❌ | ❌ | ❌ |
+| Streams | ✅ | ✅ | ❌ | ❌ |
 
 ### Performance Tiers
 
@@ -445,6 +474,11 @@ Another tab or operation has the file open. The library uses `navigator.locks` t
 4. Call `fs.promises.flush()` after bulk operations
 
 ## Changelog
+
+### v2.0.11 (2026)
+
+**Document streams API:**
+- Update readme about available streams API
 
 ### v2.0.7 (2025)
 
