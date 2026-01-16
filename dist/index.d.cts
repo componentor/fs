@@ -385,6 +385,7 @@ declare class OPFSFileSystem {
      */
     linkSync(existingPath: string, newPath: string): void;
     private parseFlags;
+    private static readonly ASYNC_ONLY_OPS;
     private fastCall;
     promises: FileSystemPromises;
     /**

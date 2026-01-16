@@ -1927,9 +1927,14 @@ var OPFSFileSystem = class _OPFSFileSystem {
   // --- Async Promises API ---
   // When Tier 1 sync kernel is available, use it for better performance (wrapped in Promise)
   // Otherwise fall back to async worker
+  // Operations NOT implemented in the sync kernel - must use async worker
+  static ASYNC_ONLY_OPS = /* @__PURE__ */ new Set([
+    "releaseAllHandles",
+    "releaseHandle"
+  ]);
   // Helper: Use sync kernel if available (in worker context), otherwise async worker
   async fastCall(type, filePath, payload) {
-    if (this.syncKernelReady) {
+    if (this.syncKernelReady && !_OPFSFileSystem.ASYNC_ONLY_OPS.has(type)) {
       if (isWorkerContext) {
         return Promise.resolve(this.syncCallTier1(type, filePath, payload));
       } else {

@@ -1869,6 +1869,12 @@ export class OPFSFileSystem {
   // When Tier 1 sync kernel is available, use it for better performance (wrapped in Promise)
   // Otherwise fall back to async worker
 
+  // Operations NOT implemented in the sync kernel - must use async worker
+  private static readonly ASYNC_ONLY_OPS = new Set([
+    'releaseAllHandles',
+    'releaseHandle',
+  ]);
+
   // Helper: Use sync kernel if available (in worker context), otherwise async worker
   private async fastCall(
     type: string,
@@ -1880,7 +1886,8 @@ export class OPFSFileSystem {
     // 1. SharedArrayBuffer zero-copy data transfer
     // 2. Optimized sync handle caching
     // 3. No postMessage serialization overhead
-    if (this.syncKernelReady) {
+    // Note: Some operations are async-only (not in kernel)
+    if (this.syncKernelReady && !OPFSFileSystem.ASYNC_ONLY_OPS.has(type)) {
       if (isWorkerContext) {
         // In Worker: use blocking Atomics.wait (fastest)
         return Promise.resolve(this.syncCallTier1(type, filePath, payload));
