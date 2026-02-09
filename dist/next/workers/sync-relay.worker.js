@@ -1229,6 +1229,8 @@ function decodeSecondPath(data) {
 
 // src/workers/sync-relay.worker.ts
 var engine = new VFSEngine();
+var leaderInitialized = false;
+var readySent = false;
 var sab;
 var ctrl;
 var readySab;
@@ -1541,7 +1543,10 @@ async function leaderLoop() {
     } else {
       const currentSignal = Atomics.load(ctrl, 0);
       if (currentSignal !== SIGNAL.REQUEST) {
-        Atomics.wait(ctrl, 0, currentSignal, 50);
+        const result = Atomics.wait(ctrl, 0, currentSignal, 50);
+        if (result === "timed-out") {
+          await yieldToEventLoop();
+        }
       }
     }
   }
@@ -1568,7 +1573,10 @@ async function followerLoop() {
       }
       continue;
     }
-    Atomics.wait(ctrl, 0, SIGNAL.IDLE, 1);
+    const waitResult = Atomics.wait(ctrl, 0, SIGNAL.IDLE, 50);
+    if (waitResult === "timed-out") {
+      await yieldToEventLoop();
+    }
   }
 }
 async function initEngine(config) {
@@ -1591,6 +1599,9 @@ async function initEngine(config) {
 self.onmessage = async (e) => {
   const msg = e.data;
   if (msg.type === "init-leader") {
+    console.log("[sync-relay] init-leader received, leaderInitialized:", leaderInitialized);
+    if (leaderInitialized) return;
+    leaderInitialized = true;
     sab = msg.sab;
     readySab = msg.readySab;
     tabId = msg.tabId;
@@ -1601,17 +1612,25 @@ self.onmessage = async (e) => {
       asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
     }
     try {
+      console.log("[sync-relay] initializing engine...");
       await initEngine(msg.config);
+      console.log("[sync-relay] engine initialized successfully");
     } catch (err) {
+      leaderInitialized = false;
       self.postMessage({
         type: "init-failed",
         error: err.message
       });
       return;
     }
-    Atomics.store(readySignal, 0, 1);
-    Atomics.notify(readySignal, 0);
-    self.postMessage({ type: "ready" });
+    if (!readySent) {
+      readySent = true;
+      console.log("[sync-relay] sending ready signal");
+      Atomics.store(readySignal, 0, 1);
+      Atomics.notify(readySignal, 0);
+      self.postMessage({ type: "ready" });
+    }
+    console.log("[sync-relay] starting leader loop");
     leaderLoop();
     return;
   }
@@ -1628,13 +1647,27 @@ self.onmessage = async (e) => {
     return;
   }
   if (msg.type === "leader-port") {
-    leaderPort = msg.port ?? e.ports[0];
-    leaderPort.onmessage = onLeaderMessage;
-    leaderPort.start();
-    Atomics.store(readySignal, 0, 1);
-    Atomics.notify(readySignal, 0);
-    self.postMessage({ type: "ready" });
-    followerLoop();
+    if (leaderInitialized) return;
+    const newPort = msg.port ?? e.ports[0];
+    if (!newPort) return;
+    if (leaderPort) {
+      leaderPort.close();
+      if (pendingResolve) {
+        const errorBuf = encodeResponse(5);
+        pendingResolve(errorBuf);
+        pendingResolve = null;
+      }
+    }
+    leaderPort = newPort;
+    newPort.onmessage = onLeaderMessage;
+    newPort.start();
+    if (!readySent) {
+      readySent = true;
+      Atomics.store(readySignal, 0, 1);
+      Atomics.notify(readySignal, 0);
+      self.postMessage({ type: "ready" });
+      followerLoop();
+    }
     return;
   }
   if (msg.type === "client-port") {

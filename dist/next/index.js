@@ -1007,6 +1007,8 @@ var VFSFileSystem = class {
   swReg = null;
   isFollower = false;
   holdingLeaderLock = false;
+  brokerInitialized = false;
+  leaderChangeBc = null;
   // Bound request functions for method delegation
   _sync = (buf) => this.syncRequest(buf);
   _async = (op, p, flags, data, path2, fdArgs) => this.asyncRequest(op, p, flags, data, path2, fdArgs);
@@ -1045,6 +1047,7 @@ var VFSFileSystem = class {
       const msg = e.data;
       console.log("[VFS] syncWorker message:", msg.type);
       if (msg.type === "ready") {
+        console.log("[VFS] resolving readyPromise, isFollower:", this.isFollower);
         this.isReady = true;
         this.resolveReady();
         if (!this.isFollower) {
@@ -1052,10 +1055,8 @@ var VFSFileSystem = class {
         }
       } else if (msg.type === "init-failed") {
         if (this.holdingLeaderLock) {
-          console.warn("[VFS] init-leader failed despite holding lock, retrying...");
           setTimeout(() => this.sendLeaderInit(), 500);
         } else if (!("locks" in navigator)) {
-          console.warn("[VFS] Leader init failed (handle busy), falling back to follower");
           this.startAsFollower();
         }
       }
@@ -1081,18 +1082,25 @@ var VFSFileSystem = class {
    *  the leader; all others become followers. When the leader dies, the browser
    *  releases the lock and the next waiting tab is promoted. */
   acquireLeaderLock() {
+    console.log("[VFS] acquireLeaderLock called");
     if (!("locks" in navigator)) {
-      console.log("[VFS] No Web Locks API \u2014 starting as leader directly");
+      console.log("[VFS] no locks API \u2014 defaulting to leader");
       this.startAsLeader();
       return;
     }
+    let decided = false;
     navigator.locks.request("vfs-leader", { ifAvailable: true }, async (lock) => {
+      console.log("[VFS] lock callback fired, decided:", decided, "lock:", !!lock);
+      if (decided) return;
+      decided = true;
       if (lock) {
         this.holdingLeaderLock = true;
+        console.log("[VFS] starting as leader");
         this.startAsLeader();
         await new Promise(() => {
         });
       } else {
+        console.log("[VFS] starting as follower");
         this.startAsFollower();
         this.waitForLeaderLock();
       }
@@ -1129,7 +1137,6 @@ var VFSFileSystem = class {
   }
   /** Start as leader — tell sync-relay to init VFS engine + OPFS handle */
   startAsLeader() {
-    console.log("[VFS] startAsLeader() \u2014 sending init-leader to sync worker");
     this.isFollower = false;
     this.sendLeaderInit();
   }
@@ -1143,6 +1150,17 @@ var VFSFileSystem = class {
       asyncSab: this.asyncSab,
       tabId: this.tabId
     });
+    this.connectToLeader();
+    this.leaderChangeBc = new BroadcastChannel("vfs-leader-change");
+    this.leaderChangeBc.onmessage = () => {
+      if (this.isFollower) {
+        console.log("[VFS] Leader changed \u2014 reconnecting");
+        this.connectToLeader();
+      }
+    };
+  }
+  /** Send a new port to sync-relay for connecting to the current leader */
+  connectToLeader() {
     this.getServiceWorker().then((sw) => {
       const mc = new MessageChannel();
       sw.postMessage({ type: "transfer-port", tabId: this.tabId }, [mc.port2]);
@@ -1151,7 +1169,7 @@ var VFSFileSystem = class {
         [mc.port1]
       );
     }).catch((err) => {
-      console.error("[VFS] Failed to init follower mode:", err.message);
+      console.error("[VFS] Failed to connect to leader:", err.message);
     });
   }
   /** Register the VFS service worker and return the active SW */
@@ -1179,6 +1197,8 @@ var VFSFileSystem = class {
   }
   /** Register as leader with SW broker (receives follower ports via control channel) */
   initLeaderBroker() {
+    if (this.brokerInitialized) return;
+    this.brokerInitialized = true;
     this.getServiceWorker().then((sw) => {
       const mc = new MessageChannel();
       sw.postMessage({ type: "register-server" }, [mc.port2]);
@@ -1194,6 +1214,9 @@ var VFSFileSystem = class {
         }
       };
       mc.port1.start();
+      const bc = new BroadcastChannel("vfs-leader-change");
+      bc.postMessage({ type: "leader-changed" });
+      bc.close();
     }).catch((err) => {
       console.warn("[VFS] SW broker unavailable, single-tab only:", err.message);
     });
@@ -1202,6 +1225,11 @@ var VFSFileSystem = class {
   promoteToLeader() {
     this.isFollower = false;
     this.isReady = false;
+    this.brokerInitialized = false;
+    if (this.leaderChangeBc) {
+      this.leaderChangeBc.close();
+      this.leaderChangeBc = null;
+    }
     this.readyPromise = new Promise((resolve2) => {
       this.resolveReady = resolve2;
     });
@@ -1598,12 +1626,15 @@ var VFSPromises = class {
 function createFS(config) {
   return new VFSFileSystem(config);
 }
-function init() {
-  return fs.init();
+var _defaultFS;
+function getDefaultFS() {
+  if (!_defaultFS) _defaultFS = new VFSFileSystem();
+  return _defaultFS;
 }
-var fs = new VFSFileSystem();
-var index_default = fs;
+function init() {
+  return getDefaultFS().init();
+}
 
-export { FSError, VFSFileSystem, constants, createError, createFS, index_default as default, fs, init, path_exports as path, statusToError };
+export { FSError, VFSFileSystem, constants, createError, createFS, getDefaultFS, init, path_exports as path, statusToError };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map

@@ -158,6 +158,10 @@
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #28a745, #20c997);"></div> OPFS Tier 1 Sync (Worker + Atomics)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #17a2b8, #20c997);"></div> OPFS Tier 1 Promises (Worker + fastCall)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #007bff, #00d4ff);"></div> OPFS Tier 2 (Main Thread Promises)</div>
+    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #6f42c1, #a855f7);"></div> VFS Sync (SAB + Atomics.wait)</div>
+    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #d63384, #e879a8);"></div> VFS Promises (async relay)</div>
+    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #ff4757, #ff6b81);"></div> Future Sync (nodecontainer FS)</div>
+    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #ffa502, #ffbe76);"></div> Future Promises (nodecontainer FS)</div>
   </div>
 
   <h2>Results</h2>
@@ -193,6 +197,10 @@
     let fs, fsTier2, LightningFS, ComponentorFS, componentorFs, git, http;
     let tier1WorkerReady = false;
     let tier1Worker = null;
+    let vfs = null;
+    let vfsReady = false;
+    let futureFs = null;
+    let futureReady = false;
 
     // Small test repo URL - using GitHub's official example repository
     // This is tiny (just a README) and guaranteed to be public
@@ -345,6 +353,75 @@
         }
       } else {
         log('Tier 1 unavailable (not crossOriginIsolated)', 'info');
+      }
+
+      // Clean corrupted VFS binaries from OPFS before init
+      // VFS next/ stores .vfs.bin inside the root subdir (e.g. opfs/vfs-bench/.vfs.bin)
+      try {
+        const opfsRoot = await navigator.storage.getDirectory();
+        // Clean root-level VFS files (used by future/)
+        for await (const [name] of opfsRoot.entries()) {
+          if (name.startsWith('.vfs')) {
+            await opfsRoot.removeEntry(name);
+            log(`Removed stale OPFS file: ${name}`, 'info');
+          }
+        }
+        // Clean VFS binary inside vfs-bench subdir (used by next/)
+        try {
+          const vfsBenchDir = await opfsRoot.getDirectoryHandle('vfs-bench');
+          await vfsBenchDir.removeEntry('.vfs.bin');
+          log('Removed stale OPFS file: vfs-bench/.vfs.bin', 'info');
+        } catch (e) {} // dir or file doesn't exist — fine
+      } catch (e) {}
+
+      // Initialize VFS (next/ implementation)
+      if (crossOriginIsolated) {
+        log('Initializing VFS...', 'info');
+        try {
+          const vfsModule = await import('/next/index.js');
+          vfs = new vfsModule.VFSFileSystem({ root: '/vfs-bench' });
+          console.log('[benchmark] awaiting vfs.init()...');
+          await Promise.race([
+            vfs.init(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('VFS init timeout (10s) - check browser console for [VFS] Sync-relay init failed')), 10000))
+          ]);
+          console.log('[benchmark] vfs.init() resolved! Starting cleanup...');
+          log('VFS init done, cleaning up...', 'info');
+          // Clean up stale state from previous benchmark runs
+          const vfsDirs = ['/bench-vfs', '/bench-vfs-p', '/bench-vfs-read', '/bench-vfs-read-p',
+            '/bench-vfs-large', '/bench-vfs-large-p', '/bench-vfs-batch', '/bench-vfs-batch-p',
+            '/bench-vfs-batch-read', '/bench-vfs-batch-read-p', '/git-bench-vfs', '/git-status-vfs'];
+          for (const d of vfsDirs) {
+            try { await vfs.promises.rm(d, { recursive: true, force: true }); } catch {}
+          }
+          console.log('[benchmark] cleanup done');
+          vfsReady = true;
+          log('VFS ready', 'success');
+        } catch (e) {
+          log('VFS init failed: ' + e.message, 'error');
+        }
+      }
+
+      // Initialize Future FS (nodecontainer FS)
+      if (crossOriginIsolated) {
+        log('Initializing Future FS...', 'info');
+        try {
+          const futureModule = await import('/future/fs.polyfill.js');
+          futureFs = futureModule.default;
+          await futureFs.init();
+          // Clean up stale state from previous runs
+          const futureDirs = ['/bench-future', '/bench-future-p', '/bench-future-read', '/bench-future-read-p',
+            '/bench-future-large', '/bench-future-large-p', '/bench-future-batch', '/bench-future-batch-p',
+            '/bench-future-batch-read', '/bench-future-batch-read-p', '/git-bench-future', '/git-status-future'];
+          for (const d of futureDirs) {
+            try { futureFs.rmSync(d, { recursive: true, force: true }); } catch {}
+          }
+          futureReady = true;
+          log('Future FS ready', 'success');
+        } catch (e) {
+          log('Future FS init failed: ' + e.message, 'error');
+          console.error('Future FS init error:', e);
+        }
       }
     }
 
@@ -500,6 +577,66 @@
         log(`OPFS Tier 1 Promises: N/A`, 'info');
       }
 
+      // VFS Sync (SAB + Atomics.wait)
+      if (vfsReady) {
+        log(`Testing VFS Sync write (${iterations} x ${fileSize} bytes)...`, 'info');
+        vfs.mkdirSync('/bench-vfs', { recursive: true });
+        const startVS = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          vfs.writeFileSync(`/bench-vfs/write-${i}.bin`, data);
+        }
+        results.vfsSync = performance.now() - startVS;
+        vfs.rmSync('/bench-vfs', { recursive: true, force: true });
+        log(`VFS Sync: ${results.vfsSync.toFixed(2)}ms`, 'success');
+      } else {
+        results.vfsSync = null;
+      }
+
+      // VFS Promises (async relay)
+      if (vfsReady) {
+        log(`Testing VFS Promises write (${iterations} x ${fileSize} bytes)...`, 'info');
+        await vfs.promises.mkdir('/bench-vfs-p', { recursive: true });
+        const startVP = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          await vfs.promises.writeFile(`/bench-vfs-p/write-${i}.bin`, data);
+        }
+        results.vfsPromises = performance.now() - startVP;
+        await vfs.promises.rm('/bench-vfs-p', { recursive: true, force: true });
+        log(`VFS Promises: ${results.vfsPromises.toFixed(2)}ms`, 'success');
+      } else {
+        results.vfsPromises = null;
+      }
+
+      // Future Sync (nodecontainer FS)
+      if (futureReady) {
+        log(`Testing Future Sync write (${iterations} x ${fileSize} bytes)...`, 'info');
+        futureFs.mkdirSync('/bench-future', { recursive: true });
+        const startFS = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          futureFs.writeFileSync(`/bench-future/write-${i}.bin`, data);
+        }
+        results.futureSync = performance.now() - startFS;
+        futureFs.rmSync('/bench-future', { recursive: true, force: true });
+        log(`Future Sync: ${results.futureSync.toFixed(2)}ms`, 'success');
+      } else {
+        results.futureSync = null;
+      }
+
+      // Future Promises (nodecontainer FS)
+      if (futureReady) {
+        log(`Testing Future Promises write (${iterations} x ${fileSize} bytes)...`, 'info');
+        await futureFs.promises.mkdir('/bench-future-p', { recursive: true });
+        const startFP = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          await futureFs.promises.writeFile(`/bench-future-p/write-${i}.bin`, data);
+        }
+        results.futurePromises = performance.now() - startFP;
+        await futureFs.promises.rm('/bench-future-p', { recursive: true, force: true });
+        log(`Future Promises: ${results.futurePromises.toFixed(2)}ms`, 'success');
+      } else {
+        results.futurePromises = null;
+      }
+
       return { ...results, iterations, fileSize, operation: 'write' };
     }
 
@@ -574,6 +711,78 @@
         log(`OPFS Tier 1 Promises: N/A`, 'info');
       }
 
+      // VFS Sync (SAB + Atomics.wait)
+      if (vfsReady) {
+        log(`Testing VFS Sync read (${iterations} x ${fileSize} bytes)...`, 'info');
+        vfs.mkdirSync('/bench-vfs-read', { recursive: true });
+        for (let i = 0; i < iterations; i++) {
+          vfs.writeFileSync(`/bench-vfs-read/read-${i}.bin`, data);
+        }
+        const startVS = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          vfs.readFileSync(`/bench-vfs-read/read-${i}.bin`);
+        }
+        results.vfsSync = performance.now() - startVS;
+        vfs.rmSync('/bench-vfs-read', { recursive: true, force: true });
+        log(`VFS Sync: ${results.vfsSync.toFixed(2)}ms`, 'success');
+      } else {
+        results.vfsSync = null;
+      }
+
+      // VFS Promises (async relay)
+      if (vfsReady) {
+        log(`Testing VFS Promises read (${iterations} x ${fileSize} bytes)...`, 'info');
+        await vfs.promises.mkdir('/bench-vfs-read-p', { recursive: true });
+        for (let i = 0; i < iterations; i++) {
+          await vfs.promises.writeFile(`/bench-vfs-read-p/read-${i}.bin`, data);
+        }
+        const startVP = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          await vfs.promises.readFile(`/bench-vfs-read-p/read-${i}.bin`);
+        }
+        results.vfsPromises = performance.now() - startVP;
+        await vfs.promises.rm('/bench-vfs-read-p', { recursive: true, force: true });
+        log(`VFS Promises: ${results.vfsPromises.toFixed(2)}ms`, 'success');
+      } else {
+        results.vfsPromises = null;
+      }
+
+      // Future Sync read
+      if (futureReady) {
+        log(`Testing Future Sync read (${iterations} x ${fileSize} bytes)...`, 'info');
+        futureFs.mkdirSync('/bench-future-read', { recursive: true });
+        for (let i = 0; i < iterations; i++) {
+          futureFs.writeFileSync(`/bench-future-read/read-${i}.bin`, data);
+        }
+        const startFS = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          futureFs.readFileSync(`/bench-future-read/read-${i}.bin`);
+        }
+        results.futureSync = performance.now() - startFS;
+        futureFs.rmSync('/bench-future-read', { recursive: true, force: true });
+        log(`Future Sync: ${results.futureSync.toFixed(2)}ms`, 'success');
+      } else {
+        results.futureSync = null;
+      }
+
+      // Future Promises read
+      if (futureReady) {
+        log(`Testing Future Promises read (${iterations} x ${fileSize} bytes)...`, 'info');
+        await futureFs.promises.mkdir('/bench-future-read-p', { recursive: true });
+        for (let i = 0; i < iterations; i++) {
+          await futureFs.promises.writeFile(`/bench-future-read-p/read-${i}.bin`, data);
+        }
+        const startFP = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          await futureFs.promises.readFile(`/bench-future-read-p/read-${i}.bin`);
+        }
+        results.futurePromises = performance.now() - startFP;
+        await futureFs.promises.rm('/bench-future-read-p', { recursive: true, force: true });
+        log(`Future Promises: ${results.futurePromises.toFixed(2)}ms`, 'success');
+      } else {
+        results.futurePromises = null;
+      }
+
       return { ...results, iterations, fileSize, operation: 'read' };
     }
 
@@ -632,6 +841,66 @@
         log(`OPFS Tier 1 Promises: N/A`, 'info');
       }
 
+      // VFS Sync (SAB + Atomics.wait) for large files
+      if (vfsReady) {
+        log(`Testing VFS Sync large write (${iterations} x ${fileSizeMB}MB)...`, 'info');
+        vfs.mkdirSync('/bench-vfs-large', { recursive: true });
+        const startVS = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          vfs.writeFileSync(`/bench-vfs-large/large-${i}.bin`, data);
+        }
+        results.vfsSync = performance.now() - startVS;
+        vfs.rmSync('/bench-vfs-large', { recursive: true, force: true });
+        log(`VFS Sync: ${results.vfsSync.toFixed(2)}ms`, 'success');
+      } else {
+        results.vfsSync = null;
+      }
+
+      // VFS Promises for large files
+      if (vfsReady) {
+        log(`Testing VFS Promises large write (${iterations} x ${fileSizeMB}MB)...`, 'info');
+        await vfs.promises.mkdir('/bench-vfs-large-p', { recursive: true });
+        const startVP = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          await vfs.promises.writeFile(`/bench-vfs-large-p/large-${i}.bin`, data);
+        }
+        results.vfsPromises = performance.now() - startVP;
+        await vfs.promises.rm('/bench-vfs-large-p', { recursive: true, force: true });
+        log(`VFS Promises: ${results.vfsPromises.toFixed(2)}ms`, 'success');
+      } else {
+        results.vfsPromises = null;
+      }
+
+      // Future Sync large write
+      if (futureReady) {
+        log(`Testing Future Sync large write (${iterations} x ${fileSizeMB}MB)...`, 'info');
+        futureFs.mkdirSync('/bench-future-large', { recursive: true });
+        const startFS = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          futureFs.writeFileSync(`/bench-future-large/large-${i}.bin`, data);
+        }
+        results.futureSync = performance.now() - startFS;
+        futureFs.rmSync('/bench-future-large', { recursive: true, force: true });
+        log(`Future Sync: ${results.futureSync.toFixed(2)}ms`, 'success');
+      } else {
+        results.futureSync = null;
+      }
+
+      // Future Promises large write
+      if (futureReady) {
+        log(`Testing Future Promises large write (${iterations} x ${fileSizeMB}MB)...`, 'info');
+        await futureFs.promises.mkdir('/bench-future-large-p', { recursive: true });
+        const startFP = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          await futureFs.promises.writeFile(`/bench-future-large-p/large-${i}.bin`, data);
+        }
+        results.futurePromises = performance.now() - startFP;
+        await futureFs.promises.rm('/bench-future-large-p', { recursive: true, force: true });
+        log(`Future Promises: ${results.futurePromises.toFixed(2)}ms`, 'success');
+      } else {
+        results.futurePromises = null;
+      }
+
       return { ...results, iterations, fileSize, fileSizeMB, operation: 'large-write' };
     }
 
@@ -688,6 +957,66 @@
         log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
       } else {
         log(`OPFS Tier 1 Promises: N/A`, 'info');
+      }
+
+      // VFS Sync batch write
+      if (vfsReady) {
+        log(`Testing VFS Sync batch write (${iterations} x ${fileSize} bytes)...`, 'info');
+        vfs.mkdirSync('/bench-vfs-batch', { recursive: true });
+        const startVS = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          vfs.writeFileSync(`/bench-vfs-batch/batch-${i}.bin`, data);
+        }
+        results.vfsSync = performance.now() - startVS;
+        vfs.rmSync('/bench-vfs-batch', { recursive: true, force: true });
+        log(`VFS Sync: ${results.vfsSync.toFixed(2)}ms`, 'success');
+      } else {
+        results.vfsSync = null;
+      }
+
+      // VFS Promises batch write
+      if (vfsReady) {
+        log(`Testing VFS Promises batch write (${iterations} x ${fileSize} bytes)...`, 'info');
+        await vfs.promises.mkdir('/bench-vfs-batch-p', { recursive: true });
+        const startVP = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          await vfs.promises.writeFile(`/bench-vfs-batch-p/batch-${i}.bin`, data);
+        }
+        results.vfsPromises = performance.now() - startVP;
+        await vfs.promises.rm('/bench-vfs-batch-p', { recursive: true, force: true });
+        log(`VFS Promises: ${results.vfsPromises.toFixed(2)}ms`, 'success');
+      } else {
+        results.vfsPromises = null;
+      }
+
+      // Future Sync batch write
+      if (futureReady) {
+        log(`Testing Future Sync batch write (${iterations} x ${fileSize} bytes)...`, 'info');
+        futureFs.mkdirSync('/bench-future-batch', { recursive: true });
+        const startFS = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          futureFs.writeFileSync(`/bench-future-batch/batch-${i}.bin`, data);
+        }
+        results.futureSync = performance.now() - startFS;
+        futureFs.rmSync('/bench-future-batch', { recursive: true, force: true });
+        log(`Future Sync: ${results.futureSync.toFixed(2)}ms`, 'success');
+      } else {
+        results.futureSync = null;
+      }
+
+      // Future Promises batch write
+      if (futureReady) {
+        log(`Testing Future Promises batch write (${iterations} x ${fileSize} bytes)...`, 'info');
+        await futureFs.promises.mkdir('/bench-future-batch-p', { recursive: true });
+        const startFP = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          await futureFs.promises.writeFile(`/bench-future-batch-p/batch-${i}.bin`, data);
+        }
+        results.futurePromises = performance.now() - startFP;
+        await futureFs.promises.rm('/bench-future-batch-p', { recursive: true, force: true });
+        log(`Future Promises: ${results.futurePromises.toFixed(2)}ms`, 'success');
+      } else {
+        results.futurePromises = null;
       }
 
       return { ...results, iterations, fileSize, operation: 'batch-write' };
@@ -763,6 +1092,78 @@
         log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
       } else {
         log(`OPFS Tier 1 Promises: N/A`, 'info');
+      }
+
+      // VFS Sync batch read
+      if (vfsReady) {
+        log(`Testing VFS Sync batch read (${iterations} x ${fileSize} bytes)...`, 'info');
+        vfs.mkdirSync('/bench-vfs-batch-read', { recursive: true });
+        for (let i = 0; i < iterations; i++) {
+          vfs.writeFileSync(`/bench-vfs-batch-read/batch-${i}.bin`, data);
+        }
+        const startVS = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          vfs.readFileSync(`/bench-vfs-batch-read/batch-${i}.bin`);
+        }
+        results.vfsSync = performance.now() - startVS;
+        vfs.rmSync('/bench-vfs-batch-read', { recursive: true, force: true });
+        log(`VFS Sync: ${results.vfsSync.toFixed(2)}ms`, 'success');
+      } else {
+        results.vfsSync = null;
+      }
+
+      // VFS Promises batch read
+      if (vfsReady) {
+        log(`Testing VFS Promises batch read (${iterations} x ${fileSize} bytes)...`, 'info');
+        await vfs.promises.mkdir('/bench-vfs-batch-read-p', { recursive: true });
+        for (let i = 0; i < iterations; i++) {
+          await vfs.promises.writeFile(`/bench-vfs-batch-read-p/batch-${i}.bin`, data);
+        }
+        const startVP = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          await vfs.promises.readFile(`/bench-vfs-batch-read-p/batch-${i}.bin`);
+        }
+        results.vfsPromises = performance.now() - startVP;
+        await vfs.promises.rm('/bench-vfs-batch-read-p', { recursive: true, force: true });
+        log(`VFS Promises: ${results.vfsPromises.toFixed(2)}ms`, 'success');
+      } else {
+        results.vfsPromises = null;
+      }
+
+      // Future Sync batch read
+      if (futureReady) {
+        log(`Testing Future Sync batch read (${iterations} x ${fileSize} bytes)...`, 'info');
+        futureFs.mkdirSync('/bench-future-batch-read', { recursive: true });
+        for (let i = 0; i < iterations; i++) {
+          futureFs.writeFileSync(`/bench-future-batch-read/batch-${i}.bin`, data);
+        }
+        const startFS = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          futureFs.readFileSync(`/bench-future-batch-read/batch-${i}.bin`);
+        }
+        results.futureSync = performance.now() - startFS;
+        futureFs.rmSync('/bench-future-batch-read', { recursive: true, force: true });
+        log(`Future Sync: ${results.futureSync.toFixed(2)}ms`, 'success');
+      } else {
+        results.futureSync = null;
+      }
+
+      // Future Promises batch read
+      if (futureReady) {
+        log(`Testing Future Promises batch read (${iterations} x ${fileSize} bytes)...`, 'info');
+        await futureFs.promises.mkdir('/bench-future-batch-read-p', { recursive: true });
+        for (let i = 0; i < iterations; i++) {
+          await futureFs.promises.writeFile(`/bench-future-batch-read-p/batch-${i}.bin`, data);
+        }
+        const startFP = performance.now();
+        for (let i = 0; i < iterations; i++) {
+          await futureFs.promises.readFile(`/bench-future-batch-read-p/batch-${i}.bin`);
+        }
+        results.futurePromises = performance.now() - startFP;
+        await futureFs.promises.rm('/bench-future-batch-read-p', { recursive: true, force: true });
+        log(`Future Promises: ${results.futurePromises.toFixed(2)}ms`, 'success');
+      } else {
+        results.futurePromises = null;
       }
 
       return { ...results, iterations, fileSize, operation: 'batch-read' };
@@ -892,6 +1293,70 @@
       // Tier 1 Sync not applicable (git requires async)
       results.tier1 = null;
 
+      // VFS Sync not applicable (git requires async)
+      results.vfsSync = null;
+
+      // VFS Promises git clone
+      if (vfsReady) {
+        log(`Testing VFS Promises git clone...`, 'info');
+        const vfsGitFs = createOpfsGitFs(vfs);
+        try { await vfs.promises.rm('/git-bench-vfs', { recursive: true, force: true }); } catch {}
+        await vfs.promises.mkdir('/git-bench-vfs', { recursive: true });
+        const startVP = performance.now();
+        try {
+          await git.clone({
+            fs: vfsGitFs,
+            http,
+            dir: '/git-bench-vfs',
+            url: repoUrl,
+            corsProxy,
+            singleBranch: true,
+            depth: 1,
+            onMessage: (msg) => log(`[git VFS] ${msg}`, 'info'),
+          });
+          results.vfsPromises = performance.now() - startVP;
+          log(`VFS Promises: ${results.vfsPromises.toFixed(2)}ms`, 'success');
+        } catch (e) {
+          log(`VFS Promises git clone failed: ${e.message}`, 'error');
+          results.vfsPromises = null;
+        }
+        try { await vfs.promises.rm('/git-bench-vfs', { recursive: true, force: true }); } catch {}
+      } else {
+        results.vfsPromises = null;
+      }
+
+      // Future Sync not applicable (git requires async)
+      results.futureSync = null;
+
+      // Future Promises git clone
+      if (futureReady) {
+        log(`Testing Future Promises git clone...`, 'info');
+        const futureGitFs = createOpfsGitFs({ promises: futureFs.promises });
+        try { futureFs.rmSync('/git-bench-future', { recursive: true, force: true }); } catch {}
+        futureFs.mkdirSync('/git-bench-future', { recursive: true });
+        const startFP = performance.now();
+        try {
+          await git.clone({
+            fs: futureGitFs,
+            http,
+            dir: '/git-bench-future',
+            url: repoUrl,
+            corsProxy,
+            singleBranch: true,
+            depth: 1,
+            onMessage: (msg) => log(`[git Future] ${msg}`, 'info'),
+          });
+          results.futurePromises = performance.now() - startFP;
+          log(`Future Promises: ${results.futurePromises.toFixed(2)}ms`, 'success');
+        } catch (e) {
+          log(`Future Promises git clone failed: ${e.message}`, 'error');
+          results.futurePromises = null;
+        }
+        try { futureFs.rmSync('/git-bench-future', { recursive: true, force: true }); } catch {}
+      } else {
+        results.futurePromises = null;
+      }
+
       return { ...results, iterations: 1, fileSize: 0, operation: 'git-clone' };
     }
 
@@ -918,7 +1383,7 @@
         });
       } catch (e) {
         log(`LightningFS clone for status failed: ${e.message}`, 'error');
-        return { lightning: null, tier1: null, tier1Promises: null, tier2: null, iterations, fileSize: 0, operation: 'git-status' };
+        return { lightning: null, tier1: null, tier1Promises: null, tier2: null, vfsSync: null, vfsPromises: null, iterations, fileSize: 0, operation: 'git-status' };
       }
 
       // OPFS Tier 1 Promises setup
@@ -937,7 +1402,7 @@
         });
       } catch (e) {
         log(`OPFS Tier 1 Promises clone for status failed: ${e.message}`, 'error');
-        return { lightning: null, tier1: null, tier1Promises: null, tier2: null, iterations, fileSize: 0, operation: 'git-status' };
+        return { lightning: null, tier1: null, tier1Promises: null, tier2: null, vfsSync: null, vfsPromises: null, iterations, fileSize: 0, operation: 'git-status' };
       }
 
       // OPFS Tier 2 setup
@@ -1031,6 +1496,74 @@
       // Tier 1 Sync not applicable (git requires async)
       results.tier1 = null;
 
+      // VFS Sync not applicable (git requires async)
+      results.vfsSync = null;
+
+      // VFS Promises git status
+      if (vfsReady) {
+        const vfsGitFs = createOpfsGitFs(vfs);
+        try { await vfs.promises.rm('/git-status-vfs', { recursive: true, force: true }); } catch {}
+        await vfs.promises.mkdir('/git-status-vfs', { recursive: true });
+        try {
+          await git.clone({
+            fs: vfsGitFs,
+            http,
+            dir: '/git-status-vfs',
+            url: repoUrl,
+            corsProxy,
+            singleBranch: true,
+            depth: 1,
+          });
+          log(`Testing VFS Promises git status (${iterations}x)...`, 'info');
+          const startVP = performance.now();
+          for (let i = 0; i < iterations; i++) {
+            await git.statusMatrix({ fs: vfsGitFs, dir: '/git-status-vfs' });
+          }
+          results.vfsPromises = performance.now() - startVP;
+          log(`VFS Promises: ${results.vfsPromises.toFixed(2)}ms`, 'success');
+        } catch (e) {
+          log(`VFS Promises git status failed: ${e.message}`, 'error');
+          results.vfsPromises = null;
+        }
+        try { await vfs.promises.rm('/git-status-vfs', { recursive: true, force: true }); } catch {}
+      } else {
+        results.vfsPromises = null;
+      }
+
+      // Future Sync not applicable (git requires async)
+      results.futureSync = null;
+
+      // Future Promises git status
+      if (futureReady) {
+        const futureGitFs = createOpfsGitFs({ promises: futureFs.promises });
+        try { futureFs.rmSync('/git-status-future', { recursive: true, force: true }); } catch {}
+        futureFs.mkdirSync('/git-status-future', { recursive: true });
+        try {
+          await git.clone({
+            fs: futureGitFs,
+            http,
+            dir: '/git-status-future',
+            url: repoUrl,
+            corsProxy,
+            singleBranch: true,
+            depth: 1,
+          });
+          log(`Testing Future Promises git status (${iterations}x)...`, 'info');
+          const startFP = performance.now();
+          for (let i = 0; i < iterations; i++) {
+            await git.statusMatrix({ fs: futureGitFs, dir: '/git-status-future' });
+          }
+          results.futurePromises = performance.now() - startFP;
+          log(`Future Promises: ${results.futurePromises.toFixed(2)}ms`, 'success');
+        } catch (e) {
+          log(`Future Promises git status failed: ${e.message}`, 'error');
+          results.futurePromises = null;
+        }
+        try { futureFs.rmSync('/git-status-future', { recursive: true, force: true }); } catch {}
+      } else {
+        results.futurePromises = null;
+      }
+
       return { ...results, iterations, fileSize: 0, operation: 'git-status' };
     }
 
@@ -1038,7 +1571,7 @@
       const container = document.getElementById('results');
 
       let html = '<table><thead><tr>';
-      html += '<th>Test</th><th>LightningFS</th><th>@componentor/fs</th><th>Tier 1 Sync</th><th>Tier 1 Promises</th><th>Tier 2</th><th>Best</th>';
+      html += '<th>Test</th><th>LightningFS</th><th>@componentor/fs</th><th>Tier 1 Sync</th><th>Tier 1 Promises</th><th>Tier 2</th><th>VFS Sync</th><th>VFS Promises</th><th>Future Sync</th><th>Future Promises</th><th>Best</th>';
       html += '</tr></thead><tbody>';
 
       for (const result of allResults) {
@@ -1048,6 +1581,10 @@
           { name: 'Tier 1 Sync', ms: result.tier1, class: 'tier1' },
           { name: 'Tier 1 Promises', ms: result.tier1Promises, class: 'tier1' },
           { name: 'Tier 2', ms: result.tier2, class: 'tier2' },
+          { name: 'VFS Sync', ms: result.vfsSync, class: 'vfs' },
+          { name: 'VFS Promises', ms: result.vfsPromises, class: 'vfs' },
+          { name: 'Future Sync', ms: result.futureSync, class: 'future' },
+          { name: 'Future Promises', ms: result.futurePromises, class: 'future' },
         ].filter(v => v.ms !== null && v.ms !== undefined);
 
         const minMs = Math.min(...values.map(v => v.ms));
@@ -1128,6 +1665,50 @@
           html += '<td style="color:#999">N/A</td>';
         }
 
+        // VFS Sync
+        if (result.vfsSync !== null && result.vfsSync !== undefined) {
+          const vsPct = (result.vfsSync / maxMs * 100).toFixed(0);
+          const vsOps = result.iterations > 0 ? (result.iterations / result.vfsSync * 1000).toFixed(0) : '-';
+          html += `<td class="${result.vfsSync === minMs ? 'winner' : ''}">`;
+          html += `<div class="bar-container"><div class="bar" style="width: ${vsPct}%; background: linear-gradient(90deg, #6f42c1, #a855f7);"></div></div>`;
+          html += `${result.vfsSync.toFixed(1)}ms${vsOps !== '-' ? ` (${vsOps} ops/s)` : ''}</td>`;
+        } else {
+          html += '<td style="color:#999">N/A</td>';
+        }
+
+        // VFS Promises
+        if (result.vfsPromises !== null && result.vfsPromises !== undefined) {
+          const vpPct = (result.vfsPromises / maxMs * 100).toFixed(0);
+          const vpOps = result.iterations > 0 ? (result.iterations / result.vfsPromises * 1000).toFixed(0) : '-';
+          html += `<td class="${result.vfsPromises === minMs ? 'winner' : ''}">`;
+          html += `<div class="bar-container"><div class="bar" style="width: ${vpPct}%; background: linear-gradient(90deg, #d63384, #e879a8);"></div></div>`;
+          html += `${result.vfsPromises.toFixed(1)}ms${vpOps !== '-' ? ` (${vpOps} ops/s)` : ''}</td>`;
+        } else {
+          html += '<td style="color:#999">N/A</td>';
+        }
+
+        // Future Sync
+        if (result.futureSync !== null && result.futureSync !== undefined) {
+          const fsPct = (result.futureSync / maxMs * 100).toFixed(0);
+          const fsOps = result.iterations > 0 ? (result.iterations / result.futureSync * 1000).toFixed(0) : '-';
+          html += `<td class="${result.futureSync === minMs ? 'winner' : ''}">`;
+          html += `<div class="bar-container"><div class="bar" style="width: ${fsPct}%; background: linear-gradient(90deg, #ff4757, #ff6b81);"></div></div>`;
+          html += `${result.futureSync.toFixed(1)}ms${fsOps !== '-' ? ` (${fsOps} ops/s)` : ''}</td>`;
+        } else {
+          html += '<td style="color:#999">N/A</td>';
+        }
+
+        // Future Promises
+        if (result.futurePromises !== null && result.futurePromises !== undefined) {
+          const fpPct = (result.futurePromises / maxMs * 100).toFixed(0);
+          const fpOps = result.iterations > 0 ? (result.iterations / result.futurePromises * 1000).toFixed(0) : '-';
+          html += `<td class="${result.futurePromises === minMs ? 'winner' : ''}">`;
+          html += `<div class="bar-container"><div class="bar" style="width: ${fpPct}%; background: linear-gradient(90deg, #ffa502, #ffbe76);"></div></div>`;
+          html += `${result.futurePromises.toFixed(1)}ms${fpOps !== '-' ? ` (${fpOps} ops/s)` : ''}</td>`;
+        } else {
+          html += '<td style="color:#999">N/A</td>';
+        }
+
         // Winner
         if (winner && result.lightning) {
           const speedup = (result.lightning / minMs).toFixed(2);
@@ -1143,10 +1724,10 @@
       html += '</tbody></table>';
 
       // Summary
-      const validResults = allResults.filter(r => r.tier2 > 0 || (r.tier1 !== null && r.tier1 > 0) || (r.tier1Promises !== null && r.tier1Promises > 0));
+      const validResults = allResults.filter(r => r.tier2 > 0 || (r.tier1 !== null && r.tier1 > 0) || (r.tier1Promises !== null && r.tier1Promises > 0) || (r.vfsSync !== null && r.vfsSync > 0) || (r.vfsPromises !== null && r.vfsPromises > 0) || (r.futureSync !== null && r.futureSync > 0) || (r.futurePromises !== null && r.futurePromises > 0));
       const avgSpeedup = validResults.length > 0
         ? validResults.reduce((acc, r) => {
-            const best = Math.min(r.tier1 || Infinity, r.tier1Promises || Infinity, r.tier2 || Infinity);
+            const best = Math.min(r.tier1 || Infinity, r.tier1Promises || Infinity, r.tier2 || Infinity, r.vfsSync || Infinity, r.vfsPromises || Infinity, r.futureSync || Infinity, r.futurePromises || Infinity);
             if (!isFinite(best) || best <= 0 || !r.lightning) return acc;
             return acc + (r.lightning / best);
           }, 0) / validResults.filter(r => r.lightning > 0).length

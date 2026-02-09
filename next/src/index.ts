@@ -51,13 +51,16 @@ export function createFS(config?: import('./types.js').VFSConfig): VFSFileSystem
   return new VFSFileSystem(config);
 }
 
-/** Async init helper — avoids blocking main thread */
-export function init(): Promise<void> {
-  return fs.init();
+// Lazy default singleton — only created on first access
+let _defaultFS: VFSFileSystem | undefined;
+
+/** Get (or create) the default VFS singleton */
+export function getDefaultFS(): VFSFileSystem {
+  if (!_defaultFS) _defaultFS = new VFSFileSystem();
+  return _defaultFS;
 }
 
-// Default singleton instance
-export const fs = new VFSFileSystem();
-
-// Default export for convenience
-export default fs;
+/** Async init helper — avoids blocking main thread */
+export function init(): Promise<void> {
+  return getDefaultFS().init();
+}

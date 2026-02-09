@@ -25,7 +25,9 @@ import { SAB_OFFSETS, SIGNAL, OP, decodeRequest, decodeSecondPath, encodeRespons
 
 const engine = new VFSEngine();
 
-// Mode ('leader' set during init-leader, 'follower' during init-follower)
+// Guards: prevent duplicate init and double-ready
+let leaderInitialized = false;
+let readySent = false;
 
 // Own tab's sync SAB
 let sab: SharedArrayBuffer;
@@ -434,14 +436,17 @@ async function leaderLoop(): Promise<void> {
 
     // === All queues empty — wait for new work ===
     if (clientPorts.size > 0) {
-      // Clients connected: yield immediately to receive port messages (~0.1ms).
-      // No Atomics.wait — eliminates the 1ms dead-time per iteration.
+      // Clients connected: yield to receive port messages (~0.1ms)
       await yieldToEventLoop();
     } else {
-      // No clients: block until own SAB notification or timeout for new connections
+      // No clients: block until SAB notification or timeout
       const currentSignal = Atomics.load(ctrl, 0);
       if (currentSignal !== SIGNAL.REQUEST) {
-        Atomics.wait(ctrl, 0, currentSignal, 50);
+        const result = Atomics.wait(ctrl, 0, currentSignal, 50);
+        if (result === 'timed-out') {
+          // Idle — yield to process pending onmessage (e.g. client-port registration)
+          await yieldToEventLoop();
+        }
       }
     }
   }
@@ -477,8 +482,12 @@ async function followerLoop(): Promise<void> {
       continue;
     }
 
-    // Wait with timeout (to check both SABs)
-    Atomics.wait(ctrl, 0, SIGNAL.IDLE, 1);
+    // Wait for SAB notification or timeout; yield on idle to process onmessage
+    // (e.g. leader-port reconnection). Requests wake via Atomics.notify on ctrl.
+    const waitResult = Atomics.wait(ctrl, 0, SIGNAL.IDLE, 50);
+    if (waitResult === 'timed-out') {
+      await yieldToEventLoop();
+    }
   }
 }
 
@@ -522,6 +531,10 @@ self.onmessage = async (e: MessageEvent) => {
 
   // --- Leader mode init ---
   if (msg.type === 'init-leader') {
+    console.log('[sync-relay] init-leader received, leaderInitialized:', leaderInitialized);
+    if (leaderInitialized) return; // Prevent duplicate init during async gap
+    leaderInitialized = true;
+
     sab = msg.sab;
     readySab = msg.readySab;
     tabId = msg.tabId;
@@ -534,9 +547,12 @@ self.onmessage = async (e: MessageEvent) => {
     }
 
     try {
+      console.log('[sync-relay] initializing engine...');
       await initEngine(msg.config);
+      console.log('[sync-relay] engine initialized successfully');
     } catch (err) {
       // OPFS handle unavailable — tell main thread to fall back
+      leaderInitialized = false; // Allow retry
       (self as unknown as Worker).postMessage({
         type: 'init-failed',
         error: (err as Error).message,
@@ -545,11 +561,16 @@ self.onmessage = async (e: MessageEvent) => {
     }
 
     // Signal ready to main thread (SAB for sync callers, postMessage for async callers)
-    Atomics.store(readySignal, 0, 1);
-    Atomics.notify(readySignal, 0);
-    (self as unknown as Worker).postMessage({ type: 'ready' });
+    if (!readySent) {
+      readySent = true;
+      console.log('[sync-relay] sending ready signal');
+      Atomics.store(readySignal, 0, 1);
+      Atomics.notify(readySignal, 0);
+      (self as unknown as Worker).postMessage({ type: 'ready' });
+    }
 
     // Start leader loop (never returns)
+    console.log('[sync-relay] starting leader loop');
     leaderLoop();
     return;
   }
@@ -571,19 +592,38 @@ self.onmessage = async (e: MessageEvent) => {
     return;
   }
 
-  // --- Leader port (follower mode) ---
+  // --- Leader port (follower mode / reconnection) ---
   if (msg.type === 'leader-port') {
-    leaderPort = msg.port ?? e.ports[0];
-    leaderPort!.onmessage = onLeaderMessage;
-    leaderPort!.start();
+    // If already running as leader, ignore stale follower port
+    if (leaderInitialized) return;
 
-    // Signal ready via SAB (for sync callers blocking in spinWait)
-    Atomics.store(readySignal, 0, 1);
-    Atomics.notify(readySignal, 0);
-    // Signal ready via postMessage (for async callers awaiting readyPromise)
-    (self as unknown as Worker).postMessage({ type: 'ready' });
+    const newPort = msg.port ?? e.ports[0];
+    if (!newPort) return;
 
-    followerLoop();
+    // Reconnection: close old port and unblock any pending forwardToLeader()
+    if (leaderPort) {
+      leaderPort.close();
+      if (pendingResolve) {
+        // Resolve with EIO error response to unblock followerLoop
+        const errorBuf = encodeResponse(5); // EIO
+        pendingResolve(errorBuf);
+        pendingResolve = null;
+      }
+    }
+
+    leaderPort = newPort;
+    newPort.onmessage = onLeaderMessage;
+    newPort.start();
+
+    if (!readySent) {
+      // First time: signal ready and start follower loop
+      readySent = true;
+      Atomics.store(readySignal, 0, 1);
+      Atomics.notify(readySignal, 0);
+      (self as unknown as Worker).postMessage({ type: 'ready' });
+      followerLoop();
+    }
+    // If followerLoop is already running, it will pick up the new port on next iteration
     return;
   }
 
