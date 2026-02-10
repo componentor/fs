@@ -17,15 +17,92 @@ interface SyncEvent {
 let serverPort: MessagePort;
 let mirrorRoot: FileSystemDirectoryHandle;
 
-// Echo suppression: tracks our own writes to ignore observer callbacks
-const pendingOps = new Map<string, number>();
-const ECHO_WINDOW_MS = 500;
+// Normalize path: ensure leading /, collapse //, strip trailing /
+function normalizePath(p: string): string {
+  if (p.charCodeAt(0) !== 47) p = '/' + p;
+  if (p.length > 1 && p.charCodeAt(p.length - 1) === 47) p = p.slice(0, -1);
+  if (p.indexOf('//') !== -1) p = p.replace(/\/\/+/g, '/');
+  return p;
+}
+
+// Echo suppression — two structures:
+//
+// pendingPaths (Set): paths currently in the queue or being processed.
+//   Added on enqueue, removed after OPFS operation completes.
+//   No timeout — stays as long as the item is in the queue.
+//   Prevents false externals when queue takes >1s (e.g., 500-file batches).
+//
+// completedPaths (Map<path, timestamp>): paths recently written by us.
+//   Added when processing completes, removed ONLY by periodic cleanup.
+//   Grace window catches delayed/batched observer events after processing.
+//
+// Parent path check (opt-in): if /dir was deleted by us, /dir/file disappearing
+// is also our echo (recursive removeEntry fires per-child events).
+// ONLY used for 'disappeared' events — NOT for 'appeared'/'modified', since
+// creating /dir doesn't mean /dir/new-file appearing is our echo.
+
+const pendingPaths = new Set<string>();
+const completedPaths = new Map<string, number>();
+const GRACE_MS = 3000;
+
+function trackPending(path: string): void {
+  pendingPaths.add(normalizePath(path));
+}
+
+function untrackPending(path: string): void {
+  pendingPaths.delete(normalizePath(path));
+}
+
+function trackCompleted(path: string): void {
+  completedPaths.set(normalizePath(path), Date.now());
+}
+
+function isOurEcho(path: string, checkParents = false): boolean {
+  path = normalizePath(path);
+  const now = Date.now();
+
+  // Check exact path
+  if (pendingPaths.has(path)) return true;
+  const ts = completedPaths.get(path);
+  if (ts && now - ts < GRACE_MS) return true;
+
+  // Walk up parent paths — ONLY for 'disappeared' events.
+  // Handles recursive delete cascading: removeEntry(dir, {recursive:true})
+  // fires individual 'disappeared' for every child file.
+  // NOT used for 'appeared'/'modified' — a parent being tracked doesn't mean
+  // a new file appearing inside it is our echo (could be genuinely external).
+  if (checkParents) {
+    let parent = path;
+    while (true) {
+      const slash = parent.lastIndexOf('/');
+      if (slash <= 0) break;
+      parent = parent.substring(0, slash);
+      if (pendingPaths.has(parent)) return true;
+      const pts = completedPaths.get(parent);
+      if (pts && now - pts < GRACE_MS) return true;
+    }
+  }
+
+  return false;
+}
+
+// Periodic cleanup — the ONLY way completedPaths entries get removed
+setInterval(() => {
+  const cutoff = Date.now() - GRACE_MS;
+  for (const [p, ts] of completedPaths) {
+    if (ts < cutoff) completedPaths.delete(p);
+  }
+}, 5000);
 
 // Event queue — process one at a time, in order
 const queue: SyncEvent[] = [];
 let processing = false;
 
 function enqueue(event: SyncEvent): void {
+  trackPending(event.path);
+  if (event.op === 'rename' && event.newPath) {
+    trackPending(event.newPath);
+  }
   queue.push(event);
   if (!processing) processNext();
 }
@@ -38,12 +115,15 @@ async function processNext(): Promise<void> {
   processing = true;
 
   const event = queue.shift()!;
-  pendingOps.set(event.path, event.ts);
 
   try {
     switch (event.op) {
       case 'write':
-        await writeToOPFS(event.path, event.data!);
+        if (event.data && event.data.byteLength > 0) {
+          await writeToOPFS(event.path, event.data);
+        } else {
+          console.warn('[opfs-sync] write skipped — no data for:', event.path);
+        }
         break;
       case 'delete':
         await deleteFromOPFS(event.path);
@@ -55,8 +135,16 @@ async function processNext(): Promise<void> {
         await renameInOPFS(event.path, event.newPath!);
         break;
     }
-  } catch {
-    // Log but don't block queue — OPFS mirror is best-effort
+  } catch (err) {
+    console.warn('[opfs-sync] mirror failed:', event.op, event.path, err);
+  }
+
+  // Move from pending → completed (starts grace window for delayed observer events)
+  untrackPending(event.path);
+  trackCompleted(event.path);
+  if (event.op === 'rename' && event.newPath) {
+    untrackPending(event.newPath);
+    trackCompleted(event.newPath);
   }
 
   processNext();
@@ -80,13 +168,18 @@ function basename(path: string): string {
 
 async function writeToOPFS(path: string, data: ArrayBuffer): Promise<void> {
   const dir = await ensureParentDirs(path);
-  const fileHandle = await dir.getFileHandle(basename(path), { create: true });
-  const syncHandle = await fileHandle.createSyncAccessHandle();
-
-  syncHandle.truncate(0);
-  syncHandle.write(new Uint8Array(data), { at: 0 });
-  syncHandle.flush();
-  syncHandle.close();
+  const name = basename(path);
+  const fileHandle = await dir.getFileHandle(name, { create: true });
+  // Use createSyncAccessHandle for reliable writes in Worker context
+  // (createWritable can silently fail in nested workers for OPFS files)
+  const accessHandle = await fileHandle.createSyncAccessHandle();
+  try {
+    accessHandle.truncate(0);
+    accessHandle.write(new Uint8Array(data), { at: 0 });
+    accessHandle.flush();
+  } finally {
+    accessHandle.close();
+  }
 }
 
 async function deleteFromOPFS(path: string): Promise<void> {
@@ -116,15 +209,18 @@ async function renameInOPFS(oldPath: string, newPath: string): Promise<void> {
 
     const newDir = await ensureParentDirs(newPath);
     const newHandle = await newDir.getFileHandle(basename(newPath), { create: true });
-    const syncHandle = await newHandle.createSyncAccessHandle();
-    syncHandle.truncate(0);
-    syncHandle.write(new Uint8Array(data), { at: 0 });
-    syncHandle.flush();
-    syncHandle.close();
+    const accessHandle = await newHandle.createSyncAccessHandle();
+    try {
+      accessHandle.truncate(0);
+      accessHandle.write(new Uint8Array(data), { at: 0 });
+      accessHandle.flush();
+    } finally {
+      accessHandle.close();
+    }
 
     await oldDir.removeEntry(basename(oldPath));
-  } catch {
-    // Best-effort
+  } catch (err) {
+    console.warn('[opfs-sync] rename failed:', oldPath, '→', newPath, err);
   }
 }
 
@@ -142,22 +238,29 @@ async function navigateToParent(path: string): Promise<FileSystemDirectoryHandle
 // ========== FileSystemObserver for external changes ==========
 
 function setupObserver(): void {
-  if (typeof FileSystemObserver === 'undefined') return;
+  if (typeof FileSystemObserver === 'undefined') {
+    console.warn('[opfs-sync] FileSystemObserver not available — external changes will not be detected');
+    return;
+  }
+
+  console.log('[opfs-sync] Setting up FileSystemObserver on mirrorRoot:', mirrorRoot.name || '(opfs-root)');
 
   const observer = new FileSystemObserver((records) => {
+    //console.log(`[opfs-sync] observer fired: ${records.length} record(s), pending=${pendingPaths.size}, completed=${completedPaths.size}`);
     for (const record of records) {
-      const path = '/' + record.relativePathComponents.join('/');
+      const path = normalizePath('/' + record.relativePathComponents.join('/'));
 
-      // Skip VFS binary file
-      if (path === '/.vfs.bin' || path === '/.vfs') continue;
+      // Skip VFS binary file and internal files
+      if (path === '/.vfs.bin' || path === '/.vfs' || path.startsWith('/.vfs')) continue;
 
-      // Echo suppression
-      const pendingTs = pendingOps.get(path);
-      if (pendingTs && Date.now() - pendingTs < ECHO_WINDOW_MS) {
-        pendingOps.delete(path);
+      // Echo suppression — check parents only for 'disappeared' (recursive delete cascading)
+      const isDelete = record.type === 'disappeared';
+      if (isOurEcho(path, isDelete)) {
+        //console.log('[opfs-sync] suppressed (echo):', record.type, path);
         continue;
       }
 
+      //console.log('[opfs-sync] external:', record.type, path);
       switch (record.type) {
         case 'appeared':
         case 'modified':
@@ -166,12 +269,12 @@ function setupObserver(): void {
         case 'disappeared':
           syncExternalDelete(path);
           break;
-        case 'moved':
-          syncExternalRename(
-            '/' + record.relativePathMovedFrom!.join('/'),
-            path
-          );
+        case 'moved': {
+          const from = normalizePath('/' + record.relativePathMovedFrom!.join('/'));
+          //console.log('[opfs-sync] external: moved from', from, '→', path);
+          syncExternalRename(from, path);
           break;
+        }
       }
     }
   });
@@ -180,18 +283,24 @@ function setupObserver(): void {
 }
 
 async function syncExternalChange(path: string, handle: FileSystemHandle | null): Promise<void> {
-  if (!handle || handle.kind !== 'file') return;
+  try {
+    if (!handle || handle.kind !== 'file') return;
 
-  const fileHandle = handle as FileSystemFileHandle;
-  const file = await fileHandle.getFile();
-  const data = await file.arrayBuffer();
+    const fileHandle = handle as FileSystemFileHandle;
+    const file = await fileHandle.getFile();
+    const data = await file.arrayBuffer();
 
-  serverPort.postMessage({
-    op: 'external-write',
-    path,
-    data,
-    ts: Date.now(),
-  }, [data]);
+    serverPort.postMessage({
+      op: 'external-write',
+      path,
+      data,
+      ts: Date.now(),
+    }, [data]);
+  } catch (err) {
+    // File may have been deleted between observer event and our read, or
+    // a sync access handle may be holding the lock — either is fine to skip
+    console.warn('[opfs-sync] external change read failed:', path, err);
+  }
 }
 
 function syncExternalDelete(path: string): void {
@@ -227,6 +336,8 @@ self.onmessage = async (e: MessageEvent) => {
         mirrorRoot = await mirrorRoot.getDirectoryHandle(segment, { create: true });
       }
     }
+
+    console.log('[opfs-sync] initialized with root:', msg.root || '/', 'mirrorRoot.name:', mirrorRoot.name || '(opfs-root)');
 
     // Set up FileSystemObserver
     setupObserver();

@@ -1484,6 +1484,14 @@ export class VFSEngine {
     return files;
   }
 
+  /** Get file path for a file descriptor (used by OPFS sync for FD-based ops) */
+  getPathForFd(fd: number): string | null {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return null;
+    const inode = this.readInode(entry.inodeIdx);
+    return this.readPath(inode.pathOffset, inode.pathLength);
+  }
+
   /** Get file data by inode index */
   getInodeData(idx: number): { type: number; data: Uint8Array; mtime: number } {
     const inode = this.readInode(idx);

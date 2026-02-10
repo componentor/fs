@@ -98,7 +98,7 @@ export class VFSFileSystem {
   private isReady = false;
 
   // Config
-  private config: Required<VFSConfig>;
+  private config: Omit<Required<VFSConfig>, 'opfsSyncRoot'> & { opfsSyncRoot?: string };
   private tabId: string;
 
   // Service worker registration for multi-tab port transfer
@@ -120,7 +120,7 @@ export class VFSFileSystem {
     this.config = {
       root: config.root ?? '/',
       opfsSync: config.opfsSync ?? true,
-      opfsSyncRoot: config.opfsSyncRoot ?? '/',
+      opfsSyncRoot: config.opfsSyncRoot,
       uid: config.uid ?? 0,
       gid: config.gid ?? 0,
       umask: config.umask ?? 0o022,
@@ -257,6 +257,7 @@ export class VFSFileSystem {
       config: {
         root: this.config.root,
         opfsSync: this.config.opfsSync,
+        opfsSyncRoot: this.config.opfsSyncRoot,
         uid: this.config.uid,
         gid: this.config.gid,
         umask: this.config.umask,

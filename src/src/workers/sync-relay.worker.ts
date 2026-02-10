@@ -31,6 +31,11 @@ let readySent = false;
 let debug = false;
 let leaderLoopRunning = false;
 
+// OPFS Sync Worker (leader mode only — mirrors VFS to real OPFS files)
+let opfsSyncPort: MessagePort | null = null;
+let opfsSyncEnabled = false;
+const suppressPaths = new Set<string>(); // break external→engine→notify loop
+
 // Own tab's sync SAB
 let sab: SharedArrayBuffer;
 let ctrl: Int32Array;
@@ -78,6 +83,7 @@ function registerClientPort(clientTabId: string, port: MessagePort): void {
         const result = handleRequest(clientTabId, e.data.buffer);
         const response = encodeResponse(result.status, result.data);
         port.postMessage({ id: e.data.id, buffer: response }, [response]);
+        if (result._op !== undefined) notifyOPFSSync(result._op, result._path!, result._newPath);
       }
     }
   };
@@ -100,6 +106,7 @@ function drainPortQueue(): void {
     const result = handleRequest(msg.tabId, msg.buffer);
     const response = encodeResponse(result.status, result.data);
     msg.port.postMessage({ id: msg.id, buffer: response }, [response]);
+    if (result._op !== undefined) notifyOPFSSync(result._op, result._path!, result._newPath);
   }
 }
 
@@ -149,12 +156,15 @@ const OP_NAMES: Record<number, string> = {
   27: 'FTRUNCATE', 28: 'FSYNC', 29: 'OPENDIR', 30: 'MKDTEMP',
 };
 
-function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number; data?: Uint8Array } {
+function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number; data?: Uint8Array; _op?: number; _path?: string; _newPath?: string } {
   const t0 = debug ? performance.now() : 0;
   const { op, flags, path, data } = decodeRequest(buffer);
   const t1 = debug ? performance.now() : 0;
 
   let result: { status: number; data?: Uint8Array | null };
+  let syncOp: number | undefined;
+  let syncPath: string | undefined;
+  let syncNewPath: string | undefined;
 
   switch (op) {
     case OP.READ:
@@ -163,14 +173,17 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
 
     case OP.WRITE:
       result = engine.write(path, data ?? new Uint8Array(0), flags);
+      if (opfsSyncEnabled && result.status === 0) { syncOp = op; syncPath = path; }
       break;
 
     case OP.APPEND:
       result = engine.append(path, data ?? new Uint8Array(0));
+      if (opfsSyncEnabled && result.status === 0) { syncOp = op; syncPath = path; }
       break;
 
     case OP.UNLINK:
       result = engine.unlink(path);
+      if (opfsSyncEnabled && result.status === 0) { syncOp = op; syncPath = path; }
       break;
 
     case OP.STAT:
@@ -183,10 +196,12 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
 
     case OP.MKDIR:
       result = engine.mkdir(path, flags);
+      if (opfsSyncEnabled && result.status === 0) { syncOp = op; syncPath = path; }
       break;
 
     case OP.RMDIR:
       result = engine.rmdir(path, flags);
+      if (opfsSyncEnabled && result.status === 0) { syncOp = op; syncPath = path; }
       break;
 
     case OP.READDIR:
@@ -196,6 +211,7 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
     case OP.RENAME: {
       const newPath = data ? decodeSecondPath(data) : '';
       result = engine.rename(path, newPath);
+      if (opfsSyncEnabled && result.status === 0) { syncOp = op; syncPath = path; syncNewPath = newPath; }
       break;
     }
 
@@ -206,12 +222,14 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
     case OP.TRUNCATE: {
       const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
       result = engine.truncate(path, len);
+      if (opfsSyncEnabled && result.status === 0) { syncOp = op; syncPath = path; }
       break;
     }
 
     case OP.COPY: {
       const destPath = data ? decodeSecondPath(data) : '';
       result = engine.copy(path, destPath, flags);
+      if (opfsSyncEnabled && result.status === 0) { syncOp = op; syncPath = destPath; }
       break;
     }
 
@@ -266,6 +284,7 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
     case OP.LINK: {
       const newPath = data ? decodeSecondPath(data) : '';
       result = engine.link(path, newPath);
+      if (opfsSyncEnabled && result.status === 0) { syncOp = op; syncPath = newPath; }
       break;
     }
 
@@ -302,6 +321,7 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
       const pos = dv.getInt32(4, true);
       const writeData = data.subarray(8);
       result = engine.fwrite(fd, writeData, pos === -1 ? null : pos);
+      if (opfsSyncEnabled && result.status === 0) { syncOp = op; syncPath = engine.getPathForFd(fd) ?? undefined; }
       break;
     }
 
@@ -320,6 +340,7 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
       const fd = dv.getUint32(0, true);
       const len = dv.getUint32(4, true);
       result = engine.ftruncate(fd, len);
+      if (opfsSyncEnabled && result.status === 0) { syncOp = op; syncPath = engine.getPathForFd(fd) ?? undefined; }
       break;
     }
 
@@ -333,6 +354,10 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
 
     case OP.MKDTEMP:
       result = engine.mkdtemp(path);
+      if (opfsSyncEnabled && result.status === 0 && result.data) {
+        syncOp = op;
+        syncPath = new TextDecoder().decode(result.data instanceof Uint8Array ? result.data : new Uint8Array(0));
+      }
       break;
 
     default:
@@ -344,7 +369,16 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
     console.log(`[sync-relay] op=${OP_NAMES[op] ?? op} path=${path} decode=${(t1-t0).toFixed(3)}ms engine=${(t2-t1).toFixed(3)}ms TOTAL=${(t2-t0).toFixed(3)}ms`);
   }
 
-  return { status: result.status, data: result.data instanceof Uint8Array ? result.data : undefined };
+  const ret: { status: number; data?: Uint8Array; _op?: number; _path?: string; _newPath?: string } = {
+    status: result.status,
+    data: result.data instanceof Uint8Array ? result.data : undefined,
+  };
+  if (syncOp !== undefined && syncPath) {
+    ret._op = syncOp;
+    ret._path = syncPath;
+    ret._newPath = syncNewPath;
+  }
+  return ret;
 }
 
 // ========== SAB I/O helpers ==========
@@ -464,8 +498,17 @@ async function leaderLoop(): Promise<void> {
   while (true) {
     // === Inner tight loop: process all pending work without yielding ===
     let processed = true;
+    let tightOps = 0;
     while (processed) {
       processed = false;
+
+      // Periodic yield: during sustained load the inner loop never exits,
+      // starving MessagePort handlers (external OPFS changes, client ports).
+      // Yield every 100 ops to let the event loop process pending messages.
+      if (++tightOps >= 100) {
+        tightOps = 0;
+        await yieldToEventLoop();
+      }
 
       // Priority 1: own tab's sync requests (fastest path)
       if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST) {
@@ -475,6 +518,7 @@ async function leaderLoop(): Promise<void> {
         const reqResult = handleRequest(tabId, payload.buffer as ArrayBuffer);
         const lt2 = debug ? performance.now() : 0;
         writeDirectResponse(sab, ctrl, reqResult.status, reqResult.data);
+        if (reqResult._op !== undefined) notifyOPFSSync(reqResult._op, reqResult._path!, reqResult._newPath);
         const lt3 = debug ? performance.now() : 0;
         if (debug) {
           console.log(`[leaderLoop] readPayload=${(lt1-lt0).toFixed(3)}ms handleRequest=${(lt2-lt1).toFixed(3)}ms writeResponse=${(lt3-lt2).toFixed(3)}ms TOTAL=${(lt3-lt0).toFixed(3)}ms`);
@@ -493,8 +537,9 @@ async function leaderLoop(): Promise<void> {
       // Priority 2: own tab's async requests
       if (asyncCtrl && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) {
         const payload = readPayload(asyncSab!, asyncCtrl);
-        const result = handleRequest(tabId, payload.buffer as ArrayBuffer);
-        writeDirectResponse(asyncSab!, asyncCtrl, result.status, result.data);
+        const asyncResult = handleRequest(tabId, payload.buffer as ArrayBuffer);
+        writeDirectResponse(asyncSab!, asyncCtrl, asyncResult.status, asyncResult.data);
+        if (asyncResult._op !== undefined) notifyOPFSSync(asyncResult._op, asyncResult._path!, asyncResult._newPath);
         const waitResult = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 10);
         if (waitResult === 'timed-out') {
           Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
@@ -511,19 +556,16 @@ async function leaderLoop(): Promise<void> {
       }
     }
 
-    // === All queues empty — wait for new work ===
-    if (clientPorts.size > 0) {
-      // Clients connected: yield to receive port messages (~0.1ms)
-      await yieldToEventLoop();
-    } else {
-      // No clients: block until SAB notification or timeout
+    // === All queues empty — yield to process MessagePort events ===
+    // Always yield: external OPFS changes arrive via opfsSyncPort.onmessage,
+    // client registrations via self.onmessage — both need the event loop.
+    await yieldToEventLoop();
+
+    // If no clients and no new SAB work, block briefly for next request
+    if (clientPorts.size === 0 && !opfsSyncEnabled) {
       const currentSignal = Atomics.load(ctrl, 0);
       if (currentSignal !== SIGNAL.REQUEST) {
-        const result = Atomics.wait(ctrl, 0, currentSignal, 50);
-        if (result === 'timed-out') {
-          // Idle — yield to process pending onmessage (e.g. client-port registration)
-          await yieldToEventLoop();
-        }
+        Atomics.wait(ctrl, 0, currentSignal, 50);
       }
     }
   }
@@ -573,6 +615,7 @@ async function followerLoop(): Promise<void> {
 async function initEngine(config: {
   root: string;
   opfsSync: boolean;
+  opfsSyncRoot?: string;
   uid: number;
   gid: number;
   umask: number;
@@ -603,6 +646,96 @@ async function initEngine(config: {
     strictPermissions: config.strictPermissions,
     debug: config.debug,
   });
+
+  // Spawn OPFS sync worker (mirrors VFS mutations to real OPFS files)
+  if (config.opfsSync) {
+    opfsSyncEnabled = true;
+    const mc = new MessageChannel();
+    opfsSyncPort = mc.port1;
+    opfsSyncPort.onmessage = (e) => handleExternalChange(e.data);
+    opfsSyncPort.start();
+
+    const workerUrl = new URL('./opfs-sync.worker.js', import.meta.url);
+    const syncWorker = new Worker(workerUrl, { type: 'module' });
+    syncWorker.postMessage(
+      { type: 'init', root: config.opfsSyncRoot ?? config.root },
+      [mc.port2],
+    );
+  }
+}
+
+// ========== OPFS sync notification (fire-and-forget, after SAB response) ==========
+
+function notifyOPFSSync(op: number, path: string, newPath?: string): void {
+  if (!opfsSyncPort) return;
+  if (suppressPaths.has(path)) {
+    suppressPaths.delete(path);
+    return;
+  }
+
+  const ts = Date.now();
+
+  switch (op) {
+    case OP.WRITE:
+    case OP.APPEND:
+    case OP.TRUNCATE:
+    case OP.FWRITE:
+    case OP.FTRUNCATE:
+    case OP.COPY:
+    case OP.LINK: {
+      const result = engine.read(path);
+      if (result.status === 0 && result.data) {
+        const buf = result.data.buffer.byteLength === result.data.byteLength
+          ? result.data.buffer
+          : result.data.slice().buffer;
+        opfsSyncPort.postMessage({ op: 'write', path, data: buf, ts } as const, [buf as ArrayBuffer]);
+      }
+      break;
+    }
+    case OP.UNLINK:
+    case OP.RMDIR:
+      opfsSyncPort.postMessage({ op: 'delete', path, ts });
+      break;
+    case OP.MKDIR:
+    case OP.MKDTEMP:
+      opfsSyncPort.postMessage({ op: 'mkdir', path, ts });
+      break;
+    case OP.RENAME:
+      if (newPath) {
+        opfsSyncPort.postMessage({ op: 'rename', path, newPath, ts });
+      }
+      break;
+  }
+}
+
+function handleExternalChange(msg: { op: string; path: string; newPath?: string; data?: ArrayBuffer }): void {
+  switch (msg.op) {
+    case 'external-write': {
+      suppressPaths.add(msg.path);
+      const result = engine.write(msg.path, new Uint8Array(msg.data!), 0);
+      console.log('[sync-relay] external-write:', msg.path, `${msg.data?.byteLength ?? 0}B`, `status=${result.status}`);
+      break;
+    }
+    case 'external-delete': {
+      suppressPaths.add(msg.path);
+      const result = engine.unlink(msg.path);
+      if (result.status !== 0) {
+        const rmdirResult = engine.rmdir(msg.path, 1);
+        console.log('[sync-relay] external-delete (rmdir):', msg.path, `status=${rmdirResult.status}`);
+      } else {
+        console.log('[sync-relay] external-delete:', msg.path, `status=${result.status}`);
+      }
+      break;
+    }
+    case 'external-rename':
+      suppressPaths.add(msg.path);
+      if (msg.newPath) {
+        suppressPaths.add(msg.newPath);
+        const result = engine.rename(msg.path, msg.newPath);
+        console.log('[sync-relay] external-rename:', msg.path, '→', msg.newPath, `status=${result.status}`);
+      }
+      break;
+  }
 }
 
 // ========== Message handling ==========
@@ -622,6 +755,7 @@ self.onmessage = async (e: MessageEvent) => {
             const result = handleRequest(tabId || 'nosab', ev.data.buffer);
             const response = encodeResponse(result.status, result.data);
             port.postMessage({ id: ev.data.id, buffer: response }, [response]);
+            if (result._op !== undefined) notifyOPFSSync(result._op, result._path!, result._newPath);
           } else if (leaderPort) {
             // Follower mode: forward to leader via leader port
             const buf = ev.data.buffer;

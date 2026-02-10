@@ -1,6 +1,6 @@
 /**
  * OPFS-FS Benchmark Suite
- * Compares performance of VFS and Future FS against LightningFS
+ * Compares performance of VFS against LightningFS
  *
  * Run with: npm run benchmark
  */
@@ -15,14 +15,12 @@ interface BenchmarkResult {
   lightning: number;
   vfsSync: number | null;
   vfsPromises: number | null;
-  futureSync: number | null;
-  futurePromises: number | null;
 }
 
 test.describe('OPFS-FS Benchmark Suite', () => {
   test.setTimeout(180000); // 3 minutes for all benchmarks
 
-  test('Full benchmark comparison: VFS vs LightningFS vs Future', async ({ page }) => {
+  test('Full benchmark comparison: VFS vs LightningFS', async ({ page }) => {
     // Navigate to benchmark page
     await page.goto('/');
 
@@ -70,9 +68,9 @@ test.describe('OPFS-FS Benchmark Suite', () => {
       return `${ms.toFixed(0).padStart(5)}ms ${opsPerSec.toString().padStart(5)}op/s`;
     };
 
-    console.log('╔══════════════════════════╦═══════════════╦═══════════════╦═══════════════╦═══════════════╦═══════════════╦══════════════╗');
-    console.log('║ Test                     ║ LightningFS   ║ VFS Sync      ║ VFS Promises  ║ Future Sync   ║ Future Prom   ║ Winner       ║');
-    console.log('╠══════════════════════════╬═══════════════╬═══════════════╬═══════════════╬═══════════════╬═══════════════╬══════════════╣');
+    console.log('╔══════════════════════════╦═══════════════╦═══════════════╦═══════════════╦══════════════╗');
+    console.log('║ Test                     ║ LightningFS   ║ VFS Sync      ║ VFS Promises  ║ Winner       ║');
+    console.log('╠══════════════════════════╬═══════════════╬═══════════════╬═══════════════╬══════════════╣');
 
     for (const result of results) {
       const testName = result.operation === 'write'
@@ -95,8 +93,6 @@ test.describe('OPFS-FS Benchmark Suite', () => {
         { name: 'LFS', ms: result.lightning },
         { name: 'VFS Sync', ms: result.vfsSync },
         { name: 'VFS Prom', ms: result.vfsPromises },
-        { name: 'Fut Sync', ms: result.futureSync },
-        { name: 'Fut Prom', ms: result.futurePromises },
       ].filter(v => v.ms !== null && v.ms !== undefined) as { name: string; ms: number }[];
 
       const minMs = values.length > 0 ? Math.min(...values.map(v => v.ms)) : 0;
@@ -105,11 +101,11 @@ test.describe('OPFS-FS Benchmark Suite', () => {
       const winnerDisplay = winner ? `${winner.name} ${speedup}x` : '-';
 
       console.log(
-        `║ ${testName.padEnd(24)} ║ ${formatMs(result.lightning, result.iterations)} ║ ${formatMs(result.vfsSync, result.iterations)} ║ ${formatMs(result.vfsPromises, result.iterations)} ║ ${formatMs(result.futureSync, result.iterations)} ║ ${formatMs(result.futurePromises, result.iterations)} ║ ${winnerDisplay.padEnd(12)} ║`
+        `║ ${testName.padEnd(24)} ║ ${formatMs(result.lightning, result.iterations)} ║ ${formatMs(result.vfsSync, result.iterations)} ║ ${formatMs(result.vfsPromises, result.iterations)} ║ ${winnerDisplay.padEnd(12)} ║`
       );
     }
 
-    console.log('╚══════════════════════════╩═══════════════╩═══════════════╩═══════════════╩═══════════════╩═══════════════╩══════════════╝');
+    console.log('╚══════════════════════════╩═══════════════╩═══════════════╩═══════════════╩══════════════╝');
 
     // Print bar chart
     console.log('\n📊 Performance Comparison (lower is better):\n');
@@ -133,7 +129,7 @@ test.describe('OPFS-FS Benchmark Suite', () => {
 
       console.log(`${testName}:`);
 
-      const allMs = [result.lightning, result.vfsSync, result.vfsPromises, result.futureSync, result.futurePromises].filter(v => v !== null && v !== undefined) as number[];
+      const allMs = [result.lightning, result.vfsSync, result.vfsPromises].filter(v => v !== null && v !== undefined) as number[];
       const maxMs = Math.max(...allMs, 1);
       const scale = 50;
 
@@ -151,8 +147,6 @@ test.describe('OPFS-FS Benchmark Suite', () => {
       drawBar('LightningFS', result.lightning, '🟡');
       drawBar('VFS Sync', result.vfsSync, '🟣');
       drawBar('VFS Promises', result.vfsPromises, '🩷');
-      drawBar('Future Sync', result.futureSync, '🔴');
-      drawBar('Future Prom', result.futurePromises, '🟠');
       console.log('');
     }
   });
@@ -175,8 +169,6 @@ test.describe('OPFS-FS Benchmark Suite', () => {
     console.log(`  LightningFS:      ${result.lightning.toFixed(2)}ms`);
     console.log(`  VFS Sync:         ${result.vfsSync?.toFixed(2) || 'N/A'}ms`);
     console.log(`  VFS Promises:     ${result.vfsPromises?.toFixed(2) || 'N/A'}ms`);
-    console.log(`  Future Sync:      ${result.futureSync?.toFixed(2) || 'N/A'}ms`);
-    console.log(`  Future Promises:  ${result.futurePromises?.toFixed(2) || 'N/A'}ms`);
   });
 
   test('Individual: Read performance (1KB)', async ({ page }) => {
@@ -197,8 +189,6 @@ test.describe('OPFS-FS Benchmark Suite', () => {
     console.log(`  LightningFS:      ${result.lightning.toFixed(2)}ms`);
     console.log(`  VFS Sync:         ${result.vfsSync?.toFixed(2) || 'N/A'}ms`);
     console.log(`  VFS Promises:     ${result.vfsPromises?.toFixed(2) || 'N/A'}ms`);
-    console.log(`  Future Sync:      ${result.futureSync?.toFixed(2) || 'N/A'}ms`);
-    console.log(`  Future Promises:  ${result.futurePromises?.toFixed(2) || 'N/A'}ms`);
   });
 
   test('Individual: Large file performance (1MB)', async ({ page }) => {
@@ -219,7 +209,5 @@ test.describe('OPFS-FS Benchmark Suite', () => {
     console.log(`  LightningFS:      ${result.lightning.toFixed(2)}ms`);
     console.log(`  VFS Sync:         ${result.vfsSync?.toFixed(2) || 'N/A'}ms`);
     console.log(`  VFS Promises:     ${result.vfsPromises?.toFixed(2) || 'N/A'}ms`);
-    console.log(`  Future Sync:      ${result.futureSync?.toFixed(2) || 'N/A'}ms`);
-    console.log(`  Future Promises:  ${result.futurePromises?.toFixed(2) || 'N/A'}ms`);
   });
 });
