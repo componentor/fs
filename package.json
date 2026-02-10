@@ -13,31 +13,27 @@
   },
   "homepage": "https://github.com/componentor/fs#readme",
   "type": "module",
-  "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
-      "import": "./dist/index.js",
-      "require": "./dist/index.cjs"
+      "import": "./dist/index.js"
     },
-    "./sw": "./dist/service-worker.js"
+    "./sw": "./dist/workers/service.worker.js"
   },
   "files": [
     "dist"
   ],
   "scripts": {
-    "build": "tsup",
-    "build:next": "cd next && npx tsup",
+    "build": "cd src && npx tsup",
     "build:future": "cd future && npx tsup",
-    "dev": "tsup --watch",
-    "test": "vitest",
-    "test:browser": "vitest run",
-    "benchmark": "npm run build && npm run build:next && npm run build:future && playwright test",
+    "dev": "cd src && npx tsup --watch",
+    "test": "cd src && npx vitest run",
+    "benchmark": "npm run build && npm run build:future && playwright test",
     "benchmark:server": "node tests/benchmark/server.js",
-    "benchmark:open": "npm run build && npm run build:next && npm run build:future && node tests/benchmark/server.js",
-    "typecheck": "tsc --noEmit"
+    "benchmark:open": "npm run build && npm run build:future && node tests/benchmark/server.js",
+    "typecheck": "tsc -p src/tsconfig.json --noEmit"
   },
   "devDependencies": {
     "@isomorphic-git/lightning-fs": "^4.6.0",

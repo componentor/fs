@@ -50,8 +50,6 @@
       transition: width 0.3s ease;
     }
     .bar.lightning { background: linear-gradient(90deg, #ffc107, #ff9800); }
-    .bar.tier1 { background: linear-gradient(90deg, #28a745, #20c997); }
-    .bar.tier2 { background: linear-gradient(90deg, #007bff, #00d4ff); }
 
     .legend {
       display: flex;
@@ -154,9 +152,6 @@
 
   <div class="legend">
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #ffc107, #ff9800);"></div> LightningFS (IndexedDB)</div>
-    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #28a745, #20c997);"></div> OPFS Tier 1 Sync (Worker + Atomics)</div>
-    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #17a2b8, #20c997);"></div> OPFS Tier 1 Promises (Worker + fastCall)</div>
-    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #007bff, #00d4ff);"></div> OPFS Tier 2 (Main Thread Promises)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #6f42c1, #a855f7);"></div> VFS Sync (SAB + Atomics.wait)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #d63384, #e879a8);"></div> VFS Promises (async relay)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #ff4757, #ff6b81);"></div> Future Sync (nodecontainer FS)</div>
@@ -193,9 +188,7 @@
     };
 
     // Import libraries
-    let fs, fsTier2, LightningFS, git, http;
-    let tier1WorkerReady = false;
-    let tier1Worker = null;
+    let LightningFS, git, http;
     let vfs = null;
     let vfsReady = false;
     let futureFs = null;
@@ -207,117 +200,7 @@
     const CORS_PROXY = 'https://cors.isomorphic-git.org';
     // Note: CORS proxy is required for browser-based git operations
 
-    async function initTier1Worker() {
-      if (tier1Worker) return tier1WorkerReady;
-
-      return new Promise((resolve) => {
-        try {
-          // Use a real worker file (not blob) so dynamic imports work correctly
-          tier1Worker = new Worker('/tier1-worker.js', { type: 'module' });
-
-          tier1Worker.onmessage = (event) => {
-            if (event.data.type === 'ready') {
-              tier1WorkerReady = true;
-              log('Tier 1 worker ready', 'success');
-              resolve(true);
-            } else if (event.data.type === 'error') {
-              log('Tier 1 worker init error: ' + event.data.error, 'error');
-              tier1WorkerReady = false;
-              resolve(false);
-            } else if (event.data.type === 'log') {
-              log('[T1Worker] ' + event.data.message, 'info');
-            }
-          };
-
-          tier1Worker.onerror = (e) => {
-            log('Tier 1 worker error: ' + e.message, 'error');
-            tier1WorkerReady = false;
-            resolve(false);
-          };
-
-          tier1Worker.postMessage({ type: 'init' });
-
-          // Timeout after 5 seconds
-          setTimeout(() => {
-            if (!tier1WorkerReady) {
-              log('Tier 1 worker timeout', 'error');
-              resolve(false);
-            }
-          }, 5000);
-        } catch (e) {
-          log('Failed to create Tier 1 worker: ' + e.message, 'error');
-          resolve(false);
-        }
-      });
-    }
-
-    async function runTier1Benchmark(type, iterations, fileSize) {
-      if (!tier1WorkerReady || !tier1Worker) {
-        return null;
-      }
-
-      return new Promise((resolve) => {
-        const data = new Uint8Array(fileSize).fill(65);
-        let resolved = false;
-        let timeoutId = null;
-
-        const cleanup = () => {
-          if (timeoutId) clearTimeout(timeoutId);
-          tier1Worker.removeEventListener('message', handler);
-        };
-
-        const handler = (event) => {
-          // Log messages are handled by the init onmessage handler - ignore here
-          if (event.data.type === 'log') {
-            return;
-          }
-
-          // Only process result/error once
-          if (resolved) return;
-          resolved = true;
-          cleanup();
-
-          if (event.data.type === 'result') {
-            resolve(event.data.elapsed);
-          } else if (event.data.type === 'error') {
-            log('Tier 1 benchmark error: ' + event.data.error, 'error');
-            resolve(null);
-          } else {
-            log('Tier 1 unexpected message: ' + JSON.stringify(event.data), 'error');
-            resolve(null);
-          }
-        };
-
-        tier1Worker.addEventListener('message', handler);
-        tier1Worker.postMessage({
-          type: 'benchmark-' + type,
-          iterations,
-          fileSize,
-          data
-        });
-
-        // Timeout after 60 seconds
-        timeoutId = setTimeout(() => {
-          if (!resolved) {
-            resolved = true;
-            cleanup();
-            log('Tier 1 benchmark timed out', 'error');
-            resolve(null);
-          }
-        }, 60000);
-      });
-    }
-
     async function init() {
-      log('Loading OPFS-FS...', 'info');
-      const opfsModule = await import('/index.js');
-      fs = opfsModule.fs;
-
-      // Create a second instance for Tier 2 testing (no sync kernel)
-      const OPFSFileSystem = opfsModule.OPFSFileSystem;
-      fsTier2 = new OPFSFileSystem();
-      log('OPFS-FS loaded (fs + fsTier2 for async-only testing)', 'success');
-
       log('Loading LightningFS...', 'info');
       const lfsModule = await import('https://esm.sh/@isomorphic-git/lightning-fs@4.6.0');
       LightningFS = lfsModule.default;
@@ -328,25 +211,6 @@
       git = gitModule.default;
       http = (await import('https://esm.sh/isomorphic-git@1.27.1/http/web')).default;
       log('isomorphic-git loaded', 'success');
-
-      // Initialize Tier 1 (sync kernel with SharedArrayBuffer)
-      if (crossOriginIsolated) {
-        log('Initializing Tier 1 worker (Atomics)...', 'info');
-        await initTier1Worker();
-
-        // Also init sync kernel for main thread (uses Atomics.waitAsync)
-        // Only for the primary fs instance - fsTier2 stays without sync kernel
-        log('Initializing sync kernel for main thread...', 'info');
-        try {
-          await fs.initSync('/kernel.js');
-          log('Sync kernel ready (main thread can use Atomics.waitAsync)', 'success');
-          log('fsTier2 will use async worker path (Tier 2)', 'info');
-        } catch (e) {
-          log('Sync kernel init failed: ' + e.message, 'error');
-        }
-      } else {
-        log('Tier 1 unavailable (not crossOriginIsolated)', 'info');
-      }
 
       // Clean corrupted VFS binaries from OPFS before init
       // VFS next/ stores .vfs.bin inside the root subdir (e.g. opfs/vfs-bench/.vfs.bin)
@@ -371,7 +235,7 @@
       if (crossOriginIsolated) {
         log('Initializing VFS...', 'info');
         try {
-          const vfsModule = await import('/next/index.js');
+          const vfsModule = await import('/index.js');
           vfs = new vfsModule.VFSFileSystem({ root: '/vfs-bench' });
           await Promise.race([
             vfs.init(),
@@ -414,17 +278,14 @@
       }
     }
 
-    // Create fs wrapper for OPFS (isomorphic-git expects specific format)
-    // Converts OPFS errors to Node.js-style errors that isomorphic-git expects
-    // @param fsInstance - optional fs instance (defaults to main fs with sync kernel)
-    function createOpfsGitFs(fsInstance = fs) {
+    // Create fs wrapper for isomorphic-git (expects specific format)
+    // Converts errors to Node.js-style errors that isomorphic-git expects
+    function createGitFs(fsInstance) {
       // Helper to convert errors to Node.js format
       const wrapError = (err, method, args) => {
-        // Only log unexpected errors (ENOENT and ENOTDIR are expected during git operations)
-        // isomorphic-git probes paths with readdir to detect files vs directories
         if (err.code !== 'ENOENT' && err.name !== 'NotFoundError' &&
             err.code !== 'ENOTDIR' && err.name !== 'TypeMismatchError') {
-          console.log(`[opfs-git] ${method} error:`, err, 'args:', args);
+          console.log(`[git-fs] ${method} error:`, err, 'args:', args);
         }
         if (err.name === 'NotFoundError' || err.code === 'ENOENT') {
           const e = new Error(err.message || 'ENOENT: no such file or directory');
@@ -441,7 +302,6 @@
           e.code = 'ENOTDIR';
           return e;
         }
-        // Preserve error code if it exists
         if (err.code) {
           const e = new Error(err.message);
           e.code = err.code;
@@ -450,11 +310,9 @@
         return err;
       };
 
-      // Helper to wrap async functions with error conversion
       const wrap = (fn, name) => async (...args) => {
         try {
-          const result = await fn(...args);
-          return result;
+          return await fn(...args);
         } catch (err) {
           throw wrapError(err, name, args);
         }
@@ -463,8 +321,7 @@
       return {
         promises: {
           readFile: wrap(async (filepath, options) => {
-            const result = await fsInstance.promises.readFile(filepath, options);
-            return result;
+            return await fsInstance.promises.readFile(filepath, options);
           }, 'readFile'),
           writeFile: wrap((filepath, data, options) => fsInstance.promises.writeFile(filepath, data, options), 'writeFile'),
           unlink: wrap((filepath) => fsInstance.promises.unlink(filepath), 'unlink'),
@@ -473,7 +330,6 @@
           rmdir: wrap((filepath, options) => fsInstance.promises.rmdir(filepath, options), 'rmdir'),
           stat: wrap(async (filepath) => {
             const stat = await fsInstance.promises.stat(filepath);
-            // Ensure stat has the methods isomorphic-git expects
             return {
               ...stat,
               isFile: () => stat.isFile ? stat.isFile() : stat.type === 'file',
@@ -525,35 +381,6 @@
       }
       results.lightning = performance.now() - startL;
       log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
-
-      // OPFS Tier 2 (Main Thread Promises)
-      log(`Testing OPFS Tier 2 (Main Thread Promises)...`, 'info');
-      await fs.promises.mkdir('/bench-t2', { recursive: true });
-      const startT2 = performance.now();
-      for (let i = 0; i < iterations; i++) {
-        await fs.promises.writeFile(`/bench-t2/write-${i}.bin`, data);
-      }
-      results.tier2 = performance.now() - startT2;
-      await fs.promises.rm('/bench-t2', { recursive: true, force: true });
-      log(`OPFS Tier 2: ${results.tier2.toFixed(2)}ms`, 'success');
-
-      // OPFS Tier 1 Sync (Worker + Atomics)
-      log(`Testing OPFS Tier 1 Sync (Atomics)...`, 'info');
-      results.tier1 = await runTier1Benchmark('write', iterations, fileSize);
-      if (results.tier1 !== null) {
-        log(`OPFS Tier 1 Sync: ${results.tier1.toFixed(2)}ms`, 'success');
-      } else {
-        log(`OPFS Tier 1 Sync: N/A`, 'info');
-      }
-
-      // OPFS Tier 1 Promises (Worker + fastCall)
-      log(`Testing OPFS Tier 1 Promises (Worker)...`, 'info');
-      results.tier1Promises = await runTier1Benchmark('promises-write', iterations, fileSize);
-      if (results.tier1Promises !== null) {
-        log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
-      } else {
-        log(`OPFS Tier 1 Promises: N/A`, 'info');
-      }
 
       // VFS Sync (SAB + Atomics.wait)
       if (vfsReady) {
@@ -628,12 +455,6 @@
         await lfs.promises.writeFile(`/read-${i}.bin`, data);
       }
 
-      // Setup files for OPFS Tier 2
-      await fs.promises.mkdir('/bench-read', { recursive: true });
-      for (let i = 0; i < iterations; i++) {
-        await fs.promises.writeFile(`/bench-read/read-${i}.bin`, data);
-      }
-
       // LightningFS
       log(`Testing LightningFS read (${iterations} x ${fileSize} bytes)...`, 'info');
       const startL = performance.now();
@@ -642,36 +463,6 @@
       }
       results.lightning = performance.now() - startL;
       log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
-
-      // OPFS Tier 2
-      log(`Testing OPFS Tier 2 (Promises)...`, 'info');
-      const startT2 = performance.now();
-      for (let i = 0; i < iterations; i++) {
-        await fs.promises.readFile(`/bench-read/read-${i}.bin`);
-      }
-      results.tier2 = performance.now() - startT2;
-      log(`OPFS Tier 2: ${results.tier2.toFixed(2)}ms`, 'success');
-
-      // Cleanup OPFS
-      await fs.promises.rm('/bench-read', { recursive: true, force: true });
-
-      // OPFS Tier 1 Sync (Worker + Atomics)
-      log(`Testing OPFS Tier 1 Sync (Atomics)...`, 'info');
-      results.tier1 = await runTier1Benchmark('read', iterations, fileSize);
-      if (results.tier1 !== null) {
-        log(`OPFS Tier 1 Sync: ${results.tier1.toFixed(2)}ms`, 'success');
-      } else {
-        log(`OPFS Tier 1 Sync: N/A`, 'info');
-      }
-
-      // OPFS Tier 1 Promises (Worker + fastCall)
-      log(`Testing OPFS Tier 1 Promises (Worker)...`, 'info');
-      results.tier1Promises = await runTier1Benchmark('promises-read', iterations, fileSize);
-      if (results.tier1Promises !== null) {
-        log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
-      } else {
-        log(`OPFS Tier 1 Promises: N/A`, 'info');
-      }
 
       // VFS Sync (SAB + Atomics.wait)
       if (vfsReady) {
@@ -763,35 +554,6 @@
       results.lightning = performance.now() - startL;
       log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
 
-      // OPFS Tier 2
-      log(`Testing OPFS Tier 2 (Promises)...`, 'info');
-      await fs.promises.mkdir('/bench-large', { recursive: true });
-      const startT2 = performance.now();
-      for (let i = 0; i < iterations; i++) {
-        await fs.promises.writeFile(`/bench-large/large-${i}.bin`, data);
-      }
-      results.tier2 = performance.now() - startT2;
-      await fs.promises.rm('/bench-large', { recursive: true, force: true });
-      log(`OPFS Tier 2: ${results.tier2.toFixed(2)}ms`, 'success');
-
-      // OPFS Tier 1 Sync (Worker + Atomics) - uses SharedArrayBuffer, no JSON overhead
-      log(`Testing OPFS Tier 1 Sync (Atomics) for large files...`, 'info');
-      results.tier1 = await runTier1Benchmark('write', iterations, fileSize);
-      if (results.tier1 !== null) {
-        log(`OPFS Tier 1 Sync: ${results.tier1.toFixed(2)}ms`, 'success');
-      } else {
-        log(`OPFS Tier 1 Sync: N/A`, 'info');
-      }
-
-      // OPFS Tier 1 Promises (Worker + fastCall) for large files
-      log(`Testing OPFS Tier 1 Promises for large files...`, 'info');
-      results.tier1Promises = await runTier1Benchmark('promises-write', iterations, fileSize);
-      if (results.tier1Promises !== null) {
-        log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
-      } else {
-        log(`OPFS Tier 1 Promises: N/A`, 'info');
-      }
-
       // VFS Sync (SAB + Atomics.wait) for large files
       if (vfsReady) {
         log(`Testing VFS Sync large write (${iterations} x ${fileSizeMB}MB)...`, 'info');
@@ -870,35 +632,6 @@
       results.lightning = performance.now() - startL;
       log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
 
-      // OPFS Tier 2 (Promises - always available)
-      log(`Testing OPFS Tier 2 (Promises) batch write...`, 'info');
-      await fs.promises.mkdir('/bench-batch-t2', { recursive: true });
-      const startT2 = performance.now();
-      for (let i = 0; i < iterations; i++) {
-        await fs.promises.writeFile(`/bench-batch-t2/batch-${i}.bin`, data);
-      }
-      results.tier2 = performance.now() - startT2;
-      await fs.promises.rm('/bench-batch-t2', { recursive: true, force: true });
-      log(`OPFS Tier 2: ${results.tier2.toFixed(2)}ms`, 'success');
-
-      // OPFS Tier 1 Sync (Worker + Atomics with flush: false)
-      log(`Testing OPFS Tier 1 Sync (Atomics) batch write...`, 'info');
-      results.tier1 = await runTier1Benchmark('batch-write', iterations, fileSize);
-      if (results.tier1 !== null) {
-        log(`OPFS Tier 1 Sync: ${results.tier1.toFixed(2)}ms`, 'success');
-      } else {
-        log(`OPFS Tier 1 Sync: N/A`, 'info');
-      }
-
-      // OPFS Tier 1 Promises (Worker + fastCall)
-      log(`Testing OPFS Tier 1 Promises batch write...`, 'info');
-      results.tier1Promises = await runTier1Benchmark('promises-batch-write', iterations, fileSize);
-      if (results.tier1Promises !== null) {
-        log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
-      } else {
-        log(`OPFS Tier 1 Promises: N/A`, 'info');
-      }
-
       // VFS Sync batch write
       if (vfsReady) {
         log(`Testing VFS Sync batch write (${iterations} x ${fileSize} bytes)...`, 'info');
@@ -973,12 +706,6 @@
         await lfs.promises.writeFile(`/batch-${i}.bin`, data);
       }
 
-      // Setup files for OPFS Tier 2
-      await fs.promises.mkdir('/bench-batch-read', { recursive: true });
-      for (let i = 0; i < iterations; i++) {
-        await fs.promises.writeFile(`/bench-batch-read/batch-${i}.bin`, data);
-      }
-
       // LightningFS
       log(`Testing LightningFS batch read (${iterations} x ${fileSize} bytes)...`, 'info');
       const startL = performance.now();
@@ -987,36 +714,6 @@
       }
       results.lightning = performance.now() - startL;
       log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
-
-      // OPFS Tier 2
-      log(`Testing OPFS Tier 2 (Promises) batch read...`, 'info');
-      const startT2 = performance.now();
-      for (let i = 0; i < iterations; i++) {
-        await fs.promises.readFile(`/bench-batch-read/batch-${i}.bin`);
-      }
-      results.tier2 = performance.now() - startT2;
-      log(`OPFS Tier 2: ${results.tier2.toFixed(2)}ms`, 'success');
-
-      // Cleanup OPFS
-      await fs.promises.rm('/bench-batch-read', { recursive: true, force: true });
-
-      // OPFS Tier 1 Sync (Worker + Atomics)
-      log(`Testing OPFS Tier 1 Sync (Atomics) batch read...`, 'info');
-      results.tier1 = await runTier1Benchmark('batch-read', iterations, fileSize);
-      if (results.tier1 !== null) {
-        log(`OPFS Tier 1 Sync: ${results.tier1.toFixed(2)}ms`, 'success');
-      } else {
-        log(`OPFS Tier 1 Sync: N/A`, 'info');
-      }
-
-      // OPFS Tier 1 Promises (Worker + fastCall)
-      log(`Testing OPFS Tier 1 Promises batch read...`, 'info');
-      results.tier1Promises = await runTier1Benchmark('promises-batch-read', iterations, fileSize);
-      if (results.tier1Promises !== null) {
-        log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
-      } else {
-        log(`OPFS Tier 1 Promises: N/A`, 'info');
-      }
 
       // VFS Sync batch read
       if (vfsReady) {
@@ -1099,10 +796,6 @@
       const repoUrl = TEST_REPO_URL;
       const corsProxy = CORS_PROXY;
 
-      // Cleanup any existing repos
-      try { await fs.promises.rm('/git-bench-opfs', { recursive: true, force: true }); } catch {}
-      try { await fsTier2.promises.rm('/git-bench-opfs-t2', { recursive: true, force: true }); } catch {}
-
       // LightningFS
       log(`Testing LightningFS git clone (${repoUrl})...`, 'info');
       const lfs = new LightningFS(`git-clone-${Date.now()}`);
@@ -1125,80 +818,13 @@
         results.lightning = null;
       }
 
-      // OPFS Tier 1 Promises (Main thread with Atomics.waitAsync)
-      // With initSync() called, fs.promises uses sync kernel via Atomics.waitAsync
-      log(`Testing OPFS Tier 1 Promises git clone (Atomics.waitAsync)...`, 'info');
-      // Clean up any leftover from previous runs and purge caches for clean state
-      try { await fs.promises.rm('/git-bench-opfs', { recursive: true, force: true }); } catch {}
-      try { await fs.promises.purge(); } catch {}
-      const opfsGitFs = createOpfsGitFs(fs);
-      await fs.promises.mkdir('/git-bench-opfs', { recursive: true });
-      const startT1P = performance.now();
-      try {
-        await git.clone({
-          fs: opfsGitFs,
-          http,
-          dir: '/git-bench-opfs',
-          url: repoUrl,
-          corsProxy,
-          singleBranch: true,
-          depth: 1,
-          onMessage: (msg) => log(`[git T1P] ${msg}`, 'info'),
-        });
-        results.tier1Promises = performance.now() - startT1P;
-        log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
-      } catch (e) {
-        log(`OPFS Tier 1 Promises git clone failed: ${e.message} (code: ${e.code}, name: ${e.name})`, 'error');
-        console.error('OPFS Tier 1 Promises clone error:', e);
-        results.tier1Promises = null;
-      }
-
-      // Cleanup Tier 1 Promises repo and purge caches
-      try { await fs.promises.rm('/git-bench-opfs', { recursive: true, force: true }); } catch {}
-      try { await fs.promises.purge(); } catch {}
-
-      // OPFS Tier 2 (Async worker without sync kernel)
-      // fsTier2 doesn't have initSync() called, so it uses the async worker path
-      log(`Testing OPFS Tier 2 git clone (async worker)...`, 'info');
-      // Clean up any leftover from previous runs and purge caches for clean state
-      try { await fsTier2.promises.rm('/git-bench-opfs-t2', { recursive: true, force: true }); } catch {}
-      try { await fsTier2.promises.purge(); } catch {}
-      const opfsGitFsTier2 = createOpfsGitFs(fsTier2);
-      await fsTier2.promises.mkdir('/git-bench-opfs-t2', { recursive: true });
-      const startT2 = performance.now();
-      try {
-        await git.clone({
-          fs: opfsGitFsTier2,
-          http,
-          dir: '/git-bench-opfs-t2',
-          url: repoUrl,
-          corsProxy,
-          singleBranch: true,
-          depth: 1,
-          onMessage: (msg) => log(`[git T2] ${msg}`, 'info'),
-        });
-        results.tier2 = performance.now() - startT2;
-        log(`OPFS Tier 2: ${results.tier2.toFixed(2)}ms`, 'success');
-      } catch (e) {
-        log(`OPFS Tier 2 git clone failed: ${e.message} (code: ${e.code}, name: ${e.name})`, 'error');
-        console.error('OPFS Tier 2 clone error:', e);
-        results.tier2 = null;
-      }
-
-      // Cleanup Tier 2 repo and purge caches
-      try { await fsTier2.promises.rm('/git-bench-opfs-t2', { recursive: true, force: true }); } catch {}
-      try { await fsTier2.promises.purge(); } catch {}
-
-      // Tier 1 Sync not applicable (git requires async)
-      results.tier1 = null;
-
       // VFS Sync not applicable (git requires async)
       results.vfsSync = null;
 
       // VFS Promises git clone
       if (vfsReady) {
         log(`Testing VFS Promises git clone...`, 'info');
-        const vfsGitFs = createOpfsGitFs(vfs);
+        const vfsGitFs = createGitFs(vfs);
         try { await vfs.promises.rm('/git-bench-vfs', { recursive: true, force: true }); } catch {}
         await vfs.promises.mkdir('/git-bench-vfs', { recursive: true });
         const startVP = performance.now();
@@ -1230,7 +856,7 @@
       // Future Promises git clone
       if (futureReady) {
         log(`Testing Future Promises git clone...`, 'info');
-        const futureGitFs = createOpfsGitFs({ promises: futureFs.promises });
+        const futureGitFs = createGitFs({ promises: futureFs.promises });
         try { futureFs.rmSync('/git-bench-future', { recursive: true, force: true }); } catch {}
         futureFs.mkdirSync('/git-bench-future', { recursive: true });
         const startFP = performance.now();
@@ -1282,45 +908,7 @@
         });
       } catch (e) {
         log(`LightningFS clone for status failed: ${e.message}`, 'error');
-        return { lightning: null, tier1: null, tier1Promises: null, tier2: null, vfsSync: null, vfsPromises: null, iterations, fileSize: 0, operation: 'git-status' };
-      }
-
-      // OPFS Tier 1 Promises setup
-      const opfsGitFs = createOpfsGitFs(fs);
-      try { await fs.promises.rm('/git-status-opfs', { recursive: true, force: true }); } catch {}
-      await fs.promises.mkdir('/git-status-opfs', { recursive: true });
-      try {
-        await git.clone({
-          fs: opfsGitFs,
-          http,
-          dir: '/git-status-opfs',
-          url: repoUrl,
-          corsProxy,
-          singleBranch: true,
-          depth: 1,
-        });
-      } catch (e) {
-        log(`OPFS Tier 1 Promises clone for status failed: ${e.message}`, 'error');
-        return { lightning: null, tier1: null, tier1Promises: null, tier2: null, vfsSync: null, vfsPromises: null, iterations, fileSize: 0, operation: 'git-status' };
-      }
-
-      // OPFS Tier 2 setup
-      const opfsGitFsTier2 = createOpfsGitFs(fsTier2);
-      try { await fsTier2.promises.rm('/git-status-opfs-t2', { recursive: true, force: true }); } catch {}
-      await fsTier2.promises.mkdir('/git-status-opfs-t2', { recursive: true });
-      try {
-        await git.clone({
-          fs: opfsGitFsTier2,
-          http,
-          dir: '/git-status-opfs-t2',
-          url: repoUrl,
-          corsProxy,
-          singleBranch: true,
-          depth: 1,
-        });
-      } catch (e) {
-        log(`OPFS Tier 2 clone for status failed: ${e.message}`, 'error');
-        // Continue with other tests even if this fails
+        return { lightning: null, vfsSync: null, vfsPromises: null, futureSync: null, futurePromises: null, iterations, fileSize: 0, operation: 'git-status' };
       }
 
       // LightningFS status benchmark
@@ -1332,42 +920,12 @@
       results.lightning = performance.now() - startL;
       log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
 
-      // OPFS Tier 1 Promises status benchmark (Main thread with Atomics.waitAsync)
-      log(`Testing OPFS Tier 1 Promises git status (${iterations}x)...`, 'info');
-      const startT1P = performance.now();
-      for (let i = 0; i < iterations; i++) {
-        await git.statusMatrix({ fs: opfsGitFs, dir: '/git-status-opfs' });
-      }
-      results.tier1Promises = performance.now() - startT1P;
-      log(`OPFS Tier 1 Promises: ${results.tier1Promises.toFixed(2)}ms`, 'success');
-
-      // OPFS Tier 2 status benchmark (async worker without sync kernel)
-      log(`Testing OPFS Tier 2 git status (${iterations}x)...`, 'info');
-      try {
-        const startT2 = performance.now();
-        for (let i = 0; i < iterations; i++) {
-          await git.statusMatrix({ fs: opfsGitFsTier2, dir: '/git-status-opfs-t2' });
-        }
-        results.tier2 = performance.now() - startT2;
-        log(`OPFS Tier 2: ${results.tier2.toFixed(2)}ms`, 'success');
-      } catch (e) {
-        log(`OPFS Tier 2 git status failed: ${e.message}`, 'error');
-        results.tier2 = null;
-      }
-
-      // Cleanup
-      try { await fs.promises.rm('/git-status-opfs', { recursive: true, force: true }); } catch {}
-      try { await fsTier2.promises.rm('/git-status-opfs-t2', { recursive: true, force: true }); } catch {}
-
-      // Tier 1 Sync not applicable (git requires async)
-      results.tier1 = null;
-
       // VFS Sync not applicable (git requires async)
       results.vfsSync = null;
 
       // VFS Promises git status
       if (vfsReady) {
-        const vfsGitFs = createOpfsGitFs(vfs);
+        const vfsGitFs = createGitFs(vfs);
         try { await vfs.promises.rm('/git-status-vfs', { recursive: true, force: true }); } catch {}
         await vfs.promises.mkdir('/git-status-vfs', { recursive: true });
         try {
@@ -1401,7 +959,7 @@
 
       // Future Promises git status
       if (futureReady) {
-        const futureGitFs = createOpfsGitFs({ promises: futureFs.promises });
+        const futureGitFs = createGitFs({ promises: futureFs.promises });
         try { futureFs.rmSync('/git-status-future', { recursive: true, force: true }); } catch {}
         futureFs.mkdirSync('/git-status-future', { recursive: true });
         try {
@@ -1437,15 +995,12 @@
       const container = document.getElementById('results');
 
       let html = '<table><thead><tr>';
-      html += '<th>Test</th><th>LightningFS</th><th>Tier 1 Sync</th><th>Tier 1 Promises</th><th>Tier 2</th><th>VFS Sync</th><th>VFS Promises</th><th>Future Sync</th><th>Future Promises</th><th>Best</th>';
+      html += '<th>Test</th><th>LightningFS</th><th>VFS Sync</th><th>VFS Promises</th><th>Future Sync</th><th>Future Promises</th><th>Best</th>';
       html += '</tr></thead><tbody>';
 
       for (const result of allResults) {
         const values = [
           { name: 'LightningFS', ms: result.lightning, class: 'lightning' },
-          { name: 'Tier 1 Sync', ms: result.tier1, class: 'tier1' },
-          { name: 'Tier 1 Promises', ms: result.tier1Promises, class: 'tier1' },
-          { name: 'Tier 2', ms: result.tier2, class: 'tier2' },
           { name: 'VFS Sync', ms: result.vfsSync, class: 'vfs' },
           { name: 'VFS Promises', ms: result.vfsPromises, class: 'vfs' },
           { name: 'Future Sync', ms: result.futureSync, class: 'future' },
@@ -1482,39 +1037,6 @@
           html += `<td class="${result.lightning === minMs ? 'winner' : ''}">`;
           html += `<div class="bar-container"><div class="bar lightning" style="width: ${lPct}%"></div></div>`;
           html += `${result.lightning.toFixed(1)}ms${lOps !== '-' ? ` (${lOps} ops/s)` : ''}</td>`;
-        } else {
-          html += '<td style="color:#999">N/A</td>';
-        }
-
-        // Tier 1 Sync
-        if (result.tier1 !== null && result.tier1 !== undefined) {
-          const t1Pct = (result.tier1 / maxMs * 100).toFixed(0);
-          const t1Ops = result.iterations > 0 ? (result.iterations / result.tier1 * 1000).toFixed(0) : '-';
-          html += `<td class="${result.tier1 === minMs ? 'winner' : ''}">`;
-          html += `<div class="bar-container"><div class="bar tier1" style="width: ${t1Pct}%"></div></div>`;
-          html += `${result.tier1.toFixed(1)}ms${t1Ops !== '-' ? ` (${t1Ops} ops/s)` : ''}</td>`;
-        } else {
-          html += '<td style="color:#999">N/A</td>';
-        }
-
-        // Tier 1 Promises
-        if (result.tier1Promises !== null && result.tier1Promises !== undefined) {
-          const t1pPct = (result.tier1Promises / maxMs * 100).toFixed(0);
-          const t1pOps = result.iterations > 0 ? (result.iterations / result.tier1Promises * 1000).toFixed(0) : '-';
-          html += `<td class="${result.tier1Promises === minMs ? 'winner' : ''}" style="background: ${result.tier1Promises === minMs ? '#d4edda' : ''}">`;
-          html += `<div class="bar-container"><div class="bar" style="width: ${t1pPct}%; background: linear-gradient(90deg, #17a2b8, #20c997);"></div></div>`;
-          html += `${result.tier1Promises.toFixed(1)}ms${t1pOps !== '-' ? ` (${t1pOps} ops/s)` : ''}</td>`;
-        } else {
-          html += '<td style="color:#999">N/A</td>';
-        }
-
-        // Tier 2
-        if (result.tier2 !== null && result.tier2 !== undefined) {
-          const t2Pct = (result.tier2 / maxMs * 100).toFixed(0);
-          const t2Ops = result.iterations > 0 ? (result.iterations / result.tier2 * 1000).toFixed(0) : '-';
-          html += `<td class="${result.tier2 === minMs ? 'winner' : ''}">`;
-          html += `<div class="bar-container"><div class="bar tier2" style="width: ${t2Pct}%"></div></div>`;
-          html += `${result.tier2.toFixed(1)}ms${t2Ops !== '-' ? ` (${t2Ops} ops/s)` : ''}</td>`;
         } else {
           html += '<td style="color:#999">N/A</td>';
         }
@@ -1578,10 +1100,10 @@
       html += '</tbody></table>';
 
       // Summary
-      const validResults = allResults.filter(r => r.tier2 > 0 || (r.tier1 !== null && r.tier1 > 0) || (r.tier1Promises !== null && r.tier1Promises > 0) || (r.vfsSync !== null && r.vfsSync > 0) || (r.vfsPromises !== null && r.vfsPromises > 0) || (r.futureSync !== null && r.futureSync > 0) || (r.futurePromises !== null && r.futurePromises > 0));
+      const validResults = allResults.filter(r => (r.vfsSync !== null && r.vfsSync > 0) || (r.vfsPromises !== null && r.vfsPromises > 0) || (r.futureSync !== null && r.futureSync > 0) || (r.futurePromises !== null && r.futurePromises > 0));
       const avgSpeedup = validResults.length > 0
         ? validResults.reduce((acc, r) => {
-            const best = Math.min(r.tier1 || Infinity, r.tier1Promises || Infinity, r.tier2 || Infinity, r.vfsSync || Infinity, r.vfsPromises || Infinity, r.futureSync || Infinity, r.futurePromises || Infinity);
+            const best = Math.min(r.vfsSync || Infinity, r.vfsPromises || Infinity, r.futureSync || Infinity, r.futurePromises || Infinity);
             if (!isFinite(best) || best <= 0 || !r.lightning) return acc;
             return acc + (r.lightning / best);
           }, 0) / validResults.filter(r => r.lightning > 0).length
@@ -1589,7 +1111,7 @@
 
       html += `<div class="summary">`;
       html += `<h3>Summary</h3>`;
-      html += `<p>Average OPFS speedup vs LightningFS: <strong style="color:${avgSpeedup >= 1 ? 'green' : 'red'}">${avgSpeedup.toFixed(2)}x</strong></p>`;
+      html += `<p>Average speedup vs LightningFS: <strong style="color:${avgSpeedup >= 1 ? 'green' : 'red'}">${avgSpeedup.toFixed(2)}x</strong></p>`;
       html += `</div>`;
 
       container.innerHTML = html;
@@ -1601,7 +1123,7 @@
     window.runBenchmark = async (type) => {
       try {
         setStatus('Initializing...', 'running');
-        if (!fs) await init();
+        if (!LightningFS) await init();
 
         let result;
         if (type === 'write') {
@@ -1639,7 +1161,7 @@
     window.runAllBenchmarks = async () => {
       try {
         setStatus('Initializing...', 'running');
-        if (!fs) await init();
+        if (!LightningFS) await init();
 
         window.allResults = [];
 

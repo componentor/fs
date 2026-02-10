@@ -5,7 +5,7 @@ const jsExtension = () => ({ js: '.js' });
 export default defineConfig([
   {
     entry: ['src/index.ts'],
-    outDir: '../dist/next',
+    outDir: '../dist',
     format: ['esm'],
     outExtension: jsExtension,
     splitting: false,
@@ -20,7 +20,7 @@ export default defineConfig([
       'src/workers/async-relay.worker.ts',
       'src/workers/service.worker.ts',
     ],
-    outDir: '../dist/next/workers',
+    outDir: '../dist/workers',
     format: ['esm'],
     outExtension: jsExtension,
     splitting: false,
