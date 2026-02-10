@@ -57,6 +57,7 @@ export class VFSEngine {
   private processUid = 0;
   private processGid = 0;
   private strictPermissions = false;
+  private debug = false;
 
   // File descriptor table
   private fdTable = new Map<number, FdEntry>();
@@ -73,13 +74,14 @@ export class VFSEngine {
 
   init(
     handle: FileSystemSyncAccessHandle,
-    opts?: { uid?: number; gid?: number; umask?: number; strictPermissions?: boolean }
+    opts?: { uid?: number; gid?: number; umask?: number; strictPermissions?: boolean; debug?: boolean }
   ): void {
     this.handle = handle;
     this.processUid = opts?.uid ?? 0;
     this.processGid = opts?.gid ?? 0;
     this.umask = opts?.umask ?? DEFAULT_UMASK;
     this.strictPermissions = opts?.strictPermissions ?? false;
+    this.debug = opts?.debug ?? false;
 
     const size = handle.getSize();
 
@@ -583,29 +585,44 @@ export class VFSEngine {
 
   // ---- READ ----
   read(path: string): { status: number; data: Uint8Array | null } {
+    const t0 = this.debug ? performance.now() : 0;
     path = this.normalizePath(path);
+    const t1 = this.debug ? performance.now() : 0;
     const idx = this.resolvePathComponents(path, true);
     if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT, data: null };
 
+    const t2 = this.debug ? performance.now() : 0;
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR, data: null };
 
+    const t3 = this.debug ? performance.now() : 0;
     const data = inode.size > 0
       ? this.readData(inode.firstBlock, inode.blockCount, inode.size)
       : new Uint8Array(0);
+    const t4 = this.debug ? performance.now() : 0;
+
+    if (this.debug) {
+      console.log(`[VFS read] path=${path} size=${inode.size} normalize=${(t1-t0).toFixed(3)}ms resolve=${(t2-t1).toFixed(3)}ms inode=${(t3-t2).toFixed(3)}ms data=${(t4-t3).toFixed(3)}ms TOTAL=${(t4-t0).toFixed(3)}ms`);
+    }
 
     return { status: 0, data };
   }
 
   // ---- WRITE ----
   write(path: string, data: Uint8Array, flags: number = 0): { status: number } {
+    const t0 = this.debug ? performance.now() : 0;
     path = this.normalizePath(path);
+    const t1 = this.debug ? performance.now() : 0;
 
     // Ensure parent directory exists
     const parentStatus = this.ensureParent(path);
     if (parentStatus !== 0) return { status: parentStatus };
+    const t2 = this.debug ? performance.now() : 0;
 
     const existingIdx = this.resolvePathComponents(path, true);
+    const t3 = this.debug ? performance.now() : 0;
+
+    let tAlloc = t3, tData = t3, tInode = t3;
 
     if (existingIdx !== undefined) {
       // Update existing file
@@ -616,7 +633,9 @@ export class VFSEngine {
 
       if (neededBlocks <= inode.blockCount) {
         // Fits in current blocks
+        tAlloc = this.debug ? performance.now() : 0;
         this.writeData(inode.firstBlock, data);
+        tData = this.debug ? performance.now() : 0;
         if (neededBlocks < inode.blockCount) {
           this.freeBlockRange(inode.firstBlock + neededBlocks, inode.blockCount - neededBlocks);
         }
@@ -624,7 +643,9 @@ export class VFSEngine {
         // Need more blocks — free old, allocate new
         this.freeBlockRange(inode.firstBlock, inode.blockCount);
         const newFirst = this.allocateBlocks(neededBlocks);
+        tAlloc = this.debug ? performance.now() : 0;
         this.writeData(newFirst, data);
+        tData = this.debug ? performance.now() : 0;
         inode.firstBlock = newFirst;
       }
 
@@ -632,13 +653,24 @@ export class VFSEngine {
       inode.blockCount = neededBlocks;
       inode.mtime = Date.now();
       this.writeInode(existingIdx, inode);
+      tInode = this.debug ? performance.now() : 0;
     } else {
       // Create new file
       const mode = DEFAULT_FILE_MODE & ~(this.umask & 0o777);
       this.createInode(path, INODE_TYPE.FILE, mode, data.byteLength, data);
+      tAlloc = this.debug ? performance.now() : 0;
+      tData = tAlloc;
+      tInode = tAlloc;
     }
 
     if (flags & 1) this.handle.flush();
+    const tFlush = this.debug ? performance.now() : 0;
+
+    if (this.debug) {
+      const existing = existingIdx !== undefined;
+      console.log(`[VFS write] path=${path} size=${data.byteLength} ${existing ? 'UPDATE' : 'CREATE'} normalize=${(t1-t0).toFixed(3)}ms parent=${(t2-t1).toFixed(3)}ms resolve=${(t3-t2).toFixed(3)}ms alloc=${(tAlloc-t3).toFixed(3)}ms data=${(tData-tAlloc).toFixed(3)}ms inode=${(tInode-tData).toFixed(3)}ms flush=${(tFlush-tInode).toFixed(3)}ms TOTAL=${(tFlush-t0).toFixed(3)}ms`);
+    }
+
     return { status: 0 };
   }
 

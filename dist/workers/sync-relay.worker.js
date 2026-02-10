@@ -133,6 +133,7 @@ var VFSEngine = class {
   processUid = 0;
   processGid = 0;
   strictPermissions = false;
+  debug = false;
   // File descriptor table
   fdTable = /* @__PURE__ */ new Map();
   nextFd = 3;
@@ -150,6 +151,7 @@ var VFSEngine = class {
     this.processGid = opts?.gid ?? 0;
     this.umask = opts?.umask ?? DEFAULT_UMASK;
     this.strictPermissions = opts?.strictPermissions ?? false;
+    this.debug = opts?.debug ?? false;
     const size = handle.getSize();
     if (size === 0) {
       this.format();
@@ -533,44 +535,70 @@ var VFSEngine = class {
   }
   // ---- READ ----
   read(path) {
+    const t0 = this.debug ? performance.now() : 0;
     path = this.normalizePath(path);
+    const t1 = this.debug ? performance.now() : 0;
     const idx = this.resolvePathComponents(path, true);
     if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    const t2 = this.debug ? performance.now() : 0;
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR, data: null };
+    const t3 = this.debug ? performance.now() : 0;
     const data = inode.size > 0 ? this.readData(inode.firstBlock, inode.blockCount, inode.size) : new Uint8Array(0);
+    const t4 = this.debug ? performance.now() : 0;
+    if (this.debug) {
+      console.log(`[VFS read] path=${path} size=${inode.size} normalize=${(t1 - t0).toFixed(3)}ms resolve=${(t2 - t1).toFixed(3)}ms inode=${(t3 - t2).toFixed(3)}ms data=${(t4 - t3).toFixed(3)}ms TOTAL=${(t4 - t0).toFixed(3)}ms`);
+    }
     return { status: 0, data };
   }
   // ---- WRITE ----
   write(path, data, flags = 0) {
+    const t0 = this.debug ? performance.now() : 0;
     path = this.normalizePath(path);
+    const t1 = this.debug ? performance.now() : 0;
     const parentStatus = this.ensureParent(path);
     if (parentStatus !== 0) return { status: parentStatus };
+    const t2 = this.debug ? performance.now() : 0;
     const existingIdx = this.resolvePathComponents(path, true);
+    const t3 = this.debug ? performance.now() : 0;
+    let tAlloc = t3, tData = t3, tInode = t3;
     if (existingIdx !== void 0) {
       const inode = this.readInode(existingIdx);
       if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
       const neededBlocks = Math.ceil(data.byteLength / this.blockSize);
       if (neededBlocks <= inode.blockCount) {
+        tAlloc = this.debug ? performance.now() : 0;
         this.writeData(inode.firstBlock, data);
+        tData = this.debug ? performance.now() : 0;
         if (neededBlocks < inode.blockCount) {
           this.freeBlockRange(inode.firstBlock + neededBlocks, inode.blockCount - neededBlocks);
         }
       } else {
         this.freeBlockRange(inode.firstBlock, inode.blockCount);
         const newFirst = this.allocateBlocks(neededBlocks);
+        tAlloc = this.debug ? performance.now() : 0;
         this.writeData(newFirst, data);
+        tData = this.debug ? performance.now() : 0;
         inode.firstBlock = newFirst;
       }
       inode.size = data.byteLength;
       inode.blockCount = neededBlocks;
       inode.mtime = Date.now();
       this.writeInode(existingIdx, inode);
+      tInode = this.debug ? performance.now() : 0;
     } else {
       const mode = DEFAULT_FILE_MODE & ~(this.umask & 511);
       this.createInode(path, INODE_TYPE.FILE, mode, data.byteLength, data);
+      tAlloc = this.debug ? performance.now() : 0;
+      tData = tAlloc;
+      tInode = tAlloc;
     }
     if (flags & 1) this.handle.flush();
+    const tFlush = this.debug ? performance.now() : 0;
+    if (this.debug) {
+      const existing = existingIdx !== void 0;
+      console.log(`[VFS write] path=${path} size=${data.byteLength} ${existing ? "UPDATE" : "CREATE"} normalize=${(t1 - t0).toFixed(3)}ms parent=${(t2 - t1).toFixed(3)}ms resolve=${(t3 - t2).toFixed(3)}ms alloc=${(tAlloc - t3).toFixed(3)}ms data=${(tData - tAlloc).toFixed(3)}ms inode=${(tInode - tData).toFixed(3)}ms flush=${(tFlush - tInode).toFixed(3)}ms TOTAL=${(tFlush - t0).toFixed(3)}ms`);
+    }
     return { status: 0 };
   }
   // ---- APPEND ----
@@ -1231,6 +1259,7 @@ function decodeSecondPath(data) {
 var engine = new VFSEngine();
 var leaderInitialized = false;
 var readySent = false;
+var debug = false;
 var sab;
 var ctrl;
 var readySab;
@@ -1297,8 +1326,42 @@ function onLeaderMessage(e) {
     resolve(e.data.buffer);
   }
 }
+var OP_NAMES = {
+  1: "READ",
+  2: "WRITE",
+  3: "UNLINK",
+  4: "STAT",
+  5: "LSTAT",
+  6: "MKDIR",
+  7: "RMDIR",
+  8: "READDIR",
+  9: "RENAME",
+  10: "EXISTS",
+  11: "TRUNCATE",
+  12: "APPEND",
+  13: "COPY",
+  14: "ACCESS",
+  15: "REALPATH",
+  16: "CHMOD",
+  17: "CHOWN",
+  18: "UTIMES",
+  19: "SYMLINK",
+  20: "READLINK",
+  21: "LINK",
+  22: "OPEN",
+  23: "CLOSE",
+  24: "FREAD",
+  25: "FWRITE",
+  26: "FSTAT",
+  27: "FTRUNCATE",
+  28: "FSYNC",
+  29: "OPENDIR",
+  30: "MKDTEMP"
+};
 function handleRequest(reqTabId, buffer) {
+  const t0 = debug ? performance.now() : 0;
   const { op, flags, path, data } = decodeRequest(buffer);
+  const t1 = debug ? performance.now() : 0;
   let result;
   switch (op) {
     case OP.READ:
@@ -1452,8 +1515,14 @@ function handleRequest(reqTabId, buffer) {
     default:
       result = { status: 7 };
   }
+  const t2 = debug ? performance.now() : 0;
   const responseData = result.data instanceof Uint8Array ? result.data : void 0;
-  return encodeResponse(result.status, responseData);
+  const response = encodeResponse(result.status, responseData);
+  const t3 = debug ? performance.now() : 0;
+  if (debug) {
+    console.log(`[sync-relay] op=${OP_NAMES[op] ?? op} path=${path} decode=${(t1 - t0).toFixed(3)}ms engine=${(t2 - t1).toFixed(3)}ms encode=${(t3 - t2).toFixed(3)}ms TOTAL=${(t3 - t0).toFixed(3)}ms`);
+  }
+  return response;
 }
 function readPayload(targetSab, targetCtrl) {
   const totalLenView = new BigUint64Array(targetSab, SAB_OFFSETS.TOTAL_LEN, 1);
@@ -1511,9 +1580,16 @@ async function leaderLoop() {
     while (processed) {
       processed = false;
       if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST) {
+        const lt0 = debug ? performance.now() : 0;
         const payload = readPayload(sab, ctrl);
+        const lt1 = debug ? performance.now() : 0;
         const response = handleRequest(tabId, payload.buffer);
+        const lt2 = debug ? performance.now() : 0;
         writeResponse(sab, ctrl, new Uint8Array(response));
+        const lt3 = debug ? performance.now() : 0;
+        if (debug) {
+          console.log(`[leaderLoop] readPayload=${(lt1 - lt0).toFixed(3)}ms handleRequest=${(lt2 - lt1).toFixed(3)}ms writeResponse=${(lt3 - lt2).toFixed(3)}ms TOTAL=${(lt3 - lt0).toFixed(3)}ms`);
+        }
         const result = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 10);
         if (result === "timed-out") {
           Atomics.store(ctrl, 0, SIGNAL.IDLE);
@@ -1580,6 +1656,7 @@ async function followerLoop() {
   }
 }
 async function initEngine(config) {
+  debug = config.debug ?? false;
   let rootDir = await navigator.storage.getDirectory();
   if (config.root && config.root !== "/") {
     const segments = config.root.split("/").filter(Boolean);
@@ -1593,19 +1670,36 @@ async function initEngine(config) {
     uid: config.uid,
     gid: config.gid,
     umask: config.umask,
-    strictPermissions: config.strictPermissions
+    strictPermissions: config.strictPermissions,
+    debug: config.debug
   });
 }
 self.onmessage = async (e) => {
   const msg = e.data;
+  if (msg.type === "async-port") {
+    const port = msg.port ?? e.ports[0];
+    if (port) {
+      port.onmessage = (ev) => {
+        if (ev.data.buffer instanceof ArrayBuffer) {
+          const response = handleRequest(tabId || "nosab", ev.data.buffer);
+          port.postMessage({ id: ev.data.id, buffer: response }, [response]);
+        }
+      };
+      port.start();
+    }
+    return;
+  }
   if (msg.type === "init-leader") {
     if (leaderInitialized) return;
     leaderInitialized = true;
-    sab = msg.sab;
-    readySab = msg.readySab;
     tabId = msg.tabId;
-    ctrl = new Int32Array(sab, 0, 8);
-    readySignal = new Int32Array(readySab, 0, 1);
+    const hasSAB = msg.sab != null;
+    if (hasSAB) {
+      sab = msg.sab;
+      readySab = msg.readySab;
+      ctrl = new Int32Array(sab, 0, 8);
+      readySignal = new Int32Array(readySab, 0, 1);
+    }
     if (msg.asyncSab) {
       asyncSab = msg.asyncSab;
       asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
@@ -1622,19 +1716,26 @@ self.onmessage = async (e) => {
     }
     if (!readySent) {
       readySent = true;
-      Atomics.store(readySignal, 0, 1);
-      Atomics.notify(readySignal, 0);
+      if (hasSAB) {
+        Atomics.store(readySignal, 0, 1);
+        Atomics.notify(readySignal, 0);
+      }
       self.postMessage({ type: "ready" });
     }
-    leaderLoop();
+    if (hasSAB) {
+      leaderLoop();
+    }
     return;
   }
   if (msg.type === "init-follower") {
-    sab = msg.sab;
-    readySab = msg.readySab;
     tabId = msg.tabId;
-    ctrl = new Int32Array(sab, 0, 8);
-    readySignal = new Int32Array(readySab, 0, 1);
+    const hasSAB = msg.sab != null;
+    if (hasSAB) {
+      sab = msg.sab;
+      readySab = msg.readySab;
+      ctrl = new Int32Array(sab, 0, 8);
+      readySignal = new Int32Array(readySab, 0, 1);
+    }
     if (msg.asyncSab) {
       asyncSab = msg.asyncSab;
       asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);

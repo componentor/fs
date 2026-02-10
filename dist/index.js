@@ -983,13 +983,15 @@ function spinWait(arr, index, value) {
   }
 }
 var VFSFileSystem = class {
-  // SAB for sync communication with sync relay worker
+  // SAB for sync communication with sync relay worker (null when SAB unavailable)
   sab;
   ctrl;
   readySab;
   readySignal;
   // SAB for async-relay ↔ sync-relay communication
   asyncSab;
+  // Whether SharedArrayBuffer is available (crossOriginIsolated)
+  hasSAB = typeof SharedArrayBuffer !== "undefined";
   // Workers
   syncWorker;
   asyncWorker;
@@ -1036,11 +1038,13 @@ var VFSFileSystem = class {
   /** Spawn workers and establish communication */
   bootstrap() {
     const sabSize = this.config.sabSize;
-    this.sab = new SharedArrayBuffer(sabSize);
-    this.readySab = new SharedArrayBuffer(4);
-    this.asyncSab = new SharedArrayBuffer(sabSize);
-    this.ctrl = new Int32Array(this.sab, 0, 8);
-    this.readySignal = new Int32Array(this.readySab, 0, 1);
+    if (this.hasSAB) {
+      this.sab = new SharedArrayBuffer(sabSize);
+      this.readySab = new SharedArrayBuffer(4);
+      this.asyncSab = new SharedArrayBuffer(sabSize);
+      this.ctrl = new Int32Array(this.sab, 0, 8);
+      this.readySignal = new Int32Array(this.readySab, 0, 1);
+    }
     this.syncWorker = this.spawnWorker("sync-relay");
     this.asyncWorker = this.spawnWorker("async-relay");
     this.syncWorker.onmessage = (e) => {
@@ -1069,11 +1073,23 @@ var VFSFileSystem = class {
         }
       }
     };
-    this.asyncWorker.postMessage({
-      type: "init-leader",
-      asyncSab: this.asyncSab,
-      wakeSab: this.sab
-    });
+    if (this.hasSAB) {
+      this.asyncWorker.postMessage({
+        type: "init-leader",
+        asyncSab: this.asyncSab,
+        wakeSab: this.sab
+      });
+    } else {
+      const mc = new MessageChannel();
+      this.asyncWorker.postMessage(
+        { type: "init-port", port: mc.port1 },
+        [mc.port1]
+      );
+      this.syncWorker.postMessage(
+        { type: "async-port", port: mc.port2 },
+        [mc.port2]
+      );
+    }
     this.acquireLeaderLock();
   }
   /** Use Web Locks API for leader election. The tab that acquires the lock is
@@ -1114,9 +1130,9 @@ var VFSFileSystem = class {
   sendLeaderInit() {
     this.syncWorker.postMessage({
       type: "init-leader",
-      sab: this.sab,
-      readySab: this.readySab,
-      asyncSab: this.asyncSab,
+      sab: this.hasSAB ? this.sab : null,
+      readySab: this.hasSAB ? this.readySab : null,
+      asyncSab: this.hasSAB ? this.asyncSab : null,
       tabId: this.tabId,
       config: {
         root: this.config.root,
@@ -1124,7 +1140,8 @@ var VFSFileSystem = class {
         uid: this.config.uid,
         gid: this.config.gid,
         umask: this.config.umask,
-        strictPermissions: this.config.strictPermissions
+        strictPermissions: this.config.strictPermissions,
+        debug: this.config.debug
       }
     });
   }
@@ -1138,9 +1155,9 @@ var VFSFileSystem = class {
     this.isFollower = true;
     this.syncWorker.postMessage({
       type: "init-follower",
-      sab: this.sab,
-      readySab: this.readySab,
-      asyncSab: this.asyncSab,
+      sab: this.hasSAB ? this.sab : null,
+      readySab: this.hasSAB ? this.readySab : null,
+      asyncSab: this.hasSAB ? this.asyncSab : null,
       tabId: this.tabId
     });
     this.connectToLeader();
@@ -1229,11 +1246,13 @@ var VFSFileSystem = class {
     this.syncWorker.terminate();
     this.asyncWorker.terminate();
     const sabSize = this.config.sabSize;
-    this.sab = new SharedArrayBuffer(sabSize);
-    this.readySab = new SharedArrayBuffer(4);
-    this.asyncSab = new SharedArrayBuffer(sabSize);
-    this.ctrl = new Int32Array(this.sab, 0, 8);
-    this.readySignal = new Int32Array(this.readySab, 0, 1);
+    if (this.hasSAB) {
+      this.sab = new SharedArrayBuffer(sabSize);
+      this.readySab = new SharedArrayBuffer(4);
+      this.asyncSab = new SharedArrayBuffer(sabSize);
+      this.ctrl = new Int32Array(this.sab, 0, 8);
+      this.readySignal = new Int32Array(this.readySab, 0, 1);
+    }
     this.syncWorker = this.spawnWorker("sync-relay");
     this.asyncWorker = this.spawnWorker("async-relay");
     this.syncWorker.onmessage = (e) => {
@@ -1257,11 +1276,23 @@ var VFSFileSystem = class {
         }
       }
     };
-    this.asyncWorker.postMessage({
-      type: "init-leader",
-      asyncSab: this.asyncSab,
-      wakeSab: this.sab
-    });
+    if (this.hasSAB) {
+      this.asyncWorker.postMessage({
+        type: "init-leader",
+        asyncSab: this.asyncSab,
+        wakeSab: this.sab
+      });
+    } else {
+      const mc = new MessageChannel();
+      this.asyncWorker.postMessage(
+        { type: "init-port", port: mc.port1 },
+        [mc.port1]
+      );
+      this.syncWorker.postMessage(
+        { type: "async-port", port: mc.port2 },
+        [mc.port2]
+      );
+    }
     this.sendLeaderInit();
   }
   /** Spawn an inline worker from bundled code */
@@ -1273,6 +1304,9 @@ var VFSFileSystem = class {
   /** Block until workers are ready */
   ensureReady() {
     if (this.isReady) return;
+    if (!this.hasSAB) {
+      throw new Error("Sync API requires crossOriginIsolated (COOP/COEP headers). Use the promises API instead.");
+    }
     if (Atomics.load(this.readySignal, 0) === 1) {
       this.isReady = true;
       return;
@@ -1283,6 +1317,7 @@ var VFSFileSystem = class {
   /** Send a sync request via SAB and wait for response */
   syncRequest(requestBuf) {
     this.ensureReady();
+    const t0 = this.config.debug ? performance.now() : 0;
     const maxChunk = this.sab.byteLength - HEADER_SIZE;
     const requestBytes = new Uint8Array(requestBuf);
     const totalLenView = new BigUint64Array(this.sab, SAB_OFFSETS.TOTAL_LEN, 1);
@@ -1337,7 +1372,12 @@ var VFSFileSystem = class {
       }
     }
     Atomics.store(this.ctrl, 0, SIGNAL.IDLE);
-    return decodeResponse(responseBytes.buffer);
+    const result = decodeResponse(responseBytes.buffer);
+    if (this.config.debug) {
+      const t1 = performance.now();
+      console.log(`[syncRequest] size=${requestBuf.byteLength} roundTrip=${(t1 - t0).toFixed(3)}ms`);
+    }
+    return result;
   }
   // ========== Async operation primitive ==========
   asyncRequest(op, filePath, flags, data, path2, fdArgs) {

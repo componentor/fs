@@ -2,9 +2,9 @@
  * Promises-only export for `import promises from '@componentor/fs/promises'`
  */
 
-import { fs } from './index.js';
+import { getDefaultFS } from './index.js';
 
-const promises = fs.promises;
+const promises = getDefaultFS().promises;
 
 export const readFile = promises.readFile.bind(promises);
 export const writeFile = promises.writeFile.bind(promises);

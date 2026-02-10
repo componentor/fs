@@ -189,6 +189,22 @@ self.onmessage = async (e) => {
     }
     return;
   }
+  if (msg.type === "init-port") {
+    const port = msg.port ?? e.ports[0];
+    if (port) {
+      leaderPort = port;
+      leaderPort.onmessage = (ev) => {
+        const { id, buffer } = ev.data;
+        const resolve = pending.get(id);
+        if (resolve) {
+          pending.delete(id);
+          resolve(buffer);
+        }
+      };
+      leaderPort.start();
+    }
+    return;
+  }
   if (msg.type === "init-follower") {
     return;
   }

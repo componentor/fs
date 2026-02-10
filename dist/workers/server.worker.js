@@ -133,6 +133,7 @@ var VFSEngine = class {
   processUid = 0;
   processGid = 0;
   strictPermissions = false;
+  debug = false;
   // File descriptor table
   fdTable = /* @__PURE__ */ new Map();
   nextFd = 3;
@@ -150,6 +151,7 @@ var VFSEngine = class {
     this.processGid = opts?.gid ?? 0;
     this.umask = opts?.umask ?? DEFAULT_UMASK;
     this.strictPermissions = opts?.strictPermissions ?? false;
+    this.debug = opts?.debug ?? false;
     const size = handle.getSize();
     if (size === 0) {
       this.format();
@@ -533,44 +535,70 @@ var VFSEngine = class {
   }
   // ---- READ ----
   read(path) {
+    const t0 = this.debug ? performance.now() : 0;
     path = this.normalizePath(path);
+    const t1 = this.debug ? performance.now() : 0;
     const idx = this.resolvePathComponents(path, true);
     if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    const t2 = this.debug ? performance.now() : 0;
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR, data: null };
+    const t3 = this.debug ? performance.now() : 0;
     const data = inode.size > 0 ? this.readData(inode.firstBlock, inode.blockCount, inode.size) : new Uint8Array(0);
+    const t4 = this.debug ? performance.now() : 0;
+    if (this.debug) {
+      console.log(`[VFS read] path=${path} size=${inode.size} normalize=${(t1 - t0).toFixed(3)}ms resolve=${(t2 - t1).toFixed(3)}ms inode=${(t3 - t2).toFixed(3)}ms data=${(t4 - t3).toFixed(3)}ms TOTAL=${(t4 - t0).toFixed(3)}ms`);
+    }
     return { status: 0, data };
   }
   // ---- WRITE ----
   write(path, data, flags = 0) {
+    const t0 = this.debug ? performance.now() : 0;
     path = this.normalizePath(path);
+    const t1 = this.debug ? performance.now() : 0;
     const parentStatus = this.ensureParent(path);
     if (parentStatus !== 0) return { status: parentStatus };
+    const t2 = this.debug ? performance.now() : 0;
     const existingIdx = this.resolvePathComponents(path, true);
+    const t3 = this.debug ? performance.now() : 0;
+    let tAlloc = t3, tData = t3, tInode = t3;
     if (existingIdx !== void 0) {
       const inode = this.readInode(existingIdx);
       if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
       const neededBlocks = Math.ceil(data.byteLength / this.blockSize);
       if (neededBlocks <= inode.blockCount) {
+        tAlloc = this.debug ? performance.now() : 0;
         this.writeData(inode.firstBlock, data);
+        tData = this.debug ? performance.now() : 0;
         if (neededBlocks < inode.blockCount) {
           this.freeBlockRange(inode.firstBlock + neededBlocks, inode.blockCount - neededBlocks);
         }
       } else {
         this.freeBlockRange(inode.firstBlock, inode.blockCount);
         const newFirst = this.allocateBlocks(neededBlocks);
+        tAlloc = this.debug ? performance.now() : 0;
         this.writeData(newFirst, data);
+        tData = this.debug ? performance.now() : 0;
         inode.firstBlock = newFirst;
       }
       inode.size = data.byteLength;
       inode.blockCount = neededBlocks;
       inode.mtime = Date.now();
       this.writeInode(existingIdx, inode);
+      tInode = this.debug ? performance.now() : 0;
     } else {
       const mode = DEFAULT_FILE_MODE & ~(this.umask & 511);
       this.createInode(path, INODE_TYPE.FILE, mode, data.byteLength, data);
+      tAlloc = this.debug ? performance.now() : 0;
+      tData = tAlloc;
+      tInode = tAlloc;
     }
     if (flags & 1) this.handle.flush();
+    const tFlush = this.debug ? performance.now() : 0;
+    if (this.debug) {
+      const existing = existingIdx !== void 0;
+      console.log(`[VFS write] path=${path} size=${data.byteLength} ${existing ? "UPDATE" : "CREATE"} normalize=${(t1 - t0).toFixed(3)}ms parent=${(t2 - t1).toFixed(3)}ms resolve=${(t3 - t2).toFixed(3)}ms alloc=${(tAlloc - t3).toFixed(3)}ms data=${(tData - tAlloc).toFixed(3)}ms inode=${(tInode - tData).toFixed(3)}ms flush=${(tFlush - tInode).toFixed(3)}ms TOTAL=${(tFlush - t0).toFixed(3)}ms`);
+    }
     return { status: 0 };
   }
   // ---- APPEND ----

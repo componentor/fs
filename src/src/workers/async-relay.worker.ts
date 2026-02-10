@@ -158,12 +158,30 @@ async function sendRequest(reqBuffer: ArrayBuffer): Promise<{ status: number; da
 self.onmessage = async (e: MessageEvent) => {
   const msg = e.data;
 
-  // --- Leader mode init ---
+  // --- Leader mode init (with SAB) ---
   if (msg.type === 'init-leader') {
     asyncSab = msg.asyncSab;
     asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
     if (msg.wakeSab) {
       wakeCtrl = new Int32Array(msg.wakeSab, 0, 1);
+    }
+    return;
+  }
+
+  // --- Port mode init (no SAB: communicate with sync-relay via MessagePort) ---
+  if (msg.type === 'init-port') {
+    const port = msg.port ?? e.ports[0];
+    if (port) {
+      leaderPort = port;
+      leaderPort!.onmessage = (ev: MessageEvent) => {
+        const { id, buffer } = ev.data;
+        const resolve = pending.get(id);
+        if (resolve) {
+          pending.delete(id);
+          resolve(buffer);
+        }
+      };
+      leaderPort!.start();
     }
     return;
   }

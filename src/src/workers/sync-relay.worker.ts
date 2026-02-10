@@ -28,6 +28,7 @@ const engine = new VFSEngine();
 // Guards: prevent duplicate init and double-ready
 let leaderInitialized = false;
 let readySent = false;
+let debug = false;
 
 // Own tab's sync SAB
 let sab: SharedArrayBuffer;
@@ -120,8 +121,19 @@ function onLeaderMessage(e: MessageEvent): void {
 
 // ========== Request dispatch (leader mode) ==========
 
+const OP_NAMES: Record<number, string> = {
+  1: 'READ', 2: 'WRITE', 3: 'UNLINK', 4: 'STAT', 5: 'LSTAT', 6: 'MKDIR',
+  7: 'RMDIR', 8: 'READDIR', 9: 'RENAME', 10: 'EXISTS', 11: 'TRUNCATE',
+  12: 'APPEND', 13: 'COPY', 14: 'ACCESS', 15: 'REALPATH', 16: 'CHMOD',
+  17: 'CHOWN', 18: 'UTIMES', 19: 'SYMLINK', 20: 'READLINK', 21: 'LINK',
+  22: 'OPEN', 23: 'CLOSE', 24: 'FREAD', 25: 'FWRITE', 26: 'FSTAT',
+  27: 'FTRUNCATE', 28: 'FSYNC', 29: 'OPENDIR', 30: 'MKDTEMP',
+};
+
 function handleRequest(reqTabId: string, buffer: ArrayBuffer): ArrayBuffer {
+  const t0 = debug ? performance.now() : 0;
   const { op, flags, path, data } = decodeRequest(buffer);
+  const t1 = debug ? performance.now() : 0;
 
   let result: { status: number; data?: Uint8Array | null };
 
@@ -308,8 +320,16 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): ArrayBuffer {
       result = { status: 7 }; // EINVAL — unknown op
   }
 
+  const t2 = debug ? performance.now() : 0;
   const responseData = result.data instanceof Uint8Array ? result.data : undefined;
-  return encodeResponse(result.status, responseData);
+  const response = encodeResponse(result.status, responseData);
+  const t3 = debug ? performance.now() : 0;
+
+  if (debug) {
+    console.log(`[sync-relay] op=${OP_NAMES[op] ?? op} path=${path} decode=${(t1-t0).toFixed(3)}ms engine=${(t2-t1).toFixed(3)}ms encode=${(t3-t2).toFixed(3)}ms TOTAL=${(t3-t0).toFixed(3)}ms`);
+  }
+
+  return response;
 }
 
 // ========== SAB I/O helpers ==========
@@ -399,9 +419,16 @@ async function leaderLoop(): Promise<void> {
 
       // Priority 1: own tab's sync requests (fastest path)
       if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST) {
+        const lt0 = debug ? performance.now() : 0;
         const payload = readPayload(sab, ctrl);
+        const lt1 = debug ? performance.now() : 0;
         const response = handleRequest(tabId, payload.buffer as ArrayBuffer);
+        const lt2 = debug ? performance.now() : 0;
         writeResponse(sab, ctrl, new Uint8Array(response));
+        const lt3 = debug ? performance.now() : 0;
+        if (debug) {
+          console.log(`[leaderLoop] readPayload=${(lt1-lt0).toFixed(3)}ms handleRequest=${(lt2-lt1).toFixed(3)}ms writeResponse=${(lt3-lt2).toFixed(3)}ms TOTAL=${(lt3-lt0).toFixed(3)}ms`);
+        }
         // Wait for main thread to consume response (10ms safety timeout).
         // Main thread sets IDLE without notify — worker stays asleep until the
         // NEXT request's notify wakes it. This gives ONE wake per operation.
@@ -500,7 +527,10 @@ async function initEngine(config: {
   gid: number;
   umask: number;
   strictPermissions: boolean;
+  debug?: boolean;
 }): Promise<void> {
+  debug = config.debug ?? false;
+
   // Navigate to configured OPFS root
   let rootDir = await navigator.storage.getDirectory();
 
@@ -521,6 +551,7 @@ async function initEngine(config: {
     gid: config.gid,
     umask: config.umask,
     strictPermissions: config.strictPermissions,
+    debug: config.debug,
   });
 }
 
@@ -529,16 +560,36 @@ async function initEngine(config: {
 self.onmessage = async (e: MessageEvent) => {
   const msg = e.data;
 
+  // --- Async port registration (no-SAB mode: async-relay connects via MessagePort) ---
+  if (msg.type === 'async-port') {
+    const port = msg.port ?? e.ports[0];
+    if (port) {
+      // Process async requests directly when received (no SAB polling)
+      port.onmessage = (ev: MessageEvent) => {
+        if (ev.data.buffer instanceof ArrayBuffer) {
+          const response = handleRequest(tabId || 'nosab', ev.data.buffer);
+          port.postMessage({ id: ev.data.id, buffer: response }, [response]);
+        }
+      };
+      port.start();
+    }
+    return;
+  }
+
   // --- Leader mode init ---
   if (msg.type === 'init-leader') {
     if (leaderInitialized) return; // Prevent duplicate init during async gap
     leaderInitialized = true;
 
-    sab = msg.sab;
-    readySab = msg.readySab;
     tabId = msg.tabId;
-    ctrl = new Int32Array(sab, 0, 8);
-    readySignal = new Int32Array(readySab, 0, 1);
+    const hasSAB = msg.sab != null;
+
+    if (hasSAB) {
+      sab = msg.sab;
+      readySab = msg.readySab;
+      ctrl = new Int32Array(sab, 0, 8);
+      readySignal = new Int32Array(readySab, 0, 1);
+    }
 
     if (msg.asyncSab) {
       asyncSab = msg.asyncSab;
@@ -557,26 +608,35 @@ self.onmessage = async (e: MessageEvent) => {
       return;
     }
 
-    // Signal ready to main thread (SAB for sync callers, postMessage for async callers)
+    // Signal ready to main thread
     if (!readySent) {
       readySent = true;
-      Atomics.store(readySignal, 0, 1);
-      Atomics.notify(readySignal, 0);
+      if (hasSAB) {
+        Atomics.store(readySignal, 0, 1);
+        Atomics.notify(readySignal, 0);
+      }
       (self as unknown as Worker).postMessage({ type: 'ready' });
     }
 
-    // Start leader loop (never returns)
-    leaderLoop();
+    // Start leader loop only when SABs are available (it uses Atomics.wait)
+    if (hasSAB) {
+      leaderLoop();
+    }
+    // When no SAB, requests arrive only via MessagePorts (async-port handler above)
     return;
   }
 
   // --- Follower mode init ---
   if (msg.type === 'init-follower') {
-    sab = msg.sab;
-    readySab = msg.readySab;
     tabId = msg.tabId;
-    ctrl = new Int32Array(sab, 0, 8);
-    readySignal = new Int32Array(readySab, 0, 1);
+    const hasSAB = msg.sab != null;
+
+    if (hasSAB) {
+      sab = msg.sab;
+      readySab = msg.readySab;
+      ctrl = new Int32Array(sab, 0, 8);
+      readySignal = new Int32Array(readySab, 0, 1);
+    }
 
     if (msg.asyncSab) {
       asyncSab = msg.asyncSab;

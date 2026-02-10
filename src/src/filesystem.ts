@@ -71,13 +71,15 @@ function spinWait(arr: Int32Array, index: number, value: number): void {
 }
 
 export class VFSFileSystem {
-  // SAB for sync communication with sync relay worker
+  // SAB for sync communication with sync relay worker (null when SAB unavailable)
   private sab!: SharedArrayBuffer;
   private ctrl!: Int32Array;
   private readySab!: SharedArrayBuffer;
   private readySignal!: Int32Array;
   // SAB for async-relay ↔ sync-relay communication
   private asyncSab!: SharedArrayBuffer;
+  // Whether SharedArrayBuffer is available (crossOriginIsolated)
+  private hasSAB = typeof SharedArrayBuffer !== 'undefined';
 
   // Workers
   private syncWorker!: Worker;
@@ -138,12 +140,14 @@ export class VFSFileSystem {
   private bootstrap(): void {
     const sabSize = this.config.sabSize;
 
-    // Allocate SABs
-    this.sab = new SharedArrayBuffer(sabSize);
-    this.readySab = new SharedArrayBuffer(4);
-    this.asyncSab = new SharedArrayBuffer(sabSize);
-    this.ctrl = new Int32Array(this.sab, 0, 8);
-    this.readySignal = new Int32Array(this.readySab, 0, 1);
+    if (this.hasSAB) {
+      // Full mode: allocate SABs for sync + async communication
+      this.sab = new SharedArrayBuffer(sabSize);
+      this.readySab = new SharedArrayBuffer(4);
+      this.asyncSab = new SharedArrayBuffer(sabSize);
+      this.ctrl = new Int32Array(this.sab, 0, 8);
+      this.readySignal = new Int32Array(this.readySab, 0, 1);
+    }
 
     // Spawn workers
     this.syncWorker = this.spawnWorker('sync-relay');
@@ -181,13 +185,25 @@ export class VFSFileSystem {
       }
     };
 
-    // Initialize async relay (same for both leader and follower modes —
-    // in follower mode, sync-relay's followerLoop reads asyncSAB and forwards)
-    this.asyncWorker.postMessage({
-      type: 'init-leader',
-      asyncSab: this.asyncSab,
-      wakeSab: this.sab,
-    });
+    if (this.hasSAB) {
+      // Initialize async relay with SAB (leader mode fast path)
+      this.asyncWorker.postMessage({
+        type: 'init-leader',
+        asyncSab: this.asyncSab,
+        wakeSab: this.sab,
+      });
+    } else {
+      // No SAB: connect async-relay ↔ sync-relay via MessagePort
+      const mc = new MessageChannel();
+      this.asyncWorker.postMessage(
+        { type: 'init-port', port: mc.port1 },
+        [mc.port1],
+      );
+      this.syncWorker.postMessage(
+        { type: 'async-port', port: mc.port2 },
+        [mc.port2],
+      );
+    }
 
     // Leader election via Web Locks
     this.acquireLeaderLock();
@@ -234,9 +250,9 @@ export class VFSFileSystem {
   private sendLeaderInit(): void {
     this.syncWorker.postMessage({
       type: 'init-leader',
-      sab: this.sab,
-      readySab: this.readySab,
-      asyncSab: this.asyncSab,
+      sab: this.hasSAB ? this.sab : null,
+      readySab: this.hasSAB ? this.readySab : null,
+      asyncSab: this.hasSAB ? this.asyncSab : null,
       tabId: this.tabId,
       config: {
         root: this.config.root,
@@ -245,6 +261,7 @@ export class VFSFileSystem {
         gid: this.config.gid,
         umask: this.config.umask,
         strictPermissions: this.config.strictPermissions,
+        debug: this.config.debug,
       },
     });
   }
@@ -262,9 +279,9 @@ export class VFSFileSystem {
     // Tell sync-relay to prepare for follower mode (sets SABs, awaits leader-port)
     this.syncWorker.postMessage({
       type: 'init-follower',
-      sab: this.sab,
-      readySab: this.readySab,
-      asyncSab: this.asyncSab,
+      sab: this.hasSAB ? this.sab : null,
+      readySab: this.hasSAB ? this.readySab : null,
+      asyncSab: this.hasSAB ? this.asyncSab : null,
       tabId: this.tabId,
     });
 
@@ -366,13 +383,15 @@ export class VFSFileSystem {
     this.syncWorker.terminate();
     this.asyncWorker.terminate();
 
-    // Allocate fresh SABs
+    // Allocate fresh SABs (only if available)
     const sabSize = this.config.sabSize;
-    this.sab = new SharedArrayBuffer(sabSize);
-    this.readySab = new SharedArrayBuffer(4);
-    this.asyncSab = new SharedArrayBuffer(sabSize);
-    this.ctrl = new Int32Array(this.sab, 0, 8);
-    this.readySignal = new Int32Array(this.readySab, 0, 1);
+    if (this.hasSAB) {
+      this.sab = new SharedArrayBuffer(sabSize);
+      this.readySab = new SharedArrayBuffer(4);
+      this.asyncSab = new SharedArrayBuffer(sabSize);
+      this.ctrl = new Int32Array(this.sab, 0, 8);
+      this.readySignal = new Int32Array(this.readySab, 0, 1);
+    }
 
     // Spawn new workers
     this.syncWorker = this.spawnWorker('sync-relay');
@@ -404,12 +423,25 @@ export class VFSFileSystem {
       }
     };
 
-    // Initialize both workers as leader
-    this.asyncWorker.postMessage({
-      type: 'init-leader',
-      asyncSab: this.asyncSab,
-      wakeSab: this.sab,
-    });
+    if (this.hasSAB) {
+      // Initialize async-relay with SAB
+      this.asyncWorker.postMessage({
+        type: 'init-leader',
+        asyncSab: this.asyncSab,
+        wakeSab: this.sab,
+      });
+    } else {
+      // No SAB: connect async-relay ↔ sync-relay via MessagePort
+      const mc = new MessageChannel();
+      this.asyncWorker.postMessage(
+        { type: 'init-port', port: mc.port1 },
+        [mc.port1],
+      );
+      this.syncWorker.postMessage(
+        { type: 'async-port', port: mc.port2 },
+        [mc.port2],
+      );
+    }
     this.sendLeaderInit();
   }
 
@@ -426,6 +458,9 @@ export class VFSFileSystem {
   /** Block until workers are ready */
   private ensureReady(): void {
     if (this.isReady) return;
+    if (!this.hasSAB) {
+      throw new Error('Sync API requires crossOriginIsolated (COOP/COEP headers). Use the promises API instead.');
+    }
     // Check if ready signal is set
     if (Atomics.load(this.readySignal, 0) === 1) {
       this.isReady = true;
@@ -440,6 +475,7 @@ export class VFSFileSystem {
   private syncRequest(requestBuf: ArrayBuffer): { status: number; data: Uint8Array | null } {
     this.ensureReady();
 
+    const t0 = this.config.debug ? performance.now() : 0;
     const maxChunk = this.sab.byteLength - HEADER_SIZE;
     const requestBytes = new Uint8Array(requestBuf);
     const totalLenView = new BigUint64Array(this.sab, SAB_OFFSETS.TOTAL_LEN, 1);
@@ -517,7 +553,12 @@ export class VFSFileSystem {
     // notify wakes it, giving us ONE cross-thread wake per operation instead of two.
     Atomics.store(this.ctrl, 0, SIGNAL.IDLE);
 
-    return decodeResponse(responseBytes.buffer as ArrayBuffer);
+    const result = decodeResponse(responseBytes.buffer as ArrayBuffer);
+    if (this.config.debug) {
+      const t1 = performance.now();
+      console.log(`[syncRequest] size=${requestBuf.byteLength} roundTrip=${(t1 - t0).toFixed(3)}ms`);
+    }
+    return result;
   }
 
   // ========== Async operation primitive ==========
