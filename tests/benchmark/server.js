@@ -10,6 +10,7 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.join(__dirname, '../../dist');
 const benchDir = __dirname;
+const noCoep = process.argv.includes('--no-coep');
 
 const MIME_TYPES = {
   '.html': 'text/html',
@@ -21,9 +22,11 @@ const MIME_TYPES = {
 };
 
 const server = http.createServer((req, res) => {
-  // Enable COOP/COEP for crossOriginIsolated
-  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
-  res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  // Enable COOP/COEP for crossOriginIsolated (unless --no-coep)
+  if (!noCoep) {
+    res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
+    res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
+  }
   res.setHeader('Access-Control-Allow-Origin', '*');
 
   let filePath;
@@ -69,5 +72,7 @@ const server = http.createServer((req, res) => {
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
   console.log(`Benchmark server running at http://localhost:${PORT}`);
-  console.log(`COOP/COEP headers enabled for crossOriginIsolated`);
+  console.log(noCoep
+    ? `COOP/COEP headers DISABLED — sync API will not work, promises-only mode`
+    : `COOP/COEP headers enabled for crossOriginIsolated`);
 });

@@ -29,6 +29,7 @@ const engine = new VFSEngine();
 let leaderInitialized = false;
 let readySent = false;
 let debug = false;
+let leaderLoopRunning = false;
 
 // Own tab's sync SAB
 let sab: SharedArrayBuffer;
@@ -64,12 +65,20 @@ function yieldToEventLoop(): Promise<void> {
 function registerClientPort(clientTabId: string, port: MessagePort): void {
   port.onmessage = (e: MessageEvent) => {
     if (e.data.buffer instanceof ArrayBuffer) {
-      portQueue.push({
-        port,
-        tabId: clientTabId,
-        id: e.data.id,
-        buffer: e.data.buffer,
-      });
+      if (leaderLoopRunning) {
+        // Leader loop will drain the queue
+        portQueue.push({
+          port,
+          tabId: clientTabId,
+          id: e.data.id,
+          buffer: e.data.buffer,
+        });
+      } else {
+        // No leader loop (no-SAB mode): handle directly
+        const result = handleRequest(clientTabId, e.data.buffer);
+        const response = encodeResponse(result.status, result.data);
+        port.postMessage({ id: e.data.id, buffer: response }, [response]);
+      }
     }
   };
   port.start();
@@ -88,7 +97,8 @@ function removeClientPort(clientTabId: string): void {
 function drainPortQueue(): void {
   while (portQueue.length > 0) {
     const msg = portQueue.shift()!;
-    const response = handleRequest(msg.tabId, msg.buffer);
+    const result = handleRequest(msg.tabId, msg.buffer);
+    const response = encodeResponse(result.status, result.data);
     msg.port.postMessage({ id: msg.id, buffer: response }, [response]);
   }
 }
@@ -97,6 +107,9 @@ function drainPortQueue(): void {
 
 let leaderPort: MessagePort | null = null;
 let pendingResolve: ((buf: ArrayBuffer) => void) | null = null;
+
+// No-SAB mode: async-relay port (for forwarding in follower mode)
+let asyncRelayPort: MessagePort | null = null;
 
 function forwardToLeader(payload: Uint8Array): Promise<ArrayBuffer> {
   return new Promise(resolve => {
@@ -112,10 +125,16 @@ function forwardToLeader(payload: Uint8Array): Promise<ArrayBuffer> {
 }
 
 function onLeaderMessage(e: MessageEvent): void {
-  if (e.data.buffer instanceof ArrayBuffer && pendingResolve) {
-    const resolve = pendingResolve;
-    pendingResolve = null;
-    resolve(e.data.buffer);
+  if (e.data.buffer instanceof ArrayBuffer) {
+    if (pendingResolve) {
+      // SAB follower: resolve sync relay promise
+      const resolve = pendingResolve;
+      pendingResolve = null;
+      resolve(e.data.buffer);
+    } else if (asyncRelayPort) {
+      // No-SAB follower: forward response back to async-relay
+      asyncRelayPort.postMessage({ id: e.data.id, buffer: e.data.buffer }, [e.data.buffer]);
+    }
   }
 }
 
@@ -130,7 +149,7 @@ const OP_NAMES: Record<number, string> = {
   27: 'FTRUNCATE', 28: 'FSYNC', 29: 'OPENDIR', 30: 'MKDTEMP',
 };
 
-function handleRequest(reqTabId: string, buffer: ArrayBuffer): ArrayBuffer {
+function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number; data?: Uint8Array } {
   const t0 = debug ? performance.now() : 0;
   const { op, flags, path, data } = decodeRequest(buffer);
   const t1 = debug ? performance.now() : 0;
@@ -320,16 +339,12 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): ArrayBuffer {
       result = { status: 7 }; // EINVAL — unknown op
   }
 
-  const t2 = debug ? performance.now() : 0;
-  const responseData = result.data instanceof Uint8Array ? result.data : undefined;
-  const response = encodeResponse(result.status, responseData);
-  const t3 = debug ? performance.now() : 0;
-
   if (debug) {
-    console.log(`[sync-relay] op=${OP_NAMES[op] ?? op} path=${path} decode=${(t1-t0).toFixed(3)}ms engine=${(t2-t1).toFixed(3)}ms encode=${(t3-t2).toFixed(3)}ms TOTAL=${(t3-t0).toFixed(3)}ms`);
+    const t2 = performance.now();
+    console.log(`[sync-relay] op=${OP_NAMES[op] ?? op} path=${path} decode=${(t1-t0).toFixed(3)}ms engine=${(t2-t1).toFixed(3)}ms TOTAL=${(t2-t0).toFixed(3)}ms`);
   }
 
-  return response;
+  return { status: result.status, data: result.data instanceof Uint8Array ? result.data : undefined };
 }
 
 // ========== SAB I/O helpers ==========
@@ -372,6 +387,40 @@ function readPayload(targetSab: SharedArrayBuffer, targetCtrl: Int32Array): Uint
 }
 
 /**
+ * Write status + data directly into a SAB (no intermediate encodeResponse buffer).
+ * Saves one full copy of the data compared to encodeResponse + writeResponse.
+ */
+function writeDirectResponse(
+  targetSab: SharedArrayBuffer,
+  targetCtrl: Int32Array,
+  status: number,
+  data?: Uint8Array
+): void {
+  const dataLen = data ? data.byteLength : 0;
+  const totalLen = 8 + dataLen;
+  const maxChunk = targetSab.byteLength - HEADER_SIZE;
+
+  if (totalLen <= maxChunk) {
+    // Fast path: write 8-byte header + data directly into SAB
+    const hdr = new DataView(targetSab, HEADER_SIZE, 8);
+    hdr.setUint32(0, status, true);
+    hdr.setUint32(4, dataLen, true);
+    if (data && dataLen > 0) {
+      new Uint8Array(targetSab, HEADER_SIZE + 8, dataLen).set(data);
+    }
+    Atomics.store(targetCtrl, 3, totalLen);
+    const totalView = new BigUint64Array(targetSab, SAB_OFFSETS.TOTAL_LEN, 1);
+    Atomics.store(totalView, 0, BigInt(totalLen));
+    Atomics.store(targetCtrl, 0, SIGNAL.RESPONSE);
+    Atomics.notify(targetCtrl, 0);
+  } else {
+    // Multi-chunk: fall back to encoded buffer + chunked write
+    const response = encodeResponse(status, data);
+    writeResponse(targetSab, targetCtrl, new Uint8Array(response));
+  }
+}
+
+/**
  * Write a response payload to a SAB and signal RESPONSE. Handles multi-chunk.
  */
 function writeResponse(targetSab: SharedArrayBuffer, targetCtrl: Int32Array, responseData: Uint8Array): void {
@@ -411,6 +460,7 @@ function writeResponse(targetSab: SharedArrayBuffer, targetCtrl: Int32Array, res
 // ========== Leader mode: main loop ==========
 
 async function leaderLoop(): Promise<void> {
+  leaderLoopRunning = true;
   while (true) {
     // === Inner tight loop: process all pending work without yielding ===
     let processed = true;
@@ -422,9 +472,9 @@ async function leaderLoop(): Promise<void> {
         const lt0 = debug ? performance.now() : 0;
         const payload = readPayload(sab, ctrl);
         const lt1 = debug ? performance.now() : 0;
-        const response = handleRequest(tabId, payload.buffer as ArrayBuffer);
+        const reqResult = handleRequest(tabId, payload.buffer as ArrayBuffer);
         const lt2 = debug ? performance.now() : 0;
-        writeResponse(sab, ctrl, new Uint8Array(response));
+        writeDirectResponse(sab, ctrl, reqResult.status, reqResult.data);
         const lt3 = debug ? performance.now() : 0;
         if (debug) {
           console.log(`[leaderLoop] readPayload=${(lt1-lt0).toFixed(3)}ms handleRequest=${(lt2-lt1).toFixed(3)}ms writeResponse=${(lt3-lt2).toFixed(3)}ms TOTAL=${(lt3-lt0).toFixed(3)}ms`);
@@ -432,8 +482,8 @@ async function leaderLoop(): Promise<void> {
         // Wait for main thread to consume response (10ms safety timeout).
         // Main thread sets IDLE without notify — worker stays asleep until the
         // NEXT request's notify wakes it. This gives ONE wake per operation.
-        const result = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 10);
-        if (result === 'timed-out') {
+        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 10);
+        if (waitResult === 'timed-out') {
           Atomics.store(ctrl, 0, SIGNAL.IDLE);
         }
         processed = true;
@@ -443,10 +493,10 @@ async function leaderLoop(): Promise<void> {
       // Priority 2: own tab's async requests
       if (asyncCtrl && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) {
         const payload = readPayload(asyncSab!, asyncCtrl);
-        const response = handleRequest(tabId, payload.buffer as ArrayBuffer);
-        writeResponse(asyncSab!, asyncCtrl, new Uint8Array(response));
-        const result = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 10);
-        if (result === 'timed-out') {
+        const result = handleRequest(tabId, payload.buffer as ArrayBuffer);
+        writeDirectResponse(asyncSab!, asyncCtrl, result.status, result.data);
+        const waitResult = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 10);
+        if (waitResult === 'timed-out') {
           Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
         }
         processed = true;
@@ -564,11 +614,19 @@ self.onmessage = async (e: MessageEvent) => {
   if (msg.type === 'async-port') {
     const port = msg.port ?? e.ports[0];
     if (port) {
-      // Process async requests directly when received (no SAB polling)
+      asyncRelayPort = port;
       port.onmessage = (ev: MessageEvent) => {
         if (ev.data.buffer instanceof ArrayBuffer) {
-          const response = handleRequest(tabId || 'nosab', ev.data.buffer);
-          port.postMessage({ id: ev.data.id, buffer: response }, [response]);
+          if (leaderInitialized) {
+            // Leader mode: handle locally (engine available)
+            const result = handleRequest(tabId || 'nosab', ev.data.buffer);
+            const response = encodeResponse(result.status, result.data);
+            port.postMessage({ id: ev.data.id, buffer: response }, [response]);
+          } else if (leaderPort) {
+            // Follower mode: forward to leader via leader port
+            const buf = ev.data.buffer;
+            leaderPort.postMessage({ id: ev.data.id, tabId, buffer: buf }, [buf]);
+          }
         }
       };
       port.start();
@@ -673,10 +731,16 @@ self.onmessage = async (e: MessageEvent) => {
     if (!readySent) {
       // First time: signal ready and start follower loop
       readySent = true;
-      Atomics.store(readySignal, 0, 1);
-      Atomics.notify(readySignal, 0);
+      if (readySignal) {
+        Atomics.store(readySignal, 0, 1);
+        Atomics.notify(readySignal, 0);
+      }
       (self as unknown as Worker).postMessage({ type: 'ready' });
-      followerLoop();
+      if (ctrl) {
+        followerLoop();
+      }
+      // When no SAB (no crossOriginIsolated), follower can't relay sync requests.
+      // Only promises work — async-relay uses MessagePort to leader's sync-relay.
     }
     // If followerLoop is already running, it will pick up the new port on next iteration
     return;

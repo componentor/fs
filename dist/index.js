@@ -176,14 +176,14 @@ var encoder2 = new TextEncoder();
 function writeFileSync(syncRequest, filePath, data, options) {
   const opts = typeof options === "string" ? { } : options;
   const encoded = typeof data === "string" ? encoder2.encode(data) : data;
-  const flags = opts?.flush !== false ? 1 : 0;
+  const flags = opts?.flush === true ? 1 : 0;
   const buf = encodeRequest(OP.WRITE, filePath, flags, encoded);
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "write", filePath);
 }
 async function writeFile(asyncRequest, filePath, data, options) {
   const opts = typeof options === "string" ? { } : options;
-  const flags = opts?.flush !== false ? 1 : 0;
+  const flags = opts?.flush === true ? 1 : 0;
   const encoded = typeof data === "string" ? encoder2.encode(data) : data;
   const { status } = await asyncRequest(OP.WRITE, filePath, flags, encoded);
   if (status !== 0) throw statusToError(status, "write", filePath);
@@ -1171,15 +1171,16 @@ var VFSFileSystem = class {
   }
   /** Send a new port to sync-relay for connecting to the current leader */
   connectToLeader() {
+    const mc = new MessageChannel();
+    this.syncWorker.postMessage(
+      { type: "leader-port", port: mc.port1 },
+      [mc.port1]
+    );
     this.getServiceWorker().then((sw) => {
-      const mc = new MessageChannel();
       sw.postMessage({ type: "transfer-port", tabId: this.tabId }, [mc.port2]);
-      this.syncWorker.postMessage(
-        { type: "leader-port", port: mc.port1 },
-        [mc.port1]
-      );
     }).catch((err) => {
       console.error("[VFS] Failed to connect to leader:", err.message);
+      mc.port2.close();
     });
   }
   /** Register the VFS service worker and return the active SW */
@@ -1193,16 +1194,23 @@ var VFSFileSystem = class {
     const sw = reg.installing || reg.waiting;
     if (!sw) throw new Error("No service worker found");
     return new Promise((resolve2, reject) => {
+      const timer = setTimeout(() => {
+        sw.removeEventListener("statechange", onState);
+        reject(new Error("Service worker activation timeout"));
+      }, 5e3);
       const onState = () => {
         if (sw.state === "activated") {
+          clearTimeout(timer);
           sw.removeEventListener("statechange", onState);
           resolve2(sw);
         } else if (sw.state === "redundant") {
+          clearTimeout(timer);
           sw.removeEventListener("statechange", onState);
           reject(new Error("SW redundant"));
         }
       };
       sw.addEventListener("statechange", onState);
+      onState();
     });
   }
   /** Register as leader with SW broker (receives follower ports via control channel) */

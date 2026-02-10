@@ -33,6 +33,7 @@
     "benchmark": "npm run build && npm run build:future && playwright test",
     "benchmark:server": "node tests/benchmark/server.js",
     "benchmark:open": "npm run build && npm run build:future && node tests/benchmark/server.js",
+    "benchmark:open:no-coep": "npm run build && npm run build:future && node tests/benchmark/server.js --no-coep",
     "typecheck": "tsc -p src/tsconfig.json --noEmit"
   },
   "devDependencies": {

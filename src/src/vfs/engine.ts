@@ -72,6 +72,15 @@ export class VFSEngine {
   private superblockBuf = new Uint8Array(SUPERBLOCK.SIZE);
   private superblockView = new DataView(this.superblockBuf.buffer);
 
+  // In-memory bitmap cache — eliminates bitmap reads from OPFS
+  private bitmap: Uint8Array | null = null;
+  private bitmapDirtyLo = Infinity;   // lowest dirty byte index
+  private bitmapDirtyHi = -1;         // highest dirty byte index (inclusive)
+  private superblockDirty = false;
+
+  // Free inode hint — skip O(n) scan
+  private freeInodeHint = 0;
+
   init(
     handle: FileSystemSyncAccessHandle,
     opts?: { uid?: number; gid?: number; umask?: number; strictPermissions?: boolean; debug?: boolean }
@@ -117,9 +126,9 @@ export class VFSEngine {
     const zeroBuf = new Uint8Array(layout.inodeTableSize);
     this.handle.write(zeroBuf, { at: this.inodeTableOffset });
 
-    // Zero out bitmap
-    const bitmapBuf = new Uint8Array(layout.bitmapSize);
-    this.handle.write(bitmapBuf, { at: this.bitmapOffset });
+    // Zero out bitmap and cache in memory
+    this.bitmap = new Uint8Array(layout.bitmapSize);
+    this.handle.write(this.bitmap, { at: this.bitmapOffset });
 
     // Create root directory inode
     this.createInode('/', INODE_TYPE.DIRECTORY, DEFAULT_DIR_MODE, 0);
@@ -148,6 +157,11 @@ export class VFSEngine {
     this.pathTableUsed = v.getUint32(SUPERBLOCK.PATH_USED, true);
     this.pathTableSize = this.bitmapOffset - this.pathTableOffset;
 
+    // Load bitmap into memory
+    const bitmapSize = Math.ceil(this.totalBlocks / 8);
+    this.bitmap = new Uint8Array(bitmapSize);
+    this.handle.read(this.bitmap, { at: this.bitmapOffset });
+
     this.rebuildIndex();
   }
 
@@ -165,6 +179,26 @@ export class VFSEngine {
     v.setFloat64(SUPERBLOCK.BITMAP_OFFSET, this.bitmapOffset, true);
     v.setUint32(SUPERBLOCK.PATH_USED, this.pathTableUsed, true);
     this.handle.write(this.superblockBuf, { at: 0 });
+  }
+
+  /** Flush pending bitmap and superblock writes to disk (one write each) */
+  private markBitmapDirty(lo: number, hi: number): void {
+    if (lo < this.bitmapDirtyLo) this.bitmapDirtyLo = lo;
+    if (hi > this.bitmapDirtyHi) this.bitmapDirtyHi = hi;
+  }
+
+  private commitPending(): void {
+    if (this.bitmapDirtyHi >= 0) {
+      const lo = this.bitmapDirtyLo;
+      const hi = this.bitmapDirtyHi;
+      this.handle.write(this.bitmap!.subarray(lo, hi + 1), { at: this.bitmapOffset + lo });
+      this.bitmapDirtyLo = Infinity;
+      this.bitmapDirtyHi = -1;
+    }
+    if (this.superblockDirty) {
+      this.writeSuperblock();
+      this.superblockDirty = false;
+    }
   }
 
   /** Rebuild in-memory path→inode index from disk */
@@ -255,9 +289,8 @@ export class VFSEngine {
     this.handle.write(bytes, { at: this.pathTableOffset + offset });
     this.pathTableUsed += bytes.byteLength;
 
-    // Update superblock with new path table usage
-    this.superblockView.setUint32(SUPERBLOCK.PATH_USED, this.pathTableUsed, true);
-    this.handle.write(this.superblockBuf.subarray(SUPERBLOCK.PATH_USED, SUPERBLOCK.PATH_USED + 4), { at: SUPERBLOCK.PATH_USED });
+    // Defer superblock write — committed in commitPending()
+    this.superblockDirty = true;
 
     return { offset, length: bytes.byteLength };
   }
@@ -268,10 +301,7 @@ export class VFSEngine {
     const growth = newSize - this.pathTableSize;
 
     // Need to shift bitmap and data region forward
-    // Read existing bitmap
-    const bitmapSize = Math.ceil(this.totalBlocks / 8);
-    const bitmapBuf = new Uint8Array(bitmapSize);
-    this.handle.read(bitmapBuf, { at: this.bitmapOffset });
+    // Use in-memory bitmap (no read needed)
 
     // Read existing data region
     const dataSize = this.totalBlocks * this.blockSize;
@@ -286,15 +316,15 @@ export class VFSEngine {
     const newBitmapOffset = this.bitmapOffset + growth;
     const newDataOffset = this.dataOffset + growth;
     this.handle.write(dataBuf, { at: newDataOffset });
-    this.handle.write(bitmapBuf, { at: newBitmapOffset });
+    this.handle.write(this.bitmap!, { at: newBitmapOffset });
 
     // Update offsets
     this.pathTableSize = newSize;
     this.bitmapOffset = newBitmapOffset;
     this.dataOffset = newDataOffset;
 
-    // Update superblock
-    this.writeSuperblock();
+    // Mark superblock dirty (will be written in commitPending)
+    this.superblockDirty = true;
   }
 
   // ========== Bitmap I/O ==========
@@ -302,11 +332,7 @@ export class VFSEngine {
   private allocateBlocks(count: number): number {
     if (count === 0) return 0;
 
-    // Find contiguous free blocks
-    const bitmapSize = Math.ceil(this.totalBlocks / 8);
-    const bitmap = new Uint8Array(bitmapSize);
-    this.handle.read(bitmap, { at: this.bitmapOffset });
-
+    const bitmap = this.bitmap!;
     let run = 0;
     let start = 0;
 
@@ -321,15 +347,15 @@ export class VFSEngine {
       } else {
         run++;
         if (run === count) {
-          // Mark blocks as used
+          // Mark blocks as used in memory
           for (let j = start; j <= i; j++) {
             const bj = j >>> 3;
             const bi = j & 7;
             bitmap[bj] |= (1 << bi);
           }
-          this.handle.write(bitmap, { at: this.bitmapOffset });
+          this.markBitmapDirty(start >>> 3, i >>> 3);
           this.freeBlocks -= count;
-          this.updateSuperblockFreeBlocks();
+          this.superblockDirty = true;
           return start;
         }
       }
@@ -349,44 +375,33 @@ export class VFSEngine {
     const newFileSize = this.dataOffset + newTotal * this.blockSize;
     this.handle.truncate(newFileSize);
 
-    // Grow bitmap
-    const oldBitmapSize = Math.ceil(oldTotal / 8);
+    // Grow in-memory bitmap
     const newBitmapSize = Math.ceil(newTotal / 8);
-    if (newBitmapSize > oldBitmapSize) {
-      const zeroes = new Uint8Array(newBitmapSize - oldBitmapSize);
-      this.handle.write(zeroes, { at: this.bitmapOffset + oldBitmapSize });
-    }
+    const newBitmap = new Uint8Array(newBitmapSize);
+    newBitmap.set(this.bitmap!);
+    this.bitmap = newBitmap;
 
     this.totalBlocks = newTotal;
     this.freeBlocks += addedBlocks;
 
-    // Now allocate from the newly freed area
+    // Allocate from the newly freed area
     const start = oldTotal;
-    const bitmap = new Uint8Array(newBitmapSize);
-    this.handle.read(bitmap, { at: this.bitmapOffset });
-
     for (let j = start; j < start + count; j++) {
       const bj = j >>> 3;
       const bi = j & 7;
-      bitmap[bj] |= (1 << bi);
+      this.bitmap[bj] |= (1 << bi);
     }
 
-    this.handle.write(bitmap, { at: this.bitmapOffset });
+    this.markBitmapDirty(start >>> 3, (start + count - 1) >>> 3);
     this.freeBlocks -= count;
-
-    // Update superblock
-    this.superblockView.setUint32(SUPERBLOCK.TOTAL_BLOCKS, this.totalBlocks, true);
-    this.superblockView.setUint32(SUPERBLOCK.FREE_BLOCKS, this.freeBlocks, true);
-    this.handle.write(this.superblockBuf, { at: 0 });
+    this.superblockDirty = true;
 
     return start;
   }
 
   private freeBlockRange(start: number, count: number): void {
     if (count === 0) return;
-    const bitmapSize = Math.ceil(this.totalBlocks / 8);
-    const bitmap = new Uint8Array(bitmapSize);
-    this.handle.read(bitmap, { at: this.bitmapOffset });
+    const bitmap = this.bitmap!;
 
     for (let i = start; i < start + count; i++) {
       const byteIdx = i >>> 3;
@@ -394,33 +409,33 @@ export class VFSEngine {
       bitmap[byteIdx] &= ~(1 << bitIdx);
     }
 
-    this.handle.write(bitmap, { at: this.bitmapOffset });
+    this.markBitmapDirty(start >>> 3, (start + count - 1) >>> 3);
     this.freeBlocks += count;
-    this.updateSuperblockFreeBlocks();
+    this.superblockDirty = true;
   }
 
-  private updateSuperblockFreeBlocks(): void {
-    this.superblockView.setUint32(SUPERBLOCK.FREE_BLOCKS, this.freeBlocks, true);
-    this.handle.write(
-      this.superblockBuf.subarray(SUPERBLOCK.FREE_BLOCKS, SUPERBLOCK.FREE_BLOCKS + 4),
-      { at: SUPERBLOCK.FREE_BLOCKS }
-    );
-  }
+  // updateSuperblockFreeBlocks is no longer needed — superblock writes are coalesced via commitPending()
 
   // ========== Inode allocation ==========
 
   private findFreeInode(): number {
-    for (let i = 0; i < this.inodeCount; i++) {
+    // Start from hint to skip already-used entries
+    for (let i = this.freeInodeHint; i < this.inodeCount; i++) {
       // Check cache first — cached entries are never FREE
       if (this.inodeCache.has(i)) continue;
 
       const offset = this.inodeTableOffset + i * INODE_SIZE;
       const typeBuf = new Uint8Array(1);
       this.handle.read(typeBuf, { at: offset });
-      if (typeBuf[0] === INODE_TYPE.FREE) return i;
+      if (typeBuf[0] === INODE_TYPE.FREE) {
+        this.freeInodeHint = i + 1;
+        return i;
+      }
     }
     // All inodes used — grow inode table
-    return this.growInodeTable();
+    const idx = this.growInodeTable();
+    this.freeInodeHint = idx + 1;
+    return idx;
   }
 
   private growInodeTable(): number {
@@ -450,7 +465,7 @@ export class VFSEngine {
     this.dataOffset += growth;
     this.inodeCount = newCount;
 
-    this.writeSuperblock();
+    this.superblockDirty = true;
 
     return oldCount; // First new free inode
   }
@@ -572,7 +587,13 @@ export class VFSEngine {
 
   /** Normalize a path: ensure leading /, resolve . and .. */
   normalizePath(p: string): string {
-    if (!p.startsWith('/')) p = '/' + p;
+    if (p.charCodeAt(0) !== 47) p = '/' + p; // 47 = '/'
+    // Fast path: already normalized (no '.', '..', '//', trailing '/')
+    if (p.length === 1) return p; // "/"
+    if (p.indexOf('/.') === -1 && p.indexOf('//') === -1 && p.charCodeAt(p.length - 1) !== 47) {
+      return p;
+    }
+    // Slow path: full normalize
     const parts = p.split('/').filter(Boolean);
     const resolved: string[] = [];
     for (const part of parts) {
@@ -587,22 +608,45 @@ export class VFSEngine {
   read(path: string): { status: number; data: Uint8Array | null } {
     const t0 = this.debug ? performance.now() : 0;
     path = this.normalizePath(path);
-    const t1 = this.debug ? performance.now() : 0;
-    const idx = this.resolvePathComponents(path, true);
+
+    // Fast path: direct index lookup (skips component-by-component walk)
+    let idx = this.pathIndex.get(path);
+    if (idx !== undefined) {
+      const inode = this.inodeCache.get(idx);
+      if (inode) {
+        // Symlink? Fall through to full resolve
+        if (inode.type === INODE_TYPE.SYMLINK) {
+          idx = this.resolvePathComponents(path, true);
+        } else if (inode.type === INODE_TYPE.DIRECTORY) {
+          return { status: CODE_TO_STATUS.EISDIR, data: null };
+        } else {
+          // Hot path: cached inode, no symlinks
+          const data = inode.size > 0
+            ? this.readData(inode.firstBlock, inode.blockCount, inode.size)
+            : new Uint8Array(0);
+          if (this.debug) {
+            const t1 = performance.now();
+            console.log(`[VFS read] path=${path} size=${inode.size} TOTAL=${(t1-t0).toFixed(3)}ms (fast)`);
+          }
+          return { status: 0, data };
+        }
+      }
+    }
+
+    // Slow path: full component resolution (handles symlinks, uncached inodes)
+    if (idx === undefined) idx = this.resolvePathComponents(path, true);
     if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT, data: null };
 
-    const t2 = this.debug ? performance.now() : 0;
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR, data: null };
 
-    const t3 = this.debug ? performance.now() : 0;
     const data = inode.size > 0
       ? this.readData(inode.firstBlock, inode.blockCount, inode.size)
       : new Uint8Array(0);
-    const t4 = this.debug ? performance.now() : 0;
 
     if (this.debug) {
-      console.log(`[VFS read] path=${path} size=${inode.size} normalize=${(t1-t0).toFixed(3)}ms resolve=${(t2-t1).toFixed(3)}ms inode=${(t3-t2).toFixed(3)}ms data=${(t4-t3).toFixed(3)}ms TOTAL=${(t4-t0).toFixed(3)}ms`);
+      const t1 = performance.now();
+      console.log(`[VFS read] path=${path} size=${inode.size} TOTAL=${(t1-t0).toFixed(3)}ms (slow path)`);
     }
 
     return { status: 0, data };
@@ -663,7 +707,10 @@ export class VFSEngine {
       tInode = tAlloc;
     }
 
-    if (flags & 1) this.handle.flush();
+    if (flags & 1) {
+      this.commitPending();
+      this.handle.flush();
+    }
     const tFlush = this.debug ? performance.now() : 0;
 
     if (this.debug) {
@@ -709,6 +756,7 @@ export class VFSEngine {
     inode.mtime = Date.now();
     this.writeInode(existingIdx, inode);
 
+    this.commitPending();
     return { status: 0 };
   }
 
@@ -730,7 +778,10 @@ export class VFSEngine {
 
     // Remove from index
     this.pathIndex.delete(path);
+    // Reset free inode hint
+    if (idx < this.freeInodeHint) this.freeInodeHint = idx;
 
+    this.commitPending();
     return { status: 0 };
   }
 
@@ -789,6 +840,7 @@ export class VFSEngine {
     const mode = DEFAULT_DIR_MODE & ~(this.umask & 0o777);
     this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
 
+    this.commitPending();
     // Return created path as data
     const pathBytes = encoder.encode(path);
     return { status: 0, data: pathBytes };
@@ -816,6 +868,7 @@ export class VFSEngine {
       if (!firstCreated) firstCreated = current;
     }
 
+    this.commitPending();
     const result = firstCreated ? encoder.encode(firstCreated) : undefined;
     return { status: 0, data: result ?? null };
   }
@@ -851,7 +904,9 @@ export class VFSEngine {
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
     this.pathIndex.delete(path);
+    if (idx < this.freeInodeHint) this.freeInodeHint = idx;
 
+    this.commitPending();
     return { status: 0 };
   }
 
@@ -981,6 +1036,7 @@ export class VFSEngine {
       }
     }
 
+    this.commitPending();
     return { status: 0 };
   }
 
@@ -1037,6 +1093,7 @@ export class VFSEngine {
     inode.mtime = Date.now();
     this.writeInode(idx, inode);
 
+    this.commitPending();
     return { status: 0 };
   }
 
@@ -1160,6 +1217,7 @@ export class VFSEngine {
     const targetBytes = encoder.encode(target);
     this.createInode(linkPath, INODE_TYPE.SYMLINK, DEFAULT_SYMLINK_MODE, targetBytes.byteLength, targetBytes);
 
+    this.commitPending();
     return { status: 0 };
   }
 
@@ -1289,6 +1347,7 @@ export class VFSEngine {
       entry.position = endPos;
     }
 
+    this.commitPending();
     const buf = new Uint8Array(4);
     new DataView(buf.buffer).setUint32(0, data.byteLength, true);
     return { status: 0, data: buf };
@@ -1313,6 +1372,7 @@ export class VFSEngine {
 
   // ---- FSYNC ----
   fsync(): { status: number } {
+    this.commitPending();
     this.handle.flush();
     return { status: 0 };
   }
@@ -1353,6 +1413,7 @@ export class VFSEngine {
     const mode = DEFAULT_DIR_MODE & ~(this.umask & 0o777);
     this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
 
+    this.commitPending();
     return { status: 0, data: encoder.encode(path) };
   }
 

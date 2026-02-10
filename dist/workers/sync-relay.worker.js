@@ -145,6 +145,15 @@ var VFSEngine = class {
   inodeCache = /* @__PURE__ */ new Map();
   superblockBuf = new Uint8Array(SUPERBLOCK.SIZE);
   superblockView = new DataView(this.superblockBuf.buffer);
+  // In-memory bitmap cache — eliminates bitmap reads from OPFS
+  bitmap = null;
+  bitmapDirtyLo = Infinity;
+  // lowest dirty byte index
+  bitmapDirtyHi = -1;
+  // highest dirty byte index (inclusive)
+  superblockDirty = false;
+  // Free inode hint — skip O(n) scan
+  freeInodeHint = 0;
   init(handle, opts) {
     this.handle = handle;
     this.processUid = opts?.uid ?? 0;
@@ -176,8 +185,8 @@ var VFSEngine = class {
     this.writeSuperblock();
     const zeroBuf = new Uint8Array(layout.inodeTableSize);
     this.handle.write(zeroBuf, { at: this.inodeTableOffset });
-    const bitmapBuf = new Uint8Array(layout.bitmapSize);
-    this.handle.write(bitmapBuf, { at: this.bitmapOffset });
+    this.bitmap = new Uint8Array(layout.bitmapSize);
+    this.handle.write(this.bitmap, { at: this.bitmapOffset });
     this.createInode("/", INODE_TYPE.DIRECTORY, DEFAULT_DIR_MODE, 0);
     this.handle.flush();
   }
@@ -199,6 +208,9 @@ var VFSEngine = class {
     this.bitmapOffset = v.getFloat64(SUPERBLOCK.BITMAP_OFFSET, true);
     this.pathTableUsed = v.getUint32(SUPERBLOCK.PATH_USED, true);
     this.pathTableSize = this.bitmapOffset - this.pathTableOffset;
+    const bitmapSize = Math.ceil(this.totalBlocks / 8);
+    this.bitmap = new Uint8Array(bitmapSize);
+    this.handle.read(this.bitmap, { at: this.bitmapOffset });
     this.rebuildIndex();
   }
   writeSuperblock() {
@@ -215,6 +227,24 @@ var VFSEngine = class {
     v.setFloat64(SUPERBLOCK.BITMAP_OFFSET, this.bitmapOffset, true);
     v.setUint32(SUPERBLOCK.PATH_USED, this.pathTableUsed, true);
     this.handle.write(this.superblockBuf, { at: 0 });
+  }
+  /** Flush pending bitmap and superblock writes to disk (one write each) */
+  markBitmapDirty(lo, hi) {
+    if (lo < this.bitmapDirtyLo) this.bitmapDirtyLo = lo;
+    if (hi > this.bitmapDirtyHi) this.bitmapDirtyHi = hi;
+  }
+  commitPending() {
+    if (this.bitmapDirtyHi >= 0) {
+      const lo = this.bitmapDirtyLo;
+      const hi = this.bitmapDirtyHi;
+      this.handle.write(this.bitmap.subarray(lo, hi + 1), { at: this.bitmapOffset + lo });
+      this.bitmapDirtyLo = Infinity;
+      this.bitmapDirtyHi = -1;
+    }
+    if (this.superblockDirty) {
+      this.writeSuperblock();
+      this.superblockDirty = false;
+    }
   }
   /** Rebuild in-memory path→inode index from disk */
   rebuildIndex() {
@@ -290,16 +320,12 @@ var VFSEngine = class {
     }
     this.handle.write(bytes, { at: this.pathTableOffset + offset });
     this.pathTableUsed += bytes.byteLength;
-    this.superblockView.setUint32(SUPERBLOCK.PATH_USED, this.pathTableUsed, true);
-    this.handle.write(this.superblockBuf.subarray(SUPERBLOCK.PATH_USED, SUPERBLOCK.PATH_USED + 4), { at: SUPERBLOCK.PATH_USED });
+    this.superblockDirty = true;
     return { offset, length: bytes.byteLength };
   }
   growPathTable(needed) {
     const newSize = Math.max(this.pathTableSize * 2, needed + INITIAL_PATH_TABLE_SIZE);
     const growth = newSize - this.pathTableSize;
-    const bitmapSize = Math.ceil(this.totalBlocks / 8);
-    const bitmapBuf = new Uint8Array(bitmapSize);
-    this.handle.read(bitmapBuf, { at: this.bitmapOffset });
     const dataSize = this.totalBlocks * this.blockSize;
     const dataBuf = new Uint8Array(dataSize);
     this.handle.read(dataBuf, { at: this.dataOffset });
@@ -308,18 +334,16 @@ var VFSEngine = class {
     const newBitmapOffset = this.bitmapOffset + growth;
     const newDataOffset = this.dataOffset + growth;
     this.handle.write(dataBuf, { at: newDataOffset });
-    this.handle.write(bitmapBuf, { at: newBitmapOffset });
+    this.handle.write(this.bitmap, { at: newBitmapOffset });
     this.pathTableSize = newSize;
     this.bitmapOffset = newBitmapOffset;
     this.dataOffset = newDataOffset;
-    this.writeSuperblock();
+    this.superblockDirty = true;
   }
   // ========== Bitmap I/O ==========
   allocateBlocks(count) {
     if (count === 0) return 0;
-    const bitmapSize = Math.ceil(this.totalBlocks / 8);
-    const bitmap = new Uint8Array(bitmapSize);
-    this.handle.read(bitmap, { at: this.bitmapOffset });
+    const bitmap = this.bitmap;
     let run = 0;
     let start = 0;
     for (let i = 0; i < this.totalBlocks; i++) {
@@ -337,9 +361,9 @@ var VFSEngine = class {
             const bi = j & 7;
             bitmap[bj] |= 1 << bi;
           }
-          this.handle.write(bitmap, { at: this.bitmapOffset });
+          this.markBitmapDirty(start >>> 3, i >>> 3);
           this.freeBlocks -= count;
-          this.updateSuperblockFreeBlocks();
+          this.superblockDirty = true;
           return start;
         }
       }
@@ -352,60 +376,51 @@ var VFSEngine = class {
     const addedBlocks = newTotal - oldTotal;
     const newFileSize = this.dataOffset + newTotal * this.blockSize;
     this.handle.truncate(newFileSize);
-    const oldBitmapSize = Math.ceil(oldTotal / 8);
     const newBitmapSize = Math.ceil(newTotal / 8);
-    if (newBitmapSize > oldBitmapSize) {
-      const zeroes = new Uint8Array(newBitmapSize - oldBitmapSize);
-      this.handle.write(zeroes, { at: this.bitmapOffset + oldBitmapSize });
-    }
+    const newBitmap = new Uint8Array(newBitmapSize);
+    newBitmap.set(this.bitmap);
+    this.bitmap = newBitmap;
     this.totalBlocks = newTotal;
     this.freeBlocks += addedBlocks;
     const start = oldTotal;
-    const bitmap = new Uint8Array(newBitmapSize);
-    this.handle.read(bitmap, { at: this.bitmapOffset });
     for (let j = start; j < start + count; j++) {
       const bj = j >>> 3;
       const bi = j & 7;
-      bitmap[bj] |= 1 << bi;
+      this.bitmap[bj] |= 1 << bi;
     }
-    this.handle.write(bitmap, { at: this.bitmapOffset });
+    this.markBitmapDirty(start >>> 3, start + count - 1 >>> 3);
     this.freeBlocks -= count;
-    this.superblockView.setUint32(SUPERBLOCK.TOTAL_BLOCKS, this.totalBlocks, true);
-    this.superblockView.setUint32(SUPERBLOCK.FREE_BLOCKS, this.freeBlocks, true);
-    this.handle.write(this.superblockBuf, { at: 0 });
+    this.superblockDirty = true;
     return start;
   }
   freeBlockRange(start, count) {
     if (count === 0) return;
-    const bitmapSize = Math.ceil(this.totalBlocks / 8);
-    const bitmap = new Uint8Array(bitmapSize);
-    this.handle.read(bitmap, { at: this.bitmapOffset });
+    const bitmap = this.bitmap;
     for (let i = start; i < start + count; i++) {
       const byteIdx = i >>> 3;
       const bitIdx = i & 7;
       bitmap[byteIdx] &= ~(1 << bitIdx);
     }
-    this.handle.write(bitmap, { at: this.bitmapOffset });
+    this.markBitmapDirty(start >>> 3, start + count - 1 >>> 3);
     this.freeBlocks += count;
-    this.updateSuperblockFreeBlocks();
+    this.superblockDirty = true;
   }
-  updateSuperblockFreeBlocks() {
-    this.superblockView.setUint32(SUPERBLOCK.FREE_BLOCKS, this.freeBlocks, true);
-    this.handle.write(
-      this.superblockBuf.subarray(SUPERBLOCK.FREE_BLOCKS, SUPERBLOCK.FREE_BLOCKS + 4),
-      { at: SUPERBLOCK.FREE_BLOCKS }
-    );
-  }
+  // updateSuperblockFreeBlocks is no longer needed — superblock writes are coalesced via commitPending()
   // ========== Inode allocation ==========
   findFreeInode() {
-    for (let i = 0; i < this.inodeCount; i++) {
+    for (let i = this.freeInodeHint; i < this.inodeCount; i++) {
       if (this.inodeCache.has(i)) continue;
       const offset = this.inodeTableOffset + i * INODE_SIZE;
       const typeBuf = new Uint8Array(1);
       this.handle.read(typeBuf, { at: offset });
-      if (typeBuf[0] === INODE_TYPE.FREE) return i;
+      if (typeBuf[0] === INODE_TYPE.FREE) {
+        this.freeInodeHint = i + 1;
+        return i;
+      }
     }
-    return this.growInodeTable();
+    const idx = this.growInodeTable();
+    this.freeInodeHint = idx + 1;
+    return idx;
   }
   growInodeTable() {
     const oldCount = this.inodeCount;
@@ -423,7 +438,7 @@ var VFSEngine = class {
     this.bitmapOffset += growth;
     this.dataOffset += growth;
     this.inodeCount = newCount;
-    this.writeSuperblock();
+    this.superblockDirty = true;
     return oldCount;
   }
   // ========== Data I/O ==========
@@ -520,7 +535,11 @@ var VFSEngine = class {
   // ========== Public API — called by server worker dispatch ==========
   /** Normalize a path: ensure leading /, resolve . and .. */
   normalizePath(p) {
-    if (!p.startsWith("/")) p = "/" + p;
+    if (p.charCodeAt(0) !== 47) p = "/" + p;
+    if (p.length === 1) return p;
+    if (p.indexOf("/.") === -1 && p.indexOf("//") === -1 && p.charCodeAt(p.length - 1) !== 47) {
+      return p;
+    }
     const parts = p.split("/").filter(Boolean);
     const resolved = [];
     for (const part of parts) {
@@ -537,17 +556,32 @@ var VFSEngine = class {
   read(path) {
     const t0 = this.debug ? performance.now() : 0;
     path = this.normalizePath(path);
-    const t1 = this.debug ? performance.now() : 0;
-    const idx = this.resolvePathComponents(path, true);
+    let idx = this.pathIndex.get(path);
+    if (idx !== void 0) {
+      const inode2 = this.inodeCache.get(idx);
+      if (inode2) {
+        if (inode2.type === INODE_TYPE.SYMLINK) {
+          idx = this.resolvePathComponents(path, true);
+        } else if (inode2.type === INODE_TYPE.DIRECTORY) {
+          return { status: CODE_TO_STATUS.EISDIR, data: null };
+        } else {
+          const data2 = inode2.size > 0 ? this.readData(inode2.firstBlock, inode2.blockCount, inode2.size) : new Uint8Array(0);
+          if (this.debug) {
+            const t1 = performance.now();
+            console.log(`[VFS read] path=${path} size=${inode2.size} TOTAL=${(t1 - t0).toFixed(3)}ms (fast)`);
+          }
+          return { status: 0, data: data2 };
+        }
+      }
+    }
+    if (idx === void 0) idx = this.resolvePathComponents(path, true);
     if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
-    const t2 = this.debug ? performance.now() : 0;
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR, data: null };
-    const t3 = this.debug ? performance.now() : 0;
     const data = inode.size > 0 ? this.readData(inode.firstBlock, inode.blockCount, inode.size) : new Uint8Array(0);
-    const t4 = this.debug ? performance.now() : 0;
     if (this.debug) {
-      console.log(`[VFS read] path=${path} size=${inode.size} normalize=${(t1 - t0).toFixed(3)}ms resolve=${(t2 - t1).toFixed(3)}ms inode=${(t3 - t2).toFixed(3)}ms data=${(t4 - t3).toFixed(3)}ms TOTAL=${(t4 - t0).toFixed(3)}ms`);
+      const t1 = performance.now();
+      console.log(`[VFS read] path=${path} size=${inode.size} TOTAL=${(t1 - t0).toFixed(3)}ms (slow path)`);
     }
     return { status: 0, data };
   }
@@ -593,7 +627,10 @@ var VFSEngine = class {
       tData = tAlloc;
       tInode = tAlloc;
     }
-    if (flags & 1) this.handle.flush();
+    if (flags & 1) {
+      this.commitPending();
+      this.handle.flush();
+    }
     const tFlush = this.debug ? performance.now() : 0;
     if (this.debug) {
       const existing = existingIdx !== void 0;
@@ -623,6 +660,7 @@ var VFSEngine = class {
     inode.size = combined.byteLength;
     inode.mtime = Date.now();
     this.writeInode(existingIdx, inode);
+    this.commitPending();
     return { status: 0 };
   }
   // ---- UNLINK ----
@@ -636,6 +674,8 @@ var VFSEngine = class {
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
     this.pathIndex.delete(path);
+    if (idx < this.freeInodeHint) this.freeInodeHint = idx;
+    this.commitPending();
     return { status: 0 };
   }
   // ---- STAT ----
@@ -679,6 +719,7 @@ var VFSEngine = class {
     if (parentStatus !== 0) return { status: parentStatus, data: null };
     const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
     this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
+    this.commitPending();
     const pathBytes = encoder.encode(path);
     return { status: 0, data: pathBytes };
   }
@@ -700,6 +741,7 @@ var VFSEngine = class {
       this.createInode(current, INODE_TYPE.DIRECTORY, mode, 0);
       if (!firstCreated) firstCreated = current;
     }
+    this.commitPending();
     const result = firstCreated ? encoder.encode(firstCreated) : void 0;
     return { status: 0, data: result ?? null };
   }
@@ -726,6 +768,8 @@ var VFSEngine = class {
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
     this.pathIndex.delete(path);
+    if (idx < this.freeInodeHint) this.freeInodeHint = idx;
+    this.commitPending();
     return { status: 0 };
   }
   // ---- READDIR ----
@@ -825,6 +869,7 @@ var VFSEngine = class {
         this.pathIndex.set(childNewPath, i);
       }
     }
+    this.commitPending();
     return { status: 0 };
   }
   // ---- EXISTS ----
@@ -870,6 +915,7 @@ var VFSEngine = class {
     }
     inode.mtime = Date.now();
     this.writeInode(idx, inode);
+    this.commitPending();
     return { status: 0 };
   }
   // ---- COPY ----
@@ -958,6 +1004,7 @@ var VFSEngine = class {
     if (parentStatus !== 0) return { status: parentStatus };
     const targetBytes = encoder.encode(target);
     this.createInode(linkPath, INODE_TYPE.SYMLINK, DEFAULT_SYMLINK_MODE, targetBytes.byteLength, targetBytes);
+    this.commitPending();
     return { status: 0 };
   }
   // ---- READLINK ----
@@ -1053,6 +1100,7 @@ var VFSEngine = class {
     if (position === null) {
       entry.position = endPos;
     }
+    this.commitPending();
     const buf = new Uint8Array(4);
     new DataView(buf.buffer).setUint32(0, data.byteLength, true);
     return { status: 0, data: buf };
@@ -1073,6 +1121,7 @@ var VFSEngine = class {
   }
   // ---- FSYNC ----
   fsync() {
+    this.commitPending();
     this.handle.flush();
     return { status: 0 };
   }
@@ -1102,6 +1151,7 @@ var VFSEngine = class {
     }
     const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
     this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
+    this.commitPending();
     return { status: 0, data: encoder.encode(path) };
   }
   // ========== Helpers ==========
@@ -1260,6 +1310,7 @@ var engine = new VFSEngine();
 var leaderInitialized = false;
 var readySent = false;
 var debug = false;
+var leaderLoopRunning = false;
 var sab;
 var ctrl;
 var readySab;
@@ -1281,12 +1332,18 @@ function yieldToEventLoop() {
 function registerClientPort(clientTabId, port) {
   port.onmessage = (e) => {
     if (e.data.buffer instanceof ArrayBuffer) {
-      portQueue.push({
-        port,
-        tabId: clientTabId,
-        id: e.data.id,
-        buffer: e.data.buffer
-      });
+      if (leaderLoopRunning) {
+        portQueue.push({
+          port,
+          tabId: clientTabId,
+          id: e.data.id,
+          buffer: e.data.buffer
+        });
+      } else {
+        const result = handleRequest(clientTabId, e.data.buffer);
+        const response = encodeResponse(result.status, result.data);
+        port.postMessage({ id: e.data.id, buffer: response }, [response]);
+      }
     }
   };
   port.start();
@@ -1303,12 +1360,14 @@ function removeClientPort(clientTabId) {
 function drainPortQueue() {
   while (portQueue.length > 0) {
     const msg = portQueue.shift();
-    const response = handleRequest(msg.tabId, msg.buffer);
+    const result = handleRequest(msg.tabId, msg.buffer);
+    const response = encodeResponse(result.status, result.data);
     msg.port.postMessage({ id: msg.id, buffer: response }, [response]);
   }
 }
 var leaderPort = null;
 var pendingResolve = null;
+var asyncRelayPort = null;
 function forwardToLeader(payload) {
   return new Promise((resolve) => {
     pendingResolve = resolve;
@@ -1320,10 +1379,14 @@ function forwardToLeader(payload) {
   });
 }
 function onLeaderMessage(e) {
-  if (e.data.buffer instanceof ArrayBuffer && pendingResolve) {
-    const resolve = pendingResolve;
-    pendingResolve = null;
-    resolve(e.data.buffer);
+  if (e.data.buffer instanceof ArrayBuffer) {
+    if (pendingResolve) {
+      const resolve = pendingResolve;
+      pendingResolve = null;
+      resolve(e.data.buffer);
+    } else if (asyncRelayPort) {
+      asyncRelayPort.postMessage({ id: e.data.id, buffer: e.data.buffer }, [e.data.buffer]);
+    }
   }
 }
 var OP_NAMES = {
@@ -1515,14 +1578,11 @@ function handleRequest(reqTabId, buffer) {
     default:
       result = { status: 7 };
   }
-  const t2 = debug ? performance.now() : 0;
-  const responseData = result.data instanceof Uint8Array ? result.data : void 0;
-  const response = encodeResponse(result.status, responseData);
-  const t3 = debug ? performance.now() : 0;
   if (debug) {
-    console.log(`[sync-relay] op=${OP_NAMES[op] ?? op} path=${path} decode=${(t1 - t0).toFixed(3)}ms engine=${(t2 - t1).toFixed(3)}ms encode=${(t3 - t2).toFixed(3)}ms TOTAL=${(t3 - t0).toFixed(3)}ms`);
+    const t2 = performance.now();
+    console.log(`[sync-relay] op=${OP_NAMES[op] ?? op} path=${path} decode=${(t1 - t0).toFixed(3)}ms engine=${(t2 - t1).toFixed(3)}ms TOTAL=${(t2 - t0).toFixed(3)}ms`);
   }
-  return response;
+  return { status: result.status, data: result.data instanceof Uint8Array ? result.data : void 0 };
 }
 function readPayload(targetSab, targetCtrl) {
   const totalLenView = new BigUint64Array(targetSab, SAB_OFFSETS.TOTAL_LEN, 1);
@@ -1545,6 +1605,27 @@ function readPayload(targetSab, targetCtrl) {
     offset += nextLen;
   }
   return fullBuffer;
+}
+function writeDirectResponse(targetSab, targetCtrl, status, data) {
+  const dataLen = data ? data.byteLength : 0;
+  const totalLen = 8 + dataLen;
+  const maxChunk = targetSab.byteLength - HEADER_SIZE;
+  if (totalLen <= maxChunk) {
+    const hdr = new DataView(targetSab, HEADER_SIZE, 8);
+    hdr.setUint32(0, status, true);
+    hdr.setUint32(4, dataLen, true);
+    if (data && dataLen > 0) {
+      new Uint8Array(targetSab, HEADER_SIZE + 8, dataLen).set(data);
+    }
+    Atomics.store(targetCtrl, 3, totalLen);
+    const totalView = new BigUint64Array(targetSab, SAB_OFFSETS.TOTAL_LEN, 1);
+    Atomics.store(totalView, 0, BigInt(totalLen));
+    Atomics.store(targetCtrl, 0, SIGNAL.RESPONSE);
+    Atomics.notify(targetCtrl, 0);
+  } else {
+    const response = encodeResponse(status, data);
+    writeResponse(targetSab, targetCtrl, new Uint8Array(response));
+  }
 }
 function writeResponse(targetSab, targetCtrl, responseData) {
   const maxChunk = targetSab.byteLength - HEADER_SIZE;
@@ -1575,6 +1656,7 @@ function writeResponse(targetSab, targetCtrl, responseData) {
   }
 }
 async function leaderLoop() {
+  leaderLoopRunning = true;
   while (true) {
     let processed = true;
     while (processed) {
@@ -1583,15 +1665,15 @@ async function leaderLoop() {
         const lt0 = debug ? performance.now() : 0;
         const payload = readPayload(sab, ctrl);
         const lt1 = debug ? performance.now() : 0;
-        const response = handleRequest(tabId, payload.buffer);
+        const reqResult = handleRequest(tabId, payload.buffer);
         const lt2 = debug ? performance.now() : 0;
-        writeResponse(sab, ctrl, new Uint8Array(response));
+        writeDirectResponse(sab, ctrl, reqResult.status, reqResult.data);
         const lt3 = debug ? performance.now() : 0;
         if (debug) {
           console.log(`[leaderLoop] readPayload=${(lt1 - lt0).toFixed(3)}ms handleRequest=${(lt2 - lt1).toFixed(3)}ms writeResponse=${(lt3 - lt2).toFixed(3)}ms TOTAL=${(lt3 - lt0).toFixed(3)}ms`);
         }
-        const result = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 10);
-        if (result === "timed-out") {
+        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 10);
+        if (waitResult === "timed-out") {
           Atomics.store(ctrl, 0, SIGNAL.IDLE);
         }
         processed = true;
@@ -1599,10 +1681,10 @@ async function leaderLoop() {
       }
       if (asyncCtrl && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) {
         const payload = readPayload(asyncSab, asyncCtrl);
-        const response = handleRequest(tabId, payload.buffer);
-        writeResponse(asyncSab, asyncCtrl, new Uint8Array(response));
-        const result = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 10);
-        if (result === "timed-out") {
+        const result = handleRequest(tabId, payload.buffer);
+        writeDirectResponse(asyncSab, asyncCtrl, result.status, result.data);
+        const waitResult = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 10);
+        if (waitResult === "timed-out") {
           Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
         }
         processed = true;
@@ -1679,10 +1761,17 @@ self.onmessage = async (e) => {
   if (msg.type === "async-port") {
     const port = msg.port ?? e.ports[0];
     if (port) {
+      asyncRelayPort = port;
       port.onmessage = (ev) => {
         if (ev.data.buffer instanceof ArrayBuffer) {
-          const response = handleRequest(tabId || "nosab", ev.data.buffer);
-          port.postMessage({ id: ev.data.id, buffer: response }, [response]);
+          if (leaderInitialized) {
+            const result = handleRequest(tabId || "nosab", ev.data.buffer);
+            const response = encodeResponse(result.status, result.data);
+            port.postMessage({ id: ev.data.id, buffer: response }, [response]);
+          } else if (leaderPort) {
+            const buf = ev.data.buffer;
+            leaderPort.postMessage({ id: ev.data.id, tabId, buffer: buf }, [buf]);
+          }
         }
       };
       port.start();
@@ -1759,10 +1848,14 @@ self.onmessage = async (e) => {
     newPort.start();
     if (!readySent) {
       readySent = true;
-      Atomics.store(readySignal, 0, 1);
-      Atomics.notify(readySignal, 0);
+      if (readySignal) {
+        Atomics.store(readySignal, 0, 1);
+        Atomics.notify(readySignal, 0);
+      }
       self.postMessage({ type: "ready" });
-      followerLoop();
+      if (ctrl) {
+        followerLoop();
+      }
     }
     return;
   }

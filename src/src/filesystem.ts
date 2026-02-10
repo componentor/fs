@@ -300,15 +300,21 @@ export class VFSFileSystem {
 
   /** Send a new port to sync-relay for connecting to the current leader */
   private connectToLeader(): void {
+    const mc = new MessageChannel();
+
+    // Send leader-port to sync-relay immediately so it can signal 'ready'.
+    // Messages posted to port1 queue until port2 is connected to the leader.
+    this.syncWorker.postMessage(
+      { type: 'leader-port', port: mc.port1 },
+      [mc.port1],
+    );
+
+    // Asynchronously connect port2 to the leader via service worker broker
     this.getServiceWorker().then(sw => {
-      const mc = new MessageChannel();
       sw.postMessage({ type: 'transfer-port', tabId: this.tabId }, [mc.port2]);
-      this.syncWorker.postMessage(
-        { type: 'leader-port', port: mc.port1 },
-        [mc.port1],
-      );
     }).catch(err => {
       console.error('[VFS] Failed to connect to leader:', (err as Error).message);
+      mc.port2.close();
     });
   }
 
@@ -325,11 +331,23 @@ export class VFSFileSystem {
     if (!sw) throw new Error('No service worker found');
 
     return new Promise<ServiceWorker>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        sw.removeEventListener('statechange', onState);
+        reject(new Error('Service worker activation timeout'));
+      }, 5000);
       const onState = () => {
-        if (sw.state === 'activated') { sw.removeEventListener('statechange', onState); resolve(sw); }
-        else if (sw.state === 'redundant') { sw.removeEventListener('statechange', onState); reject(new Error('SW redundant')); }
+        if (sw.state === 'activated') {
+          clearTimeout(timer);
+          sw.removeEventListener('statechange', onState);
+          resolve(sw);
+        } else if (sw.state === 'redundant') {
+          clearTimeout(timer);
+          sw.removeEventListener('statechange', onState);
+          reject(new Error('SW redundant'));
+        }
       };
       sw.addEventListener('statechange', onState);
+      onState(); // Check immediately — state may have changed before listener was added
     });
   }
 

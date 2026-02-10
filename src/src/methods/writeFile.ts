@@ -13,7 +13,7 @@ export function writeFileSync(
 ): void {
   const opts = typeof options === 'string' ? { encoding: options } : options;
   const encoded = typeof data === 'string' ? encoder.encode(data) : data;
-  const flags = opts?.flush !== false ? 1 : 0;
+  const flags = opts?.flush === true ? 1 : 0;
   const buf = encodeRequest(OP.WRITE, filePath, flags, encoded);
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'write', filePath);
@@ -26,7 +26,7 @@ export async function writeFile(
   options?: WriteOptions | Encoding
 ): Promise<void> {
   const opts = typeof options === 'string' ? { encoding: options } : options;
-  const flags = opts?.flush !== false ? 1 : 0;
+  const flags = opts?.flush === true ? 1 : 0;
   const encoded = typeof data === 'string' ? encoder.encode(data) : data;
   const { status } = await asyncRequest(OP.WRITE, filePath, flags, encoded);
   if (status !== 0) throw statusToError(status, 'write', filePath);
