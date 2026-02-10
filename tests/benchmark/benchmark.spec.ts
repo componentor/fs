@@ -13,7 +13,6 @@ interface BenchmarkResult {
   fileSize: number;
   fileSizeMB?: number;
   lightning: number;
-  componentor: number | null;
   tier1: number | null;
   tier1Promises: number | null;
   tier2: number | null;
@@ -72,9 +71,9 @@ test.describe('OPFS-FS Benchmark Suite', () => {
       return `${ms.toFixed(0).padStart(5)}ms ${opsPerSec.toString().padStart(5)}op/s`;
     };
 
-    console.log('╔══════════════════════════╦═══════════════╦═══════════════╦═══════════════╦═══════════════╦═══════════════╦═══════════════╦═══════════════╦══════════════╗');
-    console.log('║ Test                     ║ LightningFS   ║ @comp/fs      ║ T1 Sync       ║ T1 Promises   ║ Tier 2        ║ VFS Sync      ║ VFS Promises  ║ Winner       ║');
-    console.log('╠══════════════════════════╬═══════════════╬═══════════════╬═══════════════╬═══════════════╬═══════════════╬═══════════════╬═══════════════╬══════════════╣');
+    console.log('╔══════════════════════════╦═══════════════╦═══════════════╦═══════════════╦═══════════════╦═══════════════╦═══════════════╦══════════════╗');
+    console.log('║ Test                     ║ LightningFS   ║ T1 Sync       ║ T1 Promises   ║ Tier 2        ║ VFS Sync      ║ VFS Promises  ║ Winner       ║');
+    console.log('╠══════════════════════════╬═══════════════╬═══════════════╬═══════════════╬═══════════════╬═══════════════╬═══════════════╬══════════════╣');
 
     for (const result of results) {
       const testName = result.operation === 'write'
@@ -95,7 +94,6 @@ test.describe('OPFS-FS Benchmark Suite', () => {
 
       const values = [
         { name: 'LFS', ms: result.lightning },
-        { name: '@comp', ms: result.componentor },
         { name: 'T1 Sync', ms: result.tier1 },
         { name: 'T1 Prom', ms: result.tier1Promises },
         { name: 'T2', ms: result.tier2 },
@@ -109,11 +107,11 @@ test.describe('OPFS-FS Benchmark Suite', () => {
       const winnerDisplay = winner ? `${winner.name} ${speedup}x` : '-';
 
       console.log(
-        `║ ${testName.padEnd(24)} ║ ${formatMs(result.lightning, result.iterations)} ║ ${formatMs(result.componentor, result.iterations)} ║ ${formatMs(result.tier1, result.iterations)} ║ ${formatMs(result.tier1Promises, result.iterations)} ║ ${formatMs(result.tier2, result.iterations)} ║ ${formatMs(result.vfsSync, result.iterations)} ║ ${formatMs(result.vfsPromises, result.iterations)} ║ ${winnerDisplay.padEnd(12)} ║`
+        `║ ${testName.padEnd(24)} ║ ${formatMs(result.lightning, result.iterations)} ║ ${formatMs(result.tier1, result.iterations)} ║ ${formatMs(result.tier1Promises, result.iterations)} ║ ${formatMs(result.tier2, result.iterations)} ║ ${formatMs(result.vfsSync, result.iterations)} ║ ${formatMs(result.vfsPromises, result.iterations)} ║ ${winnerDisplay.padEnd(12)} ║`
       );
     }
 
-    console.log('╚══════════════════════════╩═══════════════╩═══════════════╩═══════════════╩═══════════════╩═══════════════╩═══════════════╩═══════════════╩══════════════╝');
+    console.log('╚══════════════════════════╩═══════════════╩═══════════════╩═══════════════╩═══════════════╩═══════════════╩═══════════════╩══════════════╝');
 
     // Print bar chart
     console.log('\n📊 Performance Comparison (lower is better):\n');
@@ -137,7 +135,7 @@ test.describe('OPFS-FS Benchmark Suite', () => {
 
       console.log(`${testName}:`);
 
-      const allMs = [result.lightning, result.componentor, result.tier1, result.tier1Promises, result.tier2, result.vfsSync, result.vfsPromises].filter(v => v !== null && v !== undefined) as number[];
+      const allMs = [result.lightning, result.tier1, result.tier1Promises, result.tier2, result.vfsSync, result.vfsPromises].filter(v => v !== null && v !== undefined) as number[];
       const maxMs = Math.max(...allMs, 1);
       const scale = 50;
 
@@ -153,7 +151,6 @@ test.describe('OPFS-FS Benchmark Suite', () => {
       };
 
       drawBar('LightningFS', result.lightning, '🟡');
-      drawBar('@comp/fs', result.componentor, '🩷');
       drawBar('T1 Sync', result.tier1, '🟢');
       drawBar('T1 Promises', result.tier1Promises, '🩵');
       drawBar('Tier 2', result.tier2, '🔵');

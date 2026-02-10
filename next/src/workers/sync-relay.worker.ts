@@ -531,7 +531,6 @@ self.onmessage = async (e: MessageEvent) => {
 
   // --- Leader mode init ---
   if (msg.type === 'init-leader') {
-    console.log('[sync-relay] init-leader received, leaderInitialized:', leaderInitialized);
     if (leaderInitialized) return; // Prevent duplicate init during async gap
     leaderInitialized = true;
 
@@ -547,9 +546,7 @@ self.onmessage = async (e: MessageEvent) => {
     }
 
     try {
-      console.log('[sync-relay] initializing engine...');
       await initEngine(msg.config);
-      console.log('[sync-relay] engine initialized successfully');
     } catch (err) {
       // OPFS handle unavailable — tell main thread to fall back
       leaderInitialized = false; // Allow retry
@@ -563,14 +560,12 @@ self.onmessage = async (e: MessageEvent) => {
     // Signal ready to main thread (SAB for sync callers, postMessage for async callers)
     if (!readySent) {
       readySent = true;
-      console.log('[sync-relay] sending ready signal');
       Atomics.store(readySignal, 0, 1);
       Atomics.notify(readySignal, 0);
       (self as unknown as Worker).postMessage({ type: 'ready' });
     }
 
     // Start leader loop (never returns)
-    console.log('[sync-relay] starting leader loop');
     leaderLoop();
     return;
   }

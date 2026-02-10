@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>@componentor/fs v2.0.0 Benchmark Suite</title>
+  <title>OPFS Benchmark Suite</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -154,7 +154,6 @@
 
   <div class="legend">
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #ffc107, #ff9800);"></div> LightningFS (IndexedDB)</div>
-    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #e83e8c, #ff6b9d);"></div> @componentor/fs v1.2.8 (Legacy)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #28a745, #20c997);"></div> OPFS Tier 1 Sync (Worker + Atomics)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #17a2b8, #20c997);"></div> OPFS Tier 1 Promises (Worker + fastCall)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #007bff, #00d4ff);"></div> OPFS Tier 2 (Main Thread Promises)</div>
@@ -194,7 +193,7 @@
     };
 
     // Import libraries
-    let fs, fsTier2, LightningFS, ComponentorFS, componentorFs, git, http;
+    let fs, fsTier2, LightningFS, git, http;
     let tier1WorkerReady = false;
     let tier1Worker = null;
     let vfs = null;
@@ -324,12 +323,6 @@
       LightningFS = lfsModule.default;
       log('LightningFS loaded', 'success');
 
-      log('Loading @componentor/fs v1.2.8 (legacy for comparison)...', 'info');
-      const componentorModule = await import('https://esm.sh/@componentor/fs@1.2.8');
-      ComponentorFS = componentorModule.default;
-      componentorFs = new ComponentorFS();
-      log('@componentor/fs v1.2.8 loaded', 'success');
-
       log('Loading isomorphic-git...', 'info');
       const gitModule = await import('https://esm.sh/isomorphic-git@1.27.1');
       git = gitModule.default;
@@ -380,13 +373,10 @@
         try {
           const vfsModule = await import('/next/index.js');
           vfs = new vfsModule.VFSFileSystem({ root: '/vfs-bench' });
-          console.log('[benchmark] awaiting vfs.init()...');
           await Promise.race([
             vfs.init(),
             new Promise((_, reject) => setTimeout(() => reject(new Error('VFS init timeout (10s) - check browser console for [VFS] Sync-relay init failed')), 10000))
           ]);
-          console.log('[benchmark] vfs.init() resolved! Starting cleanup...');
-          log('VFS init done, cleaning up...', 'info');
           // Clean up stale state from previous benchmark runs
           const vfsDirs = ['/bench-vfs', '/bench-vfs-p', '/bench-vfs-read', '/bench-vfs-read-p',
             '/bench-vfs-large', '/bench-vfs-large-p', '/bench-vfs-batch', '/bench-vfs-batch-p',
@@ -394,7 +384,6 @@
           for (const d of vfsDirs) {
             try { await vfs.promises.rm(d, { recursive: true, force: true }); } catch {}
           }
-          console.log('[benchmark] cleanup done');
           vfsReady = true;
           log('VFS ready', 'success');
         } catch (e) {
@@ -537,17 +526,6 @@
       results.lightning = performance.now() - startL;
       log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
 
-      // @componentor/fs
-      log(`Testing @componentor/fs write (${iterations} x ${fileSize} bytes)...`, 'info');
-      await componentorFs.mkdir('/bench-componentor', { recursive: true });
-      const startC = performance.now();
-      for (let i = 0; i < iterations; i++) {
-        await componentorFs.writeFile(`/bench-componentor/write-${i}.bin`, data);
-      }
-      results.componentor = performance.now() - startC;
-      await componentorFs.rm('/bench-componentor', { recursive: true, force: true });
-      log(`@componentor/fs: ${results.componentor.toFixed(2)}ms`, 'success');
-
       // OPFS Tier 2 (Main Thread Promises)
       log(`Testing OPFS Tier 2 (Main Thread Promises)...`, 'info');
       await fs.promises.mkdir('/bench-t2', { recursive: true });
@@ -656,12 +634,6 @@
         await fs.promises.writeFile(`/bench-read/read-${i}.bin`, data);
       }
 
-      // Setup files for @componentor/fs
-      await componentorFs.mkdir('/bench-read-componentor', { recursive: true });
-      for (let i = 0; i < iterations; i++) {
-        await componentorFs.writeFile(`/bench-read-componentor/read-${i}.bin`, data);
-      }
-
       // LightningFS
       log(`Testing LightningFS read (${iterations} x ${fileSize} bytes)...`, 'info');
       const startL = performance.now();
@@ -670,15 +642,6 @@
       }
       results.lightning = performance.now() - startL;
       log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
-
-      // @componentor/fs
-      log(`Testing @componentor/fs read (${iterations} x ${fileSize} bytes)...`, 'info');
-      const startC = performance.now();
-      for (let i = 0; i < iterations; i++) {
-        await componentorFs.readFile(`/bench-read-componentor/read-${i}.bin`);
-      }
-      results.componentor = performance.now() - startC;
-      log(`@componentor/fs: ${results.componentor.toFixed(2)}ms`, 'success');
 
       // OPFS Tier 2
       log(`Testing OPFS Tier 2 (Promises)...`, 'info');
@@ -691,7 +654,6 @@
 
       // Cleanup OPFS
       await fs.promises.rm('/bench-read', { recursive: true, force: true });
-      await componentorFs.rm('/bench-read-componentor', { recursive: true, force: true });
 
       // OPFS Tier 1 Sync (Worker + Atomics)
       log(`Testing OPFS Tier 1 Sync (Atomics)...`, 'info');
@@ -801,17 +763,6 @@
       results.lightning = performance.now() - startL;
       log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
 
-      // @componentor/fs
-      log(`Testing @componentor/fs large write (${iterations} x ${fileSizeMB}MB)...`, 'info');
-      await componentorFs.mkdir('/bench-large-componentor', { recursive: true });
-      const startC = performance.now();
-      for (let i = 0; i < iterations; i++) {
-        await componentorFs.writeFile(`/bench-large-componentor/large-${i}.bin`, data);
-      }
-      results.componentor = performance.now() - startC;
-      await componentorFs.rm('/bench-large-componentor', { recursive: true, force: true });
-      log(`@componentor/fs: ${results.componentor.toFixed(2)}ms`, 'success');
-
       // OPFS Tier 2
       log(`Testing OPFS Tier 2 (Promises)...`, 'info');
       await fs.promises.mkdir('/bench-large', { recursive: true });
@@ -918,17 +869,6 @@
       }
       results.lightning = performance.now() - startL;
       log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
-
-      // @componentor/fs
-      log(`Testing @componentor/fs batch write (${iterations} x ${fileSize} bytes)...`, 'info');
-      await componentorFs.mkdir('/bench-batch-componentor', { recursive: true });
-      const startC = performance.now();
-      for (let i = 0; i < iterations; i++) {
-        await componentorFs.writeFile(`/bench-batch-componentor/batch-${i}.bin`, data);
-      }
-      results.componentor = performance.now() - startC;
-      await componentorFs.rm('/bench-batch-componentor', { recursive: true, force: true });
-      log(`@componentor/fs: ${results.componentor.toFixed(2)}ms`, 'success');
 
       // OPFS Tier 2 (Promises - always available)
       log(`Testing OPFS Tier 2 (Promises) batch write...`, 'info');
@@ -1039,12 +979,6 @@
         await fs.promises.writeFile(`/bench-batch-read/batch-${i}.bin`, data);
       }
 
-      // Setup files for @componentor/fs
-      await componentorFs.mkdir('/bench-batch-read-componentor', { recursive: true });
-      for (let i = 0; i < iterations; i++) {
-        await componentorFs.writeFile(`/bench-batch-read-componentor/batch-${i}.bin`, data);
-      }
-
       // LightningFS
       log(`Testing LightningFS batch read (${iterations} x ${fileSize} bytes)...`, 'info');
       const startL = performance.now();
@@ -1053,15 +987,6 @@
       }
       results.lightning = performance.now() - startL;
       log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
-
-      // @componentor/fs
-      log(`Testing @componentor/fs batch read (${iterations} x ${fileSize} bytes)...`, 'info');
-      const startC = performance.now();
-      for (let i = 0; i < iterations; i++) {
-        await componentorFs.readFile(`/bench-batch-read-componentor/batch-${i}.bin`);
-      }
-      results.componentor = performance.now() - startC;
-      log(`@componentor/fs: ${results.componentor.toFixed(2)}ms`, 'success');
 
       // OPFS Tier 2
       log(`Testing OPFS Tier 2 (Promises) batch read...`, 'info');
@@ -1074,7 +999,6 @@
 
       // Cleanup OPFS
       await fs.promises.rm('/bench-batch-read', { recursive: true, force: true });
-      await componentorFs.rm('/bench-batch-read-componentor', { recursive: true, force: true });
 
       // OPFS Tier 1 Sync (Worker + Atomics)
       log(`Testing OPFS Tier 1 Sync (Atomics) batch read...`, 'info');
@@ -1200,31 +1124,6 @@
         console.error('LightningFS clone error:', e);
         results.lightning = null;
       }
-
-      // @componentor/fs
-      log(`Testing @componentor/fs git clone (${repoUrl})...`, 'info');
-      try { await componentorFs.rm('/git-bench-componentor', { recursive: true, force: true }); } catch {}
-      await componentorFs.mkdir('/git-bench-componentor', { recursive: true });
-      const startC = performance.now();
-      try {
-        await git.clone({
-          fs: { promises: componentorFs },
-          http,
-          dir: '/git-bench-componentor',
-          url: repoUrl,
-          corsProxy,
-          singleBranch: true,
-          depth: 1,
-        });
-        results.componentor = performance.now() - startC;
-        log(`@componentor/fs: ${results.componentor.toFixed(2)}ms`, 'success');
-      } catch (e) {
-        log(`@componentor/fs git clone failed: ${e.message} (code: ${e.code})`, 'error');
-        console.error('@componentor/fs clone error:', e);
-        results.componentor = null;
-      }
-      // Cleanup
-      try { await componentorFs.rm('/git-bench-componentor', { recursive: true, force: true }); } catch {}
 
       // OPFS Tier 1 Promises (Main thread with Atomics.waitAsync)
       // With initSync() called, fs.promises uses sync kernel via Atomics.waitAsync
@@ -1424,24 +1323,6 @@
         // Continue with other tests even if this fails
       }
 
-      // @componentor/fs setup
-      try { await componentorFs.rm('/git-status-componentor', { recursive: true, force: true }); } catch {}
-      await componentorFs.mkdir('/git-status-componentor', { recursive: true });
-      try {
-        await git.clone({
-          fs: { promises: componentorFs },
-          http,
-          dir: '/git-status-componentor',
-          url: repoUrl,
-          corsProxy,
-          singleBranch: true,
-          depth: 1,
-        });
-      } catch (e) {
-        log(`@componentor/fs clone for status failed: ${e.message}`, 'error');
-        // Continue with other tests even if this fails
-      }
-
       // LightningFS status benchmark
       log(`Testing LightningFS git status (${iterations}x)...`, 'info');
       const startL = performance.now();
@@ -1450,20 +1331,6 @@
       }
       results.lightning = performance.now() - startL;
       log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
-
-      // @componentor/fs status benchmark
-      log(`Testing @componentor/fs git status (${iterations}x)...`, 'info');
-      try {
-        const startC = performance.now();
-        for (let i = 0; i < iterations; i++) {
-          await git.statusMatrix({ fs: { promises: componentorFs }, dir: '/git-status-componentor' });
-        }
-        results.componentor = performance.now() - startC;
-        log(`@componentor/fs: ${results.componentor.toFixed(2)}ms`, 'success');
-      } catch (e) {
-        log(`@componentor/fs git status failed: ${e.message}`, 'error');
-        results.componentor = null;
-      }
 
       // OPFS Tier 1 Promises status benchmark (Main thread with Atomics.waitAsync)
       log(`Testing OPFS Tier 1 Promises git status (${iterations}x)...`, 'info');
@@ -1491,7 +1358,6 @@
       // Cleanup
       try { await fs.promises.rm('/git-status-opfs', { recursive: true, force: true }); } catch {}
       try { await fsTier2.promises.rm('/git-status-opfs-t2', { recursive: true, force: true }); } catch {}
-      try { await componentorFs.rm('/git-status-componentor', { recursive: true, force: true }); } catch {}
 
       // Tier 1 Sync not applicable (git requires async)
       results.tier1 = null;
@@ -1571,13 +1437,12 @@
       const container = document.getElementById('results');
 
       let html = '<table><thead><tr>';
-      html += '<th>Test</th><th>LightningFS</th><th>@componentor/fs</th><th>Tier 1 Sync</th><th>Tier 1 Promises</th><th>Tier 2</th><th>VFS Sync</th><th>VFS Promises</th><th>Future Sync</th><th>Future Promises</th><th>Best</th>';
+      html += '<th>Test</th><th>LightningFS</th><th>Tier 1 Sync</th><th>Tier 1 Promises</th><th>Tier 2</th><th>VFS Sync</th><th>VFS Promises</th><th>Future Sync</th><th>Future Promises</th><th>Best</th>';
       html += '</tr></thead><tbody>';
 
       for (const result of allResults) {
         const values = [
           { name: 'LightningFS', ms: result.lightning, class: 'lightning' },
-          { name: '@componentor/fs', ms: result.componentor, class: 'componentor' },
           { name: 'Tier 1 Sync', ms: result.tier1, class: 'tier1' },
           { name: 'Tier 1 Promises', ms: result.tier1Promises, class: 'tier1' },
           { name: 'Tier 2', ms: result.tier2, class: 'tier2' },
@@ -1617,17 +1482,6 @@
           html += `<td class="${result.lightning === minMs ? 'winner' : ''}">`;
           html += `<div class="bar-container"><div class="bar lightning" style="width: ${lPct}%"></div></div>`;
           html += `${result.lightning.toFixed(1)}ms${lOps !== '-' ? ` (${lOps} ops/s)` : ''}</td>`;
-        } else {
-          html += '<td style="color:#999">N/A</td>';
-        }
-
-        // @componentor/fs
-        if (result.componentor !== null && result.componentor !== undefined) {
-          const cPct = (result.componentor / maxMs * 100).toFixed(0);
-          const cOps = result.iterations > 0 ? (result.iterations / result.componentor * 1000).toFixed(0) : '-';
-          html += `<td class="${result.componentor === minMs ? 'winner' : ''}">`;
-          html += `<div class="bar-container"><div class="bar" style="width: ${cPct}%; background: linear-gradient(90deg, #e83e8c, #ff6b9d);"></div></div>`;
-          html += `${result.componentor.toFixed(1)}ms${cOps !== '-' ? ` (${cOps} ops/s)` : ''}</td>`;
         } else {
           html += '<td style="color:#999">N/A</td>';
         }

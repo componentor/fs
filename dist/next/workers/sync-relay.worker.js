@@ -1599,7 +1599,6 @@ async function initEngine(config) {
 self.onmessage = async (e) => {
   const msg = e.data;
   if (msg.type === "init-leader") {
-    console.log("[sync-relay] init-leader received, leaderInitialized:", leaderInitialized);
     if (leaderInitialized) return;
     leaderInitialized = true;
     sab = msg.sab;
@@ -1612,9 +1611,7 @@ self.onmessage = async (e) => {
       asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
     }
     try {
-      console.log("[sync-relay] initializing engine...");
       await initEngine(msg.config);
-      console.log("[sync-relay] engine initialized successfully");
     } catch (err) {
       leaderInitialized = false;
       self.postMessage({
@@ -1625,12 +1622,10 @@ self.onmessage = async (e) => {
     }
     if (!readySent) {
       readySent = true;
-      console.log("[sync-relay] sending ready signal");
       Atomics.store(readySignal, 0, 1);
       Atomics.notify(readySignal, 0);
       self.postMessage({ type: "ready" });
     }
-    console.log("[sync-relay] starting leader loop");
     leaderLoop();
     return;
   }

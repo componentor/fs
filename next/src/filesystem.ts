@@ -152,9 +152,7 @@ export class VFSFileSystem {
     // Handle messages from sync-relay
     this.syncWorker.onmessage = (e: MessageEvent) => {
       const msg = e.data;
-      console.log('[VFS] syncWorker message:', msg.type);
       if (msg.type === 'ready') {
-        console.log('[VFS] resolving readyPromise, isFollower:', this.isFollower);
         this.isReady = true;
         this.resolveReady();
         if (!this.isFollower) {
@@ -199,9 +197,7 @@ export class VFSFileSystem {
    *  the leader; all others become followers. When the leader dies, the browser
    *  releases the lock and the next waiting tab is promoted. */
   private acquireLeaderLock(): void {
-    console.log('[VFS] acquireLeaderLock called');
     if (!('locks' in navigator)) {
-      console.log('[VFS] no locks API — defaulting to leader');
       this.startAsLeader();
       return;
     }
@@ -210,16 +206,13 @@ export class VFSFileSystem {
     // with null). The `decided` flag ensures only the first invocation acts.
     let decided = false;
     navigator.locks.request('vfs-leader', { ifAvailable: true }, async (lock) => {
-      console.log('[VFS] lock callback fired, decided:', decided, 'lock:', !!lock);
       if (decided) return;
       decided = true;
       if (lock) {
         this.holdingLeaderLock = true;
-        console.log('[VFS] starting as leader');
         this.startAsLeader();
         await new Promise(() => {}); // Hold lock forever (released when tab closes)
       } else {
-        console.log('[VFS] starting as follower');
         this.startAsFollower();
         this.waitForLeaderLock();
       }
