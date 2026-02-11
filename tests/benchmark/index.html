@@ -195,6 +195,7 @@
 
   <div class="legend">
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #ffc107, #ff9800);"></div> LightningFS (IndexedDB)</div>
+    <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #20c997, #0dcaf0);"></div> memfs (in-memory)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #6f42c1, #a855f7);"></div> VFS Sync (SAB + Atomics.wait)</div>
     <div class="legend-item"><div class="legend-color" style="background: linear-gradient(90deg, #d63384, #e879a8);"></div> VFS Promises (async relay)</div>
   </div>
@@ -230,6 +231,7 @@
 
     // Import libraries
     let LightningFS, git, http;
+    let memfsModule = null; // { memfs } factory function
     let vfs = null;
     let vfsReady = false;
 
@@ -250,6 +252,27 @@
       git = gitModule.default;
       http = (await import('https://esm.sh/isomorphic-git@1.27.1/http/web')).default;
       log('isomorphic-git loaded', 'success');
+
+      log('Loading memfs...', 'info');
+      try {
+        const mod = await import('https://esm.sh/memfs@4');
+        console.log('[memfs] exports:', Object.keys(mod));
+        // memfs v4 export structure varies — detect the right factory
+        if (typeof mod.memfs === 'function') {
+          memfsModule = { create: () => mod.memfs().fs };
+        } else if (typeof mod.Volume === 'function') {
+          memfsModule = { create: () => mod.createFsFromVolume(new mod.Volume()) };
+        } else if (typeof mod.default?.memfs === 'function') {
+          memfsModule = { create: () => mod.default.memfs().fs };
+        } else if (typeof mod.default?.Volume === 'function') {
+          memfsModule = { create: () => mod.default.createFsFromVolume(new mod.default.Volume()) };
+        } else {
+          throw new Error('Could not find memfs factory — exports: ' + Object.keys(mod).join(', '));
+        }
+        log('memfs loaded', 'success');
+      } catch (e) {
+        log('memfs failed to load: ' + e.message, 'error');
+      }
 
       // Clean corrupted VFS binaries from OPFS before init
       try {
@@ -420,6 +443,23 @@
       results.perOp.lightning = computeStats(lTimes);
       log(`LightningFS: ${results.lightning.toFixed(2)}ms (avg ${results.perOp.lightning.avg.toFixed(3)}ms/op)`, 'success');
 
+      // memfs (in-memory)
+      if (memfsModule) {
+        log(`Testing memfs write (${iterations} x ${fileSize} bytes)...`, 'info');
+        const mfs = memfsModule.create();
+        const mTimes = [];
+        for (let i = 0; i < iterations; i++) {
+          const t = performance.now();
+          mfs.writeFileSync(`/write-${i}.bin`, data);
+          mTimes.push(performance.now() - t);
+        }
+        results.memfs = mTimes.reduce((a, b) => a + b, 0);
+        results.perOp.memfs = computeStats(mTimes);
+        log(`memfs: ${results.memfs.toFixed(2)}ms (avg ${results.perOp.memfs.avg.toFixed(3)}ms/op)`, 'success');
+      } else {
+        results.memfs = null;
+      }
+
       // VFS Sync (SAB + Atomics.wait) — requires crossOriginIsolated
       if (vfsReady && crossOriginIsolated) {
         log(`Testing VFS Sync write (${iterations} x ${fileSize} bytes)${flushMode ? ' [flush]' : ''}...`, 'info');
@@ -480,6 +520,26 @@
       results.lightning = lTimes.reduce((a, b) => a + b, 0);
       results.perOp.lightning = computeStats(lTimes);
       log(`LightningFS: ${results.lightning.toFixed(2)}ms (avg ${results.perOp.lightning.avg.toFixed(3)}ms/op)`, 'success');
+
+      // memfs (in-memory)
+      if (memfsModule) {
+        log(`Testing memfs read (${iterations} x ${fileSize} bytes)...`, 'info');
+        const mfs = memfsModule.create();
+        for (let i = 0; i < iterations; i++) {
+          mfs.writeFileSync(`/read-${i}.bin`, data);
+        }
+        const mTimes = [];
+        for (let i = 0; i < iterations; i++) {
+          const t = performance.now();
+          mfs.readFileSync(`/read-${i}.bin`);
+          mTimes.push(performance.now() - t);
+        }
+        results.memfs = mTimes.reduce((a, b) => a + b, 0);
+        results.perOp.memfs = computeStats(mTimes);
+        log(`memfs: ${results.memfs.toFixed(2)}ms (avg ${results.perOp.memfs.avg.toFixed(3)}ms/op)`, 'success');
+      } else {
+        results.memfs = null;
+      }
 
       // VFS Sync (SAB + Atomics.wait) — requires crossOriginIsolated
       if (vfsReady && crossOriginIsolated) {
@@ -546,6 +606,23 @@
       results.perOp.lightning = computeStats(lTimes);
       log(`LightningFS: ${results.lightning.toFixed(2)}ms (avg ${results.perOp.lightning.avg.toFixed(3)}ms/op)`, 'success');
 
+      // memfs (in-memory)
+      if (memfsModule) {
+        log(`Testing memfs large write (${iterations} x ${fileSizeMB}MB)...`, 'info');
+        const mfs = memfsModule.create();
+        const mTimes = [];
+        for (let i = 0; i < iterations; i++) {
+          const t = performance.now();
+          mfs.writeFileSync(`/large-${i}.bin`, data);
+          mTimes.push(performance.now() - t);
+        }
+        results.memfs = mTimes.reduce((a, b) => a + b, 0);
+        results.perOp.memfs = computeStats(mTimes);
+        log(`memfs: ${results.memfs.toFixed(2)}ms (avg ${results.perOp.memfs.avg.toFixed(3)}ms/op)`, 'success');
+      } else {
+        results.memfs = null;
+      }
+
       // VFS Sync (SAB + Atomics.wait) for large files — requires crossOriginIsolated
       if (vfsReady && crossOriginIsolated) {
         log(`Testing VFS Sync large write (${iterations} x ${fileSizeMB}MB)${flushMode ? ' [flush]' : ''}...`, 'info');
@@ -604,6 +681,23 @@
       results.lightning = lTimes.reduce((a, b) => a + b, 0);
       results.perOp.lightning = computeStats(lTimes);
       log(`LightningFS: ${results.lightning.toFixed(2)}ms (avg ${results.perOp.lightning.avg.toFixed(3)}ms/op)`, 'success');
+
+      // memfs (in-memory)
+      if (memfsModule) {
+        log(`Testing memfs batch write (${iterations} x ${fileSize} bytes)...`, 'info');
+        const mfs = memfsModule.create();
+        const mTimes = [];
+        for (let i = 0; i < iterations; i++) {
+          const t = performance.now();
+          mfs.writeFileSync(`/batch-${i}.bin`, data);
+          mTimes.push(performance.now() - t);
+        }
+        results.memfs = mTimes.reduce((a, b) => a + b, 0);
+        results.perOp.memfs = computeStats(mTimes);
+        log(`memfs: ${results.memfs.toFixed(2)}ms (avg ${results.perOp.memfs.avg.toFixed(3)}ms/op)`, 'success');
+      } else {
+        results.memfs = null;
+      }
 
       // VFS Sync batch write — requires crossOriginIsolated
       if (vfsReady && crossOriginIsolated) {
@@ -666,6 +760,26 @@
       results.lightning = lTimes.reduce((a, b) => a + b, 0);
       results.perOp.lightning = computeStats(lTimes);
       log(`LightningFS: ${results.lightning.toFixed(2)}ms (avg ${results.perOp.lightning.avg.toFixed(3)}ms/op)`, 'success');
+
+      // memfs (in-memory)
+      if (memfsModule) {
+        log(`Testing memfs batch read (${iterations} x ${fileSize} bytes)...`, 'info');
+        const mfs = memfsModule.create();
+        for (let i = 0; i < iterations; i++) {
+          mfs.writeFileSync(`/batch-${i}.bin`, data);
+        }
+        const mTimes = [];
+        for (let i = 0; i < iterations; i++) {
+          const t = performance.now();
+          mfs.readFileSync(`/batch-${i}.bin`);
+          mTimes.push(performance.now() - t);
+        }
+        results.memfs = mTimes.reduce((a, b) => a + b, 0);
+        results.perOp.memfs = computeStats(mTimes);
+        log(`memfs: ${results.memfs.toFixed(2)}ms (avg ${results.perOp.memfs.avg.toFixed(3)}ms/op)`, 'success');
+      } else {
+        results.memfs = null;
+      }
 
       // VFS Sync batch read — requires crossOriginIsolated
       if (vfsReady && crossOriginIsolated) {
@@ -740,6 +854,32 @@
         results.lightning = null;
       }
 
+      // memfs git clone
+      if (memfsModule) {
+        log(`Testing memfs git clone...`, 'info');
+        const mfs = memfsModule.create();
+        const memGitFs = createGitFs({ promises: mfs.promises });
+        const startM = performance.now();
+        try {
+          await git.clone({
+            fs: memGitFs,
+            http,
+            dir: '/repo',
+            url: repoUrl,
+            corsProxy,
+            singleBranch: true,
+            depth: 1,
+          });
+          results.memfs = performance.now() - startM;
+          log(`memfs: ${results.memfs.toFixed(2)}ms`, 'success');
+        } catch (e) {
+          log(`memfs git clone failed: ${e.message}`, 'error');
+          results.memfs = null;
+        }
+      } else {
+        results.memfs = null;
+      }
+
       // VFS Sync not applicable (git requires async)
       results.vfsSync = null;
 
@@ -810,6 +950,35 @@
       results.lightning = performance.now() - startL;
       log(`LightningFS: ${results.lightning.toFixed(2)}ms`, 'success');
 
+      // memfs git status
+      if (memfsModule) {
+        const mfs = memfsModule.create();
+        const memGitFs = createGitFs({ promises: mfs.promises });
+        try {
+          await git.clone({
+            fs: memGitFs,
+            http,
+            dir: '/repo-status',
+            url: repoUrl,
+            corsProxy,
+            singleBranch: true,
+            depth: 1,
+          });
+          log(`Testing memfs git status (${iterations}x)...`, 'info');
+          const startM = performance.now();
+          for (let i = 0; i < iterations; i++) {
+            await git.statusMatrix({ fs: memGitFs, dir: '/repo-status' });
+          }
+          results.memfs = performance.now() - startM;
+          log(`memfs: ${results.memfs.toFixed(2)}ms`, 'success');
+        } catch (e) {
+          log(`memfs git status failed: ${e.message}`, 'error');
+          results.memfs = null;
+        }
+      } else {
+        results.memfs = null;
+      }
+
       // VFS Sync not applicable (git requires async)
       results.vfsSync = null;
 
@@ -851,12 +1020,13 @@
       const container = document.getElementById('results');
 
       let html = '<table><thead><tr>';
-      html += '<th>Test</th><th>LightningFS</th><th>VFS Sync</th><th>VFS Promises</th><th>Best</th>';
+      html += '<th>Test</th><th>LightningFS</th><th>memfs</th><th>VFS Sync</th><th>VFS Promises</th><th>Best</th>';
       html += '</tr></thead><tbody>';
 
       for (const result of allResults) {
         const values = [
           { name: 'LightningFS', ms: result.lightning, class: 'lightning' },
+          { name: 'memfs', ms: result.memfs, class: 'memfs' },
           { name: 'VFS Sync', ms: result.vfsSync, class: 'vfs' },
           { name: 'VFS Promises', ms: result.vfsPromises, class: 'vfs' },
         ].filter(v => v.ms !== null && v.ms !== undefined);
@@ -891,6 +1061,17 @@
           html += `<td class="${result.lightning === minMs ? 'winner' : ''}">`;
           html += `<div class="bar-container"><div class="bar lightning" style="width: ${lPct}%"></div></div>`;
           html += `${result.lightning.toFixed(1)}ms${lOps !== '-' ? ` (${lOps} ops/s)` : ''}</td>`;
+        } else {
+          html += '<td style="color:#999">N/A</td>';
+        }
+
+        // memfs
+        if (result.memfs !== null && result.memfs !== undefined) {
+          const mPct = (result.memfs / maxMs * 100).toFixed(0);
+          const mOps = result.iterations > 0 ? (result.iterations / result.memfs * 1000).toFixed(0) : '-';
+          html += `<td class="${result.memfs === minMs ? 'winner' : ''}">`;
+          html += `<div class="bar-container"><div class="bar" style="width: ${mPct}%; background: linear-gradient(90deg, #20c997, #0dcaf0);"></div></div>`;
+          html += `${result.memfs.toFixed(1)}ms${mOps !== '-' ? ` (${mOps} ops/s)` : ''}</td>`;
         } else {
           html += '<td style="color:#999">N/A</td>';
         }
@@ -931,12 +1112,13 @@
         // Per-op stats row (collapsible)
         if (result.perOp && Object.keys(result.perOp).length > 0) {
           const detailId = `perop-${allResults.indexOf(result)}`;
-          html += `<tr><td colspan="5" style="padding: 2px 15px;">`;
+          html += `<tr><td colspan="6" style="padding: 2px 15px;">`;
           html += `<span class="perop-toggle" onclick="document.getElementById('${detailId}').style.display = document.getElementById('${detailId}').style.display === 'none' ? 'block' : 'none'">Per-op timing details</span>`;
           html += `<div id="${detailId}" style="display:none;">`;
           html += `<table class="perop-table"><thead><tr><th>Implementation</th><th>Avg</th><th>Min</th><th>P50</th><th>P95</th><th>Max</th></tr></thead><tbody>`;
           const statKeys = [
             ['lightning', 'LightningFS'],
+            ['memfs', 'memfs'],
             ['vfsSync', 'VFS Sync'],
             ['vfsPromises', 'VFS Promises'],
           ];
