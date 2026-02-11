@@ -684,11 +684,16 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
     case OP.COPY:
     case OP.LINK: {
       const result = engine.read(path);
-      if (result.status === 0 && result.data) {
-        const buf = result.data.buffer.byteLength === result.data.byteLength
-          ? result.data.buffer
-          : result.data.slice().buffer;
-        opfsSyncPort.postMessage({ op: 'write', path, data: buf, ts } as const, [buf as ArrayBuffer]);
+      if (result.status === 0) {
+        if (result.data && result.data.byteLength > 0) {
+          const buf = result.data.buffer.byteLength === result.data.byteLength
+            ? result.data.buffer
+            : result.data.slice().buffer;
+          opfsSyncPort.postMessage({ op: 'write', path, data: buf, ts } as const, [buf as ArrayBuffer]);
+        } else {
+          // Empty file (e.g. .gitkeep) — send with empty ArrayBuffer
+          opfsSyncPort.postMessage({ op: 'write', path, data: new ArrayBuffer(0), ts });
+        }
       }
       break;
     }

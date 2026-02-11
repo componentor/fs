@@ -64,10 +64,10 @@ async function processNext() {
   try {
     switch (event.op) {
       case "write":
-        if (event.data && event.data.byteLength > 0) {
+        if (event.data) {
           await writeToOPFS(event.path, event.data);
         } else {
-          console.warn("[opfs-sync] write skipped \u2014 no data for:", event.path);
+          await writeToOPFS(event.path, new ArrayBuffer(0));
         }
         break;
       case "delete":

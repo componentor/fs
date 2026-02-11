@@ -475,6 +475,14 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+### v3.0.1 (2026)
+
+**Bug Fixes:**
+- Fix empty files (e.g. `.gitkeep`) not being mirrored to OPFS — both the sync-relay (skipped sending empty data) and opfs-sync worker (skipped writing 0-byte files) now handle empty files correctly
+
+**Benchmark:**
+- Add memfs (in-memory) to the benchmark suite for comparison
+
 ### v3.0.0 (2026)
 
 **Complete architecture rewrite — VFS binary format with SharedArrayBuffer.**

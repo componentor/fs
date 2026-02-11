@@ -119,10 +119,11 @@ async function processNext(): Promise<void> {
   try {
     switch (event.op) {
       case 'write':
-        if (event.data && event.data.byteLength > 0) {
+        if (event.data) {
           await writeToOPFS(event.path, event.data);
         } else {
-          console.warn('[opfs-sync] write skipped — no data for:', event.path);
+          // No data but file should still exist (empty file like .gitkeep)
+          await writeToOPFS(event.path, new ArrayBuffer(0));
         }
         break;
       case 'delete':

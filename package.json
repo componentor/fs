@@ -1,6 +1,6 @@
 {
   "name": "@componentor/fs",
-  "version": "3.0.0",
+  "version": "3.0.1",
   "description": "High-performance OPFS-based Node.js fs polyfill with true sync API, VFS binary format, and bidirectional OPFS mirroring",
   "license": "MIT",
   "author": "Componentor",
