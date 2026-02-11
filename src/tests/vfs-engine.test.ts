@@ -397,6 +397,98 @@ describe('VFSEngine', () => {
       const view = new DataView(lstatResult.data!.buffer, lstatResult.data!.byteOffset);
       expect(view.getUint8(0)).toBe(INODE_TYPE.SYMLINK);
     });
+
+    it('should follow absolute symlink on read', () => {
+      engine.write('/abs-target.txt', new TextEncoder().encode('absolute target content'));
+      engine.symlink('/abs-target.txt', '/abs-link.txt');
+
+      const readResult = engine.read('/abs-link.txt');
+      expect(readResult.status).toBe(0);
+      expect(new TextDecoder().decode(readResult.data!)).toBe('absolute target content');
+    });
+
+    it('should follow relative symlink on read (npm .bin pattern)', () => {
+      // Simulates: node_modules/.bin/vite -> ../vite/bin/vite.cjs
+      engine.mkdir('/node_modules', 0);
+      engine.mkdir('/node_modules/.bin', 0);
+      engine.mkdir('/node_modules/vite', 0);
+      engine.mkdir('/node_modules/vite/bin', 0);
+      engine.write('/node_modules/vite/bin/vite.cjs', new TextEncoder().encode('#!/usr/bin/env node\nconsole.log("vite")'));
+      engine.symlink('../vite/bin/vite.cjs', '/node_modules/.bin/vite');
+
+      const readResult = engine.read('/node_modules/.bin/vite');
+      expect(readResult.status).toBe(0);
+      expect(new TextDecoder().decode(readResult.data!)).toBe('#!/usr/bin/env node\nconsole.log("vite")');
+    });
+
+    it('should follow symlink chains', () => {
+      engine.write('/chain-target.txt', new TextEncoder().encode('chain end'));
+      engine.symlink('/chain-target.txt', '/chain-mid.txt');
+      engine.symlink('/chain-mid.txt', '/chain-start.txt');
+
+      const readResult = engine.read('/chain-start.txt');
+      expect(readResult.status).toBe(0);
+      expect(new TextDecoder().decode(readResult.data!)).toBe('chain end');
+    });
+
+    it('should resolve symlinks in intermediate path components', () => {
+      // /real-dir/file.txt exists, /link-dir -> /real-dir
+      engine.mkdir('/real-dir', 0);
+      engine.write('/real-dir/file.txt', new TextEncoder().encode('through dir symlink'));
+      engine.symlink('/real-dir', '/link-dir');
+
+      const readResult = engine.read('/link-dir/file.txt');
+      expect(readResult.status).toBe(0);
+      expect(new TextDecoder().decode(readResult.data!)).toBe('through dir symlink');
+    });
+
+    it('should return ENOENT for symlink to non-existent target', () => {
+      engine.symlink('/does-not-exist.txt', '/dangling-link.txt');
+
+      const readResult = engine.read('/dangling-link.txt');
+      expect(readResult.status).not.toBe(0); // ENOENT
+    });
+
+    it('should follow symlink whose target goes through another symlink', () => {
+      // /real-lib/util.js exists
+      // /lib -> /real-lib (directory symlink)
+      // /app/link -> /lib/util.js (target traverses /lib symlink)
+      engine.mkdir('/real-lib', 0);
+      engine.write('/real-lib/util.js', new TextEncoder().encode('export default 42'));
+      engine.symlink('/real-lib', '/lib');
+      engine.mkdir('/app', 0);
+      engine.symlink('/lib/util.js', '/app/link');
+
+      const readResult = engine.read('/app/link');
+      expect(readResult.status).toBe(0);
+      expect(new TextDecoder().decode(readResult.data!)).toBe('export default 42');
+    });
+
+    it('should follow symlinks with custom root-like prefix paths', () => {
+      // Simulates custom root: /vfs-bench/node_modules/.bin/vite -> ../vite/bin/vite.cjs
+      engine.mkdir('/vfs-bench', 0);
+      engine.mkdir('/vfs-bench/node_modules', 0);
+      engine.mkdir('/vfs-bench/node_modules/.bin', 0);
+      engine.mkdir('/vfs-bench/node_modules/vite', 0);
+      engine.mkdir('/vfs-bench/node_modules/vite/bin', 0);
+      engine.write('/vfs-bench/node_modules/vite/bin/vite.cjs', new TextEncoder().encode('vite-cli'));
+      engine.symlink('../vite/bin/vite.cjs', '/vfs-bench/node_modules/.bin/vite');
+
+      const readResult = engine.read('/vfs-bench/node_modules/.bin/vite');
+      expect(readResult.status).toBe(0);
+      expect(new TextDecoder().decode(readResult.data!)).toBe('vite-cli');
+
+      // Also verify stat follows through
+      const statResult = engine.stat('/vfs-bench/node_modules/.bin/vite');
+      expect(statResult.status).toBe(0);
+      const view = new DataView(statResult.data!.buffer, statResult.data!.byteOffset);
+      expect(view.getUint8(0)).toBe(INODE_TYPE.FILE);
+
+      // And realpath resolves to the actual file path
+      const realpathResult = engine.realpath('/vfs-bench/node_modules/.bin/vite');
+      expect(realpathResult.status).toBe(0);
+      expect(new TextDecoder().decode(realpathResult.data!)).toBe('/vfs-bench/node_modules/vite/bin/vite.cjs');
+    });
   });
 
   describe('chmod/chown', () => {

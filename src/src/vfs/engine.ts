@@ -490,7 +490,10 @@ export class VFSEngine {
     if (depth > MAX_SYMLINK_DEPTH) return undefined; // ELOOP
 
     const idx = this.pathIndex.get(path);
-    if (idx === undefined) return undefined;
+    if (idx === undefined) {
+      // Path not found directly — try component resolution (handles intermediate symlinks)
+      return this.resolvePathComponents(path, true, depth);
+    }
 
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.SYMLINK) {
@@ -504,7 +507,9 @@ export class VFSEngine {
   }
 
   /** Resolve symlinks in intermediate path components */
-  private resolvePathComponents(path: string, followLast: boolean = true): number | undefined {
+  private resolvePathComponents(path: string, followLast: boolean = true, depth: number = 0): number | undefined {
+    if (depth > MAX_SYMLINK_DEPTH) return undefined; // ELOOP
+
     const parts = path.split('/').filter(Boolean);
     let current = '/';
 
@@ -521,13 +526,15 @@ export class VFSEngine {
         const resolved = target.startsWith('/') ? target : this.resolveRelative(current, target);
 
         if (isLast) {
-          return this.resolvePath(resolved);
+          // Use resolvePathComponents (not resolvePath) so intermediate symlinks
+          // in the resolved target path are also followed
+          return this.resolvePathComponents(resolved, true, depth + 1);
         }
 
         // Reconstruct remaining path with resolved symlink
         const remaining = parts.slice(i + 1).join('/');
         const newPath = resolved + (remaining ? '/' + remaining : '');
-        return this.resolvePathComponents(newPath, followLast);
+        return this.resolvePathComponents(newPath, followLast, depth + 1);
       }
     }
 

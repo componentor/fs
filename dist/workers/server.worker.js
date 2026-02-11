@@ -456,7 +456,9 @@ var VFSEngine = class {
   resolvePath(path, depth = 0) {
     if (depth > MAX_SYMLINK_DEPTH) return void 0;
     const idx = this.pathIndex.get(path);
-    if (idx === void 0) return void 0;
+    if (idx === void 0) {
+      return this.resolvePathComponents(path, true, depth);
+    }
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.SYMLINK) {
       const target = decoder.decode(this.readData(inode.firstBlock, inode.blockCount, inode.size));
@@ -466,7 +468,8 @@ var VFSEngine = class {
     return idx;
   }
   /** Resolve symlinks in intermediate path components */
-  resolvePathComponents(path, followLast = true) {
+  resolvePathComponents(path, followLast = true, depth = 0) {
+    if (depth > MAX_SYMLINK_DEPTH) return void 0;
     const parts = path.split("/").filter(Boolean);
     let current = "/";
     for (let i = 0; i < parts.length; i++) {
@@ -479,11 +482,11 @@ var VFSEngine = class {
         const target = decoder.decode(this.readData(inode.firstBlock, inode.blockCount, inode.size));
         const resolved = target.startsWith("/") ? target : this.resolveRelative(current, target);
         if (isLast) {
-          return this.resolvePath(resolved);
+          return this.resolvePathComponents(resolved, true, depth + 1);
         }
         const remaining = parts.slice(i + 1).join("/");
         const newPath = resolved + (remaining ? "/" + remaining : "");
-        return this.resolvePathComponents(newPath, followLast);
+        return this.resolvePathComponents(newPath, followLast, depth + 1);
       }
     }
     return this.pathIndex.get(current);

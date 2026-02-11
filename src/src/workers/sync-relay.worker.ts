@@ -274,6 +274,7 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
     case OP.SYMLINK: {
       const target = data ? new TextDecoder().decode(data) : '';
       result = engine.symlink(target, path);
+      if (opfsSyncEnabled && result.status === 0) { syncOp = op; syncPath = path; }
       break;
     }
 
@@ -695,6 +696,23 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
           opfsSyncPort.postMessage({ op: 'write', path, data: new ArrayBuffer(0), ts });
         }
       }
+      break;
+    }
+    case OP.SYMLINK: {
+      // OPFS has no symlinks — mirror as regular file with target's content
+      const result = engine.read(path); // follows symlink to target
+      if (result.status === 0) {
+        if (result.data && result.data.byteLength > 0) {
+          const buf = result.data.buffer.byteLength === result.data.byteLength
+            ? result.data.buffer
+            : result.data.slice().buffer;
+          opfsSyncPort.postMessage({ op: 'write', path, data: buf, ts } as const, [buf as ArrayBuffer]);
+        } else {
+          opfsSyncPort.postMessage({ op: 'write', path, data: new ArrayBuffer(0), ts });
+        }
+      }
+      // If target doesn't exist yet (dangling symlink), skip — will be synced
+      // when the target is written and read through the symlink succeeds
       break;
     }
     case OP.UNLINK:

@@ -475,6 +475,13 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+### v3.0.2 (2026)
+
+**Bug Fixes:**
+- Fix symlink resolution when resolved target path contains intermediate symlinks — `resolvePath` now falls back to component-by-component resolution instead of failing on direct lookup
+- Add ELOOP depth tracking to `resolvePathComponents` to prevent infinite recursion on circular symlinks
+- Mirror symlinks to OPFS as regular files (OPFS has no symlink concept) — reads through the symlink and writes the target's content
+
 ### v3.0.1 (2026)
 
 **Bug Fixes:**
