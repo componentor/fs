@@ -168,6 +168,13 @@ var VFSEngine = class {
       this.mount();
     }
   }
+  /** Release the sync access handle (call on fatal error or shutdown) */
+  closeHandle() {
+    try {
+      this.handle?.close();
+    } catch (_) {
+    }
+  }
   /** Format a fresh VFS */
   format() {
     const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
@@ -190,28 +197,78 @@ var VFSEngine = class {
     this.createInode("/", INODE_TYPE.DIRECTORY, DEFAULT_DIR_MODE, 0);
     this.handle.flush();
   }
-  /** Mount an existing VFS from disk */
+  /** Mount an existing VFS from disk — validates superblock integrity */
   mount() {
+    const fileSize = this.handle.getSize();
+    if (fileSize < SUPERBLOCK.SIZE) {
+      throw new Error(`Corrupt VFS: file too small (${fileSize} bytes, need at least ${SUPERBLOCK.SIZE})`);
+    }
     this.handle.read(this.superblockBuf, { at: 0 });
     const v = this.superblockView;
     const magic = v.getUint32(SUPERBLOCK.MAGIC, true);
     if (magic !== VFS_MAGIC) {
-      throw new Error(`Invalid VFS: bad magic 0x${magic.toString(16)}`);
+      throw new Error(`Corrupt VFS: bad magic 0x${magic.toString(16)} (expected 0x${VFS_MAGIC.toString(16)})`);
     }
-    this.inodeCount = v.getUint32(SUPERBLOCK.INODE_COUNT, true);
-    this.blockSize = v.getUint32(SUPERBLOCK.BLOCK_SIZE, true);
-    this.totalBlocks = v.getUint32(SUPERBLOCK.TOTAL_BLOCKS, true);
-    this.freeBlocks = v.getUint32(SUPERBLOCK.FREE_BLOCKS, true);
-    this.inodeTableOffset = v.getFloat64(SUPERBLOCK.INODE_OFFSET, true);
-    this.pathTableOffset = v.getFloat64(SUPERBLOCK.PATH_OFFSET, true);
-    this.dataOffset = v.getFloat64(SUPERBLOCK.DATA_OFFSET, true);
-    this.bitmapOffset = v.getFloat64(SUPERBLOCK.BITMAP_OFFSET, true);
-    this.pathTableUsed = v.getUint32(SUPERBLOCK.PATH_USED, true);
-    this.pathTableSize = this.bitmapOffset - this.pathTableOffset;
+    const version = v.getUint32(SUPERBLOCK.VERSION, true);
+    if (version !== VFS_VERSION) {
+      throw new Error(`Corrupt VFS: unsupported version ${version} (expected ${VFS_VERSION})`);
+    }
+    const inodeCount = v.getUint32(SUPERBLOCK.INODE_COUNT, true);
+    const blockSize = v.getUint32(SUPERBLOCK.BLOCK_SIZE, true);
+    const totalBlocks = v.getUint32(SUPERBLOCK.TOTAL_BLOCKS, true);
+    const freeBlocks = v.getUint32(SUPERBLOCK.FREE_BLOCKS, true);
+    const inodeTableOffset = v.getFloat64(SUPERBLOCK.INODE_OFFSET, true);
+    const pathTableOffset = v.getFloat64(SUPERBLOCK.PATH_OFFSET, true);
+    const dataOffset = v.getFloat64(SUPERBLOCK.DATA_OFFSET, true);
+    const bitmapOffset = v.getFloat64(SUPERBLOCK.BITMAP_OFFSET, true);
+    const pathUsed = v.getUint32(SUPERBLOCK.PATH_USED, true);
+    if (blockSize === 0 || (blockSize & blockSize - 1) !== 0) {
+      throw new Error(`Corrupt VFS: invalid block size ${blockSize} (must be power of 2)`);
+    }
+    if (inodeCount === 0) {
+      throw new Error("Corrupt VFS: inode count is 0");
+    }
+    if (freeBlocks > totalBlocks) {
+      throw new Error(`Corrupt VFS: free blocks (${freeBlocks}) exceeds total blocks (${totalBlocks})`);
+    }
+    if (inodeTableOffset !== SUPERBLOCK.SIZE) {
+      throw new Error(`Corrupt VFS: inode table offset ${inodeTableOffset} (expected ${SUPERBLOCK.SIZE})`);
+    }
+    const expectedPathOffset = inodeTableOffset + inodeCount * INODE_SIZE;
+    if (pathTableOffset !== expectedPathOffset) {
+      throw new Error(`Corrupt VFS: path table offset ${pathTableOffset} (expected ${expectedPathOffset})`);
+    }
+    if (bitmapOffset <= pathTableOffset) {
+      throw new Error(`Corrupt VFS: bitmap offset ${bitmapOffset} must be after path table ${pathTableOffset}`);
+    }
+    if (dataOffset <= bitmapOffset) {
+      throw new Error(`Corrupt VFS: data offset ${dataOffset} must be after bitmap ${bitmapOffset}`);
+    }
+    const pathTableSize = bitmapOffset - pathTableOffset;
+    if (pathUsed > pathTableSize) {
+      throw new Error(`Corrupt VFS: path used (${pathUsed}) exceeds path table size (${pathTableSize})`);
+    }
+    const expectedMinSize = dataOffset + totalBlocks * blockSize;
+    if (fileSize < expectedMinSize) {
+      throw new Error(`Corrupt VFS: file size ${fileSize} too small for layout (need ${expectedMinSize})`);
+    }
+    this.inodeCount = inodeCount;
+    this.blockSize = blockSize;
+    this.totalBlocks = totalBlocks;
+    this.freeBlocks = freeBlocks;
+    this.inodeTableOffset = inodeTableOffset;
+    this.pathTableOffset = pathTableOffset;
+    this.dataOffset = dataOffset;
+    this.bitmapOffset = bitmapOffset;
+    this.pathTableUsed = pathUsed;
+    this.pathTableSize = pathTableSize;
     const bitmapSize = Math.ceil(this.totalBlocks / 8);
     this.bitmap = new Uint8Array(bitmapSize);
     this.handle.read(this.bitmap, { at: this.bitmapOffset });
     this.rebuildIndex();
+    if (!this.pathIndex.has("/")) {
+      throw new Error('Corrupt VFS: root directory "/" not found in inode table');
+    }
   }
   writeSuperblock() {
     const v = this.superblockView;
@@ -1221,6 +1278,24 @@ var VFSEngine = class {
     const inode = this.readInode(idx);
     const data = inode.size > 0 ? this.readData(inode.firstBlock, inode.blockCount, inode.size) : new Uint8Array(0);
     return { type: inode.type, data, mtime: inode.mtime };
+  }
+  /** Export all files/dirs/symlinks from the VFS */
+  exportAll() {
+    const result = [];
+    for (const [path, idx] of this.pathIndex) {
+      const inode = this.readInode(idx);
+      let data = null;
+      if (inode.type === INODE_TYPE.FILE || inode.type === INODE_TYPE.SYMLINK) {
+        data = inode.size > 0 ? this.readData(inode.firstBlock, inode.blockCount, inode.size) : new Uint8Array(0);
+      }
+      result.push({ path, type: inode.type, data, mode: inode.mode, mtime: inode.mtime });
+    }
+    result.sort((a, b) => {
+      if (a.type === INODE_TYPE.DIRECTORY && b.type !== INODE_TYPE.DIRECTORY) return -1;
+      if (a.type !== INODE_TYPE.DIRECTORY && b.type === INODE_TYPE.DIRECTORY) return 1;
+      return a.path.localeCompare(b.path);
+    });
+    return result;
   }
   flush() {
     this.handle.flush();

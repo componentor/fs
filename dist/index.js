@@ -129,6 +129,15 @@ var STATUS_TO_CODE = {
   9: "ELOOP",
   10: "ENOSPC"
 };
+var CODE_TO_STATUS = {
+  ENOENT: 1,
+  EEXIST: 2,
+  EISDIR: 3,
+  ENOTDIR: 4,
+  ENOTEMPTY: 5,
+  EACCES: 6,
+  EINVAL: 7,
+  EBADF: 8};
 function createError(code, syscall, path) {
   const errno = ErrorCodes[code] ?? -1;
   const messages = {
@@ -293,11 +302,99 @@ async function unlink(asyncRequest, filePath) {
 }
 
 // src/vfs/layout.ts
+var VFS_MAGIC = 1447449377;
+var VFS_VERSION = 1;
+var DEFAULT_BLOCK_SIZE = 4096;
+var DEFAULT_INODE_COUNT = 1e4;
+var INODE_SIZE = 64;
+var SUPERBLOCK = {
+  SIZE: 64,
+  MAGIC: 0,
+  // uint32 - 0x56465321
+  VERSION: 4,
+  // uint32
+  INODE_COUNT: 8,
+  // uint32 - total inodes allocated
+  BLOCK_SIZE: 12,
+  // uint32 - data block size (default 4096)
+  TOTAL_BLOCKS: 16,
+  // uint32 - total data blocks
+  FREE_BLOCKS: 20,
+  // uint32 - available data blocks
+  INODE_OFFSET: 24,
+  // float64 - byte offset to inode table
+  PATH_OFFSET: 32,
+  // float64 - byte offset to path table
+  DATA_OFFSET: 40,
+  // float64 - byte offset to data region
+  BITMAP_OFFSET: 48,
+  // float64 - byte offset to free block bitmap
+  PATH_USED: 56};
+var INODE = {
+  TYPE: 0,
+  // uint8 - 0=free, 1=file, 2=directory, 3=symlink
+  FLAGS: 1,
+  // uint8[3] - reserved
+  PATH_OFFSET: 4,
+  // uint32 - byte offset into path table
+  PATH_LENGTH: 8,
+  // uint16 - length of path string
+  RESERVED_10: 10,
+  // uint16
+  MODE: 12,
+  // uint32 - permissions (e.g. 0o100644)
+  SIZE: 16,
+  // float64 - file content size in bytes (using f64 for >4GB)
+  FIRST_BLOCK: 24,
+  // uint32 - index of first data block
+  BLOCK_COUNT: 28,
+  // uint32 - number of contiguous data blocks
+  MTIME: 32,
+  // float64 - last modification time (ms since epoch)
+  CTIME: 40,
+  // float64 - creation/change time (ms since epoch)
+  ATIME: 48,
+  // float64 - last access time (ms since epoch)
+  UID: 56,
+  // uint32 - owner
+  GID: 60
+  // uint32 - group
+};
 var INODE_TYPE = {
+  FREE: 0,
   FILE: 1,
   DIRECTORY: 2,
   SYMLINK: 3
 };
+var DEFAULT_FILE_MODE = 33188;
+var DEFAULT_DIR_MODE = 16877;
+var DEFAULT_SYMLINK_MODE = 41471;
+var DEFAULT_UMASK = 18;
+var S_IFMT = 61440;
+var MAX_SYMLINK_DEPTH = 40;
+var INITIAL_PATH_TABLE_SIZE = 256 * 1024;
+var INITIAL_DATA_BLOCKS = 1024;
+function calculateLayout(inodeCount = DEFAULT_INODE_COUNT, blockSize = DEFAULT_BLOCK_SIZE, totalBlocks = INITIAL_DATA_BLOCKS) {
+  const inodeTableOffset = SUPERBLOCK.SIZE;
+  const inodeTableSize = inodeCount * INODE_SIZE;
+  const pathTableOffset = inodeTableOffset + inodeTableSize;
+  const pathTableSize = INITIAL_PATH_TABLE_SIZE;
+  const bitmapOffset = pathTableOffset + pathTableSize;
+  const bitmapSize = Math.ceil(totalBlocks / 8);
+  const dataOffset = Math.ceil((bitmapOffset + bitmapSize) / blockSize) * blockSize;
+  const totalSize = dataOffset + totalBlocks * blockSize;
+  return {
+    inodeTableOffset,
+    inodeTableSize,
+    pathTableOffset,
+    pathTableSize,
+    bitmapOffset,
+    bitmapSize,
+    dataOffset,
+    totalSize,
+    totalBlocks
+  };
+}
 
 // src/stats.ts
 function decodeStats(data) {
@@ -345,13 +442,13 @@ function decodeStats(data) {
 function decodeDirents(data) {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const count = view.getUint32(0, true);
-  const decoder8 = new TextDecoder();
+  const decoder9 = new TextDecoder();
   const entries = [];
   let offset = 4;
   for (let i = 0; i < count; i++) {
     const nameLen = view.getUint16(offset, true);
     offset += 2;
-    const name = decoder8.decode(data.subarray(offset, offset + nameLen));
+    const name = decoder9.decode(data.subarray(offset, offset + nameLen));
     offset += nameLen;
     const type = data[offset++];
     const isFile = type === INODE_TYPE.FILE;
@@ -373,13 +470,13 @@ function decodeDirents(data) {
 function decodeNames(data) {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const count = view.getUint32(0, true);
-  const decoder8 = new TextDecoder();
+  const decoder9 = new TextDecoder();
   const names = [];
   let offset = 4;
   for (let i = 0; i < count; i++) {
     const nameLen = view.getUint16(offset, true);
     offset += 2;
-    names.push(decoder8.decode(data.subarray(offset, offset + nameLen)));
+    names.push(decoder9.decode(data.subarray(offset, offset + nameLen)));
     offset += nameLen;
   }
   return names;
@@ -1866,6 +1963,1451 @@ var VFSPromises = class {
   }
 };
 
+// src/vfs/engine.ts
+var encoder10 = new TextEncoder();
+var decoder8 = new TextDecoder();
+var VFSEngine = class {
+  handle;
+  pathIndex = /* @__PURE__ */ new Map();
+  // path → inode index
+  inodeCount = 0;
+  blockSize = DEFAULT_BLOCK_SIZE;
+  totalBlocks = 0;
+  freeBlocks = 0;
+  inodeTableOffset = 0;
+  pathTableOffset = 0;
+  pathTableUsed = 0;
+  pathTableSize = 0;
+  bitmapOffset = 0;
+  dataOffset = 0;
+  umask = DEFAULT_UMASK;
+  processUid = 0;
+  processGid = 0;
+  strictPermissions = false;
+  debug = false;
+  // File descriptor table
+  fdTable = /* @__PURE__ */ new Map();
+  nextFd = 3;
+  // 0=stdin, 1=stdout, 2=stderr reserved
+  // Reusable buffers to avoid allocations
+  inodeBuf = new Uint8Array(INODE_SIZE);
+  inodeView = new DataView(this.inodeBuf.buffer);
+  // In-memory inode cache — eliminates disk reads for hot inodes
+  inodeCache = /* @__PURE__ */ new Map();
+  superblockBuf = new Uint8Array(SUPERBLOCK.SIZE);
+  superblockView = new DataView(this.superblockBuf.buffer);
+  // In-memory bitmap cache — eliminates bitmap reads from OPFS
+  bitmap = null;
+  bitmapDirtyLo = Infinity;
+  // lowest dirty byte index
+  bitmapDirtyHi = -1;
+  // highest dirty byte index (inclusive)
+  superblockDirty = false;
+  // Free inode hint — skip O(n) scan
+  freeInodeHint = 0;
+  init(handle, opts) {
+    this.handle = handle;
+    this.processUid = opts?.uid ?? 0;
+    this.processGid = opts?.gid ?? 0;
+    this.umask = opts?.umask ?? DEFAULT_UMASK;
+    this.strictPermissions = opts?.strictPermissions ?? false;
+    this.debug = opts?.debug ?? false;
+    const size = handle.getSize();
+    if (size === 0) {
+      this.format();
+    } else {
+      this.mount();
+    }
+  }
+  /** Release the sync access handle (call on fatal error or shutdown) */
+  closeHandle() {
+    try {
+      this.handle?.close();
+    } catch (_) {
+    }
+  }
+  /** Format a fresh VFS */
+  format() {
+    const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
+    this.inodeCount = DEFAULT_INODE_COUNT;
+    this.blockSize = DEFAULT_BLOCK_SIZE;
+    this.totalBlocks = layout.totalBlocks;
+    this.freeBlocks = layout.totalBlocks;
+    this.inodeTableOffset = layout.inodeTableOffset;
+    this.pathTableOffset = layout.pathTableOffset;
+    this.pathTableSize = layout.pathTableSize;
+    this.pathTableUsed = 0;
+    this.bitmapOffset = layout.bitmapOffset;
+    this.dataOffset = layout.dataOffset;
+    this.handle.truncate(layout.totalSize);
+    this.writeSuperblock();
+    const zeroBuf = new Uint8Array(layout.inodeTableSize);
+    this.handle.write(zeroBuf, { at: this.inodeTableOffset });
+    this.bitmap = new Uint8Array(layout.bitmapSize);
+    this.handle.write(this.bitmap, { at: this.bitmapOffset });
+    this.createInode("/", INODE_TYPE.DIRECTORY, DEFAULT_DIR_MODE, 0);
+    this.handle.flush();
+  }
+  /** Mount an existing VFS from disk — validates superblock integrity */
+  mount() {
+    const fileSize = this.handle.getSize();
+    if (fileSize < SUPERBLOCK.SIZE) {
+      throw new Error(`Corrupt VFS: file too small (${fileSize} bytes, need at least ${SUPERBLOCK.SIZE})`);
+    }
+    this.handle.read(this.superblockBuf, { at: 0 });
+    const v = this.superblockView;
+    const magic = v.getUint32(SUPERBLOCK.MAGIC, true);
+    if (magic !== VFS_MAGIC) {
+      throw new Error(`Corrupt VFS: bad magic 0x${magic.toString(16)} (expected 0x${VFS_MAGIC.toString(16)})`);
+    }
+    const version = v.getUint32(SUPERBLOCK.VERSION, true);
+    if (version !== VFS_VERSION) {
+      throw new Error(`Corrupt VFS: unsupported version ${version} (expected ${VFS_VERSION})`);
+    }
+    const inodeCount = v.getUint32(SUPERBLOCK.INODE_COUNT, true);
+    const blockSize = v.getUint32(SUPERBLOCK.BLOCK_SIZE, true);
+    const totalBlocks = v.getUint32(SUPERBLOCK.TOTAL_BLOCKS, true);
+    const freeBlocks = v.getUint32(SUPERBLOCK.FREE_BLOCKS, true);
+    const inodeTableOffset = v.getFloat64(SUPERBLOCK.INODE_OFFSET, true);
+    const pathTableOffset = v.getFloat64(SUPERBLOCK.PATH_OFFSET, true);
+    const dataOffset = v.getFloat64(SUPERBLOCK.DATA_OFFSET, true);
+    const bitmapOffset = v.getFloat64(SUPERBLOCK.BITMAP_OFFSET, true);
+    const pathUsed = v.getUint32(SUPERBLOCK.PATH_USED, true);
+    if (blockSize === 0 || (blockSize & blockSize - 1) !== 0) {
+      throw new Error(`Corrupt VFS: invalid block size ${blockSize} (must be power of 2)`);
+    }
+    if (inodeCount === 0) {
+      throw new Error("Corrupt VFS: inode count is 0");
+    }
+    if (freeBlocks > totalBlocks) {
+      throw new Error(`Corrupt VFS: free blocks (${freeBlocks}) exceeds total blocks (${totalBlocks})`);
+    }
+    if (inodeTableOffset !== SUPERBLOCK.SIZE) {
+      throw new Error(`Corrupt VFS: inode table offset ${inodeTableOffset} (expected ${SUPERBLOCK.SIZE})`);
+    }
+    const expectedPathOffset = inodeTableOffset + inodeCount * INODE_SIZE;
+    if (pathTableOffset !== expectedPathOffset) {
+      throw new Error(`Corrupt VFS: path table offset ${pathTableOffset} (expected ${expectedPathOffset})`);
+    }
+    if (bitmapOffset <= pathTableOffset) {
+      throw new Error(`Corrupt VFS: bitmap offset ${bitmapOffset} must be after path table ${pathTableOffset}`);
+    }
+    if (dataOffset <= bitmapOffset) {
+      throw new Error(`Corrupt VFS: data offset ${dataOffset} must be after bitmap ${bitmapOffset}`);
+    }
+    const pathTableSize = bitmapOffset - pathTableOffset;
+    if (pathUsed > pathTableSize) {
+      throw new Error(`Corrupt VFS: path used (${pathUsed}) exceeds path table size (${pathTableSize})`);
+    }
+    const expectedMinSize = dataOffset + totalBlocks * blockSize;
+    if (fileSize < expectedMinSize) {
+      throw new Error(`Corrupt VFS: file size ${fileSize} too small for layout (need ${expectedMinSize})`);
+    }
+    this.inodeCount = inodeCount;
+    this.blockSize = blockSize;
+    this.totalBlocks = totalBlocks;
+    this.freeBlocks = freeBlocks;
+    this.inodeTableOffset = inodeTableOffset;
+    this.pathTableOffset = pathTableOffset;
+    this.dataOffset = dataOffset;
+    this.bitmapOffset = bitmapOffset;
+    this.pathTableUsed = pathUsed;
+    this.pathTableSize = pathTableSize;
+    const bitmapSize = Math.ceil(this.totalBlocks / 8);
+    this.bitmap = new Uint8Array(bitmapSize);
+    this.handle.read(this.bitmap, { at: this.bitmapOffset });
+    this.rebuildIndex();
+    if (!this.pathIndex.has("/")) {
+      throw new Error('Corrupt VFS: root directory "/" not found in inode table');
+    }
+  }
+  writeSuperblock() {
+    const v = this.superblockView;
+    v.setUint32(SUPERBLOCK.MAGIC, VFS_MAGIC, true);
+    v.setUint32(SUPERBLOCK.VERSION, VFS_VERSION, true);
+    v.setUint32(SUPERBLOCK.INODE_COUNT, this.inodeCount, true);
+    v.setUint32(SUPERBLOCK.BLOCK_SIZE, this.blockSize, true);
+    v.setUint32(SUPERBLOCK.TOTAL_BLOCKS, this.totalBlocks, true);
+    v.setUint32(SUPERBLOCK.FREE_BLOCKS, this.freeBlocks, true);
+    v.setFloat64(SUPERBLOCK.INODE_OFFSET, this.inodeTableOffset, true);
+    v.setFloat64(SUPERBLOCK.PATH_OFFSET, this.pathTableOffset, true);
+    v.setFloat64(SUPERBLOCK.DATA_OFFSET, this.dataOffset, true);
+    v.setFloat64(SUPERBLOCK.BITMAP_OFFSET, this.bitmapOffset, true);
+    v.setUint32(SUPERBLOCK.PATH_USED, this.pathTableUsed, true);
+    this.handle.write(this.superblockBuf, { at: 0 });
+  }
+  /** Flush pending bitmap and superblock writes to disk (one write each) */
+  markBitmapDirty(lo, hi) {
+    if (lo < this.bitmapDirtyLo) this.bitmapDirtyLo = lo;
+    if (hi > this.bitmapDirtyHi) this.bitmapDirtyHi = hi;
+  }
+  commitPending() {
+    if (this.bitmapDirtyHi >= 0) {
+      const lo = this.bitmapDirtyLo;
+      const hi = this.bitmapDirtyHi;
+      this.handle.write(this.bitmap.subarray(lo, hi + 1), { at: this.bitmapOffset + lo });
+      this.bitmapDirtyLo = Infinity;
+      this.bitmapDirtyHi = -1;
+    }
+    if (this.superblockDirty) {
+      this.writeSuperblock();
+      this.superblockDirty = false;
+    }
+  }
+  /** Rebuild in-memory path→inode index from disk */
+  rebuildIndex() {
+    this.pathIndex.clear();
+    for (let i = 0; i < this.inodeCount; i++) {
+      const inode = this.readInode(i);
+      if (inode.type === INODE_TYPE.FREE) continue;
+      const path = this.readPath(inode.pathOffset, inode.pathLength);
+      this.pathIndex.set(path, i);
+    }
+  }
+  // ========== Low-level inode I/O ==========
+  readInode(idx) {
+    const cached = this.inodeCache.get(idx);
+    if (cached) return cached;
+    const offset = this.inodeTableOffset + idx * INODE_SIZE;
+    this.handle.read(this.inodeBuf, { at: offset });
+    const v = this.inodeView;
+    const inode = {
+      type: v.getUint8(INODE.TYPE),
+      pathOffset: v.getUint32(INODE.PATH_OFFSET, true),
+      pathLength: v.getUint16(INODE.PATH_LENGTH, true),
+      mode: v.getUint32(INODE.MODE, true),
+      size: v.getFloat64(INODE.SIZE, true),
+      firstBlock: v.getUint32(INODE.FIRST_BLOCK, true),
+      blockCount: v.getUint32(INODE.BLOCK_COUNT, true),
+      mtime: v.getFloat64(INODE.MTIME, true),
+      ctime: v.getFloat64(INODE.CTIME, true),
+      atime: v.getFloat64(INODE.ATIME, true),
+      uid: v.getUint32(INODE.UID, true),
+      gid: v.getUint32(INODE.GID, true)
+    };
+    this.inodeCache.set(idx, inode);
+    return inode;
+  }
+  writeInode(idx, inode) {
+    if (inode.type === INODE_TYPE.FREE) {
+      this.inodeCache.delete(idx);
+    } else {
+      this.inodeCache.set(idx, inode);
+    }
+    const v = this.inodeView;
+    v.setUint8(INODE.TYPE, inode.type);
+    v.setUint8(INODE.FLAGS, 0);
+    v.setUint8(INODE.FLAGS + 1, 0);
+    v.setUint8(INODE.FLAGS + 2, 0);
+    v.setUint32(INODE.PATH_OFFSET, inode.pathOffset, true);
+    v.setUint16(INODE.PATH_LENGTH, inode.pathLength, true);
+    v.setUint16(INODE.RESERVED_10, 0, true);
+    v.setUint32(INODE.MODE, inode.mode, true);
+    v.setFloat64(INODE.SIZE, inode.size, true);
+    v.setUint32(INODE.FIRST_BLOCK, inode.firstBlock, true);
+    v.setUint32(INODE.BLOCK_COUNT, inode.blockCount, true);
+    v.setFloat64(INODE.MTIME, inode.mtime, true);
+    v.setFloat64(INODE.CTIME, inode.ctime, true);
+    v.setFloat64(INODE.ATIME, inode.atime, true);
+    v.setUint32(INODE.UID, inode.uid, true);
+    v.setUint32(INODE.GID, inode.gid, true);
+    const offset = this.inodeTableOffset + idx * INODE_SIZE;
+    this.handle.write(this.inodeBuf, { at: offset });
+  }
+  // ========== Path table I/O ==========
+  readPath(offset, length) {
+    const buf = new Uint8Array(length);
+    this.handle.read(buf, { at: this.pathTableOffset + offset });
+    return decoder8.decode(buf);
+  }
+  appendPath(path) {
+    const bytes = encoder10.encode(path);
+    const offset = this.pathTableUsed;
+    if (offset + bytes.byteLength > this.pathTableSize) {
+      this.growPathTable(offset + bytes.byteLength);
+    }
+    this.handle.write(bytes, { at: this.pathTableOffset + offset });
+    this.pathTableUsed += bytes.byteLength;
+    this.superblockDirty = true;
+    return { offset, length: bytes.byteLength };
+  }
+  growPathTable(needed) {
+    const newSize = Math.max(this.pathTableSize * 2, needed + INITIAL_PATH_TABLE_SIZE);
+    const growth = newSize - this.pathTableSize;
+    const dataSize = this.totalBlocks * this.blockSize;
+    const dataBuf = new Uint8Array(dataSize);
+    this.handle.read(dataBuf, { at: this.dataOffset });
+    const newTotalSize = this.handle.getSize() + growth;
+    this.handle.truncate(newTotalSize);
+    const newBitmapOffset = this.bitmapOffset + growth;
+    const newDataOffset = this.dataOffset + growth;
+    this.handle.write(dataBuf, { at: newDataOffset });
+    this.handle.write(this.bitmap, { at: newBitmapOffset });
+    this.pathTableSize = newSize;
+    this.bitmapOffset = newBitmapOffset;
+    this.dataOffset = newDataOffset;
+    this.superblockDirty = true;
+  }
+  // ========== Bitmap I/O ==========
+  allocateBlocks(count) {
+    if (count === 0) return 0;
+    const bitmap = this.bitmap;
+    let run = 0;
+    let start = 0;
+    for (let i = 0; i < this.totalBlocks; i++) {
+      const byteIdx = i >>> 3;
+      const bitIdx = i & 7;
+      const used = bitmap[byteIdx] >>> bitIdx & 1;
+      if (used) {
+        run = 0;
+        start = i + 1;
+      } else {
+        run++;
+        if (run === count) {
+          for (let j = start; j <= i; j++) {
+            const bj = j >>> 3;
+            const bi = j & 7;
+            bitmap[bj] |= 1 << bi;
+          }
+          this.markBitmapDirty(start >>> 3, i >>> 3);
+          this.freeBlocks -= count;
+          this.superblockDirty = true;
+          return start;
+        }
+      }
+    }
+    return this.growAndAllocate(count);
+  }
+  growAndAllocate(count) {
+    const oldTotal = this.totalBlocks;
+    const newTotal = Math.max(oldTotal * 2, oldTotal + count);
+    const addedBlocks = newTotal - oldTotal;
+    const newFileSize = this.dataOffset + newTotal * this.blockSize;
+    this.handle.truncate(newFileSize);
+    const newBitmapSize = Math.ceil(newTotal / 8);
+    const newBitmap = new Uint8Array(newBitmapSize);
+    newBitmap.set(this.bitmap);
+    this.bitmap = newBitmap;
+    this.totalBlocks = newTotal;
+    this.freeBlocks += addedBlocks;
+    const start = oldTotal;
+    for (let j = start; j < start + count; j++) {
+      const bj = j >>> 3;
+      const bi = j & 7;
+      this.bitmap[bj] |= 1 << bi;
+    }
+    this.markBitmapDirty(start >>> 3, start + count - 1 >>> 3);
+    this.freeBlocks -= count;
+    this.superblockDirty = true;
+    return start;
+  }
+  freeBlockRange(start, count) {
+    if (count === 0) return;
+    const bitmap = this.bitmap;
+    for (let i = start; i < start + count; i++) {
+      const byteIdx = i >>> 3;
+      const bitIdx = i & 7;
+      bitmap[byteIdx] &= ~(1 << bitIdx);
+    }
+    this.markBitmapDirty(start >>> 3, start + count - 1 >>> 3);
+    this.freeBlocks += count;
+    this.superblockDirty = true;
+  }
+  // updateSuperblockFreeBlocks is no longer needed — superblock writes are coalesced via commitPending()
+  // ========== Inode allocation ==========
+  findFreeInode() {
+    for (let i = this.freeInodeHint; i < this.inodeCount; i++) {
+      if (this.inodeCache.has(i)) continue;
+      const offset = this.inodeTableOffset + i * INODE_SIZE;
+      const typeBuf = new Uint8Array(1);
+      this.handle.read(typeBuf, { at: offset });
+      if (typeBuf[0] === INODE_TYPE.FREE) {
+        this.freeInodeHint = i + 1;
+        return i;
+      }
+    }
+    const idx = this.growInodeTable();
+    this.freeInodeHint = idx + 1;
+    return idx;
+  }
+  growInodeTable() {
+    const oldCount = this.inodeCount;
+    const newCount = oldCount * 2;
+    const growth = (newCount - oldCount) * INODE_SIZE;
+    const afterInodeOffset = this.inodeTableOffset + oldCount * INODE_SIZE;
+    const afterSize = this.handle.getSize() - afterInodeOffset;
+    const afterBuf = new Uint8Array(afterSize);
+    this.handle.read(afterBuf, { at: afterInodeOffset });
+    this.handle.truncate(this.handle.getSize() + growth);
+    this.handle.write(afterBuf, { at: afterInodeOffset + growth });
+    const zeroes = new Uint8Array(growth);
+    this.handle.write(zeroes, { at: afterInodeOffset });
+    this.pathTableOffset += growth;
+    this.bitmapOffset += growth;
+    this.dataOffset += growth;
+    this.inodeCount = newCount;
+    this.superblockDirty = true;
+    return oldCount;
+  }
+  // ========== Data I/O ==========
+  readData(firstBlock, blockCount, size) {
+    const buf = new Uint8Array(size);
+    const offset = this.dataOffset + firstBlock * this.blockSize;
+    this.handle.read(buf, { at: offset });
+    return buf;
+  }
+  writeData(firstBlock, data) {
+    const offset = this.dataOffset + firstBlock * this.blockSize;
+    this.handle.write(data, { at: offset });
+  }
+  // ========== Path resolution ==========
+  resolvePath(path, depth = 0) {
+    if (depth > MAX_SYMLINK_DEPTH) return void 0;
+    const idx = this.pathIndex.get(path);
+    if (idx === void 0) {
+      return this.resolvePathComponents(path, true, depth);
+    }
+    const inode = this.readInode(idx);
+    if (inode.type === INODE_TYPE.SYMLINK) {
+      const target = decoder8.decode(this.readData(inode.firstBlock, inode.blockCount, inode.size));
+      const resolved = target.startsWith("/") ? target : this.resolveRelative(path, target);
+      return this.resolvePath(resolved, depth + 1);
+    }
+    return idx;
+  }
+  /** Resolve symlinks in intermediate path components */
+  resolvePathComponents(path, followLast = true, depth = 0) {
+    if (depth > MAX_SYMLINK_DEPTH) return void 0;
+    const parts = path.split("/").filter(Boolean);
+    let current = "/";
+    for (let i = 0; i < parts.length; i++) {
+      const isLast = i === parts.length - 1;
+      current = current === "/" ? "/" + parts[i] : current + "/" + parts[i];
+      const idx = this.pathIndex.get(current);
+      if (idx === void 0) return void 0;
+      const inode = this.readInode(idx);
+      if (inode.type === INODE_TYPE.SYMLINK && (!isLast || followLast)) {
+        const target = decoder8.decode(this.readData(inode.firstBlock, inode.blockCount, inode.size));
+        const resolved = target.startsWith("/") ? target : this.resolveRelative(current, target);
+        if (isLast) {
+          return this.resolvePathComponents(resolved, true, depth + 1);
+        }
+        const remaining = parts.slice(i + 1).join("/");
+        const newPath = resolved + (remaining ? "/" + remaining : "");
+        return this.resolvePathComponents(newPath, followLast, depth + 1);
+      }
+    }
+    return this.pathIndex.get(current);
+  }
+  resolveRelative(from, target) {
+    const dir = from.substring(0, from.lastIndexOf("/")) || "/";
+    const parts = (dir + "/" + target).split("/").filter(Boolean);
+    const resolved = [];
+    for (const p of parts) {
+      if (p === ".") continue;
+      if (p === "..") {
+        resolved.pop();
+        continue;
+      }
+      resolved.push(p);
+    }
+    return "/" + resolved.join("/");
+  }
+  // ========== Core inode creation helper ==========
+  createInode(path, type, mode, size, data) {
+    const idx = this.findFreeInode();
+    const { offset: pathOff, length: pathLen } = this.appendPath(path);
+    const now = Date.now();
+    let firstBlock = 0;
+    let blockCount = 0;
+    if (data && data.byteLength > 0) {
+      blockCount = Math.ceil(data.byteLength / this.blockSize);
+      firstBlock = this.allocateBlocks(blockCount);
+      this.writeData(firstBlock, data);
+    }
+    const inode = {
+      type,
+      pathOffset: pathOff,
+      pathLength: pathLen,
+      mode,
+      size,
+      firstBlock,
+      blockCount,
+      mtime: now,
+      ctime: now,
+      atime: now,
+      uid: this.processUid,
+      gid: this.processGid
+    };
+    this.writeInode(idx, inode);
+    this.pathIndex.set(path, idx);
+    return idx;
+  }
+  // ========== Public API — called by server worker dispatch ==========
+  /** Normalize a path: ensure leading /, resolve . and .. */
+  normalizePath(p) {
+    if (p.charCodeAt(0) !== 47) p = "/" + p;
+    if (p.length === 1) return p;
+    if (p.indexOf("/.") === -1 && p.indexOf("//") === -1 && p.charCodeAt(p.length - 1) !== 47) {
+      return p;
+    }
+    const parts = p.split("/").filter(Boolean);
+    const resolved = [];
+    for (const part of parts) {
+      if (part === ".") continue;
+      if (part === "..") {
+        resolved.pop();
+        continue;
+      }
+      resolved.push(part);
+    }
+    return "/" + resolved.join("/");
+  }
+  // ---- READ ----
+  read(path) {
+    const t0 = this.debug ? performance.now() : 0;
+    path = this.normalizePath(path);
+    let idx = this.pathIndex.get(path);
+    if (idx !== void 0) {
+      const inode2 = this.inodeCache.get(idx);
+      if (inode2) {
+        if (inode2.type === INODE_TYPE.SYMLINK) {
+          idx = this.resolvePathComponents(path, true);
+        } else if (inode2.type === INODE_TYPE.DIRECTORY) {
+          return { status: CODE_TO_STATUS.EISDIR, data: null };
+        } else {
+          const data2 = inode2.size > 0 ? this.readData(inode2.firstBlock, inode2.blockCount, inode2.size) : new Uint8Array(0);
+          if (this.debug) {
+            const t1 = performance.now();
+            console.log(`[VFS read] path=${path} size=${inode2.size} TOTAL=${(t1 - t0).toFixed(3)}ms (fast)`);
+          }
+          return { status: 0, data: data2 };
+        }
+      }
+    }
+    if (idx === void 0) idx = this.resolvePathComponents(path, true);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    const inode = this.readInode(idx);
+    if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR, data: null };
+    const data = inode.size > 0 ? this.readData(inode.firstBlock, inode.blockCount, inode.size) : new Uint8Array(0);
+    if (this.debug) {
+      const t1 = performance.now();
+      console.log(`[VFS read] path=${path} size=${inode.size} TOTAL=${(t1 - t0).toFixed(3)}ms (slow path)`);
+    }
+    return { status: 0, data };
+  }
+  // ---- WRITE ----
+  write(path, data, flags = 0) {
+    const t0 = this.debug ? performance.now() : 0;
+    path = this.normalizePath(path);
+    const t1 = this.debug ? performance.now() : 0;
+    const parentStatus = this.ensureParent(path);
+    if (parentStatus !== 0) return { status: parentStatus };
+    const t2 = this.debug ? performance.now() : 0;
+    const existingIdx = this.resolvePathComponents(path, true);
+    const t3 = this.debug ? performance.now() : 0;
+    let tAlloc = t3, tData = t3, tInode = t3;
+    if (existingIdx !== void 0) {
+      const inode = this.readInode(existingIdx);
+      if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
+      const neededBlocks = Math.ceil(data.byteLength / this.blockSize);
+      if (neededBlocks <= inode.blockCount) {
+        tAlloc = this.debug ? performance.now() : 0;
+        this.writeData(inode.firstBlock, data);
+        tData = this.debug ? performance.now() : 0;
+        if (neededBlocks < inode.blockCount) {
+          this.freeBlockRange(inode.firstBlock + neededBlocks, inode.blockCount - neededBlocks);
+        }
+      } else {
+        this.freeBlockRange(inode.firstBlock, inode.blockCount);
+        const newFirst = this.allocateBlocks(neededBlocks);
+        tAlloc = this.debug ? performance.now() : 0;
+        this.writeData(newFirst, data);
+        tData = this.debug ? performance.now() : 0;
+        inode.firstBlock = newFirst;
+      }
+      inode.size = data.byteLength;
+      inode.blockCount = neededBlocks;
+      inode.mtime = Date.now();
+      this.writeInode(existingIdx, inode);
+      tInode = this.debug ? performance.now() : 0;
+    } else {
+      const mode = DEFAULT_FILE_MODE & ~(this.umask & 511);
+      this.createInode(path, INODE_TYPE.FILE, mode, data.byteLength, data);
+      tAlloc = this.debug ? performance.now() : 0;
+      tData = tAlloc;
+      tInode = tAlloc;
+    }
+    if (flags & 1) {
+      this.commitPending();
+      this.handle.flush();
+    }
+    const tFlush = this.debug ? performance.now() : 0;
+    if (this.debug) {
+      const existing = existingIdx !== void 0;
+      console.log(`[VFS write] path=${path} size=${data.byteLength} ${existing ? "UPDATE" : "CREATE"} normalize=${(t1 - t0).toFixed(3)}ms parent=${(t2 - t1).toFixed(3)}ms resolve=${(t3 - t2).toFixed(3)}ms alloc=${(tAlloc - t3).toFixed(3)}ms data=${(tData - tAlloc).toFixed(3)}ms inode=${(tInode - tData).toFixed(3)}ms flush=${(tFlush - tInode).toFixed(3)}ms TOTAL=${(tFlush - t0).toFixed(3)}ms`);
+    }
+    return { status: 0 };
+  }
+  // ---- APPEND ----
+  append(path, data) {
+    path = this.normalizePath(path);
+    const existingIdx = this.resolvePathComponents(path, true);
+    if (existingIdx === void 0) {
+      return this.write(path, data);
+    }
+    const inode = this.readInode(existingIdx);
+    if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
+    const existing = inode.size > 0 ? this.readData(inode.firstBlock, inode.blockCount, inode.size) : new Uint8Array(0);
+    const combined = new Uint8Array(existing.byteLength + data.byteLength);
+    combined.set(existing);
+    combined.set(data, existing.byteLength);
+    const neededBlocks = Math.ceil(combined.byteLength / this.blockSize);
+    this.freeBlockRange(inode.firstBlock, inode.blockCount);
+    const newFirst = this.allocateBlocks(neededBlocks);
+    this.writeData(newFirst, combined);
+    inode.firstBlock = newFirst;
+    inode.blockCount = neededBlocks;
+    inode.size = combined.byteLength;
+    inode.mtime = Date.now();
+    this.writeInode(existingIdx, inode);
+    this.commitPending();
+    return { status: 0 };
+  }
+  // ---- UNLINK ----
+  unlink(path) {
+    path = this.normalizePath(path);
+    const idx = this.pathIndex.get(path);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    const inode = this.readInode(idx);
+    if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
+    this.freeBlockRange(inode.firstBlock, inode.blockCount);
+    inode.type = INODE_TYPE.FREE;
+    this.writeInode(idx, inode);
+    this.pathIndex.delete(path);
+    if (idx < this.freeInodeHint) this.freeInodeHint = idx;
+    this.commitPending();
+    return { status: 0 };
+  }
+  // ---- STAT ----
+  stat(path) {
+    path = this.normalizePath(path);
+    const idx = this.resolvePathComponents(path, true);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    return this.encodeStatResponse(idx);
+  }
+  // ---- LSTAT (no symlink follow) ----
+  lstat(path) {
+    path = this.normalizePath(path);
+    const idx = this.pathIndex.get(path);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    return this.encodeStatResponse(idx);
+  }
+  encodeStatResponse(idx) {
+    const inode = this.readInode(idx);
+    const buf = new Uint8Array(49);
+    const view = new DataView(buf.buffer);
+    view.setUint8(0, inode.type);
+    view.setUint32(1, inode.mode, true);
+    view.setFloat64(5, inode.size, true);
+    view.setFloat64(13, inode.mtime, true);
+    view.setFloat64(21, inode.ctime, true);
+    view.setFloat64(29, inode.atime, true);
+    view.setUint32(37, inode.uid, true);
+    view.setUint32(41, inode.gid, true);
+    view.setUint32(45, idx, true);
+    return { status: 0, data: buf };
+  }
+  // ---- MKDIR ----
+  mkdir(path, flags = 0) {
+    path = this.normalizePath(path);
+    const recursive = (flags & 1) !== 0;
+    if (recursive) {
+      return this.mkdirRecursive(path);
+    }
+    if (this.pathIndex.has(path)) return { status: CODE_TO_STATUS.EEXIST, data: null };
+    const parentStatus = this.ensureParent(path);
+    if (parentStatus !== 0) return { status: parentStatus, data: null };
+    const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
+    this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
+    this.commitPending();
+    const pathBytes = encoder10.encode(path);
+    return { status: 0, data: pathBytes };
+  }
+  mkdirRecursive(path) {
+    const parts = path.split("/").filter(Boolean);
+    let current = "";
+    let firstCreated = null;
+    for (const part of parts) {
+      current += "/" + part;
+      if (this.pathIndex.has(current)) {
+        const idx = this.pathIndex.get(current);
+        const inode = this.readInode(idx);
+        if (inode.type !== INODE_TYPE.DIRECTORY) {
+          return { status: CODE_TO_STATUS.ENOTDIR, data: null };
+        }
+        continue;
+      }
+      const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
+      this.createInode(current, INODE_TYPE.DIRECTORY, mode, 0);
+      if (!firstCreated) firstCreated = current;
+    }
+    this.commitPending();
+    const result = firstCreated ? encoder10.encode(firstCreated) : void 0;
+    return { status: 0, data: result ?? null };
+  }
+  // ---- RMDIR ----
+  rmdir(path, flags = 0) {
+    path = this.normalizePath(path);
+    const recursive = (flags & 1) !== 0;
+    const idx = this.pathIndex.get(path);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    const inode = this.readInode(idx);
+    if (inode.type !== INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTDIR };
+    const children = this.getDirectChildren(path);
+    if (children.length > 0) {
+      if (!recursive) return { status: CODE_TO_STATUS.ENOTEMPTY };
+      for (const child of this.getAllDescendants(path)) {
+        const childIdx = this.pathIndex.get(child);
+        const childInode = this.readInode(childIdx);
+        this.freeBlockRange(childInode.firstBlock, childInode.blockCount);
+        childInode.type = INODE_TYPE.FREE;
+        this.writeInode(childIdx, childInode);
+        this.pathIndex.delete(child);
+      }
+    }
+    inode.type = INODE_TYPE.FREE;
+    this.writeInode(idx, inode);
+    this.pathIndex.delete(path);
+    if (idx < this.freeInodeHint) this.freeInodeHint = idx;
+    this.commitPending();
+    return { status: 0 };
+  }
+  // ---- READDIR ----
+  readdir(path, flags = 0) {
+    path = this.normalizePath(path);
+    const idx = this.resolvePathComponents(path, true);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    const inode = this.readInode(idx);
+    if (inode.type !== INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTDIR, data: null };
+    const withFileTypes = (flags & 1) !== 0;
+    const children = this.getDirectChildren(path);
+    if (withFileTypes) {
+      let totalSize2 = 4;
+      const entries = [];
+      for (const childPath of children) {
+        const name = childPath.substring(childPath.lastIndexOf("/") + 1);
+        const nameBytes = encoder10.encode(name);
+        const childIdx = this.pathIndex.get(childPath);
+        const childInode = this.readInode(childIdx);
+        entries.push({ name: nameBytes, type: childInode.type });
+        totalSize2 += 2 + nameBytes.byteLength + 1;
+      }
+      const buf2 = new Uint8Array(totalSize2);
+      const view2 = new DataView(buf2.buffer);
+      view2.setUint32(0, entries.length, true);
+      let offset2 = 4;
+      for (const entry of entries) {
+        view2.setUint16(offset2, entry.name.byteLength, true);
+        offset2 += 2;
+        buf2.set(entry.name, offset2);
+        offset2 += entry.name.byteLength;
+        buf2[offset2++] = entry.type;
+      }
+      return { status: 0, data: buf2 };
+    }
+    let totalSize = 4;
+    const nameEntries = [];
+    for (const childPath of children) {
+      const name = childPath.substring(childPath.lastIndexOf("/") + 1);
+      const nameBytes = encoder10.encode(name);
+      nameEntries.push(nameBytes);
+      totalSize += 2 + nameBytes.byteLength;
+    }
+    const buf = new Uint8Array(totalSize);
+    const view = new DataView(buf.buffer);
+    view.setUint32(0, nameEntries.length, true);
+    let offset = 4;
+    for (const nameBytes of nameEntries) {
+      view.setUint16(offset, nameBytes.byteLength, true);
+      offset += 2;
+      buf.set(nameBytes, offset);
+      offset += nameBytes.byteLength;
+    }
+    return { status: 0, data: buf };
+  }
+  // ---- RENAME ----
+  rename(oldPath, newPath) {
+    oldPath = this.normalizePath(oldPath);
+    newPath = this.normalizePath(newPath);
+    const idx = this.pathIndex.get(oldPath);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    const parentStatus = this.ensureParent(newPath);
+    if (parentStatus !== 0) return { status: parentStatus };
+    const existingIdx = this.pathIndex.get(newPath);
+    if (existingIdx !== void 0) {
+      const existingInode = this.readInode(existingIdx);
+      this.freeBlockRange(existingInode.firstBlock, existingInode.blockCount);
+      existingInode.type = INODE_TYPE.FREE;
+      this.writeInode(existingIdx, existingInode);
+      this.pathIndex.delete(newPath);
+    }
+    const inode = this.readInode(idx);
+    const { offset: pathOff, length: pathLen } = this.appendPath(newPath);
+    inode.pathOffset = pathOff;
+    inode.pathLength = pathLen;
+    inode.mtime = Date.now();
+    this.writeInode(idx, inode);
+    this.pathIndex.delete(oldPath);
+    this.pathIndex.set(newPath, idx);
+    if (inode.type === INODE_TYPE.DIRECTORY) {
+      const prefix = oldPath === "/" ? "/" : oldPath + "/";
+      const toRename = [];
+      for (const [p, i] of this.pathIndex) {
+        if (p.startsWith(prefix)) {
+          toRename.push([p, i]);
+        }
+      }
+      for (const [p, i] of toRename) {
+        const suffix = p.substring(oldPath.length);
+        const childNewPath = newPath + suffix;
+        const childInode = this.readInode(i);
+        const { offset: cpo, length: cpl } = this.appendPath(childNewPath);
+        childInode.pathOffset = cpo;
+        childInode.pathLength = cpl;
+        this.writeInode(i, childInode);
+        this.pathIndex.delete(p);
+        this.pathIndex.set(childNewPath, i);
+      }
+    }
+    this.commitPending();
+    return { status: 0 };
+  }
+  // ---- EXISTS ----
+  exists(path) {
+    path = this.normalizePath(path);
+    const idx = this.resolvePathComponents(path, true);
+    const buf = new Uint8Array(1);
+    buf[0] = idx !== void 0 ? 1 : 0;
+    return { status: 0, data: buf };
+  }
+  // ---- TRUNCATE ----
+  truncate(path, len = 0) {
+    path = this.normalizePath(path);
+    const idx = this.resolvePathComponents(path, true);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    const inode = this.readInode(idx);
+    if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
+    if (len === 0) {
+      this.freeBlockRange(inode.firstBlock, inode.blockCount);
+      inode.firstBlock = 0;
+      inode.blockCount = 0;
+      inode.size = 0;
+    } else if (len < inode.size) {
+      const neededBlocks = Math.ceil(len / this.blockSize);
+      if (neededBlocks < inode.blockCount) {
+        this.freeBlockRange(inode.firstBlock + neededBlocks, inode.blockCount - neededBlocks);
+      }
+      inode.blockCount = neededBlocks;
+      inode.size = len;
+    } else if (len > inode.size) {
+      const neededBlocks = Math.ceil(len / this.blockSize);
+      if (neededBlocks > inode.blockCount) {
+        const oldData = this.readData(inode.firstBlock, inode.blockCount, inode.size);
+        this.freeBlockRange(inode.firstBlock, inode.blockCount);
+        const newFirst = this.allocateBlocks(neededBlocks);
+        const newData = new Uint8Array(len);
+        newData.set(oldData);
+        this.writeData(newFirst, newData);
+        inode.firstBlock = newFirst;
+      }
+      inode.blockCount = neededBlocks;
+      inode.size = len;
+    }
+    inode.mtime = Date.now();
+    this.writeInode(idx, inode);
+    this.commitPending();
+    return { status: 0 };
+  }
+  // ---- COPY ----
+  copy(srcPath, destPath, flags = 0) {
+    srcPath = this.normalizePath(srcPath);
+    destPath = this.normalizePath(destPath);
+    const srcIdx = this.resolvePathComponents(srcPath, true);
+    if (srcIdx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    const srcInode = this.readInode(srcIdx);
+    if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
+    if (flags & 1 && this.pathIndex.has(destPath)) {
+      return { status: CODE_TO_STATUS.EEXIST };
+    }
+    const data = srcInode.size > 0 ? this.readData(srcInode.firstBlock, srcInode.blockCount, srcInode.size) : new Uint8Array(0);
+    return this.write(destPath, data);
+  }
+  // ---- ACCESS ----
+  access(path, mode = 0) {
+    path = this.normalizePath(path);
+    const idx = this.resolvePathComponents(path, true);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (mode === 0) return { status: 0 };
+    if (!this.strictPermissions) return { status: 0 };
+    const inode = this.readInode(idx);
+    const filePerm = this.getEffectivePermission(inode);
+    if (mode & 4 && !(filePerm & 4)) return { status: CODE_TO_STATUS.EACCES };
+    if (mode & 2 && !(filePerm & 2)) return { status: CODE_TO_STATUS.EACCES };
+    if (mode & 1 && !(filePerm & 1)) return { status: CODE_TO_STATUS.EACCES };
+    return { status: 0 };
+  }
+  getEffectivePermission(inode) {
+    const modeBits = inode.mode & 511;
+    if (this.processUid === inode.uid) return modeBits >>> 6 & 7;
+    if (this.processGid === inode.gid) return modeBits >>> 3 & 7;
+    return modeBits & 7;
+  }
+  // ---- REALPATH ----
+  realpath(path) {
+    path = this.normalizePath(path);
+    const idx = this.resolvePathComponents(path, true);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    const inode = this.readInode(idx);
+    const resolvedPath = this.readPath(inode.pathOffset, inode.pathLength);
+    return { status: 0, data: encoder10.encode(resolvedPath) };
+  }
+  // ---- CHMOD ----
+  chmod(path, mode) {
+    path = this.normalizePath(path);
+    const idx = this.resolvePathComponents(path, true);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    const inode = this.readInode(idx);
+    inode.mode = inode.mode & S_IFMT | mode & 4095;
+    inode.ctime = Date.now();
+    this.writeInode(idx, inode);
+    return { status: 0 };
+  }
+  // ---- CHOWN ----
+  chown(path, uid, gid) {
+    path = this.normalizePath(path);
+    const idx = this.resolvePathComponents(path, true);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    const inode = this.readInode(idx);
+    inode.uid = uid;
+    inode.gid = gid;
+    inode.ctime = Date.now();
+    this.writeInode(idx, inode);
+    return { status: 0 };
+  }
+  // ---- UTIMES ----
+  utimes(path, atime, mtime) {
+    path = this.normalizePath(path);
+    const idx = this.resolvePathComponents(path, true);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    const inode = this.readInode(idx);
+    inode.atime = atime;
+    inode.mtime = mtime;
+    inode.ctime = Date.now();
+    this.writeInode(idx, inode);
+    return { status: 0 };
+  }
+  // ---- SYMLINK ----
+  symlink(target, linkPath) {
+    linkPath = this.normalizePath(linkPath);
+    if (this.pathIndex.has(linkPath)) return { status: CODE_TO_STATUS.EEXIST };
+    const parentStatus = this.ensureParent(linkPath);
+    if (parentStatus !== 0) return { status: parentStatus };
+    const targetBytes = encoder10.encode(target);
+    this.createInode(linkPath, INODE_TYPE.SYMLINK, DEFAULT_SYMLINK_MODE, targetBytes.byteLength, targetBytes);
+    this.commitPending();
+    return { status: 0 };
+  }
+  // ---- READLINK ----
+  readlink(path) {
+    path = this.normalizePath(path);
+    const idx = this.pathIndex.get(path);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    const inode = this.readInode(idx);
+    if (inode.type !== INODE_TYPE.SYMLINK) return { status: CODE_TO_STATUS.EINVAL, data: null };
+    const target = this.readData(inode.firstBlock, inode.blockCount, inode.size);
+    return { status: 0, data: target };
+  }
+  // ---- LINK (hard link — copies the file) ----
+  link(existingPath, newPath) {
+    return this.copy(existingPath, newPath);
+  }
+  // ---- OPEN (file descriptor) ----
+  open(path, flags, tabId) {
+    path = this.normalizePath(path);
+    const hasCreate = (flags & 64) !== 0;
+    const hasTrunc = (flags & 512) !== 0;
+    const hasExcl = (flags & 128) !== 0;
+    let idx = this.resolvePathComponents(path, true);
+    if (idx === void 0) {
+      if (!hasCreate) return { status: CODE_TO_STATUS.ENOENT, data: null };
+      const mode = DEFAULT_FILE_MODE & ~(this.umask & 511);
+      idx = this.createInode(path, INODE_TYPE.FILE, mode, 0);
+    } else if (hasExcl && hasCreate) {
+      return { status: CODE_TO_STATUS.EEXIST, data: null };
+    }
+    if (hasTrunc) {
+      this.truncate(path, 0);
+    }
+    const fd = this.nextFd++;
+    this.fdTable.set(fd, { tabId, inodeIdx: idx, position: 0, flags });
+    const buf = new Uint8Array(4);
+    new DataView(buf.buffer).setUint32(0, fd, true);
+    return { status: 0, data: buf };
+  }
+  // ---- CLOSE ----
+  close(fd) {
+    if (!this.fdTable.has(fd)) return { status: CODE_TO_STATUS.EBADF };
+    this.fdTable.delete(fd);
+    return { status: 0 };
+  }
+  // ---- FREAD ----
+  fread(fd, length, position) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return { status: CODE_TO_STATUS.EBADF, data: null };
+    const inode = this.readInode(entry.inodeIdx);
+    const pos = position ?? entry.position;
+    const readLen = Math.min(length, inode.size - pos);
+    if (readLen <= 0) return { status: 0, data: new Uint8Array(0) };
+    const dataOffset = this.dataOffset + inode.firstBlock * this.blockSize + pos;
+    const buf = new Uint8Array(readLen);
+    this.handle.read(buf, { at: dataOffset });
+    if (position === null) {
+      entry.position += readLen;
+    }
+    return { status: 0, data: buf };
+  }
+  // ---- FWRITE ----
+  fwrite(fd, data, position) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return { status: CODE_TO_STATUS.EBADF, data: null };
+    const inode = this.readInode(entry.inodeIdx);
+    const isAppend = (entry.flags & 1024) !== 0;
+    const pos = isAppend ? inode.size : position ?? entry.position;
+    const endPos = pos + data.byteLength;
+    if (endPos > inode.size) {
+      const neededBlocks = Math.ceil(endPos / this.blockSize);
+      if (neededBlocks > inode.blockCount) {
+        const oldData = inode.size > 0 ? this.readData(inode.firstBlock, inode.blockCount, inode.size) : new Uint8Array(0);
+        this.freeBlockRange(inode.firstBlock, inode.blockCount);
+        const newFirst = this.allocateBlocks(neededBlocks);
+        const newBuf = new Uint8Array(endPos);
+        newBuf.set(oldData);
+        newBuf.set(data, pos);
+        this.writeData(newFirst, newBuf);
+        inode.firstBlock = newFirst;
+        inode.blockCount = neededBlocks;
+      } else {
+        const dataOffset = this.dataOffset + inode.firstBlock * this.blockSize + pos;
+        this.handle.write(data, { at: dataOffset });
+      }
+      inode.size = endPos;
+    } else {
+      const dataOffset = this.dataOffset + inode.firstBlock * this.blockSize + pos;
+      this.handle.write(data, { at: dataOffset });
+    }
+    inode.mtime = Date.now();
+    this.writeInode(entry.inodeIdx, inode);
+    if (position === null) {
+      entry.position = endPos;
+    }
+    this.commitPending();
+    const buf = new Uint8Array(4);
+    new DataView(buf.buffer).setUint32(0, data.byteLength, true);
+    return { status: 0, data: buf };
+  }
+  // ---- FSTAT ----
+  fstat(fd) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return { status: CODE_TO_STATUS.EBADF, data: null };
+    return this.encodeStatResponse(entry.inodeIdx);
+  }
+  // ---- FTRUNCATE ----
+  ftruncate(fd, len = 0) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    const inode = this.readInode(entry.inodeIdx);
+    const path = this.readPath(inode.pathOffset, inode.pathLength);
+    return this.truncate(path, len);
+  }
+  // ---- FSYNC ----
+  fsync() {
+    this.commitPending();
+    this.handle.flush();
+    return { status: 0 };
+  }
+  // ---- OPENDIR ----
+  opendir(path, tabId) {
+    path = this.normalizePath(path);
+    const idx = this.resolvePathComponents(path, true);
+    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    const inode = this.readInode(idx);
+    if (inode.type !== INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTDIR, data: null };
+    const fd = this.nextFd++;
+    this.fdTable.set(fd, { tabId, inodeIdx: idx, position: 0, flags: 0 });
+    const buf = new Uint8Array(4);
+    new DataView(buf.buffer).setUint32(0, fd, true);
+    return { status: 0, data: buf };
+  }
+  // ---- MKDTEMP ----
+  mkdtemp(prefix) {
+    const suffix = Math.random().toString(36).substring(2, 8);
+    const path = this.normalizePath(prefix + suffix);
+    const parentStatus = this.ensureParent(path);
+    if (parentStatus !== 0) {
+      const parentPath = path.substring(0, path.lastIndexOf("/"));
+      if (parentPath) {
+        this.mkdirRecursive(parentPath);
+      }
+    }
+    const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
+    this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
+    this.commitPending();
+    return { status: 0, data: encoder10.encode(path) };
+  }
+  // ========== Helpers ==========
+  getDirectChildren(dirPath) {
+    const prefix = dirPath === "/" ? "/" : dirPath + "/";
+    const children = [];
+    for (const path of this.pathIndex.keys()) {
+      if (path === dirPath) continue;
+      if (!path.startsWith(prefix)) continue;
+      const rest = path.substring(prefix.length);
+      if (!rest.includes("/")) {
+        children.push(path);
+      }
+    }
+    return children.sort();
+  }
+  getAllDescendants(dirPath) {
+    const prefix = dirPath === "/" ? "/" : dirPath + "/";
+    const descendants = [];
+    for (const path of this.pathIndex.keys()) {
+      if (path.startsWith(prefix)) descendants.push(path);
+    }
+    return descendants.sort((a, b) => {
+      const da = a.split("/").length;
+      const db = b.split("/").length;
+      return db - da;
+    });
+  }
+  ensureParent(path) {
+    const lastSlash = path.lastIndexOf("/");
+    if (lastSlash <= 0) return 0;
+    const parentPath = path.substring(0, lastSlash);
+    const parentIdx = this.pathIndex.get(parentPath);
+    if (parentIdx === void 0) return CODE_TO_STATUS.ENOENT;
+    const parentInode = this.readInode(parentIdx);
+    if (parentInode.type !== INODE_TYPE.DIRECTORY) return CODE_TO_STATUS.ENOTDIR;
+    return 0;
+  }
+  /** Clean up all fds owned by a tab */
+  cleanupTab(tabId) {
+    for (const [fd, entry] of this.fdTable) {
+      if (entry.tabId === tabId) {
+        this.fdTable.delete(fd);
+      }
+    }
+  }
+  /** Get all file paths and their data for OPFS sync */
+  getAllFiles() {
+    const files = [];
+    for (const [path, idx] of this.pathIndex) {
+      files.push({ path, idx });
+    }
+    return files;
+  }
+  /** Get file path for a file descriptor (used by OPFS sync for FD-based ops) */
+  getPathForFd(fd) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return null;
+    const inode = this.readInode(entry.inodeIdx);
+    return this.readPath(inode.pathOffset, inode.pathLength);
+  }
+  /** Get file data by inode index */
+  getInodeData(idx) {
+    const inode = this.readInode(idx);
+    const data = inode.size > 0 ? this.readData(inode.firstBlock, inode.blockCount, inode.size) : new Uint8Array(0);
+    return { type: inode.type, data, mtime: inode.mtime };
+  }
+  /** Export all files/dirs/symlinks from the VFS */
+  exportAll() {
+    const result = [];
+    for (const [path, idx] of this.pathIndex) {
+      const inode = this.readInode(idx);
+      let data = null;
+      if (inode.type === INODE_TYPE.FILE || inode.type === INODE_TYPE.SYMLINK) {
+        data = inode.size > 0 ? this.readData(inode.firstBlock, inode.blockCount, inode.size) : new Uint8Array(0);
+      }
+      result.push({ path, type: inode.type, data, mode: inode.mode, mtime: inode.mtime });
+    }
+    result.sort((a, b) => {
+      if (a.type === INODE_TYPE.DIRECTORY && b.type !== INODE_TYPE.DIRECTORY) return -1;
+      if (a.type !== INODE_TYPE.DIRECTORY && b.type === INODE_TYPE.DIRECTORY) return 1;
+      return a.path.localeCompare(b.path);
+    });
+    return result;
+  }
+  flush() {
+    this.handle.flush();
+  }
+};
+
+// src/helpers.ts
+async function navigateToRoot(root) {
+  let dir = await navigator.storage.getDirectory();
+  if (root && root !== "/") {
+    for (const seg of root.split("/").filter(Boolean)) {
+      dir = await dir.getDirectoryHandle(seg, { create: true });
+    }
+  }
+  return dir;
+}
+async function ensureParentDirs(rootDir, path) {
+  const parts = path.split("/").filter(Boolean);
+  parts.pop();
+  let dir = rootDir;
+  for (const part of parts) {
+    dir = await dir.getDirectoryHandle(part, { create: true });
+  }
+  return dir;
+}
+function basename2(path) {
+  const parts = path.split("/").filter(Boolean);
+  return parts[parts.length - 1] || "";
+}
+async function writeOPFSFile(rootDir, path, data) {
+  const parentDir = await ensureParentDirs(rootDir, path);
+  const name = basename2(path);
+  const fileHandle = await parentDir.getFileHandle(name, { create: true });
+  const syncHandle = await fileHandle.createSyncAccessHandle();
+  try {
+    syncHandle.truncate(0);
+    if (data.byteLength > 0) {
+      syncHandle.write(data, { at: 0 });
+    }
+    syncHandle.flush();
+  } finally {
+    syncHandle.close();
+  }
+}
+async function clearDirectory(dir, skip) {
+  const entries = [];
+  for await (const name of dir.keys()) {
+    if (!skip.has(name)) entries.push(name);
+  }
+  for (const name of entries) {
+    await dir.removeEntry(name, { recursive: true });
+  }
+}
+async function readOPFSRecursive(dir, prefix, skip) {
+  const result = [];
+  for await (const [name, handle] of dir.entries()) {
+    if (prefix === "" && skip.has(name)) continue;
+    const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;
+    if (handle.kind === "directory") {
+      result.push({ path: fullPath, type: "directory" });
+      const children = await readOPFSRecursive(handle, fullPath, skip);
+      result.push(...children);
+    } else {
+      const file = await handle.getFile();
+      const data = await file.arrayBuffer();
+      result.push({ path: fullPath, type: "file", data });
+    }
+  }
+  return result;
+}
+async function unpackToOPFS(root = "/") {
+  const rootDir = await navigateToRoot(root);
+  const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin");
+  const handle = await vfsFileHandle.createSyncAccessHandle();
+  let entries;
+  try {
+    const engine = new VFSEngine();
+    engine.init(handle);
+    entries = engine.exportAll();
+  } finally {
+    handle.close();
+  }
+  await clearDirectory(rootDir, /* @__PURE__ */ new Set([".vfs.bin"]));
+  let files = 0;
+  let directories = 0;
+  for (const entry of entries) {
+    if (entry.path === "/") continue;
+    if (entry.type === INODE_TYPE.DIRECTORY) {
+      await ensureParentDirs(rootDir, entry.path + "/dummy");
+      const name = basename2(entry.path);
+      const parent = await ensureParentDirs(rootDir, entry.path);
+      await parent.getDirectoryHandle(name, { create: true });
+      directories++;
+    } else if (entry.type === INODE_TYPE.FILE) {
+      await writeOPFSFile(rootDir, entry.path, entry.data ?? new Uint8Array(0));
+      files++;
+    } else if (entry.type === INODE_TYPE.SYMLINK) {
+      await writeOPFSFile(rootDir, entry.path, entry.data ?? new Uint8Array(0));
+      files++;
+    }
+  }
+  return { files, directories };
+}
+async function loadFromOPFS(root = "/") {
+  const rootDir = await navigateToRoot(root);
+  const opfsEntries = await readOPFSRecursive(rootDir, "", /* @__PURE__ */ new Set([".vfs.bin"]));
+  try {
+    await rootDir.removeEntry(".vfs.bin");
+  } catch (_) {
+  }
+  const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin", { create: true });
+  const handle = await vfsFileHandle.createSyncAccessHandle();
+  try {
+    const engine = new VFSEngine();
+    engine.init(handle);
+    const dirs = opfsEntries.filter((e) => e.type === "directory").sort((a, b) => a.path.localeCompare(b.path));
+    let files = 0;
+    let directories = 0;
+    for (const dir of dirs) {
+      engine.mkdir(dir.path, 16877);
+      directories++;
+    }
+    const fileEntries = opfsEntries.filter((e) => e.type === "file");
+    for (const file of fileEntries) {
+      engine.write(file.path, new Uint8Array(file.data));
+      files++;
+    }
+    engine.flush();
+    return { files, directories };
+  } finally {
+    handle.close();
+  }
+}
+async function repairVFS(root = "/") {
+  const rootDir = await navigateToRoot(root);
+  const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin");
+  const file = await vfsFileHandle.getFile();
+  const raw = new Uint8Array(await file.arrayBuffer());
+  const fileSize = raw.byteLength;
+  if (fileSize < SUPERBLOCK.SIZE) {
+    throw new Error(`VFS file too small to repair (${fileSize} bytes)`);
+  }
+  const view = new DataView(raw.buffer);
+  let inodeCount;
+  let blockSize;
+  let totalBlocks;
+  let inodeTableOffset;
+  let pathTableOffset;
+  let dataOffset;
+  const magic = view.getUint32(SUPERBLOCK.MAGIC, true);
+  const version = view.getUint32(SUPERBLOCK.VERSION, true);
+  const superblockValid = magic === VFS_MAGIC && version === VFS_VERSION;
+  if (superblockValid) {
+    inodeCount = view.getUint32(SUPERBLOCK.INODE_COUNT, true);
+    blockSize = view.getUint32(SUPERBLOCK.BLOCK_SIZE, true);
+    totalBlocks = view.getUint32(SUPERBLOCK.TOTAL_BLOCKS, true);
+    inodeTableOffset = view.getFloat64(SUPERBLOCK.INODE_OFFSET, true);
+    pathTableOffset = view.getFloat64(SUPERBLOCK.PATH_OFFSET, true);
+    view.getFloat64(SUPERBLOCK.BITMAP_OFFSET, true);
+    dataOffset = view.getFloat64(SUPERBLOCK.DATA_OFFSET, true);
+    view.getUint32(SUPERBLOCK.PATH_USED, true);
+    if (blockSize === 0 || (blockSize & blockSize - 1) !== 0 || inodeCount === 0 || inodeTableOffset >= fileSize || pathTableOffset >= fileSize || dataOffset >= fileSize) {
+      const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
+      inodeCount = DEFAULT_INODE_COUNT;
+      blockSize = DEFAULT_BLOCK_SIZE;
+      totalBlocks = INITIAL_DATA_BLOCKS;
+      inodeTableOffset = layout.inodeTableOffset;
+      pathTableOffset = layout.pathTableOffset;
+      dataOffset = layout.dataOffset;
+    }
+  } else {
+    const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
+    inodeCount = DEFAULT_INODE_COUNT;
+    blockSize = DEFAULT_BLOCK_SIZE;
+    totalBlocks = INITIAL_DATA_BLOCKS;
+    inodeTableOffset = layout.inodeTableOffset;
+    pathTableOffset = layout.pathTableOffset;
+    dataOffset = layout.dataOffset;
+  }
+  const decoder9 = new TextDecoder();
+  const recovered = [];
+  let lost = 0;
+  const maxInodes = Math.min(inodeCount, Math.floor((fileSize - inodeTableOffset) / INODE_SIZE));
+  for (let i = 0; i < maxInodes; i++) {
+    const off = inodeTableOffset + i * INODE_SIZE;
+    if (off + INODE_SIZE > fileSize) break;
+    const type = raw[off + INODE.TYPE];
+    if (type < INODE_TYPE.FILE || type > INODE_TYPE.SYMLINK) continue;
+    const inodeView = new DataView(raw.buffer, off, INODE_SIZE);
+    const pathOffset = inodeView.getUint32(INODE.PATH_OFFSET, true);
+    const pathLength = inodeView.getUint16(INODE.PATH_LENGTH, true);
+    const size = inodeView.getFloat64(INODE.SIZE, true);
+    const firstBlock = inodeView.getUint32(INODE.FIRST_BLOCK, true);
+    inodeView.getUint32(INODE.BLOCK_COUNT, true);
+    const absPathOffset = pathTableOffset + pathOffset;
+    if (pathLength === 0 || pathLength > 4096 || absPathOffset + pathLength > fileSize) {
+      lost++;
+      continue;
+    }
+    let path;
+    try {
+      path = decoder9.decode(raw.subarray(absPathOffset, absPathOffset + pathLength));
+    } catch {
+      lost++;
+      continue;
+    }
+    if (!path.startsWith("/") || path.includes("\0")) {
+      lost++;
+      continue;
+    }
+    if (type === INODE_TYPE.DIRECTORY) {
+      recovered.push({ path, type, data: new Uint8Array(0) });
+      continue;
+    }
+    if (size < 0 || size > fileSize || !isFinite(size)) {
+      lost++;
+      continue;
+    }
+    const dataStart = dataOffset + firstBlock * blockSize;
+    if (dataStart + size > fileSize || firstBlock >= totalBlocks) {
+      recovered.push({ path, type, data: new Uint8Array(0) });
+      lost++;
+      continue;
+    }
+    const data = raw.slice(dataStart, dataStart + size);
+    recovered.push({ path, type, data });
+  }
+  await rootDir.removeEntry(".vfs.bin");
+  const newFileHandle = await rootDir.getFileHandle(".vfs.bin", { create: true });
+  const handle = await newFileHandle.createSyncAccessHandle();
+  try {
+    const engine = new VFSEngine();
+    engine.init(handle);
+    const dirs = recovered.filter((e) => e.type === INODE_TYPE.DIRECTORY && e.path !== "/").sort((a, b) => a.path.localeCompare(b.path));
+    const files = recovered.filter((e) => e.type === INODE_TYPE.FILE);
+    const symlinks = recovered.filter((e) => e.type === INODE_TYPE.SYMLINK);
+    for (const dir of dirs) {
+      const result = engine.mkdir(dir.path, 16877);
+      if (result.status !== 0) lost++;
+    }
+    for (const file2 of files) {
+      const result = engine.write(file2.path, file2.data);
+      if (result.status !== 0) lost++;
+    }
+    for (const sym of symlinks) {
+      const target = decoder9.decode(sym.data);
+      const result = engine.symlink(target, sym.path);
+      if (result.status !== 0) lost++;
+    }
+    engine.flush();
+  } finally {
+    handle.close();
+  }
+  const entries = recovered.filter((e) => e.path !== "/").map((e) => ({
+    path: e.path,
+    type: e.type === INODE_TYPE.FILE ? "file" : e.type === INODE_TYPE.DIRECTORY ? "directory" : "symlink",
+    size: e.data.byteLength
+  }));
+  return { recovered: entries.length, lost, entries };
+}
+
 // src/index.ts
 function createFS(config) {
   return new VFSFileSystem(config);
@@ -1879,6 +3421,6 @@ function init() {
   return getDefaultFS().init();
 }
 
-export { FSError, VFSFileSystem, constants, createError, createFS, getDefaultFS, init, path_exports as path, statusToError };
+export { FSError, VFSFileSystem, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path_exports as path, repairVFS, statusToError, unpackToOPFS };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map

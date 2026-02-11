@@ -7,7 +7,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { VFSEngine } from '../src/vfs/engine.js';
-import { VFS_MAGIC, SUPERBLOCK, INODE_TYPE } from '../src/vfs/layout.js';
+import { VFS_MAGIC, VFS_VERSION, SUPERBLOCK, INODE_TYPE, INODE_SIZE, DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS, INITIAL_PATH_TABLE_SIZE, calculateLayout } from '../src/vfs/layout.js';
 
 /**
  * Mock FileSystemSyncAccessHandle backed by an ArrayBuffer.
@@ -589,6 +589,135 @@ describe('VFSEngine', () => {
 
       // fd should be invalid now
       expect(engine.fread(fd, 100, 0).status).toBe(8); // EBADF
+    });
+  });
+
+  describe('corruption detection', () => {
+    /** Creates a valid formatted VFS handle that can be corrupted before mounting */
+    function createFormattedHandle(): MockSyncHandle {
+      const fmt = new VFSEngine();
+      const h = new MockSyncHandle(0);
+      fmt.init(h as unknown as FileSystemSyncAccessHandle);
+      return h;
+    }
+
+    /** Overwrite uint32 at byte offset */
+    function patchU32(h: MockSyncHandle, offset: number, value: number): void {
+      const buf = new Uint8Array(4);
+      new DataView(buf.buffer).setUint32(0, value, true);
+      h.write(buf, { at: offset });
+    }
+
+    /** Overwrite float64 at byte offset */
+    function patchF64(h: MockSyncHandle, offset: number, value: number): void {
+      const buf = new Uint8Array(8);
+      new DataView(buf.buffer).setFloat64(0, value, true);
+      h.write(buf, { at: offset });
+    }
+
+    it('should reject file too small for superblock', () => {
+      const h = new MockSyncHandle(0);
+      // Write only 10 bytes — smaller than SUPERBLOCK.SIZE (64)
+      h.write(new Uint8Array(10), { at: 0 });
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: file too small');
+    });
+
+    it('should reject bad magic', () => {
+      const h = createFormattedHandle();
+      patchU32(h, SUPERBLOCK.MAGIC, 0xDEADBEEF);
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: bad magic 0xdeadbeef');
+    });
+
+    it('should reject unsupported version', () => {
+      const h = createFormattedHandle();
+      patchU32(h, SUPERBLOCK.VERSION, 99);
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: unsupported version 99');
+    });
+
+    it('should reject block size of 0', () => {
+      const h = createFormattedHandle();
+      patchU32(h, SUPERBLOCK.BLOCK_SIZE, 0);
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: invalid block size 0');
+    });
+
+    it('should reject non-power-of-2 block size', () => {
+      const h = createFormattedHandle();
+      patchU32(h, SUPERBLOCK.BLOCK_SIZE, 3000);
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: invalid block size 3000');
+    });
+
+    it('should reject inode count of 0', () => {
+      const h = createFormattedHandle();
+      patchU32(h, SUPERBLOCK.INODE_COUNT, 0);
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: inode count is 0');
+    });
+
+    it('should reject free blocks exceeding total', () => {
+      const h = createFormattedHandle();
+      patchU32(h, SUPERBLOCK.FREE_BLOCKS, 999999);
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: free blocks');
+    });
+
+    it('should reject wrong inode table offset', () => {
+      const h = createFormattedHandle();
+      patchF64(h, SUPERBLOCK.INODE_OFFSET, 999);
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: inode table offset');
+    });
+
+    it('should reject path used exceeding path table size', () => {
+      const h = createFormattedHandle();
+      patchU32(h, SUPERBLOCK.PATH_USED, 999999999);
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: path used');
+    });
+
+    it('should reject file too small for declared layout', () => {
+      const h = createFormattedHandle();
+      // Set total blocks to a huge number, but file is still the same small size
+      patchU32(h, SUPERBLOCK.TOTAL_BLOCKS, 1000000);
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: file size');
+    });
+
+    it('should reject VFS with missing root directory', () => {
+      const h = createFormattedHandle();
+      // Zero out the entire inode table to remove root dir inode
+      const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
+      const zeroBuf = new Uint8Array(layout.inodeTableSize);
+      h.write(zeroBuf, { at: layout.inodeTableOffset });
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: root directory "/" not found');
+    });
+
+    it('should call closeHandle without error on a valid engine', () => {
+      // closeHandle on the already-initialized engine from beforeEach
+      expect(() => engine.closeHandle()).not.toThrow();
+    });
+
+    it('should accept a valid formatted VFS on remount', () => {
+      const h = createFormattedHandle();
+      const e = new VFSEngine();
+      // Should not throw — valid VFS
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle)).not.toThrow();
     });
   });
 });

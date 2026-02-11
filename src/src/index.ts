@@ -20,6 +20,8 @@
 export { VFSFileSystem } from './filesystem.js';
 export { constants } from './constants.js';
 export { FSError, createError, statusToError } from './errors.js';
+export { unpackToOPFS, loadFromOPFS, repairVFS } from './helpers.js';
+export type { UnpackResult, LoadResult, RepairResult } from './helpers.js';
 export * as path from './path.js';
 export type {
   Stats,

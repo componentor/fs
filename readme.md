@@ -368,6 +368,33 @@ constants.O_TRUNC    // 512
 constants.O_APPEND   // 1024
 ```
 
+## Maintenance Helpers
+
+Standalone utilities for VFS maintenance, recovery, and migration. Must be called from a Worker context (sync access handle requirement). Close any running `VFSFileSystem` instance first.
+
+```typescript
+import { unpackToOPFS, loadFromOPFS, repairVFS } from '@componentor/fs';
+
+// Export VFS contents to real OPFS files (clears existing OPFS files first)
+const { files, directories } = await unpackToOPFS('/my-app');
+
+// Rebuild VFS from real OPFS files (deletes .vfs.bin, creates fresh VFS)
+const { files, directories } = await loadFromOPFS('/my-app');
+
+// Attempt to recover files from a corrupt VFS binary
+const { recovered, lost, entries } = await repairVFS('/my-app');
+console.log(`Recovered ${recovered} entries, lost ${lost}`);
+for (const entry of entries) {
+  console.log(`  ${entry.type} ${entry.path} (${entry.size} bytes)`);
+}
+```
+
+| Function | Description |
+|----------|-------------|
+| `unpackToOPFS(root?)` | Read all files from VFS, write to real OPFS paths |
+| `loadFromOPFS(root?)` | Read all OPFS files, create fresh VFS with their contents |
+| `repairVFS(root?)` | Scan corrupt `.vfs.bin` for recoverable inodes, rebuild fresh VFS |
+
 ## isomorphic-git Integration
 
 ```typescript
@@ -419,8 +446,8 @@ await git.commit({
 │  ┌────────────────────────────────────────────────────────────┐  │
 │  │                     VFS Engine                             │  │
 │  │  ┌──────────────────┐  ┌─────────────┐  ┌──────────────┐   │  │
-│  │  │  VFS Binary File  │  │  Inode/Path │  │  Block Data │   │  │
-│  │  │  (.vfs.bin OPFS)  │  │    Table    │  │   Region    │   │  │
+│  │  │  VFS Binary File │  │  Inode/Path │  │  Block Data  │   │  │
+│  │  │  (.vfs.bin OPFS) │  │    Table    │  │   Region     │   │  │
 │  │  └──────────────────┘  └─────────────┘  └──────────────┘   │  │
 │  └────────────────────────────────────────────────────────────┘  │
 │                            │                                     │
@@ -480,6 +507,18 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 `FileSystemObserver` requires Chrome 129+. The VFS instance must be running (observer is set up during init). Changes to files outside the configured `root` directory won't be detected.
 
 ## Changelog
+
+### v3.0.4 (2026)
+
+**Features:**
+- Add `unpackToOPFS(root?)` — export all VFS contents to real OPFS files
+- Add `loadFromOPFS(root?)` — rebuild VFS from real OPFS files (deletes and recreates `.vfs.bin`)
+- Add `repairVFS(root?)` — scan corrupt VFS binary for recoverable inodes and rebuild a clean VFS
+- Add `VFSEngine.exportAll()` for extracting all files/dirs/symlinks with their data
+
+**Bug Fixes:**
+- VFS corruption detection on init — validates magic, version, block size, inode count, section offsets, file size, and root directory existence
+- Release sync access handle on init failure (previously leaked, blocking re-acquisition)
 
 ### v3.0.3 (2026)
 
@@ -548,7 +587,7 @@ git clone https://github.com/componentor/fs
 cd fs
 npm install
 npm run build       # Build the library
-npm test            # Run unit tests (84 tests)
+npm test            # Run unit tests (97 tests)
 npm run benchmark:open  # Run benchmarks in browser
 ```
 

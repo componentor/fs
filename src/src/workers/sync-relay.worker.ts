@@ -648,14 +648,20 @@ async function initEngine(config: {
   const vfsFileHandle = await rootDir.getFileHandle('.vfs.bin', { create: true });
   const vfsHandle = await vfsFileHandle.createSyncAccessHandle();
 
-  // Initialize VFS engine
-  engine.init(vfsHandle, {
-    uid: config.uid,
-    gid: config.gid,
-    umask: config.umask,
-    strictPermissions: config.strictPermissions,
-    debug: config.debug,
-  });
+  // Initialize VFS engine — release handle on corruption/failure
+  try {
+    engine.init(vfsHandle, {
+      uid: config.uid,
+      gid: config.gid,
+      umask: config.umask,
+      strictPermissions: config.strictPermissions,
+      debug: config.debug,
+    });
+  } catch (err) {
+    // Release the exclusive sync handle so it can be re-acquired
+    try { vfsHandle.close(); } catch (_) {}
+    throw err;
+  }
 
   // Spawn OPFS sync worker (mirrors VFS mutations to real OPFS files)
   if (config.opfsSync) {
