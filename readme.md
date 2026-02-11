@@ -311,17 +311,23 @@ await writer.close();
 ### Watch API
 
 ```typescript
-// Watch for changes
-const watcher = fs.watch('/dir', { recursive: true }, (eventType, filename) => {
-  console.log(eventType, filename); // 'change' 'file.txt'
+// Watch for changes (supports recursive + AbortSignal)
+const ac = new AbortController();
+const watcher = fs.watch('/dir', { recursive: true, signal: ac.signal }, (eventType, filename) => {
+  console.log(eventType, filename); // 'rename' 'newfile.txt' or 'change' 'file.txt'
 });
-watcher.close();
+watcher.close(); // or ac.abort()
 
-// Watch specific file with polling
+// Watch specific file with stat polling
 fs.watchFile('/file.txt', { interval: 1000 }, (curr, prev) => {
   console.log('File changed:', curr.mtimeMs !== prev.mtimeMs);
 });
 fs.unwatchFile('/file.txt');
+
+// Async iterable (promises API)
+for await (const event of fs.promises.watch('/dir', { recursive: true })) {
+  console.log(event.eventType, event.filename);
+}
 ```
 
 ### Path Utilities
@@ -412,23 +418,23 @@ await git.commit({
 │               sync-relay Worker (Leader)                         │
 │  ┌────────────────────────────────────────────────────────────┐  │
 │  │                     VFS Engine                             │  │
-│  │  ┌──────────────────┐  ┌─────────────┐  ┌──────────────┐  │  │
-│  │  │  VFS Binary File  │  │  Inode/Path │  │  Block Data  │  │  │
-│  │  │  (.vfs.bin OPFS)  │  │    Table    │  │   Region     │  │  │
-│  │  └──────────────────┘  └─────────────┘  └──────────────┘  │  │
+│  │  ┌──────────────────┐  ┌─────────────┐  ┌──────────────┐   │  │
+│  │  │  VFS Binary File  │  │  Inode/Path │  │  Block Data │   │  │
+│  │  │  (.vfs.bin OPFS)  │  │    Table    │  │   Region    │   │  │
+│  │  └──────────────────┘  └─────────────┘  └──────────────┘   │  │
 │  └────────────────────────────────────────────────────────────┘  │
 │                            │                                     │
-│                    notifyOPFSSync()                               │
-│                     (fire & forget)                               │
+│                    notifyOPFSSync()                              │
+│                     (fire & forget)                              │
 └────────────────────────────┼─────────────────────────────────────┘
                              │
                              ▼
 ┌──────────────────────────────────────────────────────────────────┐
-│                    opfs-sync Worker                               │
+│                    opfs-sync Worker                              │
 │  ┌────────────────────┐  ┌────────────────────────────────────┐  │
-│  │  VFS → OPFS Mirror │  │  FileSystemObserver (OPFS → VFS)  │  │
-│  │  (queue + echo     │  │  External changes detected and    │  │
-│  │   suppression)     │  │  synced back to VFS engine        │  │
+│  │  VFS → OPFS Mirror │  │  FileSystemObserver (OPFS → VFS)   │  │
+│  │  (queue + echo     │  │  External changes detected and     │  │
+│  │   suppression)     │  │  synced back to VFS engine         │  │
 │  └────────────────────┘  └────────────────────────────────────┘  │
 └──────────────────────────────────────────────────────────────────┘
 
@@ -474,6 +480,19 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 `FileSystemObserver` requires Chrome 129+. The VFS instance must be running (observer is set up during init). Changes to files outside the configured `root` directory won't be detected.
 
 ## Changelog
+
+### v3.0.3 (2026)
+
+**Features:**
+- Implement `fs.watch()`, `fs.watchFile()`, `fs.unwatchFile()`, and `promises.watch()` as Node.js-compatible polyfills
+- Watch events propagate across all tabs via `BroadcastChannel`
+- `fs.watch()` supports `recursive` option and `AbortSignal` for cleanup
+- `fs.watchFile()` supports stat-based polling with configurable `interval` (default 5007ms per Node.js)
+- `promises.watch()` returns an async iterable of watch events
+
+**Internal:**
+- Leader broadcasts `{ eventType, path }` on every successful VFS mutation (no new opcodes or protocol changes)
+- Mutation tracking now runs unconditionally (previously gated on `opfsSync`)
 
 ### v3.0.2 (2026)
 
@@ -529,7 +548,7 @@ git clone https://github.com/componentor/fs
 cd fs
 npm install
 npm run build       # Build the library
-npm test            # Run unit tests (77 tests)
+npm test            # Run unit tests (84 tests)
 npm run benchmark:open  # Run benchmarks in browser
 ```
 

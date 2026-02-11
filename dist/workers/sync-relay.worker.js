@@ -1324,6 +1324,7 @@ var leaderLoopRunning = false;
 var opfsSyncPort = null;
 var opfsSyncEnabled = false;
 var suppressPaths = /* @__PURE__ */ new Set();
+var watchBc = null;
 var sab;
 var ctrl;
 var readySab;
@@ -1450,21 +1451,21 @@ function handleRequest(reqTabId, buffer) {
       break;
     case OP.WRITE:
       result = engine.write(path, data ?? new Uint8Array(0), flags);
-      if (opfsSyncEnabled && result.status === 0) {
+      if (result.status === 0) {
         syncOp = op;
         syncPath = path;
       }
       break;
     case OP.APPEND:
       result = engine.append(path, data ?? new Uint8Array(0));
-      if (opfsSyncEnabled && result.status === 0) {
+      if (result.status === 0) {
         syncOp = op;
         syncPath = path;
       }
       break;
     case OP.UNLINK:
       result = engine.unlink(path);
-      if (opfsSyncEnabled && result.status === 0) {
+      if (result.status === 0) {
         syncOp = op;
         syncPath = path;
       }
@@ -1477,14 +1478,14 @@ function handleRequest(reqTabId, buffer) {
       break;
     case OP.MKDIR:
       result = engine.mkdir(path, flags);
-      if (opfsSyncEnabled && result.status === 0) {
+      if (result.status === 0) {
         syncOp = op;
         syncPath = path;
       }
       break;
     case OP.RMDIR:
       result = engine.rmdir(path, flags);
-      if (opfsSyncEnabled && result.status === 0) {
+      if (result.status === 0) {
         syncOp = op;
         syncPath = path;
       }
@@ -1495,7 +1496,7 @@ function handleRequest(reqTabId, buffer) {
     case OP.RENAME: {
       const newPath = data ? decodeSecondPath(data) : "";
       result = engine.rename(path, newPath);
-      if (opfsSyncEnabled && result.status === 0) {
+      if (result.status === 0) {
         syncOp = op;
         syncPath = path;
         syncNewPath = newPath;
@@ -1508,7 +1509,7 @@ function handleRequest(reqTabId, buffer) {
     case OP.TRUNCATE: {
       const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
       result = engine.truncate(path, len);
-      if (opfsSyncEnabled && result.status === 0) {
+      if (result.status === 0) {
         syncOp = op;
         syncPath = path;
       }
@@ -1517,7 +1518,7 @@ function handleRequest(reqTabId, buffer) {
     case OP.COPY: {
       const destPath = data ? decodeSecondPath(data) : "";
       result = engine.copy(path, destPath, flags);
-      if (opfsSyncEnabled && result.status === 0) {
+      if (result.status === 0) {
         syncOp = op;
         syncPath = destPath;
       }
@@ -1532,6 +1533,10 @@ function handleRequest(reqTabId, buffer) {
     case OP.CHMOD: {
       const chmodMode = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
       result = engine.chmod(path, chmodMode);
+      if (result.status === 0) {
+        syncOp = op;
+        syncPath = path;
+      }
       break;
     }
     case OP.CHOWN: {
@@ -1543,6 +1548,10 @@ function handleRequest(reqTabId, buffer) {
       const uid = dv.getUint32(0, true);
       const gid = dv.getUint32(4, true);
       result = engine.chown(path, uid, gid);
+      if (result.status === 0) {
+        syncOp = op;
+        syncPath = path;
+      }
       break;
     }
     case OP.UTIMES: {
@@ -1554,12 +1563,16 @@ function handleRequest(reqTabId, buffer) {
       const atime = dv.getFloat64(0, true);
       const mtime = dv.getFloat64(8, true);
       result = engine.utimes(path, atime, mtime);
+      if (result.status === 0) {
+        syncOp = op;
+        syncPath = path;
+      }
       break;
     }
     case OP.SYMLINK: {
       const target = data ? new TextDecoder().decode(data) : "";
       result = engine.symlink(target, path);
-      if (opfsSyncEnabled && result.status === 0) {
+      if (result.status === 0) {
         syncOp = op;
         syncPath = path;
       }
@@ -1571,7 +1584,7 @@ function handleRequest(reqTabId, buffer) {
     case OP.LINK: {
       const newPath = data ? decodeSecondPath(data) : "";
       result = engine.link(path, newPath);
-      if (opfsSyncEnabled && result.status === 0) {
+      if (result.status === 0) {
         syncOp = op;
         syncPath = newPath;
       }
@@ -1607,7 +1620,7 @@ function handleRequest(reqTabId, buffer) {
       const pos = dv.getInt32(4, true);
       const writeData = data.subarray(8);
       result = engine.fwrite(fd, writeData, pos === -1 ? null : pos);
-      if (opfsSyncEnabled && result.status === 0) {
+      if (result.status === 0) {
         syncOp = op;
         syncPath = engine.getPathForFd(fd) ?? void 0;
       }
@@ -1627,7 +1640,7 @@ function handleRequest(reqTabId, buffer) {
       const fd = dv.getUint32(0, true);
       const len = dv.getUint32(4, true);
       result = engine.ftruncate(fd, len);
-      if (opfsSyncEnabled && result.status === 0) {
+      if (result.status === 0) {
         syncOp = op;
         syncPath = engine.getPathForFd(fd) ?? void 0;
       }
@@ -1641,7 +1654,7 @@ function handleRequest(reqTabId, buffer) {
       break;
     case OP.MKDTEMP:
       result = engine.mkdtemp(path);
-      if (opfsSyncEnabled && result.status === 0 && result.data) {
+      if (result.status === 0 && result.data) {
         syncOp = op;
         syncPath = new TextDecoder().decode(result.data instanceof Uint8Array ? result.data : new Uint8Array(0));
       }
@@ -1661,6 +1674,7 @@ function handleRequest(reqTabId, buffer) {
     ret._op = syncOp;
     ret._path = syncPath;
     ret._newPath = syncNewPath;
+    broadcastWatch(syncOp, syncPath, syncNewPath);
   }
   return ret;
 }
@@ -1851,6 +1865,39 @@ async function initEngine(config) {
       [mc.port2]
     );
   }
+  watchBc = new BroadcastChannel("vfs-watch");
+}
+function broadcastWatch(op, path, newPath) {
+  if (!watchBc) return;
+  let eventType;
+  switch (op) {
+    case OP.WRITE:
+    case OP.APPEND:
+    case OP.TRUNCATE:
+    case OP.FWRITE:
+    case OP.FTRUNCATE:
+    case OP.CHMOD:
+    case OP.CHOWN:
+    case OP.UTIMES:
+      eventType = "change";
+      break;
+    case OP.UNLINK:
+    case OP.RMDIR:
+    case OP.RENAME:
+    case OP.MKDIR:
+    case OP.MKDTEMP:
+    case OP.SYMLINK:
+    case OP.LINK:
+    case OP.COPY:
+      eventType = "rename";
+      break;
+    default:
+      return;
+  }
+  watchBc.postMessage({ eventType, path });
+  if (op === OP.RENAME && newPath) {
+    watchBc.postMessage({ eventType: "rename", path: newPath });
+  }
 }
 function notifyOPFSSync(op, path, newPath) {
   if (!opfsSyncPort) return;
@@ -1910,6 +1957,7 @@ function handleExternalChange(msg) {
     case "external-write": {
       suppressPaths.add(msg.path);
       const result = engine.write(msg.path, new Uint8Array(msg.data), 0);
+      if (result.status === 0) broadcastWatch(OP.WRITE, msg.path);
       console.log("[sync-relay] external-write:", msg.path, `${msg.data?.byteLength ?? 0}B`, `status=${result.status}`);
       break;
     }
@@ -1918,8 +1966,10 @@ function handleExternalChange(msg) {
       const result = engine.unlink(msg.path);
       if (result.status !== 0) {
         const rmdirResult = engine.rmdir(msg.path, 1);
+        if (rmdirResult.status === 0) broadcastWatch(OP.RMDIR, msg.path);
         console.log("[sync-relay] external-delete (rmdir):", msg.path, `status=${rmdirResult.status}`);
       } else {
+        broadcastWatch(OP.UNLINK, msg.path);
         console.log("[sync-relay] external-delete:", msg.path, `status=${result.status}`);
       }
       break;
@@ -1929,6 +1979,7 @@ function handleExternalChange(msg) {
       if (msg.newPath) {
         suppressPaths.add(msg.newPath);
         const result = engine.rename(msg.path, msg.newPath);
+        if (result.status === 0) broadcastWatch(OP.RENAME, msg.path, msg.newPath);
         console.log("[sync-relay] external-rename:", msg.path, "\u2192", msg.newPath, `status=${result.status}`);
       }
       break;

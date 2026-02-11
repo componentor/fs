@@ -939,33 +939,233 @@ function format(obj) {
 }
 
 // src/methods/watch.ts
-function watch(_filePath, _options, _listener) {
-  const interval = setInterval(() => {
-  }, 1e3);
+var watchers = /* @__PURE__ */ new Set();
+var fileWatchers = /* @__PURE__ */ new Map();
+var bc = null;
+var bcRefCount = 0;
+function ensureBc() {
+  if (bc) {
+    bcRefCount++;
+    return;
+  }
+  bc = new BroadcastChannel("vfs-watch");
+  bcRefCount = 1;
+  bc.onmessage = onBroadcast;
+}
+function releaseBc() {
+  if (--bcRefCount <= 0 && bc) {
+    bc.close();
+    bc = null;
+    bcRefCount = 0;
+  }
+}
+function onBroadcast(event) {
+  const { eventType, path: mutatedPath } = event.data;
+  for (const entry of watchers) {
+    const filename = matchWatcher(entry, mutatedPath);
+    if (filename !== null) {
+      try {
+        entry.listener(eventType, filename);
+      } catch {
+      }
+    }
+  }
+  const fileSet = fileWatchers.get(mutatedPath);
+  if (fileSet) {
+    for (const entry of fileSet) {
+      triggerWatchFile(entry);
+    }
+  }
+}
+function matchWatcher(entry, mutatedPath) {
+  const { absPath, recursive } = entry;
+  if (mutatedPath === absPath) {
+    return basename(mutatedPath);
+  }
+  if (!mutatedPath.startsWith(absPath) || mutatedPath.charAt(absPath.length) !== "/") {
+    return null;
+  }
+  const relativePath = mutatedPath.substring(absPath.length + 1);
+  if (recursive) return relativePath;
+  return relativePath.indexOf("/") === -1 ? relativePath : null;
+}
+function watch(filePath, options, listener) {
+  const opts = typeof options === "string" ? { } : options ?? {};
+  const cb = listener ?? (() => {
+  });
+  const absPath = resolve(filePath);
+  const signal = opts.signal;
+  const entry = {
+    absPath,
+    recursive: opts.recursive ?? false,
+    listener: cb,
+    signal
+  };
+  ensureBc();
+  watchers.add(entry);
+  if (signal) {
+    const onAbort = () => {
+      watchers.delete(entry);
+      releaseBc();
+      signal.removeEventListener("abort", onAbort);
+    };
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener("abort", onAbort);
+    }
+  }
   const watcher = {
-    close: () => clearInterval(interval),
-    ref: () => watcher,
-    unref: () => watcher
+    close() {
+      watchers.delete(entry);
+      releaseBc();
+    },
+    ref() {
+      return watcher;
+    },
+    unref() {
+      return watcher;
+    }
   };
   return watcher;
 }
-async function* watchAsync(asyncRequest, filePath, options) {
-  let lastMtime = 0;
-  const signal = options?.signal;
-  while (!signal?.aborted) {
-    try {
-      const s = await stat(asyncRequest, filePath);
-      if (s.mtimeMs !== lastMtime) {
-        if (lastMtime !== 0) {
-          yield { eventType: "change", filename: basename(filePath) };
-        }
-        lastMtime = s.mtimeMs;
+function watchFile(syncRequest, filePath, optionsOrListener, listener) {
+  let opts;
+  let cb;
+  if (typeof optionsOrListener === "function") {
+    cb = optionsOrListener;
+    opts = {};
+  } else {
+    opts = optionsOrListener ?? {};
+    cb = listener;
+  }
+  if (!cb) return;
+  const absPath = resolve(filePath);
+  const interval = opts.interval ?? 5007;
+  let prevStats = null;
+  try {
+    prevStats = statSync(syncRequest, absPath);
+  } catch {
+  }
+  const entry = {
+    absPath,
+    listener: cb,
+    interval,
+    prevStats,
+    syncRequest,
+    timerId: null
+  };
+  ensureBc();
+  let set = fileWatchers.get(absPath);
+  if (!set) {
+    set = /* @__PURE__ */ new Set();
+    fileWatchers.set(absPath, set);
+  }
+  set.add(entry);
+  entry.timerId = setInterval(() => triggerWatchFile(entry), interval);
+}
+function unwatchFile(filePath, listener) {
+  const absPath = resolve(filePath);
+  const set = fileWatchers.get(absPath);
+  if (!set) return;
+  if (listener) {
+    for (const entry of set) {
+      if (entry.listener === listener) {
+        if (entry.timerId !== null) clearInterval(entry.timerId);
+        set.delete(entry);
+        releaseBc();
+        break;
       }
-    } catch {
-      yield { eventType: "rename", filename: basename(filePath) };
-      return;
     }
-    await new Promise((r) => setTimeout(r, 100));
+    if (set.size === 0) fileWatchers.delete(absPath);
+  } else {
+    for (const entry of set) {
+      if (entry.timerId !== null) clearInterval(entry.timerId);
+      releaseBc();
+    }
+    fileWatchers.delete(absPath);
+  }
+}
+function triggerWatchFile(entry) {
+  let currStats = null;
+  try {
+    currStats = statSync(entry.syncRequest, entry.absPath);
+  } catch {
+  }
+  const prev = entry.prevStats ?? emptyStats();
+  const curr = currStats ?? emptyStats();
+  if (prev.mtimeMs !== curr.mtimeMs || prev.size !== curr.size || prev.ino !== curr.ino) {
+    entry.prevStats = currStats;
+    try {
+      entry.listener(curr, prev);
+    } catch {
+    }
+  }
+}
+function emptyStats() {
+  const zero = /* @__PURE__ */ new Date(0);
+  return {
+    isFile: () => false,
+    isDirectory: () => false,
+    isBlockDevice: () => false,
+    isCharacterDevice: () => false,
+    isSymbolicLink: () => false,
+    isFIFO: () => false,
+    isSocket: () => false,
+    dev: 0,
+    ino: 0,
+    mode: 0,
+    nlink: 0,
+    uid: 0,
+    gid: 0,
+    rdev: 0,
+    size: 0,
+    blksize: 4096,
+    blocks: 0,
+    atimeMs: 0,
+    mtimeMs: 0,
+    ctimeMs: 0,
+    birthtimeMs: 0,
+    atime: zero,
+    mtime: zero,
+    ctime: zero,
+    birthtime: zero
+  };
+}
+async function* watchAsync(_asyncRequest, filePath, options) {
+  const absPath = resolve(filePath);
+  const recursive = options?.recursive ?? false;
+  const signal = options?.signal;
+  const queue = [];
+  let resolve2 = null;
+  const entry = {
+    absPath,
+    recursive,
+    listener: (eventType, filename) => {
+      queue.push({ eventType, filename });
+      if (resolve2) {
+        resolve2();
+        resolve2 = null;
+      }
+    },
+    signal
+  };
+  ensureBc();
+  watchers.add(entry);
+  try {
+    while (!signal?.aborted) {
+      if (queue.length === 0) {
+        await new Promise((r) => {
+          resolve2 = r;
+        });
+      }
+      while (queue.length > 0) {
+        yield queue.shift();
+      }
+    }
+  } finally {
+    watchers.delete(entry);
+    releaseBc();
   }
 }
 
@@ -1233,9 +1433,9 @@ var VFSFileSystem = class {
         }
       };
       mc.port1.start();
-      const bc = new BroadcastChannel("vfs-leader-change");
-      bc.postMessage({ type: "leader-changed" });
-      bc.close();
+      const bc2 = new BroadcastChannel("vfs-leader-change");
+      bc2.postMessage({ type: "leader-changed" });
+      bc2.close();
     }).catch((err) => {
       console.warn("[VFS] SW broker unavailable, single-tab only:", err.message);
     });
@@ -1501,11 +1701,13 @@ var VFSFileSystem = class {
   }
   // ---- Watch methods ----
   watch(filePath, options, listener) {
-    return watch();
+    return watch(filePath, options, listener);
   }
   watchFile(filePath, optionsOrListener, listener) {
+    watchFile(this._sync, filePath, optionsOrListener, listener);
   }
   unwatchFile(filePath, listener) {
+    unwatchFile(filePath, listener);
   }
   // ---- Stream methods ----
   createReadStream(filePath, options) {

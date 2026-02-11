@@ -740,7 +740,7 @@ export class VFSFileSystem {
   }
 
   watchFile(filePath: string, optionsOrListener?: WatchFileOptions | WatchFileListener, listener?: WatchFileListener): void {
-    _watchFile(filePath, optionsOrListener, listener);
+    _watchFile(this._sync, filePath, optionsOrListener, listener);
   }
 
   unwatchFile(filePath: string, listener?: WatchFileListener): void {
