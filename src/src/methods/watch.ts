@@ -6,6 +6,7 @@ import * as path from '../path.js';
 // ========== Watcher Registry ==========
 
 interface WatchEntry {
+  ns: string;
   absPath: string;
   recursive: boolean;
   listener: WatchListener;
@@ -13,6 +14,7 @@ interface WatchEntry {
 }
 
 interface WatchFileEntry {
+  ns: string;
   absPath: string;
   listener: WatchFileListener;
   interval: number;
@@ -27,22 +29,23 @@ const watchers = new Set<WatchEntry>();
 // fs.watchFile() entries, keyed by absolute path
 const fileWatchers = new Map<string, Set<WatchFileEntry>>();
 
-// Lazy BroadcastChannel with ref counting
-let bc: BroadcastChannel | null = null;
-let bcRefCount = 0;
+// Lazy BroadcastChannel with ref counting, per namespace
+const bcMap = new Map<string, { bc: BroadcastChannel; refCount: number }>();
 
-function ensureBc(): void {
-  if (bc) { bcRefCount++; return; }
-  bc = new BroadcastChannel('vfs-watch');
-  bcRefCount = 1;
+function ensureBc(ns: string): void {
+  const entry = bcMap.get(ns);
+  if (entry) { entry.refCount++; return; }
+  const bc = new BroadcastChannel(`${ns}-watch`);
+  bcMap.set(ns, { bc, refCount: 1 });
   bc.onmessage = onBroadcast;
 }
 
-function releaseBc(): void {
-  if (--bcRefCount <= 0 && bc) {
-    bc.close();
-    bc = null;
-    bcRefCount = 0;
+function releaseBc(ns: string): void {
+  const entry = bcMap.get(ns);
+  if (!entry) return;
+  if (--entry.refCount <= 0) {
+    entry.bc.close();
+    bcMap.delete(ns);
   }
 }
 
@@ -94,6 +97,7 @@ function matchWatcher(entry: WatchEntry, mutatedPath: string): string | null {
 // ========== fs.watch() ==========
 
 export function watch(
+  ns: string,
   filePath: string,
   options?: WatchOptions | string,
   listener?: WatchListener
@@ -107,20 +111,21 @@ export function watch(
   const signal = opts.signal;
 
   const entry: WatchEntry = {
+    ns,
     absPath,
     recursive: opts.recursive ?? false,
     listener: cb,
     signal,
   };
 
-  ensureBc();
+  ensureBc(ns);
   watchers.add(entry);
 
   // AbortSignal support
   if (signal) {
     const onAbort = () => {
       watchers.delete(entry);
-      releaseBc();
+      releaseBc(ns);
       signal.removeEventListener('abort', onAbort);
     };
     if (signal.aborted) {
@@ -133,7 +138,7 @@ export function watch(
   const watcher: FSWatcher = {
     close() {
       watchers.delete(entry);
-      releaseBc();
+      releaseBc(ns);
     },
     ref() { return watcher; },
     unref() { return watcher; },
@@ -145,6 +150,7 @@ export function watch(
 // ========== fs.watchFile() ==========
 
 export function watchFile(
+  ns: string,
   syncRequest: SyncRequestFn,
   filePath: string,
   optionsOrListener?: WatchFileOptions | WatchFileListener,
@@ -170,6 +176,7 @@ export function watchFile(
   try { prevStats = statSync(syncRequest, absPath); } catch { /* file may not exist */ }
 
   const entry: WatchFileEntry = {
+    ns,
     absPath,
     listener: cb,
     interval,
@@ -178,7 +185,7 @@ export function watchFile(
     timerId: null,
   };
 
-  ensureBc();
+  ensureBc(ns);
   let set = fileWatchers.get(absPath);
   if (!set) {
     set = new Set();
@@ -193,6 +200,7 @@ export function watchFile(
 // ========== fs.unwatchFile() ==========
 
 export function unwatchFile(
+  ns: string,
   filePath: string,
   listener?: WatchFileListener
 ): void {
@@ -205,7 +213,7 @@ export function unwatchFile(
       if (entry.listener === listener) {
         if (entry.timerId !== null) clearInterval(entry.timerId);
         set.delete(entry);
-        releaseBc();
+        releaseBc(ns);
         break;
       }
     }
@@ -213,7 +221,7 @@ export function unwatchFile(
   } else {
     for (const entry of set) {
       if (entry.timerId !== null) clearInterval(entry.timerId);
-      releaseBc();
+      releaseBc(ns);
     }
     fileWatchers.delete(absPath);
   }
@@ -254,6 +262,7 @@ function emptyStats(): Stats {
 // ========== promises.watch() ==========
 
 export async function* watchAsync(
+  ns: string,
   _asyncRequest: AsyncRequestFn,
   filePath: string,
   options?: WatchOptions
@@ -266,6 +275,7 @@ export async function* watchAsync(
   let resolve: (() => void) | null = null;
 
   const entry: WatchEntry = {
+    ns,
     absPath,
     recursive,
     listener: (eventType, filename) => {
@@ -275,7 +285,7 @@ export async function* watchAsync(
     signal,
   };
 
-  ensureBc();
+  ensureBc(ns);
   watchers.add(entry);
 
   try {
@@ -289,6 +299,6 @@ export async function* watchAsync(
     }
   } finally {
     watchers.delete(entry);
-    releaseBc();
+    releaseBc(ns);
   }
 }

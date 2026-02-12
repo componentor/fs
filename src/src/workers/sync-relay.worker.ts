@@ -624,6 +624,7 @@ async function followerLoop(): Promise<void> {
 
 async function initEngine(config: {
   root: string;
+  ns: string;
   opfsSync: boolean;
   opfsSyncRoot?: string;
   uid: number;
@@ -680,7 +681,7 @@ async function initEngine(config: {
   }
 
   // Watch broadcast channel — fires on every VFS mutation for fs.watch() support
-  watchBc = new BroadcastChannel('vfs-watch');
+  watchBc = new BroadcastChannel(`${config.ns}-watch`);
 }
 
 // ========== Watch broadcast (fire-and-forget, after SAB response) ==========

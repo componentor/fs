@@ -509,6 +509,16 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+### v3.0.6 (2026)
+
+**Performance:**
+- Bulk-read inode + path tables during mount — 2 I/O calls instead of 10,000+, dramatically faster initialization for large VFS files
+- All active inodes pre-populated in cache on mount (no cold-read penalty for first operations)
+
+**Fixes:**
+- `.vfs.bin` now auto-shrinks: trailing free blocks are trimmed on every commit, reclaiming disk space when files are deleted
+- Minimum of 1024 data blocks (4MB) retained to avoid excessive re-growth on small create/delete cycles
+
 ### v3.0.5 (2026)
 
 **Fixes:**
@@ -516,6 +526,8 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 - Remove unnecessary `clients.claim()` from the service worker — it only acts as a MessagePort broker and never needs to control pages
 - Namespace leader lock, BroadcastChannel, and SW scope by `root` so multiple `VFSFileSystem` instances with different roots don't collide
 - Add `swScope` config option for custom service worker scope override
+- Singleton registry: multiple `new VFSFileSystem()` calls with the same root return the same instance (no duplicate workers)
+- Namespace `vfs-watch` BroadcastChannel by root so watch events don't leak between different roots
 
 ### v3.0.4 (2026)
 

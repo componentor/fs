@@ -54,6 +54,10 @@ const encoder = new TextEncoder();
 
 // Default SAB size: 2MB
 const DEFAULT_SAB_SIZE = 2 * 1024 * 1024;
+
+// Singleton registry: one VFSFileSystem per root per thread.
+// Prevents duplicate workers, leader lock contention, and SW registration conflicts.
+const instanceRegistry = new Map<string, VFSFileSystem>();
 const HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
 
 // Atomics.wait() is disallowed on the browser main thread.
@@ -93,16 +97,16 @@ export class VFSFileSystem {
   }>();
 
   // Ready promise for async callers
-  private readyPromise: Promise<void>;
+  private readyPromise!: Promise<void>;
   private resolveReady!: () => void;
   private isReady = false;
 
-  // Config
-  private config: Omit<Required<VFSConfig>, 'opfsSyncRoot' | 'swScope'> & { opfsSyncRoot?: string; swScope?: string };
-  private tabId: string;
+  // Config (definite assignment — always set when constructor doesn't return singleton)
+  private config!: Omit<Required<VFSConfig>, 'opfsSyncRoot' | 'swScope'> & { opfsSyncRoot?: string; swScope?: string };
+  private tabId!: string;
   /** Namespace string derived from root — used for lock names, BroadcastChannel, and SW scope
    *  so multiple VFS instances with different roots don't collide. */
-  private ns: string;
+  private ns!: string;
 
   // Service worker registration for multi-tab port transfer
   private swReg: ServiceWorkerRegistration | null = null;
@@ -117,11 +121,18 @@ export class VFSFileSystem {
     this.asyncRequest(op, p, flags, data, path2, fdArgs);
 
   // Promises API namespace
-  readonly promises: VFSPromises;
+  readonly promises!: VFSPromises;
 
   constructor(config: VFSConfig = {}) {
+    const root = config.root ?? '/';
+    const ns = `vfs-${root.replace(/[^a-zA-Z0-9]/g, '_')}`;
+
+    // Singleton: return existing instance for the same root on this thread
+    const existing = instanceRegistry.get(ns);
+    if (existing) return existing;
+
     this.config = {
-      root: config.root ?? '/',
+      root,
       opfsSync: config.opfsSync ?? true,
       opfsSyncRoot: config.opfsSyncRoot,
       uid: config.uid ?? 0,
@@ -134,10 +145,11 @@ export class VFSFileSystem {
     };
 
     this.tabId = crypto.randomUUID();
-    this.ns = `vfs-${this.config.root.replace(/[^a-zA-Z0-9]/g, '_')}`;
+    this.ns = ns;
     this.readyPromise = new Promise(resolve => { this.resolveReady = resolve; });
-    this.promises = new VFSPromises(this._async);
+    this.promises = new VFSPromises(this._async, ns);
 
+    instanceRegistry.set(ns, this);
     this.bootstrap();
   }
 
@@ -261,6 +273,7 @@ export class VFSFileSystem {
       tabId: this.tabId,
       config: {
         root: this.config.root,
+        ns: this.ns,
         opfsSync: this.config.opfsSync,
         opfsSyncRoot: this.config.opfsSyncRoot,
         uid: this.config.uid,
@@ -742,15 +755,15 @@ export class VFSFileSystem {
   // ---- Watch methods ----
 
   watch(filePath: string, options?: WatchOptions | Encoding, listener?: WatchListener): FSWatcher {
-    return _watch(filePath, options, listener);
+    return _watch(this.ns, filePath, options, listener);
   }
 
   watchFile(filePath: string, optionsOrListener?: WatchFileOptions | WatchFileListener, listener?: WatchFileListener): void {
-    _watchFile(this._sync, filePath, optionsOrListener, listener);
+    _watchFile(this.ns, this._sync, filePath, optionsOrListener, listener);
   }
 
   unwatchFile(filePath: string, listener?: WatchFileListener): void {
-    _unwatchFile(filePath, listener);
+    _unwatchFile(this.ns, filePath, listener);
   }
 
   // ---- Stream methods ----
@@ -843,9 +856,11 @@ export class VFSFileSystem {
 
 class VFSPromises {
   private _async: AsyncRequestFn;
+  private _ns: string;
 
-  constructor(asyncRequest: AsyncRequestFn) {
+  constructor(asyncRequest: AsyncRequestFn, ns: string) {
     this._async = asyncRequest;
+    this._ns = ns;
   }
 
   readFile(filePath: string, options?: ReadOptions | Encoding | null) {
@@ -949,7 +964,7 @@ class VFSPromises {
   }
 
   async *watch(filePath: string, options?: WatchOptions): AsyncIterable<WatchEventType> {
-    yield* _watchAsync(this._async, filePath, options);
+    yield* _watchAsync(this._ns, this._async, filePath, options);
   }
 
   async flush(): Promise<void> {

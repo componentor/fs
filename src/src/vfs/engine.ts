@@ -262,6 +262,12 @@ export class VFSEngine {
   }
 
   private commitPending(): void {
+    // Trim trailing free blocks before flushing bitmap/superblock
+    if (this.blocksFreedsinceTrim) {
+      this.trimTrailingBlocks();
+      this.blocksFreedsinceTrim = false;
+    }
+
     if (this.bitmapDirtyHi >= 0) {
       const lo = this.bitmapDirtyLo;
       const hi = this.bitmapDirtyHi;
@@ -275,13 +281,92 @@ export class VFSEngine {
     }
   }
 
-  /** Rebuild in-memory path→inode index from disk */
+  /** Shrink the OPFS file by removing trailing free blocks from the data region.
+   *  Scans bitmap from end to find the last used block, then truncates. */
+  private trimTrailingBlocks(): void {
+    const bitmap = this.bitmap!;
+
+    // Find the last used block by scanning bitmap from the end
+    let lastUsed = -1;
+    for (let byteIdx = Math.ceil(this.totalBlocks / 8) - 1; byteIdx >= 0; byteIdx--) {
+      if (bitmap[byteIdx] !== 0) {
+        // Find highest set bit in this byte
+        for (let bit = 7; bit >= 0; bit--) {
+          const blockIdx = byteIdx * 8 + bit;
+          if (blockIdx < this.totalBlocks && (bitmap[byteIdx] & (1 << bit))) {
+            lastUsed = blockIdx;
+            break;
+          }
+        }
+        break;
+      }
+    }
+
+    const newTotal = Math.max(lastUsed + 1, INITIAL_DATA_BLOCKS);
+    if (newTotal >= this.totalBlocks) return; // nothing to trim
+
+    // Truncate the OPFS file
+    this.handle.truncate(this.dataOffset + newTotal * this.blockSize);
+
+    // Shrink in-memory bitmap
+    const newBitmapSize = Math.ceil(newTotal / 8);
+    this.bitmap = bitmap.slice(0, newBitmapSize);
+
+    // Update counters
+    const trimmed = this.totalBlocks - newTotal;
+    this.freeBlocks -= trimmed; // these free blocks no longer exist
+    this.totalBlocks = newTotal;
+    this.superblockDirty = true;
+
+    // Re-mark entire bitmap dirty so the smaller bitmap is flushed
+    this.bitmapDirtyLo = 0;
+    this.bitmapDirtyHi = newBitmapSize - 1;
+  }
+
+  /** Rebuild in-memory path→inode index from disk.
+   *  Bulk-reads the entire inode table + path table in 2 I/O calls,
+   *  then parses in memory (avoids 10k+ individual reads). */
   private rebuildIndex(): void {
     this.pathIndex.clear();
+    this.inodeCache.clear();
+
+    // Bulk read entire inode table (e.g. 640KB for 10k inodes)
+    const inodeTableSize = this.inodeCount * INODE_SIZE;
+    const inodeBuf = new Uint8Array(inodeTableSize);
+    this.handle.read(inodeBuf, { at: this.inodeTableOffset });
+    const inodeView = new DataView(inodeBuf.buffer);
+
+    // Bulk read used portion of path table
+    const pathBuf = this.pathTableUsed > 0 ? new Uint8Array(this.pathTableUsed) : null;
+    if (pathBuf) {
+      this.handle.read(pathBuf, { at: this.pathTableOffset });
+    }
+
     for (let i = 0; i < this.inodeCount; i++) {
-      const inode = this.readInode(i);
-      if (inode.type === INODE_TYPE.FREE) continue;
-      const path = this.readPath(inode.pathOffset, inode.pathLength);
+      const off = i * INODE_SIZE;
+      const type = inodeView.getUint8(off + INODE.TYPE);
+      if (type === INODE_TYPE.FREE) continue;
+
+      const inode: Inode = {
+        type,
+        pathOffset: inodeView.getUint32(off + INODE.PATH_OFFSET, true),
+        pathLength: inodeView.getUint16(off + INODE.PATH_LENGTH, true),
+        mode: inodeView.getUint32(off + INODE.MODE, true),
+        size: inodeView.getFloat64(off + INODE.SIZE, true),
+        firstBlock: inodeView.getUint32(off + INODE.FIRST_BLOCK, true),
+        blockCount: inodeView.getUint32(off + INODE.BLOCK_COUNT, true),
+        mtime: inodeView.getFloat64(off + INODE.MTIME, true),
+        ctime: inodeView.getFloat64(off + INODE.CTIME, true),
+        atime: inodeView.getFloat64(off + INODE.ATIME, true),
+        uid: inodeView.getUint32(off + INODE.UID, true),
+        gid: inodeView.getUint32(off + INODE.GID, true),
+      };
+      this.inodeCache.set(i, inode);
+
+      // Decode path from in-memory path table buffer (no disk read)
+      const path = pathBuf
+        ? decoder.decode(pathBuf.subarray(inode.pathOffset, inode.pathOffset + inode.pathLength))
+        : this.readPath(inode.pathOffset, inode.pathLength);
       this.pathIndex.set(path, i);
     }
   }
@@ -473,6 +558,8 @@ export class VFSEngine {
     return start;
   }
 
+  private blocksFreedsinceTrim = false;
+
   private freeBlockRange(start: number, count: number): void {
     if (count === 0) return;
     const bitmap = this.bitmap!;
@@ -486,6 +573,7 @@ export class VFSEngine {
     this.markBitmapDirty(start >>> 3, (start + count - 1) >>> 3);
     this.freeBlocks += count;
     this.superblockDirty = true;
+    this.blocksFreedsinceTrim = true;
   }
 
   // updateSuperblockFreeBlocks is no longer needed — superblock writes are coalesced via commitPending()

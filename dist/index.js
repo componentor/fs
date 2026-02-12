@@ -1038,22 +1038,23 @@ function format(obj) {
 // src/methods/watch.ts
 var watchers = /* @__PURE__ */ new Set();
 var fileWatchers = /* @__PURE__ */ new Map();
-var bc = null;
-var bcRefCount = 0;
-function ensureBc() {
-  if (bc) {
-    bcRefCount++;
+var bcMap = /* @__PURE__ */ new Map();
+function ensureBc(ns) {
+  const entry = bcMap.get(ns);
+  if (entry) {
+    entry.refCount++;
     return;
   }
-  bc = new BroadcastChannel("vfs-watch");
-  bcRefCount = 1;
+  const bc = new BroadcastChannel(`${ns}-watch`);
+  bcMap.set(ns, { bc, refCount: 1 });
   bc.onmessage = onBroadcast;
 }
-function releaseBc() {
-  if (--bcRefCount <= 0 && bc) {
-    bc.close();
-    bc = null;
-    bcRefCount = 0;
+function releaseBc(ns) {
+  const entry = bcMap.get(ns);
+  if (!entry) return;
+  if (--entry.refCount <= 0) {
+    entry.bc.close();
+    bcMap.delete(ns);
   }
 }
 function onBroadcast(event) {
@@ -1086,24 +1087,25 @@ function matchWatcher(entry, mutatedPath) {
   if (recursive) return relativePath;
   return relativePath.indexOf("/") === -1 ? relativePath : null;
 }
-function watch(filePath, options, listener) {
+function watch(ns, filePath, options, listener) {
   const opts = typeof options === "string" ? { } : options ?? {};
   const cb = listener ?? (() => {
   });
   const absPath = resolve(filePath);
   const signal = opts.signal;
   const entry = {
+    ns,
     absPath,
     recursive: opts.recursive ?? false,
     listener: cb,
     signal
   };
-  ensureBc();
+  ensureBc(ns);
   watchers.add(entry);
   if (signal) {
     const onAbort = () => {
       watchers.delete(entry);
-      releaseBc();
+      releaseBc(ns);
       signal.removeEventListener("abort", onAbort);
     };
     if (signal.aborted) {
@@ -1115,7 +1117,7 @@ function watch(filePath, options, listener) {
   const watcher = {
     close() {
       watchers.delete(entry);
-      releaseBc();
+      releaseBc(ns);
     },
     ref() {
       return watcher;
@@ -1126,7 +1128,7 @@ function watch(filePath, options, listener) {
   };
   return watcher;
 }
-function watchFile(syncRequest, filePath, optionsOrListener, listener) {
+function watchFile(ns, syncRequest, filePath, optionsOrListener, listener) {
   let opts;
   let cb;
   if (typeof optionsOrListener === "function") {
@@ -1145,6 +1147,7 @@ function watchFile(syncRequest, filePath, optionsOrListener, listener) {
   } catch {
   }
   const entry = {
+    ns,
     absPath,
     listener: cb,
     interval,
@@ -1152,7 +1155,7 @@ function watchFile(syncRequest, filePath, optionsOrListener, listener) {
     syncRequest,
     timerId: null
   };
-  ensureBc();
+  ensureBc(ns);
   let set = fileWatchers.get(absPath);
   if (!set) {
     set = /* @__PURE__ */ new Set();
@@ -1161,7 +1164,7 @@ function watchFile(syncRequest, filePath, optionsOrListener, listener) {
   set.add(entry);
   entry.timerId = setInterval(() => triggerWatchFile(entry), interval);
 }
-function unwatchFile(filePath, listener) {
+function unwatchFile(ns, filePath, listener) {
   const absPath = resolve(filePath);
   const set = fileWatchers.get(absPath);
   if (!set) return;
@@ -1170,7 +1173,7 @@ function unwatchFile(filePath, listener) {
       if (entry.listener === listener) {
         if (entry.timerId !== null) clearInterval(entry.timerId);
         set.delete(entry);
-        releaseBc();
+        releaseBc(ns);
         break;
       }
     }
@@ -1178,7 +1181,7 @@ function unwatchFile(filePath, listener) {
   } else {
     for (const entry of set) {
       if (entry.timerId !== null) clearInterval(entry.timerId);
-      releaseBc();
+      releaseBc(ns);
     }
     fileWatchers.delete(absPath);
   }
@@ -1229,13 +1232,14 @@ function emptyStats() {
     birthtime: zero
   };
 }
-async function* watchAsync(_asyncRequest, filePath, options) {
+async function* watchAsync(ns, _asyncRequest, filePath, options) {
   const absPath = resolve(filePath);
   const recursive = options?.recursive ?? false;
   const signal = options?.signal;
   const queue = [];
   let resolve2 = null;
   const entry = {
+    ns,
     absPath,
     recursive,
     listener: (eventType, filename) => {
@@ -1247,7 +1251,7 @@ async function* watchAsync(_asyncRequest, filePath, options) {
     },
     signal
   };
-  ensureBc();
+  ensureBc(ns);
   watchers.add(entry);
   try {
     while (!signal?.aborted) {
@@ -1262,13 +1266,14 @@ async function* watchAsync(_asyncRequest, filePath, options) {
     }
   } finally {
     watchers.delete(entry);
-    releaseBc();
+    releaseBc(ns);
   }
 }
 
 // src/filesystem.ts
 var encoder9 = new TextEncoder();
 var DEFAULT_SAB_SIZE = 2 * 1024 * 1024;
+var instanceRegistry = /* @__PURE__ */ new Map();
 var HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
 var _canAtomicsWait = typeof globalThis.WorkerGlobalScope !== "undefined";
 function spinWait(arr, index, value) {
@@ -1299,7 +1304,7 @@ var VFSFileSystem = class {
   readyPromise;
   resolveReady;
   isReady = false;
-  // Config
+  // Config (definite assignment — always set when constructor doesn't return singleton)
   config;
   tabId;
   /** Namespace string derived from root — used for lock names, BroadcastChannel, and SW scope
@@ -1317,8 +1322,12 @@ var VFSFileSystem = class {
   // Promises API namespace
   promises;
   constructor(config = {}) {
+    const root = config.root ?? "/";
+    const ns = `vfs-${root.replace(/[^a-zA-Z0-9]/g, "_")}`;
+    const existing = instanceRegistry.get(ns);
+    if (existing) return existing;
     this.config = {
-      root: config.root ?? "/",
+      root,
       opfsSync: config.opfsSync ?? true,
       opfsSyncRoot: config.opfsSyncRoot,
       uid: config.uid ?? 0,
@@ -1330,11 +1339,12 @@ var VFSFileSystem = class {
       swScope: config.swScope
     };
     this.tabId = crypto.randomUUID();
-    this.ns = `vfs-${this.config.root.replace(/[^a-zA-Z0-9]/g, "_")}`;
+    this.ns = ns;
     this.readyPromise = new Promise((resolve2) => {
       this.resolveReady = resolve2;
     });
-    this.promises = new VFSPromises(this._async);
+    this.promises = new VFSPromises(this._async, ns);
+    instanceRegistry.set(ns, this);
     this.bootstrap();
   }
   /** Spawn workers and establish communication */
@@ -1438,6 +1448,7 @@ var VFSFileSystem = class {
       tabId: this.tabId,
       config: {
         root: this.config.root,
+        ns: this.ns,
         opfsSync: this.config.opfsSync,
         opfsSyncRoot: this.config.opfsSyncRoot,
         uid: this.config.uid,
@@ -1536,9 +1547,9 @@ var VFSFileSystem = class {
         }
       };
       mc.port1.start();
-      const bc2 = new BroadcastChannel(`${this.ns}-leader-change`);
-      bc2.postMessage({ type: "leader-changed" });
-      bc2.close();
+      const bc = new BroadcastChannel(`${this.ns}-leader-change`);
+      bc.postMessage({ type: "leader-changed" });
+      bc.close();
     }).catch((err) => {
       console.warn("[VFS] SW broker unavailable, single-tab only:", err.message);
     });
@@ -1804,13 +1815,13 @@ var VFSFileSystem = class {
   }
   // ---- Watch methods ----
   watch(filePath, options, listener) {
-    return watch(filePath, options, listener);
+    return watch(this.ns, filePath, options, listener);
   }
   watchFile(filePath, optionsOrListener, listener) {
-    watchFile(this._sync, filePath, optionsOrListener, listener);
+    watchFile(this.ns, this._sync, filePath, optionsOrListener, listener);
   }
   unwatchFile(filePath, listener) {
-    unwatchFile(filePath, listener);
+    unwatchFile(this.ns, filePath, listener);
   }
   // ---- Stream methods ----
   createReadStream(filePath, options) {
@@ -1881,8 +1892,10 @@ var VFSFileSystem = class {
 };
 var VFSPromises = class {
   _async;
-  constructor(asyncRequest) {
+  _ns;
+  constructor(asyncRequest, ns) {
     this._async = asyncRequest;
+    this._ns = ns;
   }
   readFile(filePath, options) {
     return readFile(this._async, filePath, options);
@@ -1960,7 +1973,7 @@ var VFSPromises = class {
     return mkdtemp(this._async, prefix);
   }
   async *watch(filePath, options) {
-    yield* watchAsync(this._async, filePath, options);
+    yield* watchAsync(this._ns, this._async, filePath, options);
   }
   async flush() {
     await this._async(OP.FSYNC, "");
@@ -2148,6 +2161,10 @@ var VFSEngine = class {
     if (hi > this.bitmapDirtyHi) this.bitmapDirtyHi = hi;
   }
   commitPending() {
+    if (this.blocksFreedsinceTrim) {
+      this.trimTrailingBlocks();
+      this.blocksFreedsinceTrim = false;
+    }
     if (this.bitmapDirtyHi >= 0) {
       const lo = this.bitmapDirtyLo;
       const hi = this.bitmapDirtyHi;
@@ -2160,13 +2177,69 @@ var VFSEngine = class {
       this.superblockDirty = false;
     }
   }
-  /** Rebuild in-memory path→inode index from disk */
+  /** Shrink the OPFS file by removing trailing free blocks from the data region.
+   *  Scans bitmap from end to find the last used block, then truncates. */
+  trimTrailingBlocks() {
+    const bitmap = this.bitmap;
+    let lastUsed = -1;
+    for (let byteIdx = Math.ceil(this.totalBlocks / 8) - 1; byteIdx >= 0; byteIdx--) {
+      if (bitmap[byteIdx] !== 0) {
+        for (let bit = 7; bit >= 0; bit--) {
+          const blockIdx = byteIdx * 8 + bit;
+          if (blockIdx < this.totalBlocks && bitmap[byteIdx] & 1 << bit) {
+            lastUsed = blockIdx;
+            break;
+          }
+        }
+        break;
+      }
+    }
+    const newTotal = Math.max(lastUsed + 1, INITIAL_DATA_BLOCKS);
+    if (newTotal >= this.totalBlocks) return;
+    this.handle.truncate(this.dataOffset + newTotal * this.blockSize);
+    const newBitmapSize = Math.ceil(newTotal / 8);
+    this.bitmap = bitmap.slice(0, newBitmapSize);
+    const trimmed = this.totalBlocks - newTotal;
+    this.freeBlocks -= trimmed;
+    this.totalBlocks = newTotal;
+    this.superblockDirty = true;
+    this.bitmapDirtyLo = 0;
+    this.bitmapDirtyHi = newBitmapSize - 1;
+  }
+  /** Rebuild in-memory path→inode index from disk.
+   *  Bulk-reads the entire inode table + path table in 2 I/O calls,
+   *  then parses in memory (avoids 10k+ individual reads). */
   rebuildIndex() {
     this.pathIndex.clear();
+    this.inodeCache.clear();
+    const inodeTableSize = this.inodeCount * INODE_SIZE;
+    const inodeBuf = new Uint8Array(inodeTableSize);
+    this.handle.read(inodeBuf, { at: this.inodeTableOffset });
+    const inodeView = new DataView(inodeBuf.buffer);
+    const pathBuf = this.pathTableUsed > 0 ? new Uint8Array(this.pathTableUsed) : null;
+    if (pathBuf) {
+      this.handle.read(pathBuf, { at: this.pathTableOffset });
+    }
     for (let i = 0; i < this.inodeCount; i++) {
-      const inode = this.readInode(i);
-      if (inode.type === INODE_TYPE.FREE) continue;
-      const path = this.readPath(inode.pathOffset, inode.pathLength);
+      const off = i * INODE_SIZE;
+      const type = inodeView.getUint8(off + INODE.TYPE);
+      if (type === INODE_TYPE.FREE) continue;
+      const inode = {
+        type,
+        pathOffset: inodeView.getUint32(off + INODE.PATH_OFFSET, true),
+        pathLength: inodeView.getUint16(off + INODE.PATH_LENGTH, true),
+        mode: inodeView.getUint32(off + INODE.MODE, true),
+        size: inodeView.getFloat64(off + INODE.SIZE, true),
+        firstBlock: inodeView.getUint32(off + INODE.FIRST_BLOCK, true),
+        blockCount: inodeView.getUint32(off + INODE.BLOCK_COUNT, true),
+        mtime: inodeView.getFloat64(off + INODE.MTIME, true),
+        ctime: inodeView.getFloat64(off + INODE.CTIME, true),
+        atime: inodeView.getFloat64(off + INODE.ATIME, true),
+        uid: inodeView.getUint32(off + INODE.UID, true),
+        gid: inodeView.getUint32(off + INODE.GID, true)
+      };
+      this.inodeCache.set(i, inode);
+      const path = pathBuf ? decoder8.decode(pathBuf.subarray(inode.pathOffset, inode.pathOffset + inode.pathLength)) : this.readPath(inode.pathOffset, inode.pathLength);
       this.pathIndex.set(path, i);
     }
   }
@@ -2307,6 +2380,7 @@ var VFSEngine = class {
     this.superblockDirty = true;
     return start;
   }
+  blocksFreedsinceTrim = false;
   freeBlockRange(start, count) {
     if (count === 0) return;
     const bitmap = this.bitmap;
@@ -2318,6 +2392,7 @@ var VFSEngine = class {
     this.markBitmapDirty(start >>> 3, start + count - 1 >>> 3);
     this.freeBlocks += count;
     this.superblockDirty = true;
+    this.blocksFreedsinceTrim = true;
   }
   // updateSuperblockFreeBlocks is no longer needed — superblock writes are coalesced via commitPending()
   // ========== Inode allocation ==========
