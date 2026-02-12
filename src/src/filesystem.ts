@@ -98,8 +98,11 @@ export class VFSFileSystem {
   private isReady = false;
 
   // Config
-  private config: Omit<Required<VFSConfig>, 'opfsSyncRoot'> & { opfsSyncRoot?: string };
+  private config: Omit<Required<VFSConfig>, 'opfsSyncRoot' | 'swScope'> & { opfsSyncRoot?: string; swScope?: string };
   private tabId: string;
+  /** Namespace string derived from root — used for lock names, BroadcastChannel, and SW scope
+   *  so multiple VFS instances with different roots don't collide. */
+  private ns: string;
 
   // Service worker registration for multi-tab port transfer
   private swReg: ServiceWorkerRegistration | null = null;
@@ -127,9 +130,11 @@ export class VFSFileSystem {
       strictPermissions: config.strictPermissions ?? false,
       sabSize: config.sabSize ?? DEFAULT_SAB_SIZE,
       debug: config.debug ?? false,
+      swScope: config.swScope,
     };
 
     this.tabId = crypto.randomUUID();
+    this.ns = `vfs-${this.config.root.replace(/[^a-zA-Z0-9]/g, '_')}`;
     this.readyPromise = new Promise(resolve => { this.resolveReady = resolve; });
     this.promises = new VFSPromises(this._async);
 
@@ -221,7 +226,7 @@ export class VFSFileSystem {
     // Chrome can invoke the ifAvailable callback twice (once with lock, once
     // with null). The `decided` flag ensures only the first invocation acts.
     let decided = false;
-    navigator.locks.request('vfs-leader', { ifAvailable: true }, async (lock) => {
+    navigator.locks.request(`${this.ns}-leader`, { ifAvailable: true }, async (lock) => {
       if (decided) return;
       decided = true;
       if (lock) {
@@ -238,7 +243,7 @@ export class VFSFileSystem {
   /** Queue for leader takeover when the current leader's lock is released */
   private waitForLeaderLock(): void {
     if (!('locks' in navigator)) return;
-    navigator.locks.request('vfs-leader', async () => {
+    navigator.locks.request(`${this.ns}-leader`, async () => {
       console.log('[VFS] Leader lock acquired — promoting to leader');
       this.holdingLeaderLock = true;
       this.promoteToLeader();
@@ -290,7 +295,7 @@ export class VFSFileSystem {
     this.connectToLeader();
 
     // Listen for leader changes (BroadcastChannel is scope-independent, unlike SW clients API)
-    this.leaderChangeBc = new BroadcastChannel('vfs-leader-change');
+    this.leaderChangeBc = new BroadcastChannel(`${this.ns}-leader-change`);
     this.leaderChangeBc.onmessage = () => {
       if (this.isFollower) {
         console.log('[VFS] Leader changed — reconnecting');
@@ -323,7 +328,8 @@ export class VFSFileSystem {
   private async getServiceWorker(): Promise<ServiceWorker> {
     if (!this.swReg) {
       const swUrl = new URL('./workers/service.worker.js', import.meta.url);
-      this.swReg = await navigator.serviceWorker.register(swUrl.href, { type: 'module' });
+      const scope = this.config.swScope ?? new URL(`./${this.ns}/`, swUrl).href;
+      this.swReg = await navigator.serviceWorker.register(swUrl.href, { type: 'module', scope });
     }
     const reg = this.swReg;
 
@@ -375,7 +381,7 @@ export class VFSFileSystem {
       mc.port1.start();
 
       // Notify followers that a (new) leader is available — they should reconnect
-      const bc = new BroadcastChannel('vfs-leader-change');
+      const bc = new BroadcastChannel(`${this.ns}-leader-change`);
       bc.postMessage({ type: 'leader-changed' });
       bc.close();
     }).catch(err => {

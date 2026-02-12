@@ -5,8 +5,7 @@ var pending = [];
 sw.addEventListener("install", () => {
   sw.skipWaiting();
 });
-sw.addEventListener("activate", (event) => {
-  event.waitUntil(sw.clients.claim());
+sw.addEventListener("activate", () => {
 });
 sw.addEventListener("message", (event) => {
   const msg = event.data;

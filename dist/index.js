@@ -1302,6 +1302,9 @@ var VFSFileSystem = class {
   // Config
   config;
   tabId;
+  /** Namespace string derived from root — used for lock names, BroadcastChannel, and SW scope
+   *  so multiple VFS instances with different roots don't collide. */
+  ns;
   // Service worker registration for multi-tab port transfer
   swReg = null;
   isFollower = false;
@@ -1323,9 +1326,11 @@ var VFSFileSystem = class {
       umask: config.umask ?? 18,
       strictPermissions: config.strictPermissions ?? false,
       sabSize: config.sabSize ?? DEFAULT_SAB_SIZE,
-      debug: config.debug ?? false
+      debug: config.debug ?? false,
+      swScope: config.swScope
     };
     this.tabId = crypto.randomUUID();
+    this.ns = `vfs-${this.config.root.replace(/[^a-zA-Z0-9]/g, "_")}`;
     this.readyPromise = new Promise((resolve2) => {
       this.resolveReady = resolve2;
     });
@@ -1398,7 +1403,7 @@ var VFSFileSystem = class {
       return;
     }
     let decided = false;
-    navigator.locks.request("vfs-leader", { ifAvailable: true }, async (lock) => {
+    navigator.locks.request(`${this.ns}-leader`, { ifAvailable: true }, async (lock) => {
       if (decided) return;
       decided = true;
       if (lock) {
@@ -1415,7 +1420,7 @@ var VFSFileSystem = class {
   /** Queue for leader takeover when the current leader's lock is released */
   waitForLeaderLock() {
     if (!("locks" in navigator)) return;
-    navigator.locks.request("vfs-leader", async () => {
+    navigator.locks.request(`${this.ns}-leader`, async () => {
       console.log("[VFS] Leader lock acquired \u2014 promoting to leader");
       this.holdingLeaderLock = true;
       this.promoteToLeader();
@@ -1459,7 +1464,7 @@ var VFSFileSystem = class {
       tabId: this.tabId
     });
     this.connectToLeader();
-    this.leaderChangeBc = new BroadcastChannel("vfs-leader-change");
+    this.leaderChangeBc = new BroadcastChannel(`${this.ns}-leader-change`);
     this.leaderChangeBc.onmessage = () => {
       if (this.isFollower) {
         console.log("[VFS] Leader changed \u2014 reconnecting");
@@ -1485,7 +1490,8 @@ var VFSFileSystem = class {
   async getServiceWorker() {
     if (!this.swReg) {
       const swUrl = new URL("./workers/service.worker.js", import.meta.url);
-      this.swReg = await navigator.serviceWorker.register(swUrl.href, { type: "module" });
+      const scope = this.config.swScope ?? new URL(`./${this.ns}/`, swUrl).href;
+      this.swReg = await navigator.serviceWorker.register(swUrl.href, { type: "module", scope });
     }
     const reg = this.swReg;
     if (reg.active) return reg.active;
@@ -1530,7 +1536,7 @@ var VFSFileSystem = class {
         }
       };
       mc.port1.start();
-      const bc2 = new BroadcastChannel("vfs-leader-change");
+      const bc2 = new BroadcastChannel(`${this.ns}-leader-change`);
       bc2.postMessage({ type: "leader-changed" });
       bc2.close();
     }).catch((err) => {

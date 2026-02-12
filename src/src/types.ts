@@ -162,4 +162,8 @@ export interface VFSConfig {
   strictPermissions?: boolean;
   sabSize?: number;
   debug?: boolean;
+  /** Scope for the internal service worker registration. Defaults to
+   *  `'./opfs-fs-sw/'` (relative to the SW script URL) so it won't collide
+   *  with the host application's service worker. */
+  swScope?: string;
 }

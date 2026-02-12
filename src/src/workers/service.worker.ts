@@ -24,8 +24,10 @@ sw.addEventListener('install', () => {
   sw.skipWaiting();
 });
 
-sw.addEventListener('activate', (event: ExtendableEvent) => {
-  event.waitUntil(sw.clients.claim());
+sw.addEventListener('activate', () => {
+  // No clients.claim() — this SW is a port broker only, it does not need to
+  // control any pages. Claiming clients could interfere with the host app's
+  // own service worker.
 });
 
 sw.addEventListener('message', (event: ExtendableMessageEvent) => {

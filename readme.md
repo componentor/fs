@@ -82,6 +82,7 @@ const fs = new VFSFileSystem({
   strictPermissions: false, // Enforce Unix permissions (default: false)
   sabSize: 4194304,       // SharedArrayBuffer size in bytes (default: 4MB)
   debug: false,           // Enable debug logging (default: false)
+  swScope: undefined,     // Custom service worker scope (default: auto-scoped per root)
 });
 ```
 
@@ -507,6 +508,14 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 `FileSystemObserver` requires Chrome 129+. The VFS instance must be running (observer is set up during init). Changes to files outside the configured `root` directory won't be detected.
 
 ## Changelog
+
+### v3.0.5 (2026)
+
+**Fixes:**
+- Scope the internal service worker by default so it won't collide with the host application's own service worker
+- Remove unnecessary `clients.claim()` from the service worker — it only acts as a MessagePort broker and never needs to control pages
+- Namespace leader lock, BroadcastChannel, and SW scope by `root` so multiple `VFSFileSystem` instances with different roots don't collide
+- Add `swScope` config option for custom service worker scope override
 
 ### v3.0.4 (2026)
 
