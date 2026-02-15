@@ -81,12 +81,15 @@ function matchWatcher(entry: WatchEntry, mutatedPath: string): string | null {
     return path.basename(mutatedPath);
   }
 
-  // Check if mutatedPath is inside absPath (directory watching)
-  if (!mutatedPath.startsWith(absPath) || mutatedPath.charAt(absPath.length) !== '/') {
+  // Build the prefix that child paths must start with.
+  // For root '/', prefix stays '/' — every absolute path is inside root.
+  // For '/foo', prefix becomes '/foo/' — prevents matching '/foobar/x'.
+  const prefix = absPath.endsWith('/') ? absPath : absPath + '/';
+  if (!mutatedPath.startsWith(prefix)) {
     return null;
   }
 
-  const relativePath = mutatedPath.substring(absPath.length + 1);
+  const relativePath = mutatedPath.substring(prefix.length);
 
   if (recursive) return relativePath;
 

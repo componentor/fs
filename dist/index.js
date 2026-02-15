@@ -1080,10 +1080,11 @@ function matchWatcher(entry, mutatedPath) {
   if (mutatedPath === absPath) {
     return basename(mutatedPath);
   }
-  if (!mutatedPath.startsWith(absPath) || mutatedPath.charAt(absPath.length) !== "/") {
+  const prefix = absPath.endsWith("/") ? absPath : absPath + "/";
+  if (!mutatedPath.startsWith(prefix)) {
     return null;
   }
-  const relativePath = mutatedPath.substring(absPath.length + 1);
+  const relativePath = mutatedPath.substring(prefix.length);
   if (recursive) return relativePath;
   return relativePath.indexOf("/") === -1 ? relativePath : null;
 }

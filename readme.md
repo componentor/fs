@@ -509,6 +509,11 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+### v3.0.7 (2026)
+
+**Fixes:**
+- Fix `fs.watch()` path matching for root `/` watchers — watching `/` now correctly matches all child paths instead of missing them due to an off-by-one boundary check
+
 ### v3.0.6 (2026)
 
 **Performance:**
