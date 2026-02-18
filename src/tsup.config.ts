@@ -8,6 +8,7 @@ export default defineConfig([
     outDir: '../dist',
     format: ['esm'],
     outExtension: jsExtension,
+    dts: true,
     splitting: false,
     sourcemap: true,
     treeshake: true,

@@ -570,6 +570,11 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+### v3.0.11 (2026)
+
+**Fixes:**
+- Emit TypeScript declaration files (`dts: true` in tsup config)
+
 ### v3.0.10 (2026)
 
 **New: Three filesystem modes (`hybrid`, `vfs`, `opfs`)**
