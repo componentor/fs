@@ -12,7 +12,7 @@
 
 import type {
   Encoding, ReadOptions, WriteOptions, MkdirOptions, RmdirOptions, RmOptions,
-  ReaddirOptions, Stats, Dirent, VFSConfig,
+  ReaddirOptions, Stats, Dirent, VFSConfig, FSMode,
   WatchOptions, WatchFileOptions, WatchEventType, FSWatcher, WatchListener, WatchFileListener,
   ReadStreamOptions, WriteStreamOptions,
 } from './types.js';
@@ -99,11 +99,16 @@ export class VFSFileSystem {
   // Ready promise for async callers
   private readyPromise!: Promise<void>;
   private resolveReady!: () => void;
+  private rejectReady!: (err: Error) => void;
+  private initError: Error | null = null;
   private isReady = false;
 
+
   // Config (definite assignment — always set when constructor doesn't return singleton)
-  private config!: Omit<Required<VFSConfig>, 'opfsSyncRoot' | 'swScope'> & { opfsSyncRoot?: string; swScope?: string };
+  private config!: Omit<Required<VFSConfig>, 'opfsSyncRoot' | 'swScope' | 'mode'> & { opfsSyncRoot?: string; swScope?: string };
   private tabId!: string;
+  private _mode!: FSMode;
+  private corruptionError: Error | null = null;
   /** Namespace string derived from root — used for lock names, BroadcastChannel, and SW scope
    *  so multiple VFS instances with different roots don't collide. */
   private ns!: string;
@@ -131,9 +136,16 @@ export class VFSFileSystem {
     const existing = instanceRegistry.get(ns);
     if (existing) return existing;
 
+    // Resolve mode: explicit mode takes priority, else derive from opfsSync
+    const mode: FSMode = config.mode ?? 'hybrid';
+    this._mode = mode;
+
+    // Derive opfsSync from mode unless explicitly set
+    const opfsSync = config.opfsSync ?? (mode === 'hybrid');
+
     this.config = {
       root,
-      opfsSync: config.opfsSync ?? true,
+      opfsSync,
       opfsSyncRoot: config.opfsSyncRoot,
       uid: config.uid ?? 0,
       gid: config.gid ?? 0,
@@ -146,7 +158,10 @@ export class VFSFileSystem {
 
     this.tabId = crypto.randomUUID();
     this.ns = ns;
-    this.readyPromise = new Promise(resolve => { this.resolveReady = resolve; });
+    this.readyPromise = new Promise<void>((resolve, reject) => {
+      this.resolveReady = resolve;
+      this.rejectReady = reject;
+    });
     this.promises = new VFSPromises(this._async, ns);
 
     instanceRegistry.set(ns, this);
@@ -180,7 +195,9 @@ export class VFSFileSystem {
           this.initLeaderBroker();
         }
       } else if (msg.type === 'init-failed') {
-        if (this.holdingLeaderLock) {
+        if (msg.error?.startsWith('Corrupt VFS:')) {
+          this.handleCorruptVFS(msg.error);
+        } else if (this.holdingLeaderLock) {
           // We hold the lock but OPFS handle not released yet — retry
           setTimeout(() => this.sendLeaderInit(), 500);
         } else if (!('locks' in navigator)) {
@@ -285,10 +302,56 @@ export class VFSFileSystem {
     });
   }
 
+  /** Send init-opfs message to sync-relay for OPFS-direct mode */
+  private sendOPFSInit(): void {
+    this.syncWorker.postMessage({
+      type: 'init-opfs',
+      sab: this.hasSAB ? this.sab : null,
+      readySab: this.hasSAB ? this.readySab : null,
+      asyncSab: this.hasSAB ? this.asyncSab : null,
+      tabId: this.tabId,
+      config: {
+        root: this.config.root,
+        ns: this.ns,
+        uid: this.config.uid,
+        gid: this.config.gid,
+        debug: this.config.debug,
+      },
+    });
+  }
+
+  /** Handle VFS corruption: log error, fall back to OPFS-direct mode.
+   *  The readyPromise will resolve once OPFS mode is ready, but init()
+   *  will reject with the corruption error to inform the caller. */
+  private handleCorruptVFS(errorMessage: string): void {
+    const err = new Error(`${errorMessage} — Falling back to OPFS mode`);
+    this.corruptionError = err;
+    console.error(`[VFS] ${err.message}`);
+
+    if (this._mode === 'vfs') {
+      // VFS-only mode: no OPFS files to fall back to — reject permanently
+      this.initError = err;
+      this.rejectReady(err);
+      if (this.hasSAB) {
+        Atomics.store(this.readySignal, 0, -1);
+        Atomics.notify(this.readySignal, 0);
+      }
+      return;
+    }
+
+    // Hybrid/default: fall back to OPFS-direct mode
+    this._mode = 'opfs';
+    this.sendOPFSInit();
+  }
+
   /** Start as leader — tell sync-relay to init VFS engine + OPFS handle */
   private startAsLeader(): void {
     this.isFollower = false;
-    this.sendLeaderInit();
+    if (this._mode === 'opfs') {
+      this.sendOPFSInit();
+    } else {
+      this.sendLeaderInit();
+    }
   }
 
   /** Start as follower — connect to leader via service worker port brokering */
@@ -415,7 +478,10 @@ export class VFSFileSystem {
     }
 
     // Reset readyPromise for async callers during transition
-    this.readyPromise = new Promise(resolve => { this.resolveReady = resolve; });
+    this.readyPromise = new Promise<void>((resolve, reject) => {
+      this.resolveReady = resolve;
+      this.rejectReady = reject;
+    });
 
     // Terminate old workers
     this.syncWorker.terminate();
@@ -443,9 +509,13 @@ export class VFSFileSystem {
         this.resolveReady();
         this.initLeaderBroker();
       } else if (msg.type === 'init-failed') {
-        // OPFS handle not yet released by dead leader — retry
-        console.warn('[VFS] Promotion: OPFS handle still busy, retrying...');
-        setTimeout(() => this.sendLeaderInit(), 500);
+        if (msg.error?.startsWith('Corrupt VFS:')) {
+          this.handleCorruptVFS(msg.error);
+        } else {
+          // OPFS handle not yet released by dead leader — retry
+          console.warn('[VFS] Promotion: OPFS handle still busy, retrying...');
+          setTimeout(() => this.sendLeaderInit(), 500);
+        }
       }
     };
 
@@ -480,7 +550,11 @@ export class VFSFileSystem {
         [mc.port2],
       );
     }
-    this.sendLeaderInit();
+    if (this._mode === 'opfs') {
+      this.sendOPFSInit();
+    } else {
+      this.sendLeaderInit();
+    }
   }
 
   /** Spawn an inline worker from bundled code */
@@ -496,16 +570,27 @@ export class VFSFileSystem {
   /** Block until workers are ready */
   private ensureReady(): void {
     if (this.isReady) return;
+    if (this.initError) throw this.initError;
     if (!this.hasSAB) {
       throw new Error('Sync API requires crossOriginIsolated (COOP/COEP headers). Use the promises API instead.');
     }
     // Check if ready signal is set
-    if (Atomics.load(this.readySignal, 0) === 1) {
+    const signal = Atomics.load(this.readySignal, 0);
+    if (signal === 1) {
       this.isReady = true;
       return;
     }
+    if (signal === -1) {
+      // Permanent failure (e.g. VFS corruption in vfs-only mode)
+      throw this.initError ?? new Error('VFS initialization failed');
+    }
     // Block until ready
     spinWait(this.readySignal, 0, 0);
+    // Check again after wake — could be ready (1) or failed (-1)
+    const finalSignal = Atomics.load(this.readySignal, 0);
+    if (finalSignal === -1) {
+      throw this.initError ?? new Error('VFS initialization failed');
+    }
     this.isReady = true;
   }
 
@@ -846,8 +931,116 @@ export class VFSFileSystem {
     // No-op — VFS doesn't have external caches to purge
   }
 
-  /** Async init helper — avoid blocking main thread */
+  /** The current filesystem mode. Changes to 'opfs' on corruption fallback. */
+  get mode(): FSMode {
+    return this._mode;
+  }
+
+  /** Async init helper — avoid blocking main thread.
+   *  Rejects with corruption error if VFS was corrupt (but system falls back to OPFS mode).
+   *  Callers can catch and continue — the fs API works in OPFS mode after rejection. */
   init(): Promise<void> {
+    return this.readyPromise.then(() => {
+      if (this.corruptionError) {
+        throw this.corruptionError;
+      }
+    });
+  }
+
+  /** Switch the filesystem mode at runtime.
+   *
+   *  Typical flow for IDE corruption recovery:
+   *  1. `await fs.init()` throws with corruption error (auto-falls back to opfs)
+   *  2. IDE shows warning, user clicks "Repair" → call `repairVFS(root, fs)`
+   *  3. After repair: `await fs.setMode('hybrid')` to resume normal VFS+OPFS mode
+   *
+   *  Returns a Promise that resolves when the new mode is ready. */
+  async setMode(newMode: FSMode): Promise<void> {
+    if (newMode === this._mode && this.isReady && !this.corruptionError) {
+      return; // Already in this mode and healthy
+    }
+
+    this._mode = newMode;
+    this.corruptionError = null;
+    this.initError = null;
+    this.isReady = false;
+    this.config.opfsSync = newMode === 'hybrid';
+
+    // Reset readyPromise
+    this.readyPromise = new Promise<void>((resolve, reject) => {
+      this.resolveReady = resolve;
+      this.rejectReady = reject;
+    });
+
+    // Terminate old workers and spawn fresh ones
+    this.syncWorker.terminate();
+    this.asyncWorker.terminate();
+
+    const sabSize = this.config.sabSize;
+    if (this.hasSAB) {
+      this.sab = new SharedArrayBuffer(sabSize);
+      this.readySab = new SharedArrayBuffer(4);
+      this.asyncSab = new SharedArrayBuffer(sabSize);
+      this.ctrl = new Int32Array(this.sab, 0, 8);
+      this.readySignal = new Int32Array(this.readySab, 0, 1);
+    }
+
+    this.syncWorker = this.spawnWorker('sync-relay');
+    this.asyncWorker = this.spawnWorker('async-relay');
+
+    // Handle sync-relay messages
+    this.syncWorker.onmessage = (e: MessageEvent) => {
+      const msg = e.data;
+      if (msg.type === 'ready') {
+        this.isReady = true;
+        this.resolveReady();
+        if (!this.isFollower) {
+          this.initLeaderBroker();
+        }
+      } else if (msg.type === 'init-failed') {
+        if (msg.error?.startsWith('Corrupt VFS:')) {
+          this.handleCorruptVFS(msg.error);
+        } else if (this.holdingLeaderLock) {
+          setTimeout(() => this.sendLeaderInit(), 500);
+        }
+      }
+    };
+
+    this.asyncWorker.onmessage = (e: MessageEvent) => {
+      const msg = e.data;
+      if (msg.type === 'response') {
+        const pending = this.asyncPending.get(msg.callId);
+        if (pending) {
+          this.asyncPending.delete(msg.callId);
+          pending.resolve({ status: msg.status, data: msg.data });
+        }
+      }
+    };
+
+    if (this.hasSAB) {
+      this.asyncWorker.postMessage({
+        type: 'init-leader',
+        asyncSab: this.asyncSab,
+        wakeSab: this.sab,
+      });
+    } else {
+      const mc = new MessageChannel();
+      this.asyncWorker.postMessage(
+        { type: 'init-port', port: mc.port1 },
+        [mc.port1],
+      );
+      this.syncWorker.postMessage(
+        { type: 'async-port', port: mc.port2 },
+        [mc.port2],
+      );
+    }
+
+    if (newMode === 'opfs') {
+      this.sendOPFSInit();
+    } else {
+      this.sendLeaderInit();
+    }
+
     return this.readyPromise;
   }
 }

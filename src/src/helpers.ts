@@ -11,16 +11,12 @@
  * the exclusive sync handle on .vfs.bin. This allows these functions to work
  * from the main thread while the VFS is running.
  *
- * When `fs` is NOT provided, falls back to direct .vfs.bin access via
- * VFSEngine (requires the VFS to be stopped first, or a Worker context).
+ * When `fs` is NOT provided, spawns a repair worker that uses
+ * createSyncAccessHandle for direct disk I/O (no RAM bloat).
  */
 
 import { VFSEngine } from './vfs/engine.js';
-import {
-  VFS_MAGIC, VFS_VERSION, SUPERBLOCK, INODE, INODE_SIZE, INODE_TYPE,
-  DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS,
-  INITIAL_PATH_TABLE_SIZE, calculateLayout,
-} from './vfs/layout.js';
+import { INODE_TYPE } from './vfs/layout.js';
 
 /**
  * Minimal FS interface accepted by the helper functions.
@@ -118,26 +114,6 @@ async function openVFSHandle(
     const data = await file.arrayBuffer();
     return { handle: new MemoryHandle(data), isMemory: true };
   }
-}
-
-async function openFreshVFSHandle(
-  fileHandle: FileSystemFileHandle
-): Promise<{ handle: any; isMemory: boolean }> {
-  try {
-    const handle = await (fileHandle as any).createSyncAccessHandle();
-    return { handle, isMemory: false };
-  } catch {
-    return { handle: new MemoryHandle(), isMemory: true };
-  }
-}
-
-async function saveMemoryHandle(
-  fileHandle: FileSystemFileHandle,
-  memHandle: MemoryHandle
-): Promise<void> {
-  const writable = await (fileHandle as any).createWritable();
-  await writable.write(memHandle.getBuffer());
-  await writable.close();
 }
 
 // ========== OPFS Navigation Helpers ==========
@@ -396,52 +372,20 @@ export async function loadFromOPFS(root: string = '/', fs?: FsLike): Promise<Loa
     return { files, directories };
   }
 
-  // Direct VFSEngine path (VFS not running)
-  try {
-    await rootDir.removeEntry('.vfs.bin');
-  } catch (_) {}
-
-  const vfsFileHandle = await rootDir.getFileHandle('.vfs.bin', { create: true });
-  const { handle, isMemory } = await openFreshVFSHandle(vfsFileHandle);
-
-  try {
-    const engine = new VFSEngine();
-    engine.init(handle);
-
-    const dirs = opfsEntries
-      .filter(e => e.type === 'directory')
-      .sort((a, b) => a.path.localeCompare(b.path));
-
-    let files = 0;
-    let directories = 0;
-
-    for (const dir of dirs) {
-      engine.mkdir(dir.path, 0o040755);
-      directories++;
-    }
-
-    const fileEntries = opfsEntries.filter(e => e.type === 'file');
-    for (const file of fileEntries) {
-      engine.write(file.path, new Uint8Array(file.data!));
-      files++;
-    }
-
-    engine.flush();
-
-    if (isMemory) {
-      await saveMemoryHandle(vfsFileHandle, handle as MemoryHandle);
-    }
-
-    return { files, directories };
-  } finally {
-    handle.close();
-  }
+  // Delegate to repair worker (uses createSyncAccessHandle for disk I/O)
+  return spawnRepairWorker<LoadResult>({ type: 'load', root });
 }
 
 export interface RepairResult {
   recovered: number;
   lost: number;
-  entries: Array<{ path: string; type: 'file' | 'directory' | 'symlink'; size: number }>;
+  entries: Array<{
+    path: string;
+    type: 'file' | 'directory' | 'symlink';
+    size: number;
+    /** true when the inode was found but data blocks were out of bounds (content lost) */
+    contentLost?: boolean;
+  }>;
 }
 
 /**
@@ -470,182 +414,35 @@ export async function repairVFS(root: string = '/', fs?: FsLike): Promise<Repair
     };
   }
 
-  // Raw .vfs.bin repair (VFS not running — init failed)
-  return repairVFSRaw(root);
+  // Raw .vfs.bin repair via worker (uses createSyncAccessHandle for disk I/O)
+  return spawnRepairWorker<RepairResult>({ type: 'repair', root });
 }
 
+// ========== Repair Worker Delegation ==========
+
 /**
- * Raw .vfs.bin repair — scan inode table for valid entries, create fresh VFS.
- * Only used when VFS failed to initialize (no running instance available).
+ * Spawn the repair worker and await its result.
+ * The worker uses createSyncAccessHandle for direct disk I/O —
+ * no MemoryHandle, works from main thread, follower tabs, and workers.
  */
-async function repairVFSRaw(root: string): Promise<RepairResult> {
-  const rootDir = await navigateToRoot(root);
-
-  const vfsFileHandle = await rootDir.getFileHandle('.vfs.bin');
-  const file = await vfsFileHandle.getFile();
-  const raw = new Uint8Array(await file.arrayBuffer());
-  const fileSize = raw.byteLength;
-
-  if (fileSize < SUPERBLOCK.SIZE) {
-    throw new Error(`VFS file too small to repair (${fileSize} bytes)`);
-  }
-
-  const view = new DataView(raw.buffer);
-
-  let inodeCount: number;
-  let blockSize: number;
-  let totalBlocks: number;
-  let inodeTableOffset: number;
-  let pathTableOffset: number;
-  let bitmapOffset: number;
-  let dataOffset: number;
-  let pathTableUsed: number;
-
-  const magic = view.getUint32(SUPERBLOCK.MAGIC, true);
-  const version = view.getUint32(SUPERBLOCK.VERSION, true);
-  const superblockValid = magic === VFS_MAGIC && version === VFS_VERSION;
-
-  if (superblockValid) {
-    inodeCount = view.getUint32(SUPERBLOCK.INODE_COUNT, true);
-    blockSize = view.getUint32(SUPERBLOCK.BLOCK_SIZE, true);
-    totalBlocks = view.getUint32(SUPERBLOCK.TOTAL_BLOCKS, true);
-    inodeTableOffset = view.getFloat64(SUPERBLOCK.INODE_OFFSET, true);
-    pathTableOffset = view.getFloat64(SUPERBLOCK.PATH_OFFSET, true);
-    bitmapOffset = view.getFloat64(SUPERBLOCK.BITMAP_OFFSET, true);
-    dataOffset = view.getFloat64(SUPERBLOCK.DATA_OFFSET, true);
-    pathTableUsed = view.getUint32(SUPERBLOCK.PATH_USED, true);
-
-    if (blockSize === 0 || (blockSize & (blockSize - 1)) !== 0 || inodeCount === 0 ||
-        inodeTableOffset >= fileSize || pathTableOffset >= fileSize || dataOffset >= fileSize) {
-      const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
-      inodeCount = DEFAULT_INODE_COUNT;
-      blockSize = DEFAULT_BLOCK_SIZE;
-      totalBlocks = INITIAL_DATA_BLOCKS;
-      inodeTableOffset = layout.inodeTableOffset;
-      pathTableOffset = layout.pathTableOffset;
-      bitmapOffset = layout.bitmapOffset;
-      dataOffset = layout.dataOffset;
-      pathTableUsed = INITIAL_PATH_TABLE_SIZE;
-    }
-  } else {
-    const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
-    inodeCount = DEFAULT_INODE_COUNT;
-    blockSize = DEFAULT_BLOCK_SIZE;
-    totalBlocks = INITIAL_DATA_BLOCKS;
-    inodeTableOffset = layout.inodeTableOffset;
-    pathTableOffset = layout.pathTableOffset;
-    bitmapOffset = layout.bitmapOffset;
-    dataOffset = layout.dataOffset;
-    pathTableUsed = INITIAL_PATH_TABLE_SIZE;
-  }
-
-  const decoder = new TextDecoder();
-  const recovered: Array<{ path: string; type: number; data: Uint8Array }> = [];
-  let lost = 0;
-
-  const maxInodes = Math.min(inodeCount, Math.floor((fileSize - inodeTableOffset) / INODE_SIZE));
-
-  for (let i = 0; i < maxInodes; i++) {
-    const off = inodeTableOffset + i * INODE_SIZE;
-    if (off + INODE_SIZE > fileSize) break;
-
-    const type = raw[off + INODE.TYPE];
-    if (type < INODE_TYPE.FILE || type > INODE_TYPE.SYMLINK) continue;
-
-    const inodeView = new DataView(raw.buffer, off, INODE_SIZE);
-    const pathOffset = inodeView.getUint32(INODE.PATH_OFFSET, true);
-    const pathLength = inodeView.getUint16(INODE.PATH_LENGTH, true);
-    const size = inodeView.getFloat64(INODE.SIZE, true);
-    const firstBlock = inodeView.getUint32(INODE.FIRST_BLOCK, true);
-    const blockCount = inodeView.getUint32(INODE.BLOCK_COUNT, true);
-
-    const absPathOffset = pathTableOffset + pathOffset;
-    if (pathLength === 0 || pathLength > 4096 || absPathOffset + pathLength > fileSize) {
-      lost++;
-      continue;
-    }
-
-    let path: string;
-    try {
-      path = decoder.decode(raw.subarray(absPathOffset, absPathOffset + pathLength));
-    } catch {
-      lost++;
-      continue;
-    }
-
-    if (!path.startsWith('/') || path.includes('\0')) {
-      lost++;
-      continue;
-    }
-
-    if (type === INODE_TYPE.DIRECTORY) {
-      recovered.push({ path, type, data: new Uint8Array(0) });
-      continue;
-    }
-
-    if (size < 0 || size > fileSize || !isFinite(size)) {
-      lost++;
-      continue;
-    }
-
-    const dataStart = dataOffset + firstBlock * blockSize;
-    if (dataStart + size > fileSize || firstBlock >= totalBlocks) {
-      recovered.push({ path, type, data: new Uint8Array(0) });
-      lost++;
-      continue;
-    }
-
-    const data = raw.slice(dataStart, dataStart + size);
-    recovered.push({ path, type, data });
-  }
-
-  await rootDir.removeEntry('.vfs.bin');
-
-  const newFileHandle = await rootDir.getFileHandle('.vfs.bin', { create: true });
-  const { handle, isMemory } = await openFreshVFSHandle(newFileHandle);
-
-  try {
-    const engine = new VFSEngine();
-    engine.init(handle);
-
-    const dirs = recovered
-      .filter(e => e.type === INODE_TYPE.DIRECTORY && e.path !== '/')
-      .sort((a, b) => a.path.localeCompare(b.path));
-    const files = recovered.filter(e => e.type === INODE_TYPE.FILE);
-    const symlinks = recovered.filter(e => e.type === INODE_TYPE.SYMLINK);
-
-    for (const dir of dirs) {
-      const result = engine.mkdir(dir.path, 0o040755);
-      if (result.status !== 0) lost++;
-    }
-
-    for (const file of files) {
-      const result = engine.write(file.path, file.data);
-      if (result.status !== 0) lost++;
-    }
-
-    for (const sym of symlinks) {
-      const target = decoder.decode(sym.data);
-      const result = engine.symlink(target, sym.path);
-      if (result.status !== 0) lost++;
-    }
-
-    engine.flush();
-
-    if (isMemory) {
-      await saveMemoryHandle(newFileHandle, handle as MemoryHandle);
-    }
-  } finally {
-    handle.close();
-  }
-
-  const entries = recovered
-    .filter(e => e.path !== '/')
-    .map(e => ({
-      path: e.path,
-      type: (e.type === INODE_TYPE.FILE ? 'file' : e.type === INODE_TYPE.DIRECTORY ? 'directory' : 'symlink') as 'file' | 'directory' | 'symlink',
-      size: e.data.byteLength,
-    }));
-
-  return { recovered: entries.length, lost, entries };
+function spawnRepairWorker<T>(msg: Record<string, unknown>): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker(
+      new URL('./workers/repair.worker.js', import.meta.url),
+      { type: 'module' },
+    );
+    worker.onmessage = (event: MessageEvent) => {
+      worker.terminate();
+      if (event.data.error) {
+        reject(new Error(event.data.error));
+      } else {
+        resolve(event.data as T);
+      }
+    };
+    worker.onerror = (event) => {
+      worker.terminate();
+      reject(new Error(event.message || 'Repair worker failed'));
+    };
+    worker.postMessage(msg);
+  });
 }

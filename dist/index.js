@@ -1304,10 +1304,14 @@ var VFSFileSystem = class {
   // Ready promise for async callers
   readyPromise;
   resolveReady;
+  rejectReady;
+  initError = null;
   isReady = false;
   // Config (definite assignment — always set when constructor doesn't return singleton)
   config;
   tabId;
+  _mode;
+  corruptionError = null;
   /** Namespace string derived from root — used for lock names, BroadcastChannel, and SW scope
    *  so multiple VFS instances with different roots don't collide. */
   ns;
@@ -1327,9 +1331,12 @@ var VFSFileSystem = class {
     const ns = `vfs-${root.replace(/[^a-zA-Z0-9]/g, "_")}`;
     const existing = instanceRegistry.get(ns);
     if (existing) return existing;
+    const mode = config.mode ?? "hybrid";
+    this._mode = mode;
+    const opfsSync = config.opfsSync ?? mode === "hybrid";
     this.config = {
       root,
-      opfsSync: config.opfsSync ?? true,
+      opfsSync,
       opfsSyncRoot: config.opfsSyncRoot,
       uid: config.uid ?? 0,
       gid: config.gid ?? 0,
@@ -1341,8 +1348,9 @@ var VFSFileSystem = class {
     };
     this.tabId = crypto.randomUUID();
     this.ns = ns;
-    this.readyPromise = new Promise((resolve2) => {
+    this.readyPromise = new Promise((resolve2, reject) => {
       this.resolveReady = resolve2;
+      this.rejectReady = reject;
     });
     this.promises = new VFSPromises(this._async, ns);
     instanceRegistry.set(ns, this);
@@ -1369,7 +1377,9 @@ var VFSFileSystem = class {
           this.initLeaderBroker();
         }
       } else if (msg.type === "init-failed") {
-        if (this.holdingLeaderLock) {
+        if (msg.error?.startsWith("Corrupt VFS:")) {
+          this.handleCorruptVFS(msg.error);
+        } else if (this.holdingLeaderLock) {
           setTimeout(() => this.sendLeaderInit(), 500);
         } else if (!("locks" in navigator)) {
           this.startAsFollower();
@@ -1460,10 +1470,50 @@ var VFSFileSystem = class {
       }
     });
   }
+  /** Send init-opfs message to sync-relay for OPFS-direct mode */
+  sendOPFSInit() {
+    this.syncWorker.postMessage({
+      type: "init-opfs",
+      sab: this.hasSAB ? this.sab : null,
+      readySab: this.hasSAB ? this.readySab : null,
+      asyncSab: this.hasSAB ? this.asyncSab : null,
+      tabId: this.tabId,
+      config: {
+        root: this.config.root,
+        ns: this.ns,
+        uid: this.config.uid,
+        gid: this.config.gid,
+        debug: this.config.debug
+      }
+    });
+  }
+  /** Handle VFS corruption: log error, fall back to OPFS-direct mode.
+   *  The readyPromise will resolve once OPFS mode is ready, but init()
+   *  will reject with the corruption error to inform the caller. */
+  handleCorruptVFS(errorMessage) {
+    const err = new Error(`${errorMessage} \u2014 Falling back to OPFS mode`);
+    this.corruptionError = err;
+    console.error(`[VFS] ${err.message}`);
+    if (this._mode === "vfs") {
+      this.initError = err;
+      this.rejectReady(err);
+      if (this.hasSAB) {
+        Atomics.store(this.readySignal, 0, -1);
+        Atomics.notify(this.readySignal, 0);
+      }
+      return;
+    }
+    this._mode = "opfs";
+    this.sendOPFSInit();
+  }
   /** Start as leader — tell sync-relay to init VFS engine + OPFS handle */
   startAsLeader() {
     this.isFollower = false;
-    this.sendLeaderInit();
+    if (this._mode === "opfs") {
+      this.sendOPFSInit();
+    } else {
+      this.sendLeaderInit();
+    }
   }
   /** Start as follower — connect to leader via service worker port brokering */
   startAsFollower() {
@@ -1564,8 +1614,9 @@ var VFSFileSystem = class {
       this.leaderChangeBc.close();
       this.leaderChangeBc = null;
     }
-    this.readyPromise = new Promise((resolve2) => {
+    this.readyPromise = new Promise((resolve2, reject) => {
       this.resolveReady = resolve2;
+      this.rejectReady = reject;
     });
     this.syncWorker.terminate();
     this.asyncWorker.terminate();
@@ -1586,8 +1637,12 @@ var VFSFileSystem = class {
         this.resolveReady();
         this.initLeaderBroker();
       } else if (msg.type === "init-failed") {
-        console.warn("[VFS] Promotion: OPFS handle still busy, retrying...");
-        setTimeout(() => this.sendLeaderInit(), 500);
+        if (msg.error?.startsWith("Corrupt VFS:")) {
+          this.handleCorruptVFS(msg.error);
+        } else {
+          console.warn("[VFS] Promotion: OPFS handle still busy, retrying...");
+          setTimeout(() => this.sendLeaderInit(), 500);
+        }
       }
     };
     this.asyncWorker.onmessage = (e) => {
@@ -1617,7 +1672,11 @@ var VFSFileSystem = class {
         [mc.port2]
       );
     }
-    this.sendLeaderInit();
+    if (this._mode === "opfs") {
+      this.sendOPFSInit();
+    } else {
+      this.sendLeaderInit();
+    }
   }
   /** Spawn an inline worker from bundled code */
   spawnWorker(name) {
@@ -1628,14 +1687,23 @@ var VFSFileSystem = class {
   /** Block until workers are ready */
   ensureReady() {
     if (this.isReady) return;
+    if (this.initError) throw this.initError;
     if (!this.hasSAB) {
       throw new Error("Sync API requires crossOriginIsolated (COOP/COEP headers). Use the promises API instead.");
     }
-    if (Atomics.load(this.readySignal, 0) === 1) {
+    const signal = Atomics.load(this.readySignal, 0);
+    if (signal === 1) {
       this.isReady = true;
       return;
     }
+    if (signal === -1) {
+      throw this.initError ?? new Error("VFS initialization failed");
+    }
     spinWait(this.readySignal, 0, 0);
+    const finalSignal = Atomics.load(this.readySignal, 0);
+    if (finalSignal === -1) {
+      throw this.initError ?? new Error("VFS initialization failed");
+    }
     this.isReady = true;
   }
   /** Send a sync request via SAB and wait for response */
@@ -1886,8 +1954,101 @@ var VFSFileSystem = class {
   }
   purgeSync() {
   }
-  /** Async init helper — avoid blocking main thread */
+  /** The current filesystem mode. Changes to 'opfs' on corruption fallback. */
+  get mode() {
+    return this._mode;
+  }
+  /** Async init helper — avoid blocking main thread.
+   *  Rejects with corruption error if VFS was corrupt (but system falls back to OPFS mode).
+   *  Callers can catch and continue — the fs API works in OPFS mode after rejection. */
   init() {
+    return this.readyPromise.then(() => {
+      if (this.corruptionError) {
+        throw this.corruptionError;
+      }
+    });
+  }
+  /** Switch the filesystem mode at runtime.
+   *
+   *  Typical flow for IDE corruption recovery:
+   *  1. `await fs.init()` throws with corruption error (auto-falls back to opfs)
+   *  2. IDE shows warning, user clicks "Repair" → call `repairVFS(root, fs)`
+   *  3. After repair: `await fs.setMode('hybrid')` to resume normal VFS+OPFS mode
+   *
+   *  Returns a Promise that resolves when the new mode is ready. */
+  async setMode(newMode) {
+    if (newMode === this._mode && this.isReady && !this.corruptionError) {
+      return;
+    }
+    this._mode = newMode;
+    this.corruptionError = null;
+    this.initError = null;
+    this.isReady = false;
+    this.config.opfsSync = newMode === "hybrid";
+    this.readyPromise = new Promise((resolve2, reject) => {
+      this.resolveReady = resolve2;
+      this.rejectReady = reject;
+    });
+    this.syncWorker.terminate();
+    this.asyncWorker.terminate();
+    const sabSize = this.config.sabSize;
+    if (this.hasSAB) {
+      this.sab = new SharedArrayBuffer(sabSize);
+      this.readySab = new SharedArrayBuffer(4);
+      this.asyncSab = new SharedArrayBuffer(sabSize);
+      this.ctrl = new Int32Array(this.sab, 0, 8);
+      this.readySignal = new Int32Array(this.readySab, 0, 1);
+    }
+    this.syncWorker = this.spawnWorker("sync-relay");
+    this.asyncWorker = this.spawnWorker("async-relay");
+    this.syncWorker.onmessage = (e) => {
+      const msg = e.data;
+      if (msg.type === "ready") {
+        this.isReady = true;
+        this.resolveReady();
+        if (!this.isFollower) {
+          this.initLeaderBroker();
+        }
+      } else if (msg.type === "init-failed") {
+        if (msg.error?.startsWith("Corrupt VFS:")) {
+          this.handleCorruptVFS(msg.error);
+        } else if (this.holdingLeaderLock) {
+          setTimeout(() => this.sendLeaderInit(), 500);
+        }
+      }
+    };
+    this.asyncWorker.onmessage = (e) => {
+      const msg = e.data;
+      if (msg.type === "response") {
+        const pending = this.asyncPending.get(msg.callId);
+        if (pending) {
+          this.asyncPending.delete(msg.callId);
+          pending.resolve({ status: msg.status, data: msg.data });
+        }
+      }
+    };
+    if (this.hasSAB) {
+      this.asyncWorker.postMessage({
+        type: "init-leader",
+        asyncSab: this.asyncSab,
+        wakeSab: this.sab
+      });
+    } else {
+      const mc = new MessageChannel();
+      this.asyncWorker.postMessage(
+        { type: "init-port", port: mc.port1 },
+        [mc.port1]
+      );
+      this.syncWorker.postMessage(
+        { type: "async-port", port: mc.port2 },
+        [mc.port2]
+      );
+    }
+    if (newMode === "opfs") {
+      this.sendOPFSInit();
+    } else {
+      this.sendLeaderInit();
+    }
     return this.readyPromise;
   }
 };
@@ -2066,6 +2227,7 @@ var VFSEngine = class {
     this.bitmap = new Uint8Array(layout.bitmapSize);
     this.handle.write(this.bitmap, { at: this.bitmapOffset });
     this.createInode("/", INODE_TYPE.DIRECTORY, DEFAULT_DIR_MODE, 0);
+    this.writeSuperblock();
     this.handle.flush();
   }
   /** Mount an existing VFS from disk — validates superblock integrity */
@@ -2225,14 +2387,33 @@ var VFSEngine = class {
       const off = i * INODE_SIZE;
       const type = inodeView.getUint8(off + INODE.TYPE);
       if (type === INODE_TYPE.FREE) continue;
+      if (type < INODE_TYPE.FILE || type > INODE_TYPE.SYMLINK) {
+        throw new Error(`Corrupt VFS: inode ${i} has invalid type ${type}`);
+      }
+      const pathOffset = inodeView.getUint32(off + INODE.PATH_OFFSET, true);
+      const pathLength = inodeView.getUint16(off + INODE.PATH_LENGTH, true);
+      const size = inodeView.getFloat64(off + INODE.SIZE, true);
+      const firstBlock = inodeView.getUint32(off + INODE.FIRST_BLOCK, true);
+      const blockCount = inodeView.getUint32(off + INODE.BLOCK_COUNT, true);
+      if (pathLength === 0 || pathOffset + pathLength > this.pathTableUsed) {
+        throw new Error(`Corrupt VFS: inode ${i} path out of bounds (offset=${pathOffset}, len=${pathLength}, tableUsed=${this.pathTableUsed})`);
+      }
+      if (type !== INODE_TYPE.DIRECTORY) {
+        if (size < 0 || !isFinite(size)) {
+          throw new Error(`Corrupt VFS: inode ${i} has invalid size ${size}`);
+        }
+        if (blockCount > 0 && firstBlock + blockCount > this.totalBlocks) {
+          throw new Error(`Corrupt VFS: inode ${i} data blocks out of range (first=${firstBlock}, count=${blockCount}, total=${this.totalBlocks})`);
+        }
+      }
       const inode = {
         type,
-        pathOffset: inodeView.getUint32(off + INODE.PATH_OFFSET, true),
-        pathLength: inodeView.getUint16(off + INODE.PATH_LENGTH, true),
+        pathOffset,
+        pathLength,
         mode: inodeView.getUint32(off + INODE.MODE, true),
-        size: inodeView.getFloat64(off + INODE.SIZE, true),
-        firstBlock: inodeView.getUint32(off + INODE.FIRST_BLOCK, true),
-        blockCount: inodeView.getUint32(off + INODE.BLOCK_COUNT, true),
+        size,
+        firstBlock,
+        blockCount,
         mtime: inodeView.getFloat64(off + INODE.MTIME, true),
         ctime: inodeView.getFloat64(off + INODE.CTIME, true),
         atime: inodeView.getFloat64(off + INODE.ATIME, true),
@@ -2240,7 +2421,15 @@ var VFSEngine = class {
         gid: inodeView.getUint32(off + INODE.GID, true)
       };
       this.inodeCache.set(i, inode);
-      const path = pathBuf ? decoder8.decode(pathBuf.subarray(inode.pathOffset, inode.pathOffset + inode.pathLength)) : this.readPath(inode.pathOffset, inode.pathLength);
+      let path;
+      if (pathBuf) {
+        path = decoder8.decode(pathBuf.subarray(inode.pathOffset, inode.pathOffset + inode.pathLength));
+      } else {
+        path = this.readPath(inode.pathOffset, inode.pathLength);
+      }
+      if (!path.startsWith("/") || path.includes("\0")) {
+        throw new Error(`Corrupt VFS: inode ${i} has invalid path "${path.substring(0, 50)}"`);
+      }
       this.pathIndex.set(path, i);
     }
   }
@@ -3303,19 +3492,6 @@ async function openVFSHandle(fileHandle) {
     return { handle: new MemoryHandle(data), isMemory: true };
   }
 }
-async function openFreshVFSHandle(fileHandle) {
-  try {
-    const handle = await fileHandle.createSyncAccessHandle();
-    return { handle, isMemory: false };
-  } catch {
-    return { handle: new MemoryHandle(), isMemory: true };
-  }
-}
-async function saveMemoryHandle(fileHandle, memHandle) {
-  const writable = await fileHandle.createWritable();
-  await writable.write(memHandle.getBuffer());
-  await writable.close();
-}
 async function navigateToRoot(root) {
   let dir = await navigator.storage.getDirectory();
   if (root && root !== "/") {
@@ -3500,35 +3676,7 @@ async function loadFromOPFS(root = "/", fs) {
     }
     return { files, directories };
   }
-  try {
-    await rootDir.removeEntry(".vfs.bin");
-  } catch (_) {
-  }
-  const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin", { create: true });
-  const { handle, isMemory } = await openFreshVFSHandle(vfsFileHandle);
-  try {
-    const engine = new VFSEngine();
-    engine.init(handle);
-    const dirs = opfsEntries.filter((e) => e.type === "directory").sort((a, b) => a.path.localeCompare(b.path));
-    let files = 0;
-    let directories = 0;
-    for (const dir of dirs) {
-      engine.mkdir(dir.path, 16877);
-      directories++;
-    }
-    const fileEntries = opfsEntries.filter((e) => e.type === "file");
-    for (const file of fileEntries) {
-      engine.write(file.path, new Uint8Array(file.data));
-      files++;
-    }
-    engine.flush();
-    if (isMemory) {
-      await saveMemoryHandle(vfsFileHandle, handle);
-    }
-    return { files, directories };
-  } finally {
-    handle.close();
-  }
+  return spawnRepairWorker({ type: "load", root });
 }
 async function repairVFS(root = "/", fs) {
   if (fs) {
@@ -3542,137 +3690,28 @@ async function repairVFS(root = "/", fs) {
       // Detailed entries not available in fs-based path
     };
   }
-  return repairVFSRaw(root);
+  return spawnRepairWorker({ type: "repair", root });
 }
-async function repairVFSRaw(root) {
-  const rootDir = await navigateToRoot(root);
-  const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin");
-  const file = await vfsFileHandle.getFile();
-  const raw = new Uint8Array(await file.arrayBuffer());
-  const fileSize = raw.byteLength;
-  if (fileSize < SUPERBLOCK.SIZE) {
-    throw new Error(`VFS file too small to repair (${fileSize} bytes)`);
-  }
-  const view = new DataView(raw.buffer);
-  let inodeCount;
-  let blockSize;
-  let totalBlocks;
-  let inodeTableOffset;
-  let pathTableOffset;
-  let dataOffset;
-  const magic = view.getUint32(SUPERBLOCK.MAGIC, true);
-  const version = view.getUint32(SUPERBLOCK.VERSION, true);
-  const superblockValid = magic === VFS_MAGIC && version === VFS_VERSION;
-  if (superblockValid) {
-    inodeCount = view.getUint32(SUPERBLOCK.INODE_COUNT, true);
-    blockSize = view.getUint32(SUPERBLOCK.BLOCK_SIZE, true);
-    totalBlocks = view.getUint32(SUPERBLOCK.TOTAL_BLOCKS, true);
-    inodeTableOffset = view.getFloat64(SUPERBLOCK.INODE_OFFSET, true);
-    pathTableOffset = view.getFloat64(SUPERBLOCK.PATH_OFFSET, true);
-    view.getFloat64(SUPERBLOCK.BITMAP_OFFSET, true);
-    dataOffset = view.getFloat64(SUPERBLOCK.DATA_OFFSET, true);
-    view.getUint32(SUPERBLOCK.PATH_USED, true);
-    if (blockSize === 0 || (blockSize & blockSize - 1) !== 0 || inodeCount === 0 || inodeTableOffset >= fileSize || pathTableOffset >= fileSize || dataOffset >= fileSize) {
-      const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
-      inodeCount = DEFAULT_INODE_COUNT;
-      blockSize = DEFAULT_BLOCK_SIZE;
-      totalBlocks = INITIAL_DATA_BLOCKS;
-      inodeTableOffset = layout.inodeTableOffset;
-      pathTableOffset = layout.pathTableOffset;
-      dataOffset = layout.dataOffset;
-    }
-  } else {
-    const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
-    inodeCount = DEFAULT_INODE_COUNT;
-    blockSize = DEFAULT_BLOCK_SIZE;
-    totalBlocks = INITIAL_DATA_BLOCKS;
-    inodeTableOffset = layout.inodeTableOffset;
-    pathTableOffset = layout.pathTableOffset;
-    dataOffset = layout.dataOffset;
-  }
-  const decoder9 = new TextDecoder();
-  const recovered = [];
-  let lost = 0;
-  const maxInodes = Math.min(inodeCount, Math.floor((fileSize - inodeTableOffset) / INODE_SIZE));
-  for (let i = 0; i < maxInodes; i++) {
-    const off = inodeTableOffset + i * INODE_SIZE;
-    if (off + INODE_SIZE > fileSize) break;
-    const type = raw[off + INODE.TYPE];
-    if (type < INODE_TYPE.FILE || type > INODE_TYPE.SYMLINK) continue;
-    const inodeView = new DataView(raw.buffer, off, INODE_SIZE);
-    const pathOffset = inodeView.getUint32(INODE.PATH_OFFSET, true);
-    const pathLength = inodeView.getUint16(INODE.PATH_LENGTH, true);
-    const size = inodeView.getFloat64(INODE.SIZE, true);
-    const firstBlock = inodeView.getUint32(INODE.FIRST_BLOCK, true);
-    inodeView.getUint32(INODE.BLOCK_COUNT, true);
-    const absPathOffset = pathTableOffset + pathOffset;
-    if (pathLength === 0 || pathLength > 4096 || absPathOffset + pathLength > fileSize) {
-      lost++;
-      continue;
-    }
-    let path;
-    try {
-      path = decoder9.decode(raw.subarray(absPathOffset, absPathOffset + pathLength));
-    } catch {
-      lost++;
-      continue;
-    }
-    if (!path.startsWith("/") || path.includes("\0")) {
-      lost++;
-      continue;
-    }
-    if (type === INODE_TYPE.DIRECTORY) {
-      recovered.push({ path, type, data: new Uint8Array(0) });
-      continue;
-    }
-    if (size < 0 || size > fileSize || !isFinite(size)) {
-      lost++;
-      continue;
-    }
-    const dataStart = dataOffset + firstBlock * blockSize;
-    if (dataStart + size > fileSize || firstBlock >= totalBlocks) {
-      recovered.push({ path, type, data: new Uint8Array(0) });
-      lost++;
-      continue;
-    }
-    const data = raw.slice(dataStart, dataStart + size);
-    recovered.push({ path, type, data });
-  }
-  await rootDir.removeEntry(".vfs.bin");
-  const newFileHandle = await rootDir.getFileHandle(".vfs.bin", { create: true });
-  const { handle, isMemory } = await openFreshVFSHandle(newFileHandle);
-  try {
-    const engine = new VFSEngine();
-    engine.init(handle);
-    const dirs = recovered.filter((e) => e.type === INODE_TYPE.DIRECTORY && e.path !== "/").sort((a, b) => a.path.localeCompare(b.path));
-    const files = recovered.filter((e) => e.type === INODE_TYPE.FILE);
-    const symlinks = recovered.filter((e) => e.type === INODE_TYPE.SYMLINK);
-    for (const dir of dirs) {
-      const result = engine.mkdir(dir.path, 16877);
-      if (result.status !== 0) lost++;
-    }
-    for (const file2 of files) {
-      const result = engine.write(file2.path, file2.data);
-      if (result.status !== 0) lost++;
-    }
-    for (const sym of symlinks) {
-      const target = decoder9.decode(sym.data);
-      const result = engine.symlink(target, sym.path);
-      if (result.status !== 0) lost++;
-    }
-    engine.flush();
-    if (isMemory) {
-      await saveMemoryHandle(newFileHandle, handle);
-    }
-  } finally {
-    handle.close();
-  }
-  const entries = recovered.filter((e) => e.path !== "/").map((e) => ({
-    path: e.path,
-    type: e.type === INODE_TYPE.FILE ? "file" : e.type === INODE_TYPE.DIRECTORY ? "directory" : "symlink",
-    size: e.data.byteLength
-  }));
-  return { recovered: entries.length, lost, entries };
+function spawnRepairWorker(msg) {
+  return new Promise((resolve2, reject) => {
+    const worker = new Worker(
+      new URL("./workers/repair.worker.js", import.meta.url),
+      { type: "module" }
+    );
+    worker.onmessage = (event) => {
+      worker.terminate();
+      if (event.data.error) {
+        reject(new Error(event.data.error));
+      } else {
+        resolve2(event.data);
+      }
+    };
+    worker.onerror = (event) => {
+      worker.terminate();
+      reject(new Error(event.message || "Repair worker failed"));
+    };
+    worker.postMessage(msg);
+  });
 }
 
 // src/index.ts

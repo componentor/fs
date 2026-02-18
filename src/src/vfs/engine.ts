@@ -142,6 +142,8 @@ export class VFSEngine {
     // Create root directory inode
     this.createInode('/', INODE_TYPE.DIRECTORY, DEFAULT_DIR_MODE, 0);
 
+    // Re-write superblock with updated pathTableUsed (createInode appended "/" to path table)
+    this.writeSuperblock();
     this.handle.flush();
   }
 
@@ -347,14 +349,40 @@ export class VFSEngine {
       const type = inodeView.getUint8(off + INODE.TYPE);
       if (type === INODE_TYPE.FREE) continue;
 
+      // Validate inode type
+      if (type < INODE_TYPE.FILE || type > INODE_TYPE.SYMLINK) {
+        throw new Error(`Corrupt VFS: inode ${i} has invalid type ${type}`);
+      }
+
+      const pathOffset = inodeView.getUint32(off + INODE.PATH_OFFSET, true);
+      const pathLength = inodeView.getUint16(off + INODE.PATH_LENGTH, true);
+      const size = inodeView.getFloat64(off + INODE.SIZE, true);
+      const firstBlock = inodeView.getUint32(off + INODE.FIRST_BLOCK, true);
+      const blockCount = inodeView.getUint32(off + INODE.BLOCK_COUNT, true);
+
+      // Validate path bounds
+      if (pathLength === 0 || pathOffset + pathLength > this.pathTableUsed) {
+        throw new Error(`Corrupt VFS: inode ${i} path out of bounds (offset=${pathOffset}, len=${pathLength}, tableUsed=${this.pathTableUsed})`);
+      }
+
+      // Validate data bounds for files/symlinks
+      if (type !== INODE_TYPE.DIRECTORY) {
+        if (size < 0 || !isFinite(size)) {
+          throw new Error(`Corrupt VFS: inode ${i} has invalid size ${size}`);
+        }
+        if (blockCount > 0 && firstBlock + blockCount > this.totalBlocks) {
+          throw new Error(`Corrupt VFS: inode ${i} data blocks out of range (first=${firstBlock}, count=${blockCount}, total=${this.totalBlocks})`);
+        }
+      }
+
       const inode: Inode = {
         type,
-        pathOffset: inodeView.getUint32(off + INODE.PATH_OFFSET, true),
-        pathLength: inodeView.getUint16(off + INODE.PATH_LENGTH, true),
+        pathOffset,
+        pathLength,
         mode: inodeView.getUint32(off + INODE.MODE, true),
-        size: inodeView.getFloat64(off + INODE.SIZE, true),
-        firstBlock: inodeView.getUint32(off + INODE.FIRST_BLOCK, true),
-        blockCount: inodeView.getUint32(off + INODE.BLOCK_COUNT, true),
+        size,
+        firstBlock,
+        blockCount,
         mtime: inodeView.getFloat64(off + INODE.MTIME, true),
         ctime: inodeView.getFloat64(off + INODE.CTIME, true),
         atime: inodeView.getFloat64(off + INODE.ATIME, true),
@@ -364,9 +392,18 @@ export class VFSEngine {
       this.inodeCache.set(i, inode);
 
       // Decode path from in-memory path table buffer (no disk read)
-      const path = pathBuf
-        ? decoder.decode(pathBuf.subarray(inode.pathOffset, inode.pathOffset + inode.pathLength))
-        : this.readPath(inode.pathOffset, inode.pathLength);
+      let path: string;
+      if (pathBuf) {
+        path = decoder.decode(pathBuf.subarray(inode.pathOffset, inode.pathOffset + inode.pathLength));
+      } else {
+        path = this.readPath(inode.pathOffset, inode.pathLength);
+      }
+
+      // Validate path format
+      if (!path.startsWith('/') || path.includes('\0')) {
+        throw new Error(`Corrupt VFS: inode ${i} has invalid path "${path.substring(0, 50)}"`);
+      }
+
       this.pathIndex.set(path, i);
     }
   }

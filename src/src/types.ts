@@ -151,9 +151,20 @@ export interface FSWatcher {
 export type WatchListener = (eventType: 'rename' | 'change', filename: string | null) => void;
 export type WatchFileListener = (curr: Stats, prev: Stats) => void;
 
+/** Filesystem operating mode:
+ *  - 'hybrid' (default): VFS binary + bidirectional OPFS sync. Best of both worlds.
+ *  - 'vfs': VFS binary only, no OPFS mirroring. Fastest, but data lives only in .vfs.bin.
+ *  - 'opfs': Pure OPFS files, no VFS binary. Slowest but most resilient.
+ *    Automatically selected as fallback when VFS corruption is detected in hybrid mode.
+ */
+export type FSMode = 'hybrid' | 'vfs' | 'opfs';
+
 /** VFS configuration options */
 export interface VFSConfig {
   root?: string;
+  /** Filesystem mode. Defaults to 'hybrid'. */
+  mode?: FSMode;
+  /** @deprecated Use `mode` instead. When set, overrides mode's OPFS sync behavior. */
   opfsSync?: boolean;
   opfsSyncRoot?: string;
   uid?: number;

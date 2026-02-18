@@ -1172,7 +1172,7 @@ var VFSEngine = class {
     return this.copy(existingPath, newPath);
   }
   // ---- OPEN (file descriptor) ----
-  open(path, flags, tabId2) {
+  open(path, flags, tabId) {
     path = this.normalizePath(path);
     const hasCreate = (flags & 64) !== 0;
     const hasTrunc = (flags & 512) !== 0;
@@ -1189,7 +1189,7 @@ var VFSEngine = class {
       this.truncate(path, 0);
     }
     const fd = this.nextFd++;
-    this.fdTable.set(fd, { tabId: tabId2, inodeIdx: idx, position: 0, flags });
+    this.fdTable.set(fd, { tabId, inodeIdx: idx, position: 0, flags });
     const buf = new Uint8Array(4);
     new DataView(buf.buffer).setUint32(0, fd, true);
     return { status: 0, data: buf };
@@ -1276,14 +1276,14 @@ var VFSEngine = class {
     return { status: 0 };
   }
   // ---- OPENDIR ----
-  opendir(path, tabId2) {
+  opendir(path, tabId) {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
     if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
     const inode = this.readInode(idx);
     if (inode.type !== INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTDIR, data: null };
     const fd = this.nextFd++;
-    this.fdTable.set(fd, { tabId: tabId2, inodeIdx: idx, position: 0, flags: 0 });
+    this.fdTable.set(fd, { tabId, inodeIdx: idx, position: 0, flags: 0 });
     const buf = new Uint8Array(4);
     new DataView(buf.buffer).setUint32(0, fd, true);
     return { status: 0, data: buf };
@@ -1341,9 +1341,9 @@ var VFSEngine = class {
     return 0;
   }
   /** Clean up all fds owned by a tab */
-  cleanupTab(tabId2) {
+  cleanupTab(tabId) {
     for (const [fd, entry] of this.fdTable) {
-      if (entry.tabId === tabId2) {
+      if (entry.tabId === tabId) {
         this.fdTable.delete(fd);
       }
     }
@@ -1392,1669 +1392,287 @@ var VFSEngine = class {
   }
 };
 
-// src/opfs-engine.ts
-var encoder2 = new TextEncoder();
-var TYPE_FILE = 1;
-var TYPE_DIRECTORY = 2;
-var OK = 0;
-var ENOENT = 1;
-var EEXIST = 2;
-var ENOTEMPTY = 5;
-var EINVAL = 7;
-var EBADF = 8;
-var OPFSEngine = class {
-  rootDir;
-  fdTable = /* @__PURE__ */ new Map();
-  nextFd = 3;
-  nextIno = 1;
-  processUid = 0;
-  processGid = 0;
-  async init(rootDir, opts) {
-    this.rootDir = rootDir;
-    this.processUid = opts?.uid ?? 0;
-    this.processGid = opts?.gid ?? 0;
-  }
-  cleanupTab(_tabId) {
-    for (const [fd, entry] of this.fdTable) {
-      try {
-        entry.handle.close();
-      } catch {
-      }
-      this.fdTable.delete(fd);
-    }
-  }
-  getPathForFd(fd) {
-    return this.fdTable.get(fd)?.path ?? null;
-  }
-  // ========== Path helpers ==========
-  normalizePath(path) {
-    if (!path.startsWith("/")) path = "/" + path;
-    while (path.length > 1 && path.endsWith("/")) path = path.slice(0, -1);
-    const parts = path.split("/");
-    const resolved = [];
-    for (const part of parts) {
-      if (part === "" || part === ".") continue;
-      if (part === "..") {
-        resolved.pop();
-        continue;
-      }
-      resolved.push(part);
-    }
-    return "/" + resolved.join("/");
-  }
-  /** Navigate to the parent directory of a path, returning the parent handle and child name. */
-  async navigateToParent(path) {
-    const parts = path.split("/").filter(Boolean);
-    if (parts.length === 0) return null;
-    const name = parts.pop();
-    let dir = this.rootDir;
-    for (const part of parts) {
-      try {
-        dir = await dir.getDirectoryHandle(part);
-      } catch {
-        return null;
-      }
-    }
-    return { dir, name };
-  }
-  /** Navigate to a directory by path. */
-  async navigateToDir(path) {
-    if (path === "/") return this.rootDir;
-    const parts = path.split("/").filter(Boolean);
-    let dir = this.rootDir;
-    for (const part of parts) {
-      try {
-        dir = await dir.getDirectoryHandle(part);
-      } catch {
-        return null;
-      }
-    }
-    return dir;
-  }
-  /** Get a file or directory handle for a path. */
-  async getEntry(path) {
-    if (path === "/") return { handle: this.rootDir, kind: "directory" };
-    const nav = await this.navigateToParent(path);
-    if (!nav) return null;
-    try {
-      return { handle: await nav.dir.getFileHandle(nav.name), kind: "file" };
-    } catch {
-      try {
-        return { handle: await nav.dir.getDirectoryHandle(nav.name), kind: "directory" };
-      } catch {
-        return null;
-      }
-    }
-  }
-  /** Ensure all parent directories exist (recursive mkdir for parents). */
-  async ensureParent(path) {
-    const parts = path.split("/").filter(Boolean);
-    parts.pop();
-    let dir = this.rootDir;
-    for (const part of parts) {
-      try {
-        dir = await dir.getDirectoryHandle(part, { create: true });
-      } catch {
-        return null;
-      }
-    }
-    return dir;
-  }
-  encodeStat(kind, size, mtime, ino) {
-    const buf = new Uint8Array(49);
-    const view = new DataView(buf.buffer);
-    view.setUint8(0, kind === "file" ? TYPE_FILE : TYPE_DIRECTORY);
-    view.setUint32(1, kind === "file" ? 33188 : 16877, true);
-    view.setFloat64(5, size, true);
-    view.setFloat64(13, mtime, true);
-    view.setFloat64(21, mtime, true);
-    view.setFloat64(29, mtime, true);
-    view.setUint32(37, this.processUid, true);
-    view.setUint32(41, this.processGid, true);
-    view.setUint32(45, ino, true);
-    return buf;
-  }
-  // ========== FS Operations ==========
-  async read(path) {
-    path = this.normalizePath(path);
-    const nav = await this.navigateToParent(path);
-    if (!nav) return { status: ENOENT, data: null };
-    try {
-      const fh = await nav.dir.getFileHandle(nav.name);
-      const file = await fh.getFile();
-      return { status: OK, data: new Uint8Array(await file.arrayBuffer()) };
-    } catch {
-      return { status: ENOENT, data: null };
-    }
-  }
-  async write(path, data, _flags) {
-    path = this.normalizePath(path);
-    const parentDir = await this.ensureParent(path);
-    if (!parentDir) return { status: ENOENT, data: null };
-    const name = path.split("/").filter(Boolean).pop();
-    try {
-      const fh = await parentDir.getFileHandle(name, { create: true });
-      const sh = await fh.createSyncAccessHandle();
-      try {
-        sh.truncate(0);
-        if (data.byteLength > 0) sh.write(data, { at: 0 });
-        sh.flush();
-      } finally {
-        sh.close();
-      }
-      return { status: OK, data: null };
-    } catch {
-      return { status: ENOENT, data: null };
-    }
-  }
-  async append(path, data) {
-    path = this.normalizePath(path);
-    const parentDir = await this.ensureParent(path);
-    if (!parentDir) return { status: ENOENT, data: null };
-    const name = path.split("/").filter(Boolean).pop();
-    try {
-      const fh = await parentDir.getFileHandle(name, { create: true });
-      const sh = await fh.createSyncAccessHandle();
-      try {
-        const size = sh.getSize();
-        sh.write(data, { at: size });
-        sh.flush();
-      } finally {
-        sh.close();
-      }
-      return { status: OK, data: null };
-    } catch {
-      return { status: ENOENT, data: null };
-    }
-  }
-  async unlink(path) {
-    path = this.normalizePath(path);
-    const nav = await this.navigateToParent(path);
-    if (!nav) return { status: ENOENT, data: null };
-    try {
-      await nav.dir.getFileHandle(nav.name);
-      await nav.dir.removeEntry(nav.name);
-      return { status: OK, data: null };
-    } catch {
-      return { status: ENOENT, data: null };
-    }
-  }
-  async stat(path) {
-    path = this.normalizePath(path);
-    const entry = await this.getEntry(path);
-    if (!entry) return { status: ENOENT, data: null };
-    if (entry.kind === "file") {
-      const file = await entry.handle.getFile();
-      return { status: OK, data: this.encodeStat("file", file.size, file.lastModified, this.nextIno++) };
-    }
-    return { status: OK, data: this.encodeStat("directory", 0, Date.now(), this.nextIno++) };
-  }
-  async lstat(path) {
-    return this.stat(path);
-  }
-  async mkdir(path, flags = 0) {
-    path = this.normalizePath(path);
-    const recursive = (flags & 1) !== 0;
-    if (recursive) {
-      const parts = path.split("/").filter(Boolean);
-      let dir = this.rootDir;
-      for (const part of parts) {
-        dir = await dir.getDirectoryHandle(part, { create: true });
-      }
-      return { status: OK, data: encoder2.encode(path) };
-    }
-    const nav = await this.navigateToParent(path);
-    if (!nav) return { status: ENOENT, data: null };
-    try {
-      try {
-        await nav.dir.getDirectoryHandle(nav.name);
-        return { status: EEXIST, data: null };
-      } catch {
-      }
-      await nav.dir.getDirectoryHandle(nav.name, { create: true });
-      return { status: OK, data: encoder2.encode(path) };
-    } catch {
-      return { status: ENOENT, data: null };
-    }
-  }
-  async rmdir(path, flags = 0) {
-    path = this.normalizePath(path);
-    if (path === "/") return { status: EINVAL, data: null };
-    const recursive = (flags & 1) !== 0;
-    const nav = await this.navigateToParent(path);
-    if (!nav) return { status: ENOENT, data: null };
-    try {
-      await nav.dir.getDirectoryHandle(nav.name);
-      await nav.dir.removeEntry(nav.name, { recursive });
-      return { status: OK, data: null };
-    } catch (err) {
-      if (err.name === "InvalidModificationError") return { status: ENOTEMPTY, data: null };
-      return { status: ENOENT, data: null };
-    }
-  }
-  async readdir(path, flags = 0) {
-    path = this.normalizePath(path);
-    const dir = await this.navigateToDir(path);
-    if (!dir) return { status: ENOENT, data: null };
-    const withFileTypes = (flags & 1) !== 0;
-    const entries = [];
-    for await (const [name, handle] of dir.entries()) {
-      entries.push({ name, kind: handle.kind });
-    }
-    if (withFileTypes) {
-      let totalSize2 = 4;
-      const encoded = [];
-      for (const e of entries) {
-        const nameBytes = encoder2.encode(e.name);
-        encoded.push({ nameBytes, type: e.kind === "file" ? TYPE_FILE : TYPE_DIRECTORY });
-        totalSize2 += 2 + nameBytes.byteLength + 1;
-      }
-      const buf2 = new Uint8Array(totalSize2);
-      const view2 = new DataView(buf2.buffer);
-      view2.setUint32(0, encoded.length, true);
-      let offset2 = 4;
-      for (const e of encoded) {
-        view2.setUint16(offset2, e.nameBytes.byteLength, true);
-        offset2 += 2;
-        buf2.set(e.nameBytes, offset2);
-        offset2 += e.nameBytes.byteLength;
-        buf2[offset2++] = e.type;
-      }
-      return { status: OK, data: buf2 };
-    }
-    let totalSize = 4;
-    const nameEntries = [];
-    for (const e of entries) {
-      const nameBytes = encoder2.encode(e.name);
-      nameEntries.push(nameBytes);
-      totalSize += 2 + nameBytes.byteLength;
-    }
-    const buf = new Uint8Array(totalSize);
-    const view = new DataView(buf.buffer);
-    view.setUint32(0, nameEntries.length, true);
-    let offset = 4;
-    for (const nameBytes of nameEntries) {
-      view.setUint16(offset, nameBytes.byteLength, true);
-      offset += 2;
-      buf.set(nameBytes, offset);
-      offset += nameBytes.byteLength;
-    }
-    return { status: OK, data: buf };
-  }
-  async rename(oldPath, newPath) {
-    oldPath = this.normalizePath(oldPath);
-    newPath = this.normalizePath(newPath);
-    const entry = await this.getEntry(oldPath);
-    if (!entry) return { status: ENOENT, data: null };
-    if (entry.kind === "file") {
-      const fh = entry.handle;
-      const file = await fh.getFile();
-      const data = new Uint8Array(await file.arrayBuffer());
-      const writeResult = await this.write(newPath, data);
-      if (writeResult.status !== OK) return writeResult;
-      await this.unlink(oldPath);
-    } else {
-      await this.mkdir(newPath, 1);
-      await this.copyDirectoryContents(oldPath, newPath);
-      await this.rmdir(oldPath, 1);
-    }
-    return { status: OK, data: null };
-  }
-  async copyDirectoryContents(srcPath, dstPath) {
-    const srcDir = await this.navigateToDir(srcPath);
-    if (!srcDir) return;
-    for await (const [name, handle] of srcDir.entries()) {
-      const srcChild = srcPath === "/" ? `/${name}` : `${srcPath}/${name}`;
-      const dstChild = dstPath === "/" ? `/${name}` : `${dstPath}/${name}`;
-      if (handle.kind === "directory") {
-        await this.mkdir(dstChild, 1);
-        await this.copyDirectoryContents(srcChild, dstChild);
-      } else {
-        const file = await handle.getFile();
-        const data = new Uint8Array(await file.arrayBuffer());
-        await this.write(dstChild, data);
-      }
-    }
-  }
-  async exists(path) {
-    path = this.normalizePath(path);
-    const entry = await this.getEntry(path);
-    return { status: OK, data: new Uint8Array([entry ? 1 : 0]) };
-  }
-  async truncate(path, len) {
-    path = this.normalizePath(path);
-    const nav = await this.navigateToParent(path);
-    if (!nav) return { status: ENOENT, data: null };
-    try {
-      const fh = await nav.dir.getFileHandle(nav.name);
-      const sh = await fh.createSyncAccessHandle();
-      try {
-        sh.truncate(len);
-        sh.flush();
-      } finally {
-        sh.close();
-      }
-      return { status: OK, data: null };
-    } catch {
-      return { status: ENOENT, data: null };
-    }
-  }
-  async copy(src, dest, _flags) {
-    src = this.normalizePath(src);
-    dest = this.normalizePath(dest);
-    const readResult = await this.read(src);
-    if (readResult.status !== OK) return readResult;
-    return this.write(dest, readResult.data ?? new Uint8Array(0));
-  }
-  async access(path, _mode) {
-    path = this.normalizePath(path);
-    const entry = await this.getEntry(path);
-    if (!entry) return { status: ENOENT, data: null };
-    return { status: OK, data: null };
-  }
-  async realpath(path) {
-    path = this.normalizePath(path);
-    const entry = await this.getEntry(path);
-    if (!entry) return { status: ENOENT, data: null };
-    return { status: OK, data: encoder2.encode(path) };
-  }
-  // OPFS doesn't support permissions — these are no-ops
-  async chmod(path, _mode) {
-    path = this.normalizePath(path);
-    const entry = await this.getEntry(path);
-    if (!entry) return { status: ENOENT, data: null };
-    return { status: OK, data: null };
-  }
-  async chown(path, _uid, _gid) {
-    path = this.normalizePath(path);
-    const entry = await this.getEntry(path);
-    if (!entry) return { status: ENOENT, data: null };
-    return { status: OK, data: null };
-  }
-  async utimes(path, _atime, _mtime) {
-    path = this.normalizePath(path);
-    const entry = await this.getEntry(path);
-    if (!entry) return { status: ENOENT, data: null };
-    return { status: OK, data: null };
-  }
-  // OPFS has no symlinks or hard links
-  async symlink(_target, _linkPath) {
-    return { status: EINVAL, data: null };
-  }
-  async readlink(_path) {
-    return { status: EINVAL, data: null };
-  }
-  async link(existingPath, newPath) {
-    return this.copy(existingPath, newPath);
-  }
-  // ========== File descriptor operations ==========
-  async open(path, flags, _tabId) {
-    path = this.normalizePath(path);
-    const hasCreate = (flags & 64) !== 0;
-    const hasTrunc = (flags & 512) !== 0;
-    const hasExcl = (flags & 128) !== 0;
-    const parentDir = await this.ensureParent(path);
-    if (!parentDir) return { status: ENOENT, data: null };
-    const name = path.split("/").filter(Boolean).pop();
-    try {
-      let exists = true;
-      try {
-        await parentDir.getFileHandle(name);
-      } catch {
-        exists = false;
-      }
-      if (!exists && !hasCreate) return { status: ENOENT, data: null };
-      if (exists && hasExcl && hasCreate) return { status: EEXIST, data: null };
-      const fh = await parentDir.getFileHandle(name, { create: hasCreate });
-      const sh = await fh.createSyncAccessHandle();
-      if (hasTrunc) {
-        sh.truncate(0);
-        sh.flush();
-      }
-      const fd = this.nextFd++;
-      this.fdTable.set(fd, { handle: sh, path, position: 0, flags });
-      const buf = new Uint8Array(4);
-      new DataView(buf.buffer).setUint32(0, fd, true);
-      return { status: OK, data: buf };
-    } catch {
-      return { status: ENOENT, data: null };
-    }
-  }
-  async close(fd) {
-    const entry = this.fdTable.get(fd);
-    if (!entry) return { status: EBADF, data: null };
-    try {
-      entry.handle.close();
-    } catch {
-    }
-    this.fdTable.delete(fd);
-    return { status: OK, data: null };
-  }
-  async fread(fd, length, position) {
-    const entry = this.fdTable.get(fd);
-    if (!entry) return { status: EBADF, data: null };
-    const pos = position ?? entry.position;
-    const size = entry.handle.getSize();
-    const readLen = Math.min(length, size - pos);
-    if (readLen <= 0) return { status: OK, data: new Uint8Array(0) };
-    const buf = new Uint8Array(readLen);
-    entry.handle.read(buf, { at: pos });
-    if (position === null) {
-      entry.position += readLen;
-    }
-    return { status: OK, data: buf };
-  }
-  async fwrite(fd, data, position) {
-    const entry = this.fdTable.get(fd);
-    if (!entry) return { status: EBADF, data: null };
-    const isAppend = (entry.flags & 1024) !== 0;
-    const pos = isAppend ? entry.handle.getSize() : position ?? entry.position;
-    entry.handle.write(data, { at: pos });
-    if (position === null) {
-      entry.position = pos + data.byteLength;
-    }
-    const buf = new Uint8Array(4);
-    new DataView(buf.buffer).setUint32(0, data.byteLength, true);
-    return { status: OK, data: buf };
-  }
-  async fstat(fd) {
-    const entry = this.fdTable.get(fd);
-    if (!entry) return { status: EBADF, data: null };
-    const size = entry.handle.getSize();
-    return { status: OK, data: this.encodeStat("file", size, Date.now(), fd) };
-  }
-  async ftruncate(fd, len = 0) {
-    const entry = this.fdTable.get(fd);
-    if (!entry) return { status: EBADF, data: null };
-    entry.handle.truncate(len);
-    entry.handle.flush();
-    return { status: OK, data: null };
-  }
-  async fsync() {
-    for (const [, entry] of this.fdTable) {
-      try {
-        entry.handle.flush();
-      } catch {
-      }
-    }
-    return { status: OK, data: null };
-  }
-  async opendir(path, _tabId) {
-    return this.readdir(path, 1);
-  }
-  async mkdtemp(prefix) {
-    const random = Math.random().toString(36).substring(2, 8);
-    const path = this.normalizePath(prefix + random);
-    return this.mkdir(path, 1);
-  }
-};
-
-// src/protocol/opcodes.ts
-var OP = {
-  READ: 1,
-  WRITE: 2,
-  UNLINK: 3,
-  STAT: 4,
-  LSTAT: 5,
-  MKDIR: 6,
-  RMDIR: 7,
-  READDIR: 8,
-  RENAME: 9,
-  EXISTS: 10,
-  TRUNCATE: 11,
-  APPEND: 12,
-  COPY: 13,
-  ACCESS: 14,
-  REALPATH: 15,
-  CHMOD: 16,
-  CHOWN: 17,
-  UTIMES: 18,
-  SYMLINK: 19,
-  READLINK: 20,
-  LINK: 21,
-  OPEN: 22,
-  CLOSE: 23,
-  FREAD: 24,
-  FWRITE: 25,
-  FSTAT: 26,
-  FTRUNCATE: 27,
-  FSYNC: 28,
-  OPENDIR: 29,
-  MKDTEMP: 30
-};
-var SAB_OFFSETS = {
-  CONTROL: 0,
-  // Int32 - signal (0=idle, 1=request, 2=response, 3=chunk, 4=ack)
-  OPCODE: 4,
-  // Int32 - operation code
-  STATUS: 8,
-  // Int32 - response status / error
-  CHUNK_LEN: 12,
-  // Int32 - bytes in this chunk
-  TOTAL_LEN: 16,
-  // BigUint64 - full data size across all chunks
-  CHUNK_IDX: 24,
-  // Int32 - 0-based chunk index
-  RESERVED: 28,
-  // Int32 - reserved
-  HEADER_SIZE: 32
-  // Data payload starts here
-};
-var SIGNAL = {
-  IDLE: 0,
-  REQUEST: 1,
-  RESPONSE: 2,
-  CHUNK: 3,
-  CHUNK_ACK: 4
-};
-var encoder3 = new TextEncoder();
-var decoder2 = new TextDecoder();
-function decodeRequest(buf) {
-  const view = new DataView(buf);
-  const op = view.getUint32(0, true);
-  const flags = view.getUint32(4, true);
-  const pathLen = view.getUint32(8, true);
-  const dataLen = view.getUint32(12, true);
-  const bytes = new Uint8Array(buf);
-  const path = decoder2.decode(bytes.subarray(16, 16 + pathLen));
-  const data = dataLen > 0 ? bytes.subarray(16 + pathLen, 16 + pathLen + dataLen) : null;
-  return { op, flags, path, data };
-}
-function encodeResponse(status, data) {
-  const dataLen = data ? data.byteLength : 0;
-  const buf = new ArrayBuffer(8 + dataLen);
-  const view = new DataView(buf);
-  view.setUint32(0, status, true);
-  view.setUint32(4, dataLen, true);
-  if (data) {
-    new Uint8Array(buf).set(data, 8);
-  }
-  return buf;
-}
-function decodeSecondPath(data) {
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const pathLen = view.getUint32(0, true);
-  return decoder2.decode(data.subarray(4, 4 + pathLen));
-}
-
-// src/workers/sync-relay.worker.ts
-var engine = new VFSEngine();
-var opfsEngine = null;
-var opfsMode = false;
-var leaderInitialized = false;
-var readySent = false;
-var debug = false;
-var leaderLoopRunning = false;
-var opfsSyncPort = null;
-var opfsSyncEnabled = false;
-var suppressPaths = /* @__PURE__ */ new Set();
-var watchBc = null;
-var sab;
-var ctrl;
-var readySab;
-var readySignal;
-var asyncSab = null;
-var asyncCtrl = null;
-var tabId = "";
-var HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
-var clientPorts = /* @__PURE__ */ new Map();
-var portQueue = [];
-var yieldChannel = new MessageChannel();
-yieldChannel.port2.start();
-function yieldToEventLoop() {
-  return new Promise((resolve) => {
-    yieldChannel.port2.onmessage = () => resolve();
-    yieldChannel.port1.postMessage(null);
-  });
-}
-function registerClientPort(clientTabId, port) {
-  port.onmessage = async (e) => {
-    if (e.data.buffer instanceof ArrayBuffer) {
-      if (leaderLoopRunning) {
-        portQueue.push({
-          port,
-          tabId: clientTabId,
-          id: e.data.id,
-          buffer: e.data.buffer
-        });
-      } else {
-        const result = opfsMode ? await handleRequestOPFS(clientTabId, e.data.buffer) : handleRequest(clientTabId, e.data.buffer);
-        const response = encodeResponse(result.status, result.data);
-        port.postMessage({ id: e.data.id, buffer: response }, [response]);
-        if (!opfsMode && result._op !== void 0) notifyOPFSSync(result._op, result._path, result._newPath);
-      }
-    }
-  };
-  port.start();
-  clientPorts.set(clientTabId, port);
-}
-function removeClientPort(clientTabId) {
-  const port = clientPorts.get(clientTabId);
-  if (port) {
-    port.close();
-    clientPorts.delete(clientTabId);
-  }
-  if (opfsMode) {
-    opfsEngine?.cleanupTab(clientTabId);
-  } else {
-    engine.cleanupTab(clientTabId);
-  }
-}
-function drainPortQueue() {
-  while (portQueue.length > 0) {
-    const msg = portQueue.shift();
-    const result = handleRequest(msg.tabId, msg.buffer);
-    const response = encodeResponse(result.status, result.data);
-    msg.port.postMessage({ id: msg.id, buffer: response }, [response]);
-    if (result._op !== void 0) notifyOPFSSync(result._op, result._path, result._newPath);
-  }
-}
-async function drainPortQueueAsync() {
-  while (portQueue.length > 0) {
-    const msg = portQueue.shift();
-    const result = await handleRequestOPFS(msg.tabId, msg.buffer);
-    const response = encodeResponse(result.status, result.data);
-    msg.port.postMessage({ id: msg.id, buffer: response }, [response]);
-  }
-}
-var leaderPort = null;
-var pendingResolve = null;
-var asyncRelayPort = null;
-function forwardToLeader(payload) {
-  return new Promise((resolve) => {
-    pendingResolve = resolve;
-    const buf = payload.buffer.byteLength === payload.byteLength ? payload.buffer : payload.slice().buffer;
-    leaderPort.postMessage(
-      { id: tabId, tabId, buffer: buf },
-      [buf]
-    );
-  });
-}
-function onLeaderMessage(e) {
-  if (e.data.buffer instanceof ArrayBuffer) {
-    if (pendingResolve) {
-      const resolve = pendingResolve;
-      pendingResolve = null;
-      resolve(e.data.buffer);
-    } else if (asyncRelayPort) {
-      asyncRelayPort.postMessage({ id: e.data.id, buffer: e.data.buffer }, [e.data.buffer]);
-    }
-  }
-}
-var OP_NAMES = {
-  1: "READ",
-  2: "WRITE",
-  3: "UNLINK",
-  4: "STAT",
-  5: "LSTAT",
-  6: "MKDIR",
-  7: "RMDIR",
-  8: "READDIR",
-  9: "RENAME",
-  10: "EXISTS",
-  11: "TRUNCATE",
-  12: "APPEND",
-  13: "COPY",
-  14: "ACCESS",
-  15: "REALPATH",
-  16: "CHMOD",
-  17: "CHOWN",
-  18: "UTIMES",
-  19: "SYMLINK",
-  20: "READLINK",
-  21: "LINK",
-  22: "OPEN",
-  23: "CLOSE",
-  24: "FREAD",
-  25: "FWRITE",
-  26: "FSTAT",
-  27: "FTRUNCATE",
-  28: "FSYNC",
-  29: "OPENDIR",
-  30: "MKDTEMP"
-};
-function handleRequest(reqTabId, buffer) {
-  const t0 = debug ? performance.now() : 0;
-  const { op, flags, path, data } = decodeRequest(buffer);
-  const t1 = debug ? performance.now() : 0;
-  let result;
-  let syncOp;
-  let syncPath;
-  let syncNewPath;
-  switch (op) {
-    case OP.READ:
-      result = engine.read(path);
-      break;
-    case OP.WRITE:
-      result = engine.write(path, data ?? new Uint8Array(0), flags);
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = path;
-      }
-      break;
-    case OP.APPEND:
-      result = engine.append(path, data ?? new Uint8Array(0));
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = path;
-      }
-      break;
-    case OP.UNLINK:
-      result = engine.unlink(path);
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = path;
-      }
-      break;
-    case OP.STAT:
-      result = engine.stat(path);
-      break;
-    case OP.LSTAT:
-      result = engine.lstat(path);
-      break;
-    case OP.MKDIR:
-      result = engine.mkdir(path, flags);
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = path;
-      }
-      break;
-    case OP.RMDIR:
-      result = engine.rmdir(path, flags);
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = path;
-      }
-      break;
-    case OP.READDIR:
-      result = engine.readdir(path, flags);
-      break;
-    case OP.RENAME: {
-      const newPath = data ? decodeSecondPath(data) : "";
-      result = engine.rename(path, newPath);
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = path;
-        syncNewPath = newPath;
-      }
-      break;
-    }
-    case OP.EXISTS:
-      result = engine.exists(path);
-      break;
-    case OP.TRUNCATE: {
-      const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = engine.truncate(path, len);
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = path;
-      }
-      break;
-    }
-    case OP.COPY: {
-      const destPath = data ? decodeSecondPath(data) : "";
-      result = engine.copy(path, destPath, flags);
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = destPath;
-      }
-      break;
-    }
-    case OP.ACCESS:
-      result = engine.access(path, flags);
-      break;
-    case OP.REALPATH:
-      result = engine.realpath(path);
-      break;
-    case OP.CHMOD: {
-      const chmodMode = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = engine.chmod(path, chmodMode);
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = path;
-      }
-      break;
-    }
-    case OP.CHOWN: {
-      if (!data || data.byteLength < 8) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const uid = dv.getUint32(0, true);
-      const gid = dv.getUint32(4, true);
-      result = engine.chown(path, uid, gid);
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = path;
-      }
-      break;
-    }
-    case OP.UTIMES: {
-      if (!data || data.byteLength < 16) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const atime = dv.getFloat64(0, true);
-      const mtime = dv.getFloat64(8, true);
-      result = engine.utimes(path, atime, mtime);
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = path;
-      }
-      break;
-    }
-    case OP.SYMLINK: {
-      const target = data ? new TextDecoder().decode(data) : "";
-      result = engine.symlink(target, path);
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = path;
-      }
-      break;
-    }
-    case OP.READLINK:
-      result = engine.readlink(path);
-      break;
-    case OP.LINK: {
-      const newPath = data ? decodeSecondPath(data) : "";
-      result = engine.link(path, newPath);
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = newPath;
-      }
-      break;
-    }
-    case OP.OPEN:
-      result = engine.open(path, flags, reqTabId);
-      break;
-    case OP.CLOSE: {
-      const fd = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = engine.close(fd);
-      break;
-    }
-    case OP.FREAD: {
-      if (!data || data.byteLength < 12) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const length = dv.getUint32(4, true);
-      const pos = dv.getInt32(8, true);
-      result = engine.fread(fd, length, pos === -1 ? null : pos);
-      break;
-    }
-    case OP.FWRITE: {
-      if (!data || data.byteLength < 8) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const pos = dv.getInt32(4, true);
-      const writeData = data.subarray(8);
-      result = engine.fwrite(fd, writeData, pos === -1 ? null : pos);
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = engine.getPathForFd(fd) ?? void 0;
-      }
-      break;
-    }
-    case OP.FSTAT: {
-      const fd = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = engine.fstat(fd);
-      break;
-    }
-    case OP.FTRUNCATE: {
-      if (!data || data.byteLength < 8) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const len = dv.getUint32(4, true);
-      result = engine.ftruncate(fd, len);
-      if (result.status === 0) {
-        syncOp = op;
-        syncPath = engine.getPathForFd(fd) ?? void 0;
-      }
-      break;
-    }
-    case OP.FSYNC:
-      result = engine.fsync();
-      break;
-    case OP.OPENDIR:
-      result = engine.opendir(path, reqTabId);
-      break;
-    case OP.MKDTEMP:
-      result = engine.mkdtemp(path);
-      if (result.status === 0 && result.data) {
-        syncOp = op;
-        syncPath = new TextDecoder().decode(result.data instanceof Uint8Array ? result.data : new Uint8Array(0));
-      }
-      break;
-    default:
-      result = { status: 7 };
-  }
-  if (debug) {
-    const t2 = performance.now();
-    console.log(`[sync-relay] op=${OP_NAMES[op] ?? op} path=${path} decode=${(t1 - t0).toFixed(3)}ms engine=${(t2 - t1).toFixed(3)}ms TOTAL=${(t2 - t0).toFixed(3)}ms`);
-  }
-  const ret = {
-    status: result.status,
-    data: result.data instanceof Uint8Array ? result.data : void 0
-  };
-  if (syncOp !== void 0 && syncPath) {
-    ret._op = syncOp;
-    ret._path = syncPath;
-    ret._newPath = syncNewPath;
-    broadcastWatch(syncOp, syncPath, syncNewPath);
-  }
-  return ret;
-}
-async function handleRequestOPFS(reqTabId, buffer) {
-  const oe = opfsEngine;
-  const { op, flags, path, data } = decodeRequest(buffer);
-  let result;
-  let syncPath;
-  let syncNewPath;
-  switch (op) {
-    case OP.READ:
-      result = await oe.read(path);
-      break;
-    case OP.WRITE:
-      result = await oe.write(path, data ?? new Uint8Array(0), flags);
-      syncPath = path;
-      break;
-    case OP.APPEND:
-      result = await oe.append(path, data ?? new Uint8Array(0));
-      syncPath = path;
-      break;
-    case OP.UNLINK:
-      result = await oe.unlink(path);
-      syncPath = path;
-      break;
-    case OP.STAT:
-      result = await oe.stat(path);
-      break;
-    case OP.LSTAT:
-      result = await oe.lstat(path);
-      break;
-    case OP.MKDIR:
-      result = await oe.mkdir(path, flags);
-      syncPath = path;
-      break;
-    case OP.RMDIR:
-      result = await oe.rmdir(path, flags);
-      syncPath = path;
-      break;
-    case OP.READDIR:
-      result = await oe.readdir(path, flags);
-      break;
-    case OP.RENAME: {
-      const newPath = data ? decodeSecondPath(data) : "";
-      result = await oe.rename(path, newPath);
-      syncPath = path;
-      syncNewPath = newPath;
-      break;
-    }
-    case OP.EXISTS:
-      result = await oe.exists(path);
-      break;
-    case OP.TRUNCATE: {
-      const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = await oe.truncate(path, len);
-      syncPath = path;
-      break;
-    }
-    case OP.COPY: {
-      const destPath = data ? decodeSecondPath(data) : "";
-      result = await oe.copy(path, destPath, flags);
-      syncPath = destPath;
-      break;
-    }
-    case OP.ACCESS:
-      result = await oe.access(path, flags);
-      break;
-    case OP.REALPATH:
-      result = await oe.realpath(path);
-      break;
-    case OP.CHMOD: {
-      const chmodMode = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = await oe.chmod(path, chmodMode);
-      break;
-    }
-    case OP.CHOWN: {
-      if (!data || data.byteLength < 8) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      result = await oe.chown(path, dv.getUint32(0, true), dv.getUint32(4, true));
-      break;
-    }
-    case OP.UTIMES: {
-      if (!data || data.byteLength < 16) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      result = await oe.utimes(path, dv.getFloat64(0, true), dv.getFloat64(8, true));
-      break;
-    }
-    case OP.SYMLINK: {
-      const target = data ? new TextDecoder().decode(data) : "";
-      result = await oe.symlink(target, path);
-      break;
-    }
-    case OP.READLINK:
-      result = await oe.readlink(path);
-      break;
-    case OP.LINK: {
-      const newPath = data ? decodeSecondPath(data) : "";
-      result = await oe.link(path, newPath);
-      syncPath = newPath;
-      break;
-    }
-    case OP.OPEN:
-      result = await oe.open(path, flags, reqTabId);
-      break;
-    case OP.CLOSE: {
-      const fd = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = await oe.close(fd);
-      break;
-    }
-    case OP.FREAD: {
-      if (!data || data.byteLength < 12) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      result = await oe.fread(dv.getUint32(0, true), dv.getUint32(4, true), dv.getInt32(8, true) === -1 ? null : dv.getInt32(8, true));
-      break;
-    }
-    case OP.FWRITE: {
-      if (!data || data.byteLength < 8) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const pos = dv.getInt32(4, true);
-      result = await oe.fwrite(fd, data.subarray(8), pos === -1 ? null : pos);
-      syncPath = oe.getPathForFd(fd) ?? void 0;
-      break;
-    }
-    case OP.FSTAT: {
-      const fd = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = await oe.fstat(fd);
-      break;
-    }
-    case OP.FTRUNCATE: {
-      if (!data || data.byteLength < 8) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      result = await oe.ftruncate(dv.getUint32(0, true), dv.getUint32(4, true));
-      syncPath = oe.getPathForFd(dv.getUint32(0, true)) ?? void 0;
-      break;
-    }
-    case OP.FSYNC:
-      result = await oe.fsync();
-      break;
-    case OP.OPENDIR:
-      result = await oe.opendir(path, reqTabId);
-      break;
-    case OP.MKDTEMP:
-      result = await oe.mkdtemp(path);
-      if (result.status === 0 && result.data) {
-        syncPath = new TextDecoder().decode(result.data instanceof Uint8Array ? result.data : new Uint8Array(0));
-      }
-      break;
-    default:
-      result = { status: 7 };
-  }
-  const ret = {
-    status: result.status,
-    data: result.data instanceof Uint8Array ? result.data : void 0
-  };
-  if (result.status === 0 && syncPath) {
-    broadcastWatch(op, syncPath, syncNewPath);
-  }
-  return ret;
-}
-function readPayload(targetSab, targetCtrl) {
-  const totalLenView = new BigUint64Array(targetSab, SAB_OFFSETS.TOTAL_LEN, 1);
-  const maxChunk = targetSab.byteLength - HEADER_SIZE;
-  const chunkLen = Atomics.load(targetCtrl, 3);
-  const totalLen = Number(Atomics.load(totalLenView, 0));
-  if (totalLen <= maxChunk) {
-    return new Uint8Array(targetSab, HEADER_SIZE, chunkLen).slice();
-  }
-  const fullBuffer = new Uint8Array(totalLen);
-  let offset = 0;
-  fullBuffer.set(new Uint8Array(targetSab, HEADER_SIZE, chunkLen), offset);
-  offset += chunkLen;
-  while (offset < totalLen) {
-    Atomics.store(targetCtrl, 0, SIGNAL.CHUNK_ACK);
-    Atomics.notify(targetCtrl, 0);
-    Atomics.wait(targetCtrl, 0, SIGNAL.CHUNK_ACK);
-    const nextLen = Atomics.load(targetCtrl, 3);
-    fullBuffer.set(new Uint8Array(targetSab, HEADER_SIZE, nextLen), offset);
-    offset += nextLen;
-  }
-  return fullBuffer;
-}
-function writeDirectResponse(targetSab, targetCtrl, status, data) {
-  const dataLen = data ? data.byteLength : 0;
-  const totalLen = 8 + dataLen;
-  const maxChunk = targetSab.byteLength - HEADER_SIZE;
-  if (totalLen <= maxChunk) {
-    const hdr = new DataView(targetSab, HEADER_SIZE, 8);
-    hdr.setUint32(0, status, true);
-    hdr.setUint32(4, dataLen, true);
-    if (data && dataLen > 0) {
-      new Uint8Array(targetSab, HEADER_SIZE + 8, dataLen).set(data);
-    }
-    Atomics.store(targetCtrl, 3, totalLen);
-    const totalView = new BigUint64Array(targetSab, SAB_OFFSETS.TOTAL_LEN, 1);
-    Atomics.store(totalView, 0, BigInt(totalLen));
-    Atomics.store(targetCtrl, 0, SIGNAL.RESPONSE);
-    Atomics.notify(targetCtrl, 0);
-  } else {
-    const response = encodeResponse(status, data);
-    writeResponse(targetSab, targetCtrl, new Uint8Array(response));
-  }
-}
-function writeResponse(targetSab, targetCtrl, responseData) {
-  const maxChunk = targetSab.byteLength - HEADER_SIZE;
-  if (responseData.byteLength <= maxChunk) {
-    new Uint8Array(targetSab, HEADER_SIZE, responseData.byteLength).set(responseData);
-    Atomics.store(targetCtrl, 3, responseData.byteLength);
-    const totalView = new BigUint64Array(targetSab, SAB_OFFSETS.TOTAL_LEN, 1);
-    Atomics.store(totalView, 0, BigInt(responseData.byteLength));
-    Atomics.store(targetCtrl, 0, SIGNAL.RESPONSE);
-    Atomics.notify(targetCtrl, 0);
-  } else {
-    let sent = 0;
-    while (sent < responseData.byteLength) {
-      const chunkSize = Math.min(maxChunk, responseData.byteLength - sent);
-      new Uint8Array(targetSab, HEADER_SIZE, chunkSize).set(
-        responseData.subarray(sent, sent + chunkSize)
-      );
-      Atomics.store(targetCtrl, 3, chunkSize);
-      Atomics.store(targetCtrl, 6, Math.floor(sent / maxChunk));
-      const isLast = sent + chunkSize >= responseData.byteLength;
-      Atomics.store(targetCtrl, 0, isLast ? SIGNAL.RESPONSE : SIGNAL.CHUNK);
-      Atomics.notify(targetCtrl, 0);
-      if (!isLast) {
-        Atomics.wait(targetCtrl, 0, SIGNAL.CHUNK);
-      }
-      sent += chunkSize;
-    }
-  }
-}
-async function leaderLoop() {
-  leaderLoopRunning = true;
-  while (true) {
-    let processed = true;
-    let tightOps = 0;
-    while (processed) {
-      processed = false;
-      if (++tightOps >= 100) {
-        tightOps = 0;
-        await yieldToEventLoop();
-      }
-      if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST) {
-        const lt0 = debug ? performance.now() : 0;
-        const payload = readPayload(sab, ctrl);
-        const lt1 = debug ? performance.now() : 0;
-        const reqResult = handleRequest(tabId, payload.buffer);
-        const lt2 = debug ? performance.now() : 0;
-        writeDirectResponse(sab, ctrl, reqResult.status, reqResult.data);
-        if (reqResult._op !== void 0) notifyOPFSSync(reqResult._op, reqResult._path, reqResult._newPath);
-        const lt3 = debug ? performance.now() : 0;
-        if (debug) {
-          console.log(`[leaderLoop] readPayload=${(lt1 - lt0).toFixed(3)}ms handleRequest=${(lt2 - lt1).toFixed(3)}ms writeResponse=${(lt3 - lt2).toFixed(3)}ms TOTAL=${(lt3 - lt0).toFixed(3)}ms`);
-        }
-        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 10);
-        if (waitResult === "timed-out") {
-          Atomics.store(ctrl, 0, SIGNAL.IDLE);
-        }
-        processed = true;
-        continue;
-      }
-      if (asyncCtrl && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) {
-        const payload = readPayload(asyncSab, asyncCtrl);
-        const asyncResult = handleRequest(tabId, payload.buffer);
-        writeDirectResponse(asyncSab, asyncCtrl, asyncResult.status, asyncResult.data);
-        if (asyncResult._op !== void 0) notifyOPFSSync(asyncResult._op, asyncResult._path, asyncResult._newPath);
-        const waitResult = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 10);
-        if (waitResult === "timed-out") {
-          Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
-        }
-        processed = true;
-        continue;
-      }
-      if (portQueue.length > 0) {
-        drainPortQueue();
-        processed = true;
-        continue;
-      }
-    }
-    await yieldToEventLoop();
-    if (clientPorts.size === 0 && !opfsSyncEnabled) {
-      const currentSignal = Atomics.load(ctrl, 0);
-      if (currentSignal !== SIGNAL.REQUEST) {
-        Atomics.wait(ctrl, 0, currentSignal, 50);
-      }
-    }
-  }
-}
-async function leaderLoopOPFS() {
-  leaderLoopRunning = true;
-  while (true) {
-    let processed = true;
-    let tightOps = 0;
-    while (processed) {
-      processed = false;
-      if (++tightOps >= 100) {
-        tightOps = 0;
-        await yieldToEventLoop();
-      }
-      if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST) {
-        const payload = readPayload(sab, ctrl);
-        const reqResult = await handleRequestOPFS(tabId, payload.buffer);
-        writeDirectResponse(sab, ctrl, reqResult.status, reqResult.data);
-        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 10);
-        if (waitResult === "timed-out") {
-          Atomics.store(ctrl, 0, SIGNAL.IDLE);
-        }
-        processed = true;
-        continue;
-      }
-      if (asyncCtrl && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) {
-        const payload = readPayload(asyncSab, asyncCtrl);
-        const asyncResult = await handleRequestOPFS(tabId, payload.buffer);
-        writeDirectResponse(asyncSab, asyncCtrl, asyncResult.status, asyncResult.data);
-        const waitResult = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 10);
-        if (waitResult === "timed-out") {
-          Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
-        }
-        processed = true;
-        continue;
-      }
-      if (portQueue.length > 0) {
-        await drainPortQueueAsync();
-        processed = true;
-        continue;
-      }
-    }
-    await yieldToEventLoop();
-    if (clientPorts.size === 0) {
-      const currentSignal = Atomics.load(ctrl, 0);
-      if (currentSignal !== SIGNAL.REQUEST) {
-        Atomics.wait(ctrl, 0, currentSignal, 50);
-      }
-    }
-  }
-}
-async function followerLoop() {
-  while (true) {
-    if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST) {
-      const payload = readPayload(sab, ctrl);
-      const response = await forwardToLeader(payload);
-      writeResponse(sab, ctrl, new Uint8Array(response));
-      const result = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 10);
-      if (result === "timed-out") {
-        Atomics.store(ctrl, 0, SIGNAL.IDLE);
-      }
-      continue;
-    }
-    if (asyncCtrl && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) {
-      const payload = readPayload(asyncSab, asyncCtrl);
-      const response = await forwardToLeader(payload);
-      writeResponse(asyncSab, asyncCtrl, new Uint8Array(response));
-      const result = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 10);
-      if (result === "timed-out") {
-        Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
-      }
-      continue;
-    }
-    const waitResult = Atomics.wait(ctrl, 0, SIGNAL.IDLE, 50);
-    if (waitResult === "timed-out") {
-      await yieldToEventLoop();
-    }
-  }
-}
-async function initEngine(config) {
-  debug = config.debug ?? false;
-  let rootDir = await navigator.storage.getDirectory();
-  if (config.root && config.root !== "/") {
-    const segments = config.root.split("/").filter(Boolean);
-    for (const segment of segments) {
-      rootDir = await rootDir.getDirectoryHandle(segment, { create: true });
-    }
-  }
-  const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin", { create: true });
-  const vfsHandle = await vfsFileHandle.createSyncAccessHandle();
+// src/workers/repair.worker.ts
+self.onmessage = async (event) => {
   try {
-    engine.init(vfsHandle, {
-      uid: config.uid,
-      gid: config.gid,
-      umask: config.umask,
-      strictPermissions: config.strictPermissions,
-      debug: config.debug
-    });
+    const msg = event.data;
+    if (msg.type === "repair") {
+      self.postMessage(await handleRepair(msg.root));
+    } else if (msg.type === "load") {
+      self.postMessage(await handleLoad(msg.root));
+    } else {
+      throw new Error(`Unknown message type: ${msg.type}`);
+    }
   } catch (err) {
-    try {
-      vfsHandle.close();
-    } catch (_) {
-    }
-    throw err;
-  }
-  if (config.opfsSync) {
-    opfsSyncEnabled = true;
-    const mc = new MessageChannel();
-    opfsSyncPort = mc.port1;
-    opfsSyncPort.onmessage = (e) => handleExternalChange(e.data);
-    opfsSyncPort.start();
-    const workerUrl = new URL("./opfs-sync.worker.js", import.meta.url);
-    const syncWorker = new Worker(workerUrl, { type: "module" });
-    syncWorker.postMessage(
-      { type: "init", root: config.opfsSyncRoot ?? config.root },
-      [mc.port2]
-    );
-  }
-  watchBc = new BroadcastChannel(`${config.ns}-watch`);
-}
-async function initOPFSEngine(config) {
-  debug = config.debug ?? false;
-  opfsMode = true;
-  let rootDir = await navigator.storage.getDirectory();
-  if (config.root && config.root !== "/") {
-    const segments = config.root.split("/").filter(Boolean);
-    for (const segment of segments) {
-      rootDir = await rootDir.getDirectoryHandle(segment, { create: true });
-    }
-  }
-  opfsEngine = new OPFSEngine();
-  await opfsEngine.init(rootDir, {
-    uid: config.uid,
-    gid: config.gid
-  });
-  watchBc = new BroadcastChannel(`${config.ns}-watch`);
-}
-function broadcastWatch(op, path, newPath) {
-  if (!watchBc) return;
-  let eventType;
-  switch (op) {
-    case OP.WRITE:
-    case OP.APPEND:
-    case OP.TRUNCATE:
-    case OP.FWRITE:
-    case OP.FTRUNCATE:
-    case OP.CHMOD:
-    case OP.CHOWN:
-    case OP.UTIMES:
-      eventType = "change";
-      break;
-    case OP.UNLINK:
-    case OP.RMDIR:
-    case OP.RENAME:
-    case OP.MKDIR:
-    case OP.MKDTEMP:
-    case OP.SYMLINK:
-    case OP.LINK:
-    case OP.COPY:
-      eventType = "rename";
-      break;
-    default:
-      return;
-  }
-  watchBc.postMessage({ eventType, path });
-  if (op === OP.RENAME && newPath) {
-    watchBc.postMessage({ eventType: "rename", path: newPath });
-  }
-}
-function notifyOPFSSync(op, path, newPath) {
-  if (!opfsSyncPort) return;
-  if (suppressPaths.has(path)) {
-    suppressPaths.delete(path);
-    return;
-  }
-  const ts = Date.now();
-  switch (op) {
-    case OP.WRITE:
-    case OP.APPEND:
-    case OP.TRUNCATE:
-    case OP.FWRITE:
-    case OP.FTRUNCATE:
-    case OP.COPY:
-    case OP.LINK: {
-      const result = engine.read(path);
-      if (result.status === 0) {
-        if (result.data && result.data.byteLength > 0) {
-          const buf = result.data.buffer.byteLength === result.data.byteLength ? result.data.buffer : result.data.slice().buffer;
-          opfsSyncPort.postMessage({ op: "write", path, data: buf, ts }, [buf]);
-        } else {
-          opfsSyncPort.postMessage({ op: "write", path, data: new ArrayBuffer(0), ts });
-        }
-      }
-      break;
-    }
-    case OP.SYMLINK: {
-      const result = engine.read(path);
-      if (result.status === 0) {
-        if (result.data && result.data.byteLength > 0) {
-          const buf = result.data.buffer.byteLength === result.data.byteLength ? result.data.buffer : result.data.slice().buffer;
-          opfsSyncPort.postMessage({ op: "write", path, data: buf, ts }, [buf]);
-        } else {
-          opfsSyncPort.postMessage({ op: "write", path, data: new ArrayBuffer(0), ts });
-        }
-      }
-      break;
-    }
-    case OP.UNLINK:
-    case OP.RMDIR:
-      opfsSyncPort.postMessage({ op: "delete", path, ts });
-      break;
-    case OP.MKDIR:
-    case OP.MKDTEMP:
-      opfsSyncPort.postMessage({ op: "mkdir", path, ts });
-      break;
-    case OP.RENAME:
-      if (newPath) {
-        opfsSyncPort.postMessage({ op: "rename", path, newPath, ts });
-      }
-      break;
-  }
-}
-function handleExternalChange(msg) {
-  switch (msg.op) {
-    case "external-write": {
-      suppressPaths.add(msg.path);
-      const result = engine.write(msg.path, new Uint8Array(msg.data), 0);
-      if (result.status === 0) broadcastWatch(OP.WRITE, msg.path);
-      console.log("[sync-relay] external-write:", msg.path, `${msg.data?.byteLength ?? 0}B`, `status=${result.status}`);
-      break;
-    }
-    case "external-delete": {
-      suppressPaths.add(msg.path);
-      const result = engine.unlink(msg.path);
-      if (result.status !== 0) {
-        const rmdirResult = engine.rmdir(msg.path, 1);
-        if (rmdirResult.status === 0) broadcastWatch(OP.RMDIR, msg.path);
-        console.log("[sync-relay] external-delete (rmdir):", msg.path, `status=${rmdirResult.status}`);
-      } else {
-        broadcastWatch(OP.UNLINK, msg.path);
-        console.log("[sync-relay] external-delete:", msg.path, `status=${result.status}`);
-      }
-      break;
-    }
-    case "external-rename":
-      suppressPaths.add(msg.path);
-      if (msg.newPath) {
-        suppressPaths.add(msg.newPath);
-        const result = engine.rename(msg.path, msg.newPath);
-        if (result.status === 0) broadcastWatch(OP.RENAME, msg.path, msg.newPath);
-        console.log("[sync-relay] external-rename:", msg.path, "\u2192", msg.newPath, `status=${result.status}`);
-      }
-      break;
-  }
-}
-self.onmessage = async (e) => {
-  const msg = e.data;
-  if (msg.type === "async-port") {
-    const port = msg.port ?? e.ports[0];
-    if (port) {
-      asyncRelayPort = port;
-      port.onmessage = async (ev) => {
-        if (ev.data.buffer instanceof ArrayBuffer) {
-          if (leaderInitialized) {
-            const result = opfsMode ? await handleRequestOPFS(tabId || "nosab", ev.data.buffer) : handleRequest(tabId || "nosab", ev.data.buffer);
-            const response = encodeResponse(result.status, result.data);
-            port.postMessage({ id: ev.data.id, buffer: response }, [response]);
-            if (!opfsMode && result._op !== void 0) notifyOPFSSync(result._op, result._path, result._newPath);
-          } else if (leaderPort) {
-            const buf = ev.data.buffer;
-            leaderPort.postMessage({ id: ev.data.id, tabId, buffer: buf }, [buf]);
-          }
-        }
-      };
-      port.start();
-    }
-    return;
-  }
-  if (msg.type === "init-leader") {
-    if (leaderInitialized) return;
-    leaderInitialized = true;
-    tabId = msg.tabId;
-    const hasSAB = msg.sab != null;
-    if (hasSAB) {
-      sab = msg.sab;
-      readySab = msg.readySab;
-      ctrl = new Int32Array(sab, 0, 8);
-      readySignal = new Int32Array(readySab, 0, 1);
-    }
-    if (msg.asyncSab) {
-      asyncSab = msg.asyncSab;
-      asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
-    }
-    try {
-      await initEngine(msg.config);
-    } catch (err) {
-      leaderInitialized = false;
-      self.postMessage({
-        type: "init-failed",
-        error: err.message
-      });
-      return;
-    }
-    if (!readySent) {
-      readySent = true;
-      if (hasSAB) {
-        Atomics.store(readySignal, 0, 1);
-        Atomics.notify(readySignal, 0);
-      }
-      self.postMessage({ type: "ready" });
-    }
-    if (hasSAB) {
-      leaderLoop();
-    }
-    return;
-  }
-  if (msg.type === "init-opfs") {
-    leaderInitialized = true;
-    readySent = false;
-    tabId = msg.tabId;
-    const hasSAB = msg.sab != null;
-    if (hasSAB) {
-      sab = msg.sab;
-      readySab = msg.readySab;
-      ctrl = new Int32Array(sab, 0, 8);
-      readySignal = new Int32Array(readySab, 0, 1);
-    }
-    if (msg.asyncSab) {
-      asyncSab = msg.asyncSab;
-      asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
-    }
-    try {
-      await initOPFSEngine(msg.config);
-    } catch (err) {
-      leaderInitialized = false;
-      self.postMessage({
-        type: "init-failed",
-        error: err.message
-      });
-      return;
-    }
-    if (!readySent) {
-      readySent = true;
-      if (hasSAB) {
-        Atomics.store(readySignal, 0, 1);
-        Atomics.notify(readySignal, 0);
-      }
-      self.postMessage({ type: "ready", mode: "opfs" });
-    }
-    if (hasSAB) {
-      leaderLoopOPFS();
-    }
-    return;
-  }
-  if (msg.type === "init-follower") {
-    tabId = msg.tabId;
-    const hasSAB = msg.sab != null;
-    if (hasSAB) {
-      sab = msg.sab;
-      readySab = msg.readySab;
-      ctrl = new Int32Array(sab, 0, 8);
-      readySignal = new Int32Array(readySab, 0, 1);
-    }
-    if (msg.asyncSab) {
-      asyncSab = msg.asyncSab;
-      asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
-    }
-    return;
-  }
-  if (msg.type === "leader-port") {
-    if (leaderInitialized) return;
-    const newPort = msg.port ?? e.ports[0];
-    if (!newPort) return;
-    if (leaderPort) {
-      leaderPort.close();
-      if (pendingResolve) {
-        const errorBuf = encodeResponse(5);
-        pendingResolve(errorBuf);
-        pendingResolve = null;
-      }
-    }
-    leaderPort = newPort;
-    newPort.onmessage = onLeaderMessage;
-    newPort.start();
-    if (!readySent) {
-      readySent = true;
-      if (readySignal) {
-        Atomics.store(readySignal, 0, 1);
-        Atomics.notify(readySignal, 0);
-      }
-      self.postMessage({ type: "ready" });
-      if (ctrl) {
-        followerLoop();
-      }
-    }
-    return;
-  }
-  if (msg.type === "client-port") {
-    registerClientPort(msg.tabId, msg.port ?? e.ports[0]);
-    return;
-  }
-  if (msg.type === "client-lost") {
-    removeClientPort(msg.tabId);
-    return;
+    self.postMessage({ error: err.message || String(err) });
   }
 };
-//# sourceMappingURL=sync-relay.worker.js.map
+async function navigateToRoot(root) {
+  let dir = await navigator.storage.getDirectory();
+  if (root && root !== "/") {
+    for (const seg of root.split("/").filter(Boolean)) {
+      dir = await dir.getDirectoryHandle(seg, { create: true });
+    }
+  }
+  return dir;
+}
+async function readOPFSRecursive(dir, prefix, skip) {
+  const result = [];
+  for await (const [name, handle] of dir.entries()) {
+    if (prefix === "" && skip.has(name)) continue;
+    const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;
+    if (handle.kind === "directory") {
+      result.push({ path: fullPath, type: "directory" });
+      const children = await readOPFSRecursive(handle, fullPath, skip);
+      result.push(...children);
+    } else {
+      const file = await handle.getFile();
+      const data = await file.arrayBuffer();
+      result.push({ path: fullPath, type: "file", data });
+    }
+  }
+  return result;
+}
+async function cleanupTmpFile(rootDir) {
+  try {
+    await rootDir.removeEntry(".vfs.bin.tmp");
+  } catch {
+  }
+}
+async function verifyVFS(fileHandle) {
+  const handle = await fileHandle.createSyncAccessHandle();
+  try {
+    const engine = new VFSEngine();
+    engine.init(handle);
+  } finally {
+    handle.close();
+  }
+}
+async function swapTmpToVFS(rootDir, tmpFileHandle) {
+  await verifyVFS(tmpFileHandle);
+  const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin", { create: true });
+  const srcHandle = await tmpFileHandle.createSyncAccessHandle();
+  const dstHandle = await vfsFileHandle.createSyncAccessHandle();
+  try {
+    const size = srcHandle.getSize();
+    dstHandle.truncate(size);
+    const CHUNK = 1024 * 1024;
+    const buf = new Uint8Array(CHUNK);
+    for (let off = 0; off < size; off += CHUNK) {
+      const n = srcHandle.read(buf, { at: off });
+      dstHandle.write(n < CHUNK ? buf.subarray(0, n) : buf, { at: off });
+    }
+    dstHandle.flush();
+  } finally {
+    dstHandle.close();
+    srcHandle.close();
+  }
+  try {
+    await rootDir.removeEntry(".vfs.bin.tmp");
+  } catch {
+  }
+}
+async function handleRepair(root) {
+  const rootDir = await navigateToRoot(root);
+  await cleanupTmpFile(rootDir);
+  const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin");
+  const file = await vfsFileHandle.getFile();
+  const raw = new Uint8Array(await file.arrayBuffer());
+  const fileSize = raw.byteLength;
+  if (fileSize < SUPERBLOCK.SIZE) {
+    throw new Error(`VFS file too small to repair (${fileSize} bytes)`);
+  }
+  const view = new DataView(raw.buffer);
+  let inodeCount;
+  let blockSize;
+  let totalBlocks;
+  let inodeTableOffset;
+  let pathTableOffset;
+  let dataOffset;
+  let pathTableUsed;
+  const magic = view.getUint32(SUPERBLOCK.MAGIC, true);
+  const version = view.getUint32(SUPERBLOCK.VERSION, true);
+  const superblockValid = magic === VFS_MAGIC && version === VFS_VERSION;
+  if (superblockValid) {
+    inodeCount = view.getUint32(SUPERBLOCK.INODE_COUNT, true);
+    blockSize = view.getUint32(SUPERBLOCK.BLOCK_SIZE, true);
+    totalBlocks = view.getUint32(SUPERBLOCK.TOTAL_BLOCKS, true);
+    inodeTableOffset = view.getFloat64(SUPERBLOCK.INODE_OFFSET, true);
+    pathTableOffset = view.getFloat64(SUPERBLOCK.PATH_OFFSET, true);
+    dataOffset = view.getFloat64(SUPERBLOCK.DATA_OFFSET, true);
+    pathTableUsed = view.getUint32(SUPERBLOCK.PATH_USED, true);
+    if (blockSize === 0 || (blockSize & blockSize - 1) !== 0 || inodeCount === 0 || inodeTableOffset >= fileSize || pathTableOffset >= fileSize || dataOffset >= fileSize) {
+      const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
+      inodeCount = DEFAULT_INODE_COUNT;
+      blockSize = DEFAULT_BLOCK_SIZE;
+      totalBlocks = INITIAL_DATA_BLOCKS;
+      inodeTableOffset = layout.inodeTableOffset;
+      pathTableOffset = layout.pathTableOffset;
+      dataOffset = layout.dataOffset;
+      pathTableUsed = INITIAL_PATH_TABLE_SIZE;
+    }
+  } else {
+    const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
+    inodeCount = DEFAULT_INODE_COUNT;
+    blockSize = DEFAULT_BLOCK_SIZE;
+    totalBlocks = INITIAL_DATA_BLOCKS;
+    inodeTableOffset = layout.inodeTableOffset;
+    pathTableOffset = layout.pathTableOffset;
+    dataOffset = layout.dataOffset;
+    pathTableUsed = INITIAL_PATH_TABLE_SIZE;
+  }
+  const decoder2 = new TextDecoder("utf-8", { fatal: true });
+  const recovered = [];
+  let lost = 0;
+  const maxInodes = Math.min(inodeCount, Math.floor((fileSize - inodeTableOffset) / INODE_SIZE));
+  for (let i = 0; i < maxInodes; i++) {
+    const off = inodeTableOffset + i * INODE_SIZE;
+    if (off + INODE_SIZE > fileSize) break;
+    const type = raw[off + INODE.TYPE];
+    if (type < INODE_TYPE.FILE || type > INODE_TYPE.SYMLINK) continue;
+    const inodeView = new DataView(raw.buffer, off, INODE_SIZE);
+    const pathOff = inodeView.getUint32(INODE.PATH_OFFSET, true);
+    const pathLength = inodeView.getUint16(INODE.PATH_LENGTH, true);
+    const size = inodeView.getFloat64(INODE.SIZE, true);
+    const firstBlock = inodeView.getUint32(INODE.FIRST_BLOCK, true);
+    const absPathOffset = pathTableOffset + pathOff;
+    if (pathLength === 0 || pathLength > 4096 || absPathOffset + pathLength > fileSize || pathOff + pathLength > pathTableUsed) {
+      lost++;
+      continue;
+    }
+    let entryPath;
+    try {
+      entryPath = decoder2.decode(raw.subarray(absPathOffset, absPathOffset + pathLength));
+    } catch {
+      lost++;
+      continue;
+    }
+    if (!entryPath.startsWith("/") || entryPath.includes("\0")) {
+      lost++;
+      continue;
+    }
+    if (type === INODE_TYPE.DIRECTORY) {
+      recovered.push({ path: entryPath, type, dataOffset: 0, dataSize: 0, contentLost: false });
+      continue;
+    }
+    if (size < 0 || size > fileSize || !isFinite(size)) {
+      lost++;
+      continue;
+    }
+    const blockCount = inodeView.getUint32(INODE.BLOCK_COUNT, true);
+    const dataStart = dataOffset + firstBlock * blockSize;
+    if (dataStart + size > fileSize || firstBlock >= totalBlocks || blockCount > 0 && firstBlock + blockCount > totalBlocks) {
+      recovered.push({ path: entryPath, type, dataOffset: 0, dataSize: 0, contentLost: true });
+      lost++;
+      continue;
+    }
+    recovered.push({ path: entryPath, type, dataOffset: dataStart, dataSize: size, contentLost: false });
+  }
+  const tmpFileHandle = await rootDir.getFileHandle(".vfs.bin.tmp", { create: true });
+  const tmpHandle = await tmpFileHandle.createSyncAccessHandle();
+  let repairOk = false;
+  let criticalErrors = 0;
+  const MAX_CRITICAL_ERRORS = 5;
+  try {
+    const engine = new VFSEngine();
+    engine.init(tmpHandle);
+    const dirs = recovered.filter((e) => e.type === INODE_TYPE.DIRECTORY && e.path !== "/").sort((a, b) => a.path.localeCompare(b.path));
+    const files = recovered.filter((e) => e.type === INODE_TYPE.FILE);
+    const symlinks = recovered.filter((e) => e.type === INODE_TYPE.SYMLINK);
+    for (const dir of dirs) {
+      if (engine.mkdir(dir.path, 16877).status !== 0) {
+        criticalErrors++;
+        lost++;
+        if (criticalErrors >= MAX_CRITICAL_ERRORS) {
+          throw new Error(`Repair aborted: too many critical errors (${criticalErrors} mkdir failures)`);
+        }
+      }
+    }
+    for (const f of files) {
+      const data = f.dataSize > 0 ? raw.subarray(f.dataOffset, f.dataOffset + f.dataSize) : new Uint8Array(0);
+      if (engine.write(f.path, data).status !== 0) {
+        lost++;
+      }
+    }
+    for (const sym of symlinks) {
+      if (sym.dataSize === 0 && sym.contentLost) {
+        lost++;
+        continue;
+      }
+      const data = sym.dataSize > 0 ? raw.subarray(sym.dataOffset, sym.dataOffset + sym.dataSize) : new Uint8Array(0);
+      let target;
+      try {
+        target = decoder2.decode(data);
+      } catch {
+        lost++;
+        continue;
+      }
+      if (target.length === 0 || target.includes("\0")) {
+        lost++;
+        continue;
+      }
+      if (engine.symlink(target, sym.path).status !== 0) lost++;
+    }
+    engine.flush();
+    repairOk = true;
+  } finally {
+    tmpHandle.close();
+    if (!repairOk) {
+      await cleanupTmpFile(rootDir);
+    }
+  }
+  try {
+    await swapTmpToVFS(rootDir, tmpFileHandle);
+  } catch (err) {
+    await cleanupTmpFile(rootDir);
+    throw new Error(`Repair built a VFS but verification failed: ${err.message}`);
+  }
+  const entries = recovered.filter((e) => e.path !== "/").map((e) => ({
+    path: e.path,
+    type: e.type === INODE_TYPE.FILE ? "file" : e.type === INODE_TYPE.DIRECTORY ? "directory" : "symlink",
+    size: e.dataSize,
+    contentLost: e.contentLost
+  }));
+  return { recovered: entries.length, lost, entries };
+}
+async function handleLoad(root) {
+  const rootDir = await navigateToRoot(root);
+  await cleanupTmpFile(rootDir);
+  const opfsEntries = await readOPFSRecursive(rootDir, "", /* @__PURE__ */ new Set([".vfs.bin", ".vfs.bin.tmp"]));
+  const tmpFileHandle = await rootDir.getFileHandle(".vfs.bin.tmp", { create: true });
+  const tmpHandle = await tmpFileHandle.createSyncAccessHandle();
+  let buildOk = false;
+  let files = 0;
+  let directories = 0;
+  try {
+    const engine = new VFSEngine();
+    engine.init(tmpHandle);
+    const dirs = opfsEntries.filter((e) => e.type === "directory").sort((a, b) => a.path.localeCompare(b.path));
+    for (const dir of dirs) {
+      if (engine.mkdir(dir.path, 16877).status === 0) {
+        directories++;
+      }
+    }
+    const fileEntries = opfsEntries.filter((e) => e.type === "file");
+    for (const file of fileEntries) {
+      if (engine.write(file.path, new Uint8Array(file.data ?? new ArrayBuffer(0))).status === 0) {
+        files++;
+      }
+    }
+    engine.flush();
+    buildOk = true;
+  } finally {
+    tmpHandle.close();
+    if (!buildOk) {
+      await cleanupTmpFile(rootDir);
+    }
+  }
+  try {
+    await swapTmpToVFS(rootDir, tmpFileHandle);
+  } catch (err) {
+    await cleanupTmpFile(rootDir);
+    throw new Error(`Load built a VFS but verification failed: ${err.message}`);
+  }
+  return { files, directories };
+}
+//# sourceMappingURL=repair.worker.js.map

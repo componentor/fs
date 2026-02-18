@@ -20,6 +20,7 @@ export default defineConfig([
       'src/workers/async-relay.worker.ts',
       'src/workers/service.worker.ts',
       'src/workers/opfs-sync.worker.ts',
+      'src/workers/repair.worker.ts',
     ],
     outDir: '../dist/workers',
     format: ['esm'],

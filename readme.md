@@ -74,7 +74,7 @@ await init(); // initializes the default singleton
 ```typescript
 const fs = new VFSFileSystem({
   root: '/',              // OPFS root directory (default: '/')
-  opfsSync: true,         // Mirror VFS to real OPFS files (default: true)
+  mode: 'hybrid',        // 'hybrid' | 'vfs' | 'opfs' (default: 'hybrid')
   opfsSyncRoot: undefined, // Custom OPFS root for mirroring (default: same as root)
   uid: 0,                 // User ID for file ownership (default: 0)
   gid: 0,                 // Group ID for file ownership (default: 0)
@@ -86,24 +86,72 @@ const fs = new VFSFileSystem({
 });
 ```
 
-### OPFS Sync
+### Filesystem Modes
 
-When `opfsSync` is enabled (the default), VFS mutations are mirrored to real OPFS files in the background:
+The `mode` option controls how the filesystem stores data:
 
-- **VFS → OPFS**: Every write, delete, mkdir, rename is replicated to real OPFS files after the sync operation completes (zero performance impact on the hot path)
+| Mode | Storage | OPFS Sync | Speed | Resilience |
+|------|---------|-----------|-------|------------|
+| `hybrid` (default) | VFS binary + OPFS mirror | Bidirectional | Fast | High |
+| `vfs` | VFS binary only | None | Fastest | Medium |
+| `opfs` | Real OPFS files only | N/A | Slower | Highest |
+
+```typescript
+// Hybrid mode (default) — best of both worlds
+const fs = new VFSFileSystem({ mode: 'hybrid' });
+fs.writeFileSync('/file.txt', 'data');
+// → stored in .vfs.bin AND mirrored to real OPFS files
+
+// VFS-only mode — maximum performance, no OPFS mirroring
+const fastFs = new VFSFileSystem({ mode: 'vfs' });
+
+// OPFS-only mode — no VFS binary, operates directly on OPFS files
+const safeFs = new VFSFileSystem({ mode: 'opfs' });
+```
+
+**Hybrid mode** mirrors all VFS mutations to real OPFS files in the background:
+
+- **VFS → OPFS**: Every write, delete, mkdir, rename is replicated after the sync operation completes (zero performance impact on the hot path)
 - **OPFS → VFS**: A `FileSystemObserver` watches for external changes and syncs them back (Chrome 129+)
 
 This allows external tools (browser DevTools, OPFS extensions) to see and modify files while VFS handles all the fast read/write operations internally.
 
-```typescript
-// OPFS sync enabled (default)
-const fs = new VFSFileSystem({ opfsSync: true });
-fs.writeFileSync('/file.txt', 'data');
-// → /file.txt also appears in OPFS (visible in DevTools > Application > Storage)
+#### Corruption Fallback
 
-// Disable for maximum performance (no OPFS mirroring)
-const fastFs = new VFSFileSystem({ opfsSync: false });
+In `hybrid` mode, if VFS corruption is detected during initialization, the filesystem automatically falls back to `opfs` mode. The `init()` call rejects with an error describing the corruption, but all filesystem operations continue working via OPFS:
+
+```typescript
+const fs = new VFSFileSystem(); // hybrid mode
+
+try {
+  await fs.init();
+} catch (err) {
+  // VFS was corrupt — system is now running in OPFS mode
+  console.warn(err.message); // "Falling back to OPFS mode: <reason>"
+  console.log(fs.mode);      // 'opfs'
+}
+
+// Filesystem still works — reads/writes go through OPFS
+fs.writeFileSync('/file.txt', 'still works!');
 ```
+
+#### Runtime Mode Switching
+
+Use `setMode()` to switch modes at runtime. This is useful for IDE workflows where you want to recover from corruption:
+
+```typescript
+// Corruption detected, currently in OPFS fallback mode
+console.log(fs.mode); // 'opfs'
+
+// Repair the VFS binary
+await repairVFS('/my-app');
+
+// Switch back to hybrid mode
+await fs.setMode('hybrid');
+console.log(fs.mode); // 'hybrid'
+```
+
+`setMode()` terminates internal workers, allocates fresh shared memory, and reinitializes the filesystem in the requested mode.
 
 ## COOP/COEP Headers
 
@@ -309,6 +357,19 @@ await writer.write(new Uint8Array([1, 2, 3]));
 await writer.close();
 ```
 
+### Instance Methods
+
+```typescript
+// Get the current filesystem mode
+fs.mode: 'hybrid' | 'vfs' | 'opfs'
+
+// Switch mode at runtime (terminates workers, reinitializes)
+await fs.setMode('hybrid' | 'vfs' | 'opfs'): Promise<void>
+
+// Non-blocking async init (waits for VFS to be ready)
+await fs.init(): Promise<void>
+```
+
 ### Watch API
 
 ```typescript
@@ -508,6 +569,37 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 `FileSystemObserver` requires Chrome 129+. The VFS instance must be running (observer is set up during init). Changes to files outside the configured `root` directory won't be detected.
 
 ## Changelog
+
+### v3.0.10 (2026)
+
+**New: Three filesystem modes (`hybrid`, `vfs`, `opfs`)**
+- `mode: 'hybrid'` (default) — VFS binary + bidirectional OPFS sync
+- `mode: 'vfs'` — VFS binary only, no OPFS mirroring (fastest)
+- `mode: 'opfs'` — Pure OPFS files, no VFS binary (most resilient)
+- New `OPFSEngine` implements all fs operations directly on OPFS files
+
+**Automatic corruption fallback**
+- Hybrid mode auto-falls back to OPFS mode on VFS corruption
+- `await fs.init()` rejects with descriptive error while system works in OPFS mode
+- `fs.mode` getter reflects current mode (changes to `'opfs'` on fallback)
+
+**Runtime mode switching**
+- `await fs.setMode('hybrid' | 'vfs' | 'opfs')` for switching modes at runtime
+- IDE workflow: corruption → OPFS fallback → repair → `setMode('hybrid')`
+
+**Corruption detection improvements**
+- `rebuildIndex()` validates every inode: type, path bounds, data block range, path format
+- Fixed `format()` not persisting `pathTableUsed` after root inode creation
+
+**Repair safety**
+- Dedicated repair worker with `createSyncAccessHandle` — no RAM bloat
+- Original `.vfs.bin` is never deleted until replacement is verified via re-mount
+- Copy-then-delete swap: crash mid-copy leaves `.vfs.bin.tmp` intact for retry
+- `loadFromOPFS` builds in temp file first — original untouched until verified
+- Strict UTF-8 decoding for recovered paths and symlink targets (rejects invalid sequences)
+- `contentLost` flag on repair entries distinguishes empty files from files with lost data
+- Repair aborts after 5 critical `mkdir` failures (fail-fast threshold)
+- Orphaned `.vfs.bin.tmp` files cleaned up automatically on repair entry
 
 ### v3.0.9 (2026)
 
