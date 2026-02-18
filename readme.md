@@ -570,6 +570,11 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+### v3.0.13 (2026)
+
+**Fixes:**
+- Revert `.d.ts` extension override in `outExtension` — `dts: true` handles it correctly
+
 ### v3.0.12 (2026)
 
 **Fixes:**

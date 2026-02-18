@@ -1,6 +1,6 @@
 {
   "name": "@componentor/fs",
-  "version": "3.0.12",
+  "version": "3.0.13",
   "description": "High-performance OPFS-based Node.js fs polyfill with true sync API, VFS binary format, and bidirectional OPFS mirroring",
   "license": "MIT",
   "author": "Componentor",
@@ -14,10 +14,10 @@
   "homepage": "https://github.com/componentor/fs#readme",
   "type": "module",
   "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
+  "types": "./dist/index.d.mts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
+      "types": "./dist/index.d.mts",
       "import": "./dist/index.js"
     },
     "./sw": "./dist/workers/service.worker.js"

@@ -1,6 +1,6 @@
 import { defineConfig } from 'tsup';
 
-const jsExtension = () => ({ js: '.js', dts: '.d.ts' });
+const jsExtension = () => ({ js: '.js' });
 
 export default defineConfig([
   {
