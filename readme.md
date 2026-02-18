@@ -509,6 +509,13 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+### v3.0.8 (2026)
+
+**Improvements:**
+- Add VFS helper functions: `unpackToOPFS`, `loadFromOPFS`, and `repairVFS` for VFS maintenance, migration, and recovery
+- Helpers work in both Worker (sync access handle) and main thread (in-memory buffer + async writable) contexts
+- Remove redundant I/O call in `unpackToOPFS` directory creation
+
 ### v3.0.7 (2026)
 
 **Fixes:**

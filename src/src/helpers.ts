@@ -6,9 +6,9 @@
  * - loadFromOPFS: Rebuild VFS from real OPFS files
  * - repairVFS: Attempt to recover files from a corrupt VFS binary
  *
- * These functions acquire an exclusive sync access handle on .vfs.bin,
- * so any running VFSFileSystem instance must be closed first.
- * Must be called from a Worker context (createSyncAccessHandle requirement).
+ * Works in both Worker and main thread contexts.
+ * Workers use createSyncAccessHandle for direct OPFS access.
+ * Main thread falls back to an in-memory buffer + createWritable.
  */
 
 import { VFSEngine } from './vfs/engine.js';
@@ -17,6 +17,128 @@ import {
   DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS,
   INITIAL_PATH_TABLE_SIZE, calculateLayout,
 } from './vfs/layout.js';
+
+// ========== In-Memory Handle (main thread fallback) ==========
+
+/**
+ * In-memory implementation of FileSystemSyncAccessHandle.
+ * Used on the main thread where createSyncAccessHandle is unavailable.
+ * After operations complete, call saveToOPFS() to persist.
+ */
+class MemoryHandle {
+  private buf: Uint8Array;
+  private len: number;
+
+  constructor(initialData?: ArrayBuffer) {
+    if (initialData && initialData.byteLength > 0) {
+      this.buf = new Uint8Array(initialData);
+      this.len = initialData.byteLength;
+    } else {
+      this.buf = new Uint8Array(1024 * 1024); // 1MB initial
+      this.len = 0;
+    }
+  }
+
+  getSize(): number {
+    return this.len;
+  }
+
+  read(target: ArrayBufferView, opts?: { at?: number }): number {
+    const offset = opts?.at ?? 0;
+    const dst = new Uint8Array(target.buffer, target.byteOffset, target.byteLength);
+    const bytesToRead = Math.min(dst.length, this.len - offset);
+    if (bytesToRead <= 0) return 0;
+    dst.set(this.buf.subarray(offset, offset + bytesToRead));
+    return bytesToRead;
+  }
+
+  write(data: ArrayBufferView, opts?: { at?: number }): number {
+    const offset = opts?.at ?? 0;
+    const src = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    const needed = offset + src.length;
+    if (needed > this.buf.length) {
+      this.grow(needed);
+    }
+    this.buf.set(src, offset);
+    if (needed > this.len) this.len = needed;
+    return src.length;
+  }
+
+  truncate(size: number): void {
+    if (size > this.buf.length) {
+      this.grow(size);
+    }
+    if (size > this.len) {
+      // Zero-fill the extension
+      this.buf.fill(0, this.len, size);
+    }
+    this.len = size;
+  }
+
+  flush(): void {
+    // No-op — data stays in memory until saveToOPFS
+  }
+
+  close(): void {
+    // No-op
+  }
+
+  /** Get the current data as an ArrayBuffer (trimmed to actual size) */
+  getBuffer(): ArrayBuffer {
+    return this.buf.buffer.slice(0, this.len);
+  }
+
+  private grow(minSize: number): void {
+    const newSize = Math.max(minSize, this.buf.length * 2);
+    const newBuf = new Uint8Array(newSize);
+    newBuf.set(this.buf.subarray(0, this.len));
+    this.buf = newBuf;
+  }
+}
+
+/**
+ * Open a VFS handle — tries createSyncAccessHandle (workers),
+ * falls back to MemoryHandle (main thread).
+ */
+async function openVFSHandle(
+  fileHandle: FileSystemFileHandle
+): Promise<{ handle: any; isMemory: boolean }> {
+  try {
+    const handle = await (fileHandle as any).createSyncAccessHandle();
+    return { handle, isMemory: false };
+  } catch {
+    // Main thread — load file into memory
+    const file = await fileHandle.getFile();
+    const data = await file.arrayBuffer();
+    return { handle: new MemoryHandle(data), isMemory: true };
+  }
+}
+
+/**
+ * Open a fresh (empty) VFS handle for writing.
+ */
+async function openFreshVFSHandle(
+  fileHandle: FileSystemFileHandle
+): Promise<{ handle: any; isMemory: boolean }> {
+  try {
+    const handle = await (fileHandle as any).createSyncAccessHandle();
+    return { handle, isMemory: false };
+  } catch {
+    return { handle: new MemoryHandle(), isMemory: true };
+  }
+}
+
+/**
+ * Save a MemoryHandle's content back to OPFS using the async createWritable API.
+ */
+async function saveMemoryHandle(
+  fileHandle: FileSystemFileHandle,
+  memHandle: MemoryHandle
+): Promise<void> {
+  const writable = await (fileHandle as any).createWritable();
+  await writable.write(memHandle.getBuffer());
+  await writable.close();
+}
 
 // ========== OPFS Navigation Helpers ==========
 
@@ -49,15 +171,23 @@ async function writeOPFSFile(rootDir: FileSystemDirectoryHandle, path: string, d
   const parentDir = await ensureParentDirs(rootDir, path);
   const name = basename(path);
   const fileHandle = await parentDir.getFileHandle(name, { create: true });
-  const syncHandle = await fileHandle.createSyncAccessHandle();
   try {
-    syncHandle.truncate(0);
-    if (data.byteLength > 0) {
-      syncHandle.write(data, { at: 0 });
+    // Worker context — use sync access handle
+    const syncHandle = await (fileHandle as any).createSyncAccessHandle();
+    try {
+      syncHandle.truncate(0);
+      if (data.byteLength > 0) {
+        syncHandle.write(data, { at: 0 });
+      }
+      syncHandle.flush();
+    } finally {
+      syncHandle.close();
     }
-    syncHandle.flush();
-  } finally {
-    syncHandle.close();
+  } catch {
+    // Main thread — use async writable stream
+    const writable = await (fileHandle as any).createWritable();
+    await writable.write(data);
+    await writable.close();
   }
 }
 
@@ -119,7 +249,7 @@ export async function unpackToOPFS(root: string = '/'): Promise<UnpackResult> {
 
   // Open VFS binary
   const vfsFileHandle = await rootDir.getFileHandle('.vfs.bin');
-  const handle = await vfsFileHandle.createSyncAccessHandle();
+  const { handle } = await openVFSHandle(vfsFileHandle);
 
   let entries: Array<{ path: string; type: number; data: Uint8Array | null; mode: number; mtime: number }>;
   try {
@@ -139,7 +269,6 @@ export async function unpackToOPFS(root: string = '/'): Promise<UnpackResult> {
   for (const entry of entries) {
     if (entry.path === '/') continue; // Skip root
     if (entry.type === INODE_TYPE.DIRECTORY) {
-      await ensureParentDirs(rootDir, entry.path + '/dummy');
       const name = basename(entry.path);
       const parent = await ensureParentDirs(rootDir, entry.path);
       await parent.getDirectoryHandle(name, { create: true });
@@ -185,7 +314,7 @@ export async function loadFromOPFS(root: string = '/'): Promise<LoadResult> {
 
   // Create fresh VFS
   const vfsFileHandle = await rootDir.getFileHandle('.vfs.bin', { create: true });
-  const handle = await vfsFileHandle.createSyncAccessHandle();
+  const { handle, isMemory } = await openFreshVFSHandle(vfsFileHandle);
 
   try {
     const engine = new VFSEngine();
@@ -212,6 +341,12 @@ export async function loadFromOPFS(root: string = '/'): Promise<LoadResult> {
     }
 
     engine.flush();
+
+    // Persist MemoryHandle to OPFS if on main thread
+    if (isMemory) {
+      await saveMemoryHandle(vfsFileHandle, handle as MemoryHandle);
+    }
+
     return { files, directories };
   } finally {
     handle.close();
@@ -370,7 +505,7 @@ export async function repairVFS(root: string = '/'): Promise<RepairResult> {
 
   // Create fresh VFS with recovered data
   const newFileHandle = await rootDir.getFileHandle('.vfs.bin', { create: true });
-  const handle = await newFileHandle.createSyncAccessHandle();
+  const { handle, isMemory } = await openFreshVFSHandle(newFileHandle);
 
   try {
     const engine = new VFSEngine();
@@ -403,6 +538,11 @@ export async function repairVFS(root: string = '/'): Promise<RepairResult> {
     }
 
     engine.flush();
+
+    // Persist MemoryHandle to OPFS if on main thread
+    if (isMemory) {
+      await saveMemoryHandle(newFileHandle, handle as MemoryHandle);
+    }
   } finally {
     handle.close();
   }

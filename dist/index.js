@@ -3236,6 +3236,87 @@ var VFSEngine = class {
 };
 
 // src/helpers.ts
+var MemoryHandle = class {
+  buf;
+  len;
+  constructor(initialData) {
+    if (initialData && initialData.byteLength > 0) {
+      this.buf = new Uint8Array(initialData);
+      this.len = initialData.byteLength;
+    } else {
+      this.buf = new Uint8Array(1024 * 1024);
+      this.len = 0;
+    }
+  }
+  getSize() {
+    return this.len;
+  }
+  read(target, opts) {
+    const offset = opts?.at ?? 0;
+    const dst = new Uint8Array(target.buffer, target.byteOffset, target.byteLength);
+    const bytesToRead = Math.min(dst.length, this.len - offset);
+    if (bytesToRead <= 0) return 0;
+    dst.set(this.buf.subarray(offset, offset + bytesToRead));
+    return bytesToRead;
+  }
+  write(data, opts) {
+    const offset = opts?.at ?? 0;
+    const src = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    const needed = offset + src.length;
+    if (needed > this.buf.length) {
+      this.grow(needed);
+    }
+    this.buf.set(src, offset);
+    if (needed > this.len) this.len = needed;
+    return src.length;
+  }
+  truncate(size) {
+    if (size > this.buf.length) {
+      this.grow(size);
+    }
+    if (size > this.len) {
+      this.buf.fill(0, this.len, size);
+    }
+    this.len = size;
+  }
+  flush() {
+  }
+  close() {
+  }
+  /** Get the current data as an ArrayBuffer (trimmed to actual size) */
+  getBuffer() {
+    return this.buf.buffer.slice(0, this.len);
+  }
+  grow(minSize) {
+    const newSize = Math.max(minSize, this.buf.length * 2);
+    const newBuf = new Uint8Array(newSize);
+    newBuf.set(this.buf.subarray(0, this.len));
+    this.buf = newBuf;
+  }
+};
+async function openVFSHandle(fileHandle) {
+  try {
+    const handle = await fileHandle.createSyncAccessHandle();
+    return { handle, isMemory: false };
+  } catch {
+    const file = await fileHandle.getFile();
+    const data = await file.arrayBuffer();
+    return { handle: new MemoryHandle(data), isMemory: true };
+  }
+}
+async function openFreshVFSHandle(fileHandle) {
+  try {
+    const handle = await fileHandle.createSyncAccessHandle();
+    return { handle, isMemory: false };
+  } catch {
+    return { handle: new MemoryHandle(), isMemory: true };
+  }
+}
+async function saveMemoryHandle(fileHandle, memHandle) {
+  const writable = await fileHandle.createWritable();
+  await writable.write(memHandle.getBuffer());
+  await writable.close();
+}
 async function navigateToRoot(root) {
   let dir = await navigator.storage.getDirectory();
   if (root && root !== "/") {
@@ -3262,15 +3343,21 @@ async function writeOPFSFile(rootDir, path, data) {
   const parentDir = await ensureParentDirs(rootDir, path);
   const name = basename2(path);
   const fileHandle = await parentDir.getFileHandle(name, { create: true });
-  const syncHandle = await fileHandle.createSyncAccessHandle();
   try {
-    syncHandle.truncate(0);
-    if (data.byteLength > 0) {
-      syncHandle.write(data, { at: 0 });
+    const syncHandle = await fileHandle.createSyncAccessHandle();
+    try {
+      syncHandle.truncate(0);
+      if (data.byteLength > 0) {
+        syncHandle.write(data, { at: 0 });
+      }
+      syncHandle.flush();
+    } finally {
+      syncHandle.close();
     }
-    syncHandle.flush();
-  } finally {
-    syncHandle.close();
+  } catch {
+    const writable = await fileHandle.createWritable();
+    await writable.write(data);
+    await writable.close();
   }
 }
 async function clearDirectory(dir, skip) {
@@ -3302,7 +3389,7 @@ async function readOPFSRecursive(dir, prefix, skip) {
 async function unpackToOPFS(root = "/") {
   const rootDir = await navigateToRoot(root);
   const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin");
-  const handle = await vfsFileHandle.createSyncAccessHandle();
+  const { handle } = await openVFSHandle(vfsFileHandle);
   let entries;
   try {
     const engine = new VFSEngine();
@@ -3340,7 +3427,7 @@ async function loadFromOPFS(root = "/") {
   } catch (_) {
   }
   const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin", { create: true });
-  const handle = await vfsFileHandle.createSyncAccessHandle();
+  const { handle, isMemory } = await openFreshVFSHandle(vfsFileHandle);
   try {
     const engine = new VFSEngine();
     engine.init(handle);
@@ -3357,6 +3444,9 @@ async function loadFromOPFS(root = "/") {
       files++;
     }
     engine.flush();
+    if (isMemory) {
+      await saveMemoryHandle(vfsFileHandle, handle);
+    }
     return { files, directories };
   } finally {
     handle.close();
@@ -3458,7 +3548,7 @@ async function repairVFS(root = "/") {
   }
   await rootDir.removeEntry(".vfs.bin");
   const newFileHandle = await rootDir.getFileHandle(".vfs.bin", { create: true });
-  const handle = await newFileHandle.createSyncAccessHandle();
+  const { handle, isMemory } = await openFreshVFSHandle(newFileHandle);
   try {
     const engine = new VFSEngine();
     engine.init(handle);
@@ -3479,6 +3569,9 @@ async function repairVFS(root = "/") {
       if (result.status !== 0) lost++;
     }
     engine.flush();
+    if (isMemory) {
+      await saveMemoryHandle(newFileHandle, handle);
+    }
   } finally {
     handle.close();
   }
