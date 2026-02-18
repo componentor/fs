@@ -570,6 +570,12 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+### v3.0.14 (2026)
+
+**Fixes:**
+- Fix `PATH_USED` not persisted after `write()` without flush flag — `commitPending()` now runs unconditionally after every write, preventing "path out of bounds" corruption on reload
+- Repair inode scanner uses the full allocated path table region instead of `PATH_USED` from the superblock — recovers files even when the superblock counter was stale
+
 ### v3.0.13 (2026)
 
 **Fixes:**

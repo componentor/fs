@@ -777,8 +777,8 @@ var VFSEngine = class {
       tData = tAlloc;
       tInode = tAlloc;
     }
+    this.commitPending();
     if (flags & 1) {
-      this.commitPending();
       this.handle.flush();
     }
     const tFlush = this.debug ? performance.now() : 0;
@@ -1489,7 +1489,8 @@ async function handleRepair(root) {
   let inodeTableOffset;
   let pathTableOffset;
   let dataOffset;
-  let pathTableUsed;
+  let bitmapOffset;
+  let pathTableSize;
   const magic = view.getUint32(SUPERBLOCK.MAGIC, true);
   const version = view.getUint32(SUPERBLOCK.VERSION, true);
   const superblockValid = magic === VFS_MAGIC && version === VFS_VERSION;
@@ -1500,8 +1501,9 @@ async function handleRepair(root) {
     inodeTableOffset = view.getFloat64(SUPERBLOCK.INODE_OFFSET, true);
     pathTableOffset = view.getFloat64(SUPERBLOCK.PATH_OFFSET, true);
     dataOffset = view.getFloat64(SUPERBLOCK.DATA_OFFSET, true);
-    pathTableUsed = view.getUint32(SUPERBLOCK.PATH_USED, true);
-    if (blockSize === 0 || (blockSize & blockSize - 1) !== 0 || inodeCount === 0 || inodeTableOffset >= fileSize || pathTableOffset >= fileSize || dataOffset >= fileSize) {
+    bitmapOffset = view.getFloat64(SUPERBLOCK.BITMAP_OFFSET, true);
+    pathTableSize = bitmapOffset - pathTableOffset;
+    if (blockSize === 0 || (blockSize & blockSize - 1) !== 0 || inodeCount === 0 || inodeTableOffset >= fileSize || pathTableOffset >= fileSize || dataOffset >= fileSize || pathTableSize <= 0) {
       const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
       inodeCount = DEFAULT_INODE_COUNT;
       blockSize = DEFAULT_BLOCK_SIZE;
@@ -1509,7 +1511,8 @@ async function handleRepair(root) {
       inodeTableOffset = layout.inodeTableOffset;
       pathTableOffset = layout.pathTableOffset;
       dataOffset = layout.dataOffset;
-      pathTableUsed = INITIAL_PATH_TABLE_SIZE;
+      bitmapOffset = layout.bitmapOffset;
+      pathTableSize = bitmapOffset - pathTableOffset;
     }
   } else {
     const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
@@ -1519,7 +1522,8 @@ async function handleRepair(root) {
     inodeTableOffset = layout.inodeTableOffset;
     pathTableOffset = layout.pathTableOffset;
     dataOffset = layout.dataOffset;
-    pathTableUsed = INITIAL_PATH_TABLE_SIZE;
+    bitmapOffset = layout.bitmapOffset;
+    pathTableSize = bitmapOffset - pathTableOffset;
   }
   const decoder2 = new TextDecoder("utf-8", { fatal: true });
   const recovered = [];
@@ -1536,7 +1540,7 @@ async function handleRepair(root) {
     const size = inodeView.getFloat64(INODE.SIZE, true);
     const firstBlock = inodeView.getUint32(INODE.FIRST_BLOCK, true);
     const absPathOffset = pathTableOffset + pathOff;
-    if (pathLength === 0 || pathLength > 4096 || absPathOffset + pathLength > fileSize || pathOff + pathLength > pathTableUsed) {
+    if (pathLength === 0 || pathLength > 4096 || absPathOffset + pathLength > fileSize || pathOff + pathLength > pathTableSize) {
       lost++;
       continue;
     }

@@ -168,7 +168,8 @@ async function handleRepair(root: string) {
   let inodeTableOffset: number;
   let pathTableOffset: number;
   let dataOffset: number;
-  let pathTableUsed: number;
+  let bitmapOffset: number;
+  let pathTableSize: number;
 
   const magic = view.getUint32(SUPERBLOCK.MAGIC, true);
   const version = view.getUint32(SUPERBLOCK.VERSION, true);
@@ -181,10 +182,15 @@ async function handleRepair(root: string) {
     inodeTableOffset = view.getFloat64(SUPERBLOCK.INODE_OFFSET, true);
     pathTableOffset = view.getFloat64(SUPERBLOCK.PATH_OFFSET, true);
     dataOffset = view.getFloat64(SUPERBLOCK.DATA_OFFSET, true);
-    pathTableUsed = view.getUint32(SUPERBLOCK.PATH_USED, true);
+    bitmapOffset = view.getFloat64(SUPERBLOCK.BITMAP_OFFSET, true);
+    // Use the full allocated path table size (not PATH_USED) for repair validation.
+    // PATH_USED may be stale if the superblock wasn't flushed after a write —
+    // paths were written to OPFS but the superblock counter wasn't updated.
+    pathTableSize = bitmapOffset - pathTableOffset;
 
     if (blockSize === 0 || (blockSize & (blockSize - 1)) !== 0 || inodeCount === 0 ||
-        inodeTableOffset >= fileSize || pathTableOffset >= fileSize || dataOffset >= fileSize) {
+        inodeTableOffset >= fileSize || pathTableOffset >= fileSize || dataOffset >= fileSize ||
+        pathTableSize <= 0) {
       const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
       inodeCount = DEFAULT_INODE_COUNT;
       blockSize = DEFAULT_BLOCK_SIZE;
@@ -192,7 +198,8 @@ async function handleRepair(root: string) {
       inodeTableOffset = layout.inodeTableOffset;
       pathTableOffset = layout.pathTableOffset;
       dataOffset = layout.dataOffset;
-      pathTableUsed = INITIAL_PATH_TABLE_SIZE;
+      bitmapOffset = layout.bitmapOffset;
+      pathTableSize = bitmapOffset - pathTableOffset;
     }
   } else {
     const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
@@ -202,7 +209,8 @@ async function handleRepair(root: string) {
     inodeTableOffset = layout.inodeTableOffset;
     pathTableOffset = layout.pathTableOffset;
     dataOffset = layout.dataOffset;
-    pathTableUsed = INITIAL_PATH_TABLE_SIZE;
+    bitmapOffset = layout.bitmapOffset;
+    pathTableSize = bitmapOffset - pathTableOffset;
   }
 
   // Scan inodes for recoverable entries
@@ -232,11 +240,13 @@ async function handleRepair(root: string) {
     const size = inodeView.getFloat64(INODE.SIZE, true);
     const firstBlock = inodeView.getUint32(INODE.FIRST_BLOCK, true);
 
-    // Validate path bounds against both the path table and file size
+    // Validate path bounds against the allocated path table region and file size.
+    // Use pathTableSize (not PATH_USED from superblock) because PATH_USED may be
+    // stale if the superblock wasn't flushed — the path bytes are still on disk.
     const absPathOffset = pathTableOffset + pathOff;
     if (pathLength === 0 || pathLength > 4096 ||
         absPathOffset + pathLength > fileSize ||
-        pathOff + pathLength > pathTableUsed) {
+        pathOff + pathLength > pathTableSize) {
       lost++;
       continue;
     }

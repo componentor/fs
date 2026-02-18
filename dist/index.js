@@ -2809,8 +2809,8 @@ var VFSEngine = class {
       tData = tAlloc;
       tInode = tAlloc;
     }
+    this.commitPending();
     if (flags & 1) {
-      this.commitPending();
       this.handle.flush();
     }
     const tFlush = this.debug ? performance.now() : 0;

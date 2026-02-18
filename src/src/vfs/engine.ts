@@ -913,8 +913,11 @@ export class VFSEngine {
       tInode = tAlloc;
     }
 
+    // Always commit pending superblock/bitmap changes (matches unlink, mkdir, etc.)
+    // Without this, PATH_USED won't be persisted for newly created files,
+    // causing "path out of bounds" corruption on reload.
+    this.commitPending();
     if (flags & 1) {
-      this.commitPending();
       this.handle.flush();
     }
     const tFlush = this.debug ? performance.now() : 0;
