@@ -6,9 +6,13 @@
  * - loadFromOPFS: Rebuild VFS from real OPFS files
  * - repairVFS: Attempt to recover files from a corrupt VFS binary
  *
- * Works in both Worker and main thread contexts.
- * Workers use createSyncAccessHandle for direct OPFS access.
- * Main thread falls back to an in-memory buffer + createWritable.
+ * Each function accepts an optional `fs` parameter (a running VFSFileSystem
+ * instance). When provided, operations go through the VFS worker which holds
+ * the exclusive sync handle on .vfs.bin. This allows these functions to work
+ * from the main thread while the VFS is running.
+ *
+ * When `fs` is NOT provided, falls back to direct .vfs.bin access via
+ * VFSEngine (requires the VFS to be stopped first, or a Worker context).
  */
 
 import { VFSEngine } from './vfs/engine.js';
@@ -17,6 +21,20 @@ import {
   DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS,
   INITIAL_PATH_TABLE_SIZE, calculateLayout,
 } from './vfs/layout.js';
+
+/**
+ * Minimal FS interface accepted by the helper functions.
+ * Compatible with VFSFileSystem — avoids circular import.
+ */
+interface FsLike {
+  readFileSync(path: string, options?: any): any;
+  writeFileSync(path: string, data: any, options?: any): void;
+  mkdirSync(path: string, options?: any): any;
+  readdirSync(path: string, options?: any): any;
+  rmSync(path: string, options?: any): void;
+  statSync(path: string): any;
+  symlinkSync?(target: string, path: string): void;
+}
 
 // ========== In-Memory Handle (main thread fallback) ==========
 
@@ -69,23 +87,16 @@ class MemoryHandle {
       this.grow(size);
     }
     if (size > this.len) {
-      // Zero-fill the extension
       this.buf.fill(0, this.len, size);
     }
     this.len = size;
   }
 
-  flush(): void {
-    // No-op — data stays in memory until saveToOPFS
-  }
+  flush(): void {}
+  close(): void {}
 
-  close(): void {
-    // No-op
-  }
-
-  /** Get the current data as an ArrayBuffer (trimmed to actual size) */
   getBuffer(): ArrayBuffer {
-    return this.buf.buffer.slice(0, this.len);
+    return this.buf.buffer.slice(0, this.len) as ArrayBuffer;
   }
 
   private grow(minSize: number): void {
@@ -96,10 +107,6 @@ class MemoryHandle {
   }
 }
 
-/**
- * Open a VFS handle — tries createSyncAccessHandle (workers),
- * falls back to MemoryHandle (main thread).
- */
 async function openVFSHandle(
   fileHandle: FileSystemFileHandle
 ): Promise<{ handle: any; isMemory: boolean }> {
@@ -107,16 +114,12 @@ async function openVFSHandle(
     const handle = await (fileHandle as any).createSyncAccessHandle();
     return { handle, isMemory: false };
   } catch {
-    // Main thread — load file into memory
     const file = await fileHandle.getFile();
     const data = await file.arrayBuffer();
     return { handle: new MemoryHandle(data), isMemory: true };
   }
 }
 
-/**
- * Open a fresh (empty) VFS handle for writing.
- */
 async function openFreshVFSHandle(
   fileHandle: FileSystemFileHandle
 ): Promise<{ handle: any; isMemory: boolean }> {
@@ -128,9 +131,6 @@ async function openFreshVFSHandle(
   }
 }
 
-/**
- * Save a MemoryHandle's content back to OPFS using the async createWritable API.
- */
 async function saveMemoryHandle(
   fileHandle: FileSystemFileHandle,
   memHandle: MemoryHandle
@@ -154,7 +154,7 @@ async function navigateToRoot(root: string): Promise<FileSystemDirectoryHandle> 
 
 async function ensureParentDirs(rootDir: FileSystemDirectoryHandle, path: string): Promise<FileSystemDirectoryHandle> {
   const parts = path.split('/').filter(Boolean);
-  parts.pop(); // Remove filename
+  parts.pop();
   let dir = rootDir;
   for (const part of parts) {
     dir = await dir.getDirectoryHandle(part, { create: true });
@@ -172,7 +172,6 @@ async function writeOPFSFile(rootDir: FileSystemDirectoryHandle, path: string, d
   const name = basename(path);
   const fileHandle = await parentDir.getFileHandle(name, { create: true });
   try {
-    // Worker context — use sync access handle
     const syncHandle = await (fileHandle as any).createSyncAccessHandle();
     try {
       syncHandle.truncate(0);
@@ -184,7 +183,6 @@ async function writeOPFSFile(rootDir: FileSystemDirectoryHandle, path: string, d
       syncHandle.close();
     }
   } catch {
-    // Main thread — use async writable stream
     const writable = await (fileHandle as any).createWritable();
     await writable.write(data);
     await writable.close();
@@ -229,6 +227,34 @@ async function readOPFSRecursive(
   return result;
 }
 
+/**
+ * Recursively read all VFS entries via the fs API.
+ */
+function readVFSRecursive(fs: FsLike, vfsPath: string): Array<{ path: string; type: 'file' | 'directory'; data?: Uint8Array }> {
+  const result: Array<{ path: string; type: 'file' | 'directory'; data?: Uint8Array }> = [];
+  let entries: any[];
+  try {
+    entries = fs.readdirSync(vfsPath, { withFileTypes: true });
+  } catch {
+    return result;
+  }
+  for (const entry of entries) {
+    const fullPath = vfsPath === '/' ? `/${entry.name}` : `${vfsPath}/${entry.name}`;
+    if (entry.isDirectory()) {
+      result.push({ path: fullPath, type: 'directory' });
+      result.push(...readVFSRecursive(fs, fullPath));
+    } else {
+      try {
+        const data = fs.readFileSync(fullPath) as Uint8Array;
+        result.push({ path: fullPath, type: 'file', data });
+      } catch {
+        // Skip unreadable files
+      }
+    }
+  }
+  return result;
+}
+
 // ========== Public Helper Functions ==========
 
 export interface UnpackResult {
@@ -239,15 +265,43 @@ export interface UnpackResult {
 /**
  * Unpack VFS contents to real OPFS files.
  *
- * Reads all files/directories from the VFS binary and writes them as real
- * OPFS files. Clears existing OPFS files (except .vfs.bin) first.
+ * When `fs` is provided: reads VFS via the running instance (communicates
+ * with VFS worker), writes to OPFS additively (no deletions).
  *
- * Must be called from a Worker. Close any running VFSFileSystem first.
+ * When `fs` is NOT provided: opens .vfs.bin directly via VFSEngine,
+ * clears OPFS (except .vfs.bin), then writes all entries.
+ * Requires VFS to be stopped or a Worker context.
  */
-export async function unpackToOPFS(root: string = '/'): Promise<UnpackResult> {
+export async function unpackToOPFS(root: string = '/', fs?: FsLike): Promise<UnpackResult> {
   const rootDir = await navigateToRoot(root);
 
-  // Open VFS binary
+  if (fs) {
+    // Read all entries from VFS via the running instance
+    const vfsEntries = readVFSRecursive(fs, '/');
+
+    let files = 0;
+    let directories = 0;
+
+    for (const entry of vfsEntries) {
+      if (entry.type === 'directory') {
+        const name = basename(entry.path);
+        const parent = await ensureParentDirs(rootDir, entry.path);
+        await parent.getDirectoryHandle(name, { create: true });
+        directories++;
+      } else {
+        try {
+          await writeOPFSFile(rootDir, entry.path, entry.data ?? new Uint8Array(0));
+          files++;
+        } catch (err: any) {
+          console.warn(`[VFS] Failed to write OPFS file ${entry.path}: ${err.message}`);
+        }
+      }
+    }
+
+    return { files, directories };
+  }
+
+  // Direct VFSEngine path (VFS not running)
   const vfsFileHandle = await rootDir.getFileHandle('.vfs.bin');
   const { handle } = await openVFSHandle(vfsFileHandle);
 
@@ -260,24 +314,18 @@ export async function unpackToOPFS(root: string = '/'): Promise<UnpackResult> {
     handle.close();
   }
 
-  // Clear OPFS (except .vfs.bin)
   await clearDirectory(rootDir, new Set(['.vfs.bin']));
 
-  // Write all entries
   let files = 0;
   let directories = 0;
   for (const entry of entries) {
-    if (entry.path === '/') continue; // Skip root
+    if (entry.path === '/') continue;
     if (entry.type === INODE_TYPE.DIRECTORY) {
       const name = basename(entry.path);
       const parent = await ensureParentDirs(rootDir, entry.path);
       await parent.getDirectoryHandle(name, { create: true });
       directories++;
-    } else if (entry.type === INODE_TYPE.FILE) {
-      await writeOPFSFile(rootDir, entry.path, entry.data ?? new Uint8Array(0));
-      files++;
-    } else if (entry.type === INODE_TYPE.SYMLINK) {
-      // OPFS has no symlink concept — write target content as regular file
+    } else if (entry.type === INODE_TYPE.FILE || entry.type === INODE_TYPE.SYMLINK) {
       await writeOPFSFile(rootDir, entry.path, entry.data ?? new Uint8Array(0));
       files++;
     }
@@ -292,35 +340,74 @@ export interface LoadResult {
 }
 
 /**
- * Load all real OPFS files into a fresh VFS.
+ * Load all real OPFS files into VFS.
  *
- * Reads all OPFS files/directories recursively, deletes the existing .vfs.bin,
- * creates a fresh VFS, and writes all OPFS content into it.
+ * When `fs` is provided: reads OPFS files, clears VFS, writes to VFS via
+ * the running instance. Never touches .vfs.bin directly.
  *
- * Must be called from a Worker. Close any running VFSFileSystem first.
+ * When `fs` is NOT provided: reads OPFS files, deletes .vfs.bin, creates
+ * fresh VFS via VFSEngine. Requires VFS to be stopped or a Worker context.
  */
-export async function loadFromOPFS(root: string = '/'): Promise<LoadResult> {
+export async function loadFromOPFS(root: string = '/', fs?: FsLike): Promise<LoadResult> {
   const rootDir = await navigateToRoot(root);
-
-  // Read all OPFS entries (skip .vfs.bin)
   const opfsEntries = await readOPFSRecursive(rootDir, '', new Set(['.vfs.bin']));
 
-  // Delete old VFS binary
-  try {
-    await rootDir.removeEntry('.vfs.bin');
-  } catch (_) {
-    // May not exist
+  if (fs) {
+    // Clear VFS root entries
+    try {
+      const rootEntries = fs.readdirSync('/') as string[];
+      for (const entry of rootEntries) {
+        try {
+          fs.rmSync(`/${entry}`, { recursive: true, force: true });
+        } catch { /* skip entries that can't be removed */ }
+      }
+    } catch { /* root might be empty */ }
+
+    // Write directories first (sorted by depth)
+    const dirs = opfsEntries
+      .filter(e => e.type === 'directory')
+      .sort((a, b) => a.path.localeCompare(b.path));
+
+    let files = 0;
+    let directories = 0;
+
+    for (const dir of dirs) {
+      try {
+        fs.mkdirSync(dir.path, { recursive: true, mode: 0o755 });
+        directories++;
+      } catch { /* may already exist */ }
+    }
+
+    // Write files
+    const fileEntries = opfsEntries.filter(e => e.type === 'file');
+    for (const file of fileEntries) {
+      try {
+        const parentPath = file.path.substring(0, file.path.lastIndexOf('/')) || '/';
+        if (parentPath !== '/') {
+          try { fs.mkdirSync(parentPath, { recursive: true, mode: 0o755 }); } catch {}
+        }
+        fs.writeFileSync(file.path, new Uint8Array(file.data!));
+        files++;
+      } catch (err: any) {
+        console.warn(`[VFS] Failed to write ${file.path}: ${err.message}`);
+      }
+    }
+
+    return { files, directories };
   }
 
-  // Create fresh VFS
+  // Direct VFSEngine path (VFS not running)
+  try {
+    await rootDir.removeEntry('.vfs.bin');
+  } catch (_) {}
+
   const vfsFileHandle = await rootDir.getFileHandle('.vfs.bin', { create: true });
   const { handle, isMemory } = await openFreshVFSHandle(vfsFileHandle);
 
   try {
     const engine = new VFSEngine();
-    engine.init(handle); // size=0 → formats fresh VFS
+    engine.init(handle);
 
-    // Write directories first (sorted by depth)
     const dirs = opfsEntries
       .filter(e => e.type === 'directory')
       .sort((a, b) => a.path.localeCompare(b.path));
@@ -333,7 +420,6 @@ export async function loadFromOPFS(root: string = '/'): Promise<LoadResult> {
       directories++;
     }
 
-    // Write files
     const fileEntries = opfsEntries.filter(e => e.type === 'file');
     for (const file of fileEntries) {
       engine.write(file.path, new Uint8Array(file.data!));
@@ -342,7 +428,6 @@ export async function loadFromOPFS(root: string = '/'): Promise<LoadResult> {
 
     engine.flush();
 
-    // Persist MemoryHandle to OPFS if on main thread
     if (isMemory) {
       await saveMemoryHandle(vfsFileHandle, handle as MemoryHandle);
     }
@@ -360,18 +445,42 @@ export interface RepairResult {
 }
 
 /**
- * Attempt to recover files from a corrupt VFS binary.
+ * Attempt to repair a VFS.
  *
- * Reads the raw .vfs.bin binary, scans the inode table for valid-looking
- * entries, extracts recoverable files, then creates a fresh VFS with the
- * recovered data.
+ * When `fs` is provided: rebuilds VFS from OPFS files (non-destructive read
+ * of OPFS), then syncs repaired VFS back to OPFS (additive, no deletions).
+ * This is the safe path — OPFS is the source of truth.
  *
- * Must be called from a Worker. Close any running VFSFileSystem first.
+ * When `fs` is NOT provided: scans raw .vfs.bin for recoverable inodes,
+ * creates fresh VFS with recovered data. For corrupt VFS where init failed.
  */
-export async function repairVFS(root: string = '/'): Promise<RepairResult> {
+export async function repairVFS(root: string = '/', fs?: FsLike): Promise<RepairResult> {
+  if (fs) {
+    // Step 1: Rebuild VFS from OPFS (reads OPFS, writes to VFS — OPFS untouched)
+    const loadResult = await loadFromOPFS(root, fs);
+
+    // Step 2: Only now that VFS is healthy, sync back to OPFS (additive)
+    await unpackToOPFS(root, fs);
+
+    const total = loadResult.files + loadResult.directories;
+    return {
+      recovered: total,
+      lost: 0,
+      entries: [], // Detailed entries not available in fs-based path
+    };
+  }
+
+  // Raw .vfs.bin repair (VFS not running — init failed)
+  return repairVFSRaw(root);
+}
+
+/**
+ * Raw .vfs.bin repair — scan inode table for valid entries, create fresh VFS.
+ * Only used when VFS failed to initialize (no running instance available).
+ */
+async function repairVFSRaw(root: string): Promise<RepairResult> {
   const rootDir = await navigateToRoot(root);
 
-  // Read corrupt VFS into memory
   const vfsFileHandle = await rootDir.getFileHandle('.vfs.bin');
   const file = await vfsFileHandle.getFile();
   const raw = new Uint8Array(await file.arrayBuffer());
@@ -383,7 +492,6 @@ export async function repairVFS(root: string = '/'): Promise<RepairResult> {
 
   const view = new DataView(raw.buffer);
 
-  // Try to determine layout from superblock, fall back to defaults
   let inodeCount: number;
   let blockSize: number;
   let totalBlocks: number;
@@ -398,7 +506,6 @@ export async function repairVFS(root: string = '/'): Promise<RepairResult> {
   const superblockValid = magic === VFS_MAGIC && version === VFS_VERSION;
 
   if (superblockValid) {
-    // Superblock looks valid — use its values with sanity checks
     inodeCount = view.getUint32(SUPERBLOCK.INODE_COUNT, true);
     blockSize = view.getUint32(SUPERBLOCK.BLOCK_SIZE, true);
     totalBlocks = view.getUint32(SUPERBLOCK.TOTAL_BLOCKS, true);
@@ -408,7 +515,6 @@ export async function repairVFS(root: string = '/'): Promise<RepairResult> {
     dataOffset = view.getFloat64(SUPERBLOCK.DATA_OFFSET, true);
     pathTableUsed = view.getUint32(SUPERBLOCK.PATH_USED, true);
 
-    // Sanity check — if values are unreasonable, fall back to defaults
     if (blockSize === 0 || (blockSize & (blockSize - 1)) !== 0 || inodeCount === 0 ||
         inodeTableOffset >= fileSize || pathTableOffset >= fileSize || dataOffset >= fileSize) {
       const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
@@ -422,7 +528,6 @@ export async function repairVFS(root: string = '/'): Promise<RepairResult> {
       pathTableUsed = INITIAL_PATH_TABLE_SIZE;
     }
   } else {
-    // Superblock corrupt — use default layout
     const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
     inodeCount = DEFAULT_INODE_COUNT;
     blockSize = DEFAULT_BLOCK_SIZE;
@@ -434,7 +539,6 @@ export async function repairVFS(root: string = '/'): Promise<RepairResult> {
     pathTableUsed = INITIAL_PATH_TABLE_SIZE;
   }
 
-  // Scan inode table for valid entries
   const decoder = new TextDecoder();
   const recovered: Array<{ path: string; type: number; data: Uint8Array }> = [];
   let lost = 0;
@@ -446,7 +550,7 @@ export async function repairVFS(root: string = '/'): Promise<RepairResult> {
     if (off + INODE_SIZE > fileSize) break;
 
     const type = raw[off + INODE.TYPE];
-    if (type < INODE_TYPE.FILE || type > INODE_TYPE.SYMLINK) continue; // Skip free/invalid
+    if (type < INODE_TYPE.FILE || type > INODE_TYPE.SYMLINK) continue;
 
     const inodeView = new DataView(raw.buffer, off, INODE_SIZE);
     const pathOffset = inodeView.getUint32(INODE.PATH_OFFSET, true);
@@ -455,7 +559,6 @@ export async function repairVFS(root: string = '/'): Promise<RepairResult> {
     const firstBlock = inodeView.getUint32(INODE.FIRST_BLOCK, true);
     const blockCount = inodeView.getUint32(INODE.BLOCK_COUNT, true);
 
-    // Try to read path
     const absPathOffset = pathTableOffset + pathOffset;
     if (pathLength === 0 || pathLength > 4096 || absPathOffset + pathLength > fileSize) {
       lost++;
@@ -470,19 +573,16 @@ export async function repairVFS(root: string = '/'): Promise<RepairResult> {
       continue;
     }
 
-    // Validate path looks reasonable
     if (!path.startsWith('/') || path.includes('\0')) {
       lost++;
       continue;
     }
 
-    // For directories, no data needed
     if (type === INODE_TYPE.DIRECTORY) {
       recovered.push({ path, type, data: new Uint8Array(0) });
       continue;
     }
 
-    // Try to read file data
     if (size < 0 || size > fileSize || !isFinite(size)) {
       lost++;
       continue;
@@ -490,7 +590,6 @@ export async function repairVFS(root: string = '/'): Promise<RepairResult> {
 
     const dataStart = dataOffset + firstBlock * blockSize;
     if (dataStart + size > fileSize || firstBlock >= totalBlocks) {
-      // Data blocks out of bounds — try to recover with empty data
       recovered.push({ path, type, data: new Uint8Array(0) });
       lost++;
       continue;
@@ -500,37 +599,31 @@ export async function repairVFS(root: string = '/'): Promise<RepairResult> {
     recovered.push({ path, type, data });
   }
 
-  // Delete corrupt VFS
   await rootDir.removeEntry('.vfs.bin');
 
-  // Create fresh VFS with recovered data
   const newFileHandle = await rootDir.getFileHandle('.vfs.bin', { create: true });
   const { handle, isMemory } = await openFreshVFSHandle(newFileHandle);
 
   try {
     const engine = new VFSEngine();
-    engine.init(handle); // Fresh format
+    engine.init(handle);
 
-    // Sort: directories first (by depth), then files
     const dirs = recovered
       .filter(e => e.type === INODE_TYPE.DIRECTORY && e.path !== '/')
       .sort((a, b) => a.path.localeCompare(b.path));
     const files = recovered.filter(e => e.type === INODE_TYPE.FILE);
     const symlinks = recovered.filter(e => e.type === INODE_TYPE.SYMLINK);
 
-    // Create directories
     for (const dir of dirs) {
       const result = engine.mkdir(dir.path, 0o040755);
       if (result.status !== 0) lost++;
     }
 
-    // Write files
     for (const file of files) {
       const result = engine.write(file.path, file.data);
       if (result.status !== 0) lost++;
     }
 
-    // Recreate symlinks
     for (const sym of symlinks) {
       const target = decoder.decode(sym.data);
       const result = engine.symlink(target, sym.path);
@@ -539,7 +632,6 @@ export async function repairVFS(root: string = '/'): Promise<RepairResult> {
 
     engine.flush();
 
-    // Persist MemoryHandle to OPFS if on main thread
     if (isMemory) {
       await saveMemoryHandle(newFileHandle, handle as MemoryHandle);
     }

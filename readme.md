@@ -509,6 +509,13 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+### v3.0.9 (2026)
+
+**Improvements:**
+- `unpackToOPFS`, `loadFromOPFS`, and `repairVFS` now accept an optional `fs` parameter (a running `VFSFileSystem` instance) so they work from any tab — leader or follower — without stopping the VFS
+- When `fs` is not provided, falls back to direct `.vfs.bin` access via VFSEngine (requires VFS to be stopped or a Worker context)
+- `repairVFS` with a running instance uses OPFS as source of truth: rebuilds VFS from OPFS, then syncs back for full consistency
+
 ### v3.0.8 (2026)
 
 **Improvements:**

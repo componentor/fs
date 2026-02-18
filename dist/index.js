@@ -3283,7 +3283,6 @@ var MemoryHandle = class {
   }
   close() {
   }
-  /** Get the current data as an ArrayBuffer (trimmed to actual size) */
   getBuffer() {
     return this.buf.buffer.slice(0, this.len);
   }
@@ -3386,8 +3385,52 @@ async function readOPFSRecursive(dir, prefix, skip) {
   }
   return result;
 }
-async function unpackToOPFS(root = "/") {
+function readVFSRecursive(fs, vfsPath) {
+  const result = [];
+  let entries;
+  try {
+    entries = fs.readdirSync(vfsPath, { withFileTypes: true });
+  } catch {
+    return result;
+  }
+  for (const entry of entries) {
+    const fullPath = vfsPath === "/" ? `/${entry.name}` : `${vfsPath}/${entry.name}`;
+    if (entry.isDirectory()) {
+      result.push({ path: fullPath, type: "directory" });
+      result.push(...readVFSRecursive(fs, fullPath));
+    } else {
+      try {
+        const data = fs.readFileSync(fullPath);
+        result.push({ path: fullPath, type: "file", data });
+      } catch {
+      }
+    }
+  }
+  return result;
+}
+async function unpackToOPFS(root = "/", fs) {
   const rootDir = await navigateToRoot(root);
+  if (fs) {
+    const vfsEntries = readVFSRecursive(fs, "/");
+    let files2 = 0;
+    let directories2 = 0;
+    for (const entry of vfsEntries) {
+      if (entry.type === "directory") {
+        const name = basename2(entry.path);
+        const parent = await ensureParentDirs(rootDir, entry.path);
+        await parent.getDirectoryHandle(name, { create: true });
+        directories2++;
+      } else {
+        try {
+          await writeOPFSFile(rootDir, entry.path, entry.data ?? new Uint8Array(0));
+          files2++;
+        } catch (err) {
+          console.warn(`[VFS] Failed to write OPFS file ${entry.path}: ${err.message}`);
+        }
+      }
+    }
+    return { files: files2, directories: directories2 };
+  }
   const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin");
   const { handle } = await openVFSHandle(vfsFileHandle);
   let entries;
@@ -3404,24 +3447,59 @@ async function unpackToOPFS(root = "/") {
   for (const entry of entries) {
     if (entry.path === "/") continue;
     if (entry.type === INODE_TYPE.DIRECTORY) {
-      await ensureParentDirs(rootDir, entry.path + "/dummy");
       const name = basename2(entry.path);
       const parent = await ensureParentDirs(rootDir, entry.path);
       await parent.getDirectoryHandle(name, { create: true });
       directories++;
-    } else if (entry.type === INODE_TYPE.FILE) {
-      await writeOPFSFile(rootDir, entry.path, entry.data ?? new Uint8Array(0));
-      files++;
-    } else if (entry.type === INODE_TYPE.SYMLINK) {
+    } else if (entry.type === INODE_TYPE.FILE || entry.type === INODE_TYPE.SYMLINK) {
       await writeOPFSFile(rootDir, entry.path, entry.data ?? new Uint8Array(0));
       files++;
     }
   }
   return { files, directories };
 }
-async function loadFromOPFS(root = "/") {
+async function loadFromOPFS(root = "/", fs) {
   const rootDir = await navigateToRoot(root);
   const opfsEntries = await readOPFSRecursive(rootDir, "", /* @__PURE__ */ new Set([".vfs.bin"]));
+  if (fs) {
+    try {
+      const rootEntries = fs.readdirSync("/");
+      for (const entry of rootEntries) {
+        try {
+          fs.rmSync(`/${entry}`, { recursive: true, force: true });
+        } catch {
+        }
+      }
+    } catch {
+    }
+    const dirs = opfsEntries.filter((e) => e.type === "directory").sort((a, b) => a.path.localeCompare(b.path));
+    let files = 0;
+    let directories = 0;
+    for (const dir of dirs) {
+      try {
+        fs.mkdirSync(dir.path, { recursive: true, mode: 493 });
+        directories++;
+      } catch {
+      }
+    }
+    const fileEntries = opfsEntries.filter((e) => e.type === "file");
+    for (const file of fileEntries) {
+      try {
+        const parentPath = file.path.substring(0, file.path.lastIndexOf("/")) || "/";
+        if (parentPath !== "/") {
+          try {
+            fs.mkdirSync(parentPath, { recursive: true, mode: 493 });
+          } catch {
+          }
+        }
+        fs.writeFileSync(file.path, new Uint8Array(file.data));
+        files++;
+      } catch (err) {
+        console.warn(`[VFS] Failed to write ${file.path}: ${err.message}`);
+      }
+    }
+    return { files, directories };
+  }
   try {
     await rootDir.removeEntry(".vfs.bin");
   } catch (_) {
@@ -3452,7 +3530,21 @@ async function loadFromOPFS(root = "/") {
     handle.close();
   }
 }
-async function repairVFS(root = "/") {
+async function repairVFS(root = "/", fs) {
+  if (fs) {
+    const loadResult = await loadFromOPFS(root, fs);
+    await unpackToOPFS(root, fs);
+    const total = loadResult.files + loadResult.directories;
+    return {
+      recovered: total,
+      lost: 0,
+      entries: []
+      // Detailed entries not available in fs-based path
+    };
+  }
+  return repairVFSRaw(root);
+}
+async function repairVFSRaw(root) {
   const rootDir = await navigateToRoot(root);
   const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin");
   const file = await vfsFileHandle.getFile();
