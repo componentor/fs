@@ -570,6 +570,11 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+### v3.0.12 (2026)
+
+**Fixes:**
+- Fix `.d.ts` output extension mapping so declaration files resolve correctly
+
 ### v3.0.11 (2026)
 
 **Fixes:**
