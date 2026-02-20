@@ -570,6 +570,13 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+### v3.0.15 (2026)
+
+**Fixes:**
+- Add bounds validation to `decodeRequest` — rejects truncated SAB payloads instead of reading out-of-bounds
+- Wrap `decodeRequest` in try/catch in both VFS and OPFS leader loop handlers — corrupt buffers return `status: -1` instead of crashing the leader loop
+- Guard `readPayload` against zero/negative/overflow chunk lengths from stale SAB data
+
 ### v3.0.14 (2026)
 
 **Fixes:**

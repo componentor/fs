@@ -124,11 +124,22 @@ export function decodeRequest(buf: ArrayBuffer): {
   path: string;
   data: Uint8Array | null;
 } {
+  // Minimum header: 16 bytes (op + flags + pathLen + dataLen)
+  if (buf.byteLength < 16) {
+    throw new Error(`Request buffer too small: ${buf.byteLength} < 16 bytes (possible SAB race)`);
+  }
+
   const view = new DataView(buf);
   const op = view.getUint32(0, true);
   const flags = view.getUint32(4, true);
   const pathLen = view.getUint32(8, true);
   const dataLen = view.getUint32(12, true);
+
+  // Validate payload fits in buffer
+  const expectedMin = 16 + pathLen + dataLen;
+  if (buf.byteLength < expectedMin) {
+    throw new Error(`Request buffer truncated: ${buf.byteLength} < ${expectedMin} bytes (op=${op}, pathLen=${pathLen}, dataLen=${dataLen})`);
+  }
 
   const bytes = new Uint8Array(buf);
   const path = decoder.decode(bytes.subarray(16, 16 + pathLen));

@@ -1950,11 +1950,18 @@ var SIGNAL = {
 var encoder3 = new TextEncoder();
 var decoder2 = new TextDecoder();
 function decodeRequest(buf) {
+  if (buf.byteLength < 16) {
+    throw new Error(`Request buffer too small: ${buf.byteLength} < 16 bytes (possible SAB race)`);
+  }
   const view = new DataView(buf);
   const op = view.getUint32(0, true);
   const flags = view.getUint32(4, true);
   const pathLen = view.getUint32(8, true);
   const dataLen = view.getUint32(12, true);
+  const expectedMin = 16 + pathLen + dataLen;
+  if (buf.byteLength < expectedMin) {
+    throw new Error(`Request buffer truncated: ${buf.byteLength} < ${expectedMin} bytes (op=${op}, pathLen=${pathLen}, dataLen=${dataLen})`);
+  }
   const bytes = new Uint8Array(buf);
   const path = decoder2.decode(bytes.subarray(16, 16 + pathLen));
   const data = dataLen > 0 ? bytes.subarray(16 + pathLen, 16 + pathLen + dataLen) : null;
@@ -2115,7 +2122,13 @@ var OP_NAMES = {
 };
 function handleRequest(reqTabId, buffer) {
   const t0 = debug ? performance.now() : 0;
-  const { op, flags, path, data } = decodeRequest(buffer);
+  let op, flags, path, data;
+  try {
+    ({ op, flags, path, data } = decodeRequest(buffer));
+  } catch (err) {
+    console.error(`[sync-relay] decodeRequest failed (bufLen=${buffer.byteLength}): ${err.message}`);
+    return { status: -1 };
+  }
   const t1 = debug ? performance.now() : 0;
   let result;
   let syncOp;
@@ -2356,7 +2369,13 @@ function handleRequest(reqTabId, buffer) {
 }
 async function handleRequestOPFS(reqTabId, buffer) {
   const oe = opfsEngine;
-  const { op, flags, path, data } = decodeRequest(buffer);
+  let op, flags, path, data;
+  try {
+    ({ op, flags, path, data } = decodeRequest(buffer));
+  } catch (err) {
+    console.error(`[sync-relay] decodeRequest failed in OPFS handler (bufLen=${buffer.byteLength}): ${err.message}`);
+    return { status: -1 };
+  }
   let result;
   let syncPath;
   let syncNewPath;
@@ -2531,6 +2550,10 @@ function readPayload(targetSab, targetCtrl) {
   const maxChunk = targetSab.byteLength - HEADER_SIZE;
   const chunkLen = Atomics.load(targetCtrl, 3);
   const totalLen = Number(Atomics.load(totalLenView, 0));
+  if (chunkLen <= 0 || chunkLen > maxChunk) {
+    console.error(`[sync-relay] readPayload: invalid chunkLen=${chunkLen} (maxChunk=${maxChunk}, totalLen=${totalLen})`);
+    return new Uint8Array(0);
+  }
   if (totalLen <= maxChunk) {
     return new Uint8Array(targetSab, HEADER_SIZE, chunkLen).slice();
   }

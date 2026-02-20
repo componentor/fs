@@ -179,7 +179,13 @@ const OP_NAMES: Record<number, string> = {
 
 function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number; data?: Uint8Array; _op?: number; _path?: string; _newPath?: string } {
   const t0 = debug ? performance.now() : 0;
-  const { op, flags, path, data } = decodeRequest(buffer);
+  let op: number, flags: number, path: string, data: Uint8Array | null;
+  try {
+    ({ op, flags, path, data } = decodeRequest(buffer));
+  } catch (err: any) {
+    console.error(`[sync-relay] decodeRequest failed (bufLen=${buffer.byteLength}): ${err.message}`);
+    return { status: -1 };
+  }
   const t1 = debug ? performance.now() : 0;
 
   let result: { status: number; data?: Uint8Array | null };
@@ -413,7 +419,13 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
 
 async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise<{ status: number; data?: Uint8Array; _op?: number; _path?: string; _newPath?: string }> {
   const oe = opfsEngine!;
-  const { op, flags, path, data } = decodeRequest(buffer);
+  let op: number, flags: number, path: string, data: Uint8Array | null;
+  try {
+    ({ op, flags, path, data } = decodeRequest(buffer));
+  } catch (err: any) {
+    console.error(`[sync-relay] decodeRequest failed in OPFS handler (bufLen=${buffer.byteLength}): ${err.message}`);
+    return { status: -1 };
+  }
 
   let result: { status: number; data?: Uint8Array | null };
   let syncPath: string | undefined;
@@ -584,6 +596,12 @@ function readPayload(targetSab: SharedArrayBuffer, targetCtrl: Int32Array): Uint
 
   const chunkLen = Atomics.load(targetCtrl, 3);
   const totalLen = Number(Atomics.load(totalLenView, 0));
+
+  // Guard against zero/negative chunk lengths (SAB race or stale data)
+  if (chunkLen <= 0 || chunkLen > maxChunk) {
+    console.error(`[sync-relay] readPayload: invalid chunkLen=${chunkLen} (maxChunk=${maxChunk}, totalLen=${totalLen})`);
+    return new Uint8Array(0);
+  }
 
   if (totalLen <= maxChunk) {
     // Fast path: single chunk
