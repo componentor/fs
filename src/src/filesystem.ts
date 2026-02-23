@@ -64,12 +64,21 @@ const HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
 // Use spin-wait (Atomics.load loop) as fallback.
 const _canAtomicsWait = typeof globalThis.WorkerGlobalScope !== 'undefined';
 
+// Main-thread spin-wait timeout: 10 seconds.
+// If SharedWorker is dead/broken, abort instead of blocking the main thread forever.
+const SPIN_TIMEOUT_MS = 10_000;
+
 function spinWait(arr: Int32Array, index: number, value: number): void {
   if (_canAtomicsWait) {
     Atomics.wait(arr, index, value);
   } else {
+    const start = performance.now();
     while (Atomics.load(arr, index) === value) {
-      // spin
+      if (performance.now() - start > SPIN_TIMEOUT_MS) {
+        throw new Error(
+          `VFS sync operation timed out after ${SPIN_TIMEOUT_MS / 1000}s — SharedWorker may be unresponsive`
+        );
+      }
     }
   }
 }

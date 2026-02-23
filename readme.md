@@ -570,6 +570,11 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+### v3.0.16 (2026)
+
+**Fixes:**
+- Add 10s timeout to main-thread spin-wait — prevents infinite busy loop if SharedWorker is dead or unresponsive
+
 ### v3.0.15 (2026)
 
 **Fixes:**

@@ -1277,11 +1277,18 @@ var DEFAULT_SAB_SIZE = 2 * 1024 * 1024;
 var instanceRegistry = /* @__PURE__ */ new Map();
 var HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
 var _canAtomicsWait = typeof globalThis.WorkerGlobalScope !== "undefined";
+var SPIN_TIMEOUT_MS = 1e4;
 function spinWait(arr, index, value) {
   if (_canAtomicsWait) {
     Atomics.wait(arr, index, value);
   } else {
+    const start = performance.now();
     while (Atomics.load(arr, index) === value) {
+      if (performance.now() - start > SPIN_TIMEOUT_MS) {
+        throw new Error(
+          `VFS sync operation timed out after ${SPIN_TIMEOUT_MS / 1e3}s \u2014 SharedWorker may be unresponsive`
+        );
+      }
     }
   }
 }
