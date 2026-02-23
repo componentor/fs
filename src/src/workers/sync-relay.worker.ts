@@ -881,6 +881,36 @@ async function followerLoop(): Promise<void> {
 
 // ========== OPFS + VFS engine initialization (leader only) ==========
 
+// ========== OPFS directory scanning (for auto-populate on fresh VFS) ==========
+
+interface OPFSInitEntry {
+  path: string;
+  type: 'file' | 'directory';
+  data?: Uint8Array;
+}
+
+const OPFS_SKIP = new Set(['.vfs.bin', '.vfs.bin.tmp']);
+
+async function scanOPFSEntries(
+  dir: FileSystemDirectoryHandle,
+  prefix: string,
+): Promise<OPFSInitEntry[]> {
+  const result: OPFSInitEntry[] = [];
+  for await (const [name, handle] of (dir as any).entries()) {
+    if (prefix === '' && OPFS_SKIP.has(name)) continue;
+    const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;
+    if (handle.kind === 'directory') {
+      result.push({ path: fullPath, type: 'directory' });
+      result.push(...await scanOPFSEntries(handle as FileSystemDirectoryHandle, fullPath));
+    } else {
+      const file = await (handle as FileSystemFileHandle).getFile();
+      const buf = await file.arrayBuffer();
+      result.push({ path: fullPath, type: 'file', data: new Uint8Array(buf) });
+    }
+  }
+  return result;
+}
+
 async function initEngine(config: {
   root: string;
   ns: string;
@@ -907,6 +937,7 @@ async function initEngine(config: {
   // Open VFS binary file with exclusive sync access
   const vfsFileHandle = await rootDir.getFileHandle('.vfs.bin', { create: true });
   const vfsHandle = await vfsFileHandle.createSyncAccessHandle();
+  const wasFresh = vfsHandle.getSize() === 0;
 
   // Initialize VFS engine — release handle on corruption/failure
   try {
@@ -921,6 +952,23 @@ async function initEngine(config: {
     // Release the exclusive sync handle so it can be re-acquired
     try { vfsHandle.close(); } catch (_) {}
     throw err;
+  }
+
+  // Auto-populate fresh VFS from existing OPFS files
+  if (wasFresh) {
+    const opfsEntries = await scanOPFSEntries(rootDir, '');
+    if (opfsEntries.length > 0) {
+      const dirs = opfsEntries
+        .filter(e => e.type === 'directory')
+        .sort((a, b) => a.path.localeCompare(b.path));
+      for (const dir of dirs) {
+        engine.mkdir(dir.path, 0o040755);
+      }
+      for (const file of opfsEntries.filter(e => e.type === 'file')) {
+        engine.write(file.path, file.data!);
+      }
+      engine.flush();
+    }
   }
 
   // Spawn OPFS sync worker (mirrors VFS mutations to real OPFS files)

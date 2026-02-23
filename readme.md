@@ -570,6 +570,11 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+### v3.0.17 (2026)
+
+**Features:**
+- Auto-populate VFS from existing OPFS files when `.vfs.bin` doesn't exist — seamless transition from OPFS mode back to hybrid mode without manual `loadFromOPFS()` call
+
 ### v3.0.16 (2026)
 
 **Fixes:**

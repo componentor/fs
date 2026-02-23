@@ -2753,6 +2753,23 @@ async function followerLoop() {
     }
   }
 }
+var OPFS_SKIP = /* @__PURE__ */ new Set([".vfs.bin", ".vfs.bin.tmp"]);
+async function scanOPFSEntries(dir, prefix) {
+  const result = [];
+  for await (const [name, handle] of dir.entries()) {
+    if (prefix === "" && OPFS_SKIP.has(name)) continue;
+    const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;
+    if (handle.kind === "directory") {
+      result.push({ path: fullPath, type: "directory" });
+      result.push(...await scanOPFSEntries(handle, fullPath));
+    } else {
+      const file = await handle.getFile();
+      const buf = await file.arrayBuffer();
+      result.push({ path: fullPath, type: "file", data: new Uint8Array(buf) });
+    }
+  }
+  return result;
+}
 async function initEngine(config) {
   debug = config.debug ?? false;
   let rootDir = await navigator.storage.getDirectory();
@@ -2764,6 +2781,7 @@ async function initEngine(config) {
   }
   const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin", { create: true });
   const vfsHandle = await vfsFileHandle.createSyncAccessHandle();
+  const wasFresh = vfsHandle.getSize() === 0;
   try {
     engine.init(vfsHandle, {
       uid: config.uid,
@@ -2778,6 +2796,19 @@ async function initEngine(config) {
     } catch (_) {
     }
     throw err;
+  }
+  if (wasFresh) {
+    const opfsEntries = await scanOPFSEntries(rootDir, "");
+    if (opfsEntries.length > 0) {
+      const dirs = opfsEntries.filter((e) => e.type === "directory").sort((a, b) => a.path.localeCompare(b.path));
+      for (const dir of dirs) {
+        engine.mkdir(dir.path, 16877);
+      }
+      for (const file of opfsEntries.filter((e) => e.type === "file")) {
+        engine.write(file.path, file.data);
+      }
+      engine.flush();
+    }
   }
   if (config.opfsSync) {
     opfsSyncEnabled = true;
