@@ -114,7 +114,7 @@ export class VFSFileSystem {
 
 
   // Config (definite assignment — always set when constructor doesn't return singleton)
-  private config!: Omit<Required<VFSConfig>, 'opfsSyncRoot' | 'swScope' | 'mode'> & { opfsSyncRoot?: string; swScope?: string };
+  private config!: Omit<Required<VFSConfig>, 'opfsSyncRoot' | 'swScope' | 'mode' | 'limits'> & { opfsSyncRoot?: string; swScope?: string; limits?: VFSConfig['limits'] };
   private tabId!: string;
   private _mode!: FSMode;
   private corruptionError: Error | null = null;
@@ -163,6 +163,7 @@ export class VFSFileSystem {
       sabSize: config.sabSize ?? DEFAULT_SAB_SIZE,
       debug: config.debug ?? false,
       swScope: config.swScope,
+      limits: config.limits,
     };
 
     this.tabId = crypto.randomUUID();
@@ -307,6 +308,7 @@ export class VFSFileSystem {
         umask: this.config.umask,
         strictPermissions: this.config.strictPermissions,
         debug: this.config.debug,
+        limits: this.config.limits,
       },
     });
   }

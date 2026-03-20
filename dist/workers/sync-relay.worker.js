@@ -154,6 +154,13 @@ var VFSEngine = class {
   superblockDirty = false;
   // Free inode hint — skip O(n) scan
   freeInodeHint = 0;
+  // Configurable upper bounds
+  maxInodes = 4e6;
+  maxBlocks = 4e6;
+  maxPathTable = 256 * 1024 * 1024;
+  // 256MB
+  maxVFSSize = 100 * 1024 * 1024 * 1024;
+  // 100GB
   init(handle, opts) {
     this.handle = handle;
     this.processUid = opts?.uid ?? 0;
@@ -161,11 +168,23 @@ var VFSEngine = class {
     this.umask = opts?.umask ?? DEFAULT_UMASK;
     this.strictPermissions = opts?.strictPermissions ?? false;
     this.debug = opts?.debug ?? false;
+    if (opts?.limits) {
+      if (opts.limits.maxInodes != null) this.maxInodes = opts.limits.maxInodes;
+      if (opts.limits.maxBlocks != null) this.maxBlocks = opts.limits.maxBlocks;
+      if (opts.limits.maxPathTable != null) this.maxPathTable = opts.limits.maxPathTable;
+      if (opts.limits.maxVFSSize != null) this.maxVFSSize = opts.limits.maxVFSSize;
+    }
     const size = handle.getSize();
     if (size === 0) {
       this.format();
     } else {
-      this.mount();
+      try {
+        this.mount();
+      } catch (err) {
+        const msg = err.message ?? String(err);
+        if (msg.startsWith("Corrupt VFS:")) throw err;
+        throw new Error(`Corrupt VFS: ${msg}`);
+      }
     }
   }
   /** Release the sync access handle (call on fatal error or shutdown) */
@@ -232,6 +251,18 @@ var VFSEngine = class {
     if (freeBlocks > totalBlocks) {
       throw new Error(`Corrupt VFS: free blocks (${freeBlocks}) exceeds total blocks (${totalBlocks})`);
     }
+    if (inodeCount > this.maxInodes) {
+      throw new Error(`Corrupt VFS: inode count ${inodeCount} exceeds maximum ${this.maxInodes}`);
+    }
+    if (totalBlocks > this.maxBlocks) {
+      throw new Error(`Corrupt VFS: total blocks ${totalBlocks} exceeds maximum ${this.maxBlocks}`);
+    }
+    if (fileSize > this.maxVFSSize) {
+      throw new Error(`Corrupt VFS: file size ${fileSize} exceeds maximum ${this.maxVFSSize}`);
+    }
+    if (!Number.isFinite(inodeTableOffset) || inodeTableOffset < 0 || !Number.isFinite(pathTableOffset) || pathTableOffset < 0 || !Number.isFinite(bitmapOffset) || bitmapOffset < 0 || !Number.isFinite(dataOffset) || dataOffset < 0) {
+      throw new Error(`Corrupt VFS: non-finite or negative section offset`);
+    }
     if (inodeTableOffset !== SUPERBLOCK.SIZE) {
       throw new Error(`Corrupt VFS: inode table offset ${inodeTableOffset} (expected ${SUPERBLOCK.SIZE})`);
     }
@@ -249,7 +280,13 @@ var VFSEngine = class {
     if (pathUsed > pathTableSize) {
       throw new Error(`Corrupt VFS: path used (${pathUsed}) exceeds path table size (${pathTableSize})`);
     }
+    if (pathTableSize > this.maxPathTable) {
+      throw new Error(`Corrupt VFS: path table size ${pathTableSize} exceeds maximum ${this.maxPathTable}`);
+    }
     const expectedMinSize = dataOffset + totalBlocks * blockSize;
+    if (expectedMinSize > this.maxVFSSize) {
+      throw new Error(`Corrupt VFS: computed layout size ${expectedMinSize} exceeds maximum ${this.maxVFSSize}`);
+    }
     if (fileSize < expectedMinSize) {
       throw new Error(`Corrupt VFS: file size ${fileSize} too small for layout (need ${expectedMinSize})`);
     }
@@ -2557,6 +2594,10 @@ function readPayload(targetSab, targetCtrl) {
   if (totalLen <= maxChunk) {
     return new Uint8Array(targetSab, HEADER_SIZE, chunkLen).slice();
   }
+  if (totalLen > activeLimits.maxPayload || totalLen <= 0) {
+    console.error(`[sync-relay] readPayload: totalLen=${totalLen} exceeds limit (${activeLimits.maxPayload}) or invalid`);
+    return new Uint8Array(0);
+  }
   const fullBuffer = new Uint8Array(totalLen);
   let offset = 0;
   fullBuffer.set(new Uint8Array(targetSab, HEADER_SIZE, chunkLen), offset);
@@ -2566,6 +2607,10 @@ function readPayload(targetSab, targetCtrl) {
     Atomics.notify(targetCtrl, 0);
     Atomics.wait(targetCtrl, 0, SIGNAL.CHUNK_ACK);
     const nextLen = Atomics.load(targetCtrl, 3);
+    if (nextLen <= 0 || nextLen > maxChunk) {
+      console.error(`[sync-relay] readPayload: invalid nextLen=${nextLen} at offset=${offset}`);
+      return fullBuffer.slice(0, offset);
+    }
     fullBuffer.set(new Uint8Array(targetSab, HEADER_SIZE, nextLen), offset);
     offset += nextLen;
   }
@@ -2770,8 +2815,57 @@ async function scanOPFSEntries(dir, prefix) {
   }
   return result;
 }
+var DEFAULT_LIMITS = {
+  maxInodes: 4e6,
+  maxBlocks: 4e6,
+  maxPathTable: 256 * 1024 * 1024,
+  maxVFSSize: 100 * 1024 * 1024 * 1024,
+  maxPayload: 2 * 1024 * 1024 * 1024
+};
+function resolveLimits(input) {
+  return { ...DEFAULT_LIMITS, ...input };
+}
+var activeLimits = { ...DEFAULT_LIMITS };
+function quickValidateVFS(handle, fileSize, limits) {
+  if (fileSize < SUPERBLOCK.SIZE) return `file too small (${fileSize} bytes)`;
+  const buf = new Uint8Array(SUPERBLOCK.SIZE);
+  handle.read(buf, { at: 0 });
+  const v = new DataView(buf.buffer);
+  const magic = v.getUint32(SUPERBLOCK.MAGIC, true);
+  if (magic !== VFS_MAGIC) return `bad magic 0x${magic.toString(16)}`;
+  const version = v.getUint32(SUPERBLOCK.VERSION, true);
+  if (version !== VFS_VERSION) return `unsupported version ${version}`;
+  const inodeCount = v.getUint32(SUPERBLOCK.INODE_COUNT, true);
+  const blockSize = v.getUint32(SUPERBLOCK.BLOCK_SIZE, true);
+  const totalBlocks = v.getUint32(SUPERBLOCK.TOTAL_BLOCKS, true);
+  const freeBlocks = v.getUint32(SUPERBLOCK.FREE_BLOCKS, true);
+  const inodeTableOffset = v.getFloat64(SUPERBLOCK.INODE_OFFSET, true);
+  const pathTableOffset = v.getFloat64(SUPERBLOCK.PATH_OFFSET, true);
+  const dataOffset = v.getFloat64(SUPERBLOCK.DATA_OFFSET, true);
+  const bitmapOffset = v.getFloat64(SUPERBLOCK.BITMAP_OFFSET, true);
+  const pathUsed = v.getUint32(SUPERBLOCK.PATH_USED, true);
+  if (blockSize === 0 || (blockSize & blockSize - 1) !== 0) return `invalid block size ${blockSize}`;
+  if (inodeCount === 0) return "inode count is 0";
+  if (inodeCount > limits.maxInodes) return `inode count ${inodeCount} exceeds maximum ${limits.maxInodes}`;
+  if (totalBlocks > limits.maxBlocks) return `total blocks ${totalBlocks} exceeds maximum ${limits.maxBlocks}`;
+  if (freeBlocks > totalBlocks) return `free blocks (${freeBlocks}) exceeds total (${totalBlocks})`;
+  if (!Number.isFinite(inodeTableOffset) || inodeTableOffset < 0 || !Number.isFinite(pathTableOffset) || pathTableOffset < 0 || !Number.isFinite(bitmapOffset) || bitmapOffset < 0 || !Number.isFinite(dataOffset) || dataOffset < 0) return "non-finite or negative section offset";
+  if (inodeTableOffset !== SUPERBLOCK.SIZE) return `inode table offset ${inodeTableOffset} (expected ${SUPERBLOCK.SIZE})`;
+  const expectedPathOffset = inodeTableOffset + inodeCount * INODE_SIZE;
+  if (pathTableOffset !== expectedPathOffset) return `path table offset ${pathTableOffset} (expected ${expectedPathOffset})`;
+  if (bitmapOffset <= pathTableOffset) return "bitmap offset must be after path table";
+  if (dataOffset <= bitmapOffset) return "data offset must be after bitmap";
+  const pathTableSize = bitmapOffset - pathTableOffset;
+  if (pathUsed > pathTableSize) return `path used (${pathUsed}) exceeds path table size (${pathTableSize})`;
+  if (pathTableSize > limits.maxPathTable) return `path table size ${pathTableSize} exceeds maximum ${limits.maxPathTable}`;
+  const expectedMinSize = dataOffset + totalBlocks * blockSize;
+  if (expectedMinSize > limits.maxVFSSize) return `computed layout size ${expectedMinSize} exceeds maximum ${limits.maxVFSSize}`;
+  if (fileSize < expectedMinSize) return `file size ${fileSize} too small for layout (need ${expectedMinSize})`;
+  return null;
+}
 async function initEngine(config) {
   debug = config.debug ?? false;
+  activeLimits = resolveLimits(config.limits);
   let rootDir = await navigator.storage.getDirectory();
   if (config.root && config.root !== "/") {
     const segments = config.root.split("/").filter(Boolean);
@@ -2781,14 +2875,26 @@ async function initEngine(config) {
   }
   const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin", { create: true });
   const vfsHandle = await vfsFileHandle.createSyncAccessHandle();
-  const wasFresh = vfsHandle.getSize() === 0;
+  const vfsSize = vfsHandle.getSize();
+  if (vfsSize > 0) {
+    const validationError = quickValidateVFS(vfsHandle, vfsSize, activeLimits);
+    if (validationError) {
+      try {
+        vfsHandle.close();
+      } catch (_) {
+      }
+      throw new Error(`Corrupt VFS: ${validationError}`);
+    }
+  }
+  const wasFresh = vfsSize === 0;
   try {
     engine.init(vfsHandle, {
       uid: config.uid,
       gid: config.gid,
       umask: config.umask,
       strictPermissions: config.strictPermissions,
-      debug: config.debug
+      debug: config.debug,
+      limits: activeLimits
     });
   } catch (err) {
     try {

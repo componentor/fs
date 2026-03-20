@@ -37,6 +37,7 @@ export type {
   FileHandle,
   Dir,
   VFSConfig,
+  VFSLimits,
   FSMode,
   WatchOptions,
   WatchEventType,

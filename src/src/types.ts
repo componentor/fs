@@ -159,6 +159,20 @@ export type WatchFileListener = (curr: Stats, prev: Stats) => void;
  */
 export type FSMode = 'hybrid' | 'vfs' | 'opfs';
 
+/** Upper bounds for VFS validation. Prevents corrupt data from causing OOM/hangs. */
+export interface VFSLimits {
+  /** Maximum number of inodes (default: 4,000,000) */
+  maxInodes?: number;
+  /** Maximum number of data blocks (default: 4,000,000) */
+  maxBlocks?: number;
+  /** Maximum path table size in bytes (default: 256MB) */
+  maxPathTable?: number;
+  /** Maximum total VFS file size in bytes (default: 100GB) */
+  maxVFSSize?: number;
+  /** Maximum single SAB payload size in bytes (default: 2GB) */
+  maxPayload?: number;
+}
+
 /** VFS configuration options */
 export interface VFSConfig {
   root?: string;
@@ -177,4 +191,6 @@ export interface VFSConfig {
    *  `'./opfs-fs-sw/'` (relative to the SW script URL) so it won't collide
    *  with the host application's service worker. */
   swScope?: string;
+  /** Upper bounds for VFS validation (prevents corrupt data from causing OOM/hangs). */
+  limits?: VFSLimits;
 }

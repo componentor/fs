@@ -719,5 +719,86 @@ describe('VFSEngine', () => {
       // Should not throw — valid VFS
       expect(() => e.init(h as unknown as FileSystemSyncAccessHandle)).not.toThrow();
     });
+
+    it('should reject inode count exceeding default max', () => {
+      const h = createFormattedHandle();
+      patchU32(h, SUPERBLOCK.INODE_COUNT, 5_000_000);
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: inode count 5000000 exceeds maximum 4000000');
+    });
+
+    it('should reject total blocks exceeding default max', () => {
+      const h = createFormattedHandle();
+      patchU32(h, SUPERBLOCK.TOTAL_BLOCKS, 5_000_000);
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: total blocks 5000000 exceeds maximum 4000000');
+    });
+
+    it('should reject non-finite section offsets', () => {
+      const h = createFormattedHandle();
+      patchF64(h, SUPERBLOCK.INODE_OFFSET, NaN);
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: non-finite or negative section offset');
+    });
+
+    it('should reject negative section offsets', () => {
+      const h = createFormattedHandle();
+      patchF64(h, SUPERBLOCK.DATA_OFFSET, -1);
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle))
+        .toThrow('Corrupt VFS: non-finite or negative section offset');
+    });
+
+    it('should reject path table exceeding max size via custom limit', () => {
+      const h = createFormattedHandle();
+      // Default path table is 256KB — set max to 10 bytes to trigger rejection
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle, { limits: { maxPathTable: 10 } }))
+        .toThrow('Corrupt VFS: path table size');
+    });
+
+    it('should respect custom limits.maxInodes', () => {
+      const h = createFormattedHandle();
+      // Default inode count is 10000, set max to 100
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle, { limits: { maxInodes: 100 } }))
+        .toThrow('Corrupt VFS: inode count 10000 exceeds maximum 100');
+    });
+
+    it('should respect custom limits.maxBlocks', () => {
+      const h = createFormattedHandle();
+      // Default blocks is 1024, set max to 100
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle, { limits: { maxBlocks: 100 } }))
+        .toThrow('Corrupt VFS: total blocks 1024 exceeds maximum 100');
+    });
+
+    it('should respect custom limits.maxVFSSize', () => {
+      const h = createFormattedHandle();
+      // Set max VFS size to 1KB — any valid VFS is bigger than that
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle, { limits: { maxVFSSize: 1024 } }))
+        .toThrow('Corrupt VFS: file size');
+    });
+
+    it('should respect custom limits.maxPathTable', () => {
+      const h = createFormattedHandle();
+      // Default path table is 256KB, set max to 100 bytes
+      const e = new VFSEngine();
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle, { limits: { maxPathTable: 100 } }))
+        .toThrow('Corrupt VFS: path table size');
+    });
+
+    it('should accept valid VFS with elevated limits', () => {
+      const h = createFormattedHandle();
+      const e = new VFSEngine();
+      // Huge limits — should not affect a normal VFS
+      expect(() => e.init(h as unknown as FileSystemSyncAccessHandle, {
+        limits: { maxInodes: 100_000_000, maxBlocks: 100_000_000, maxVFSSize: 1e15, maxPathTable: 1e12 },
+      })).not.toThrow();
+    });
   });
 });

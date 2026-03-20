@@ -1351,7 +1351,8 @@ var VFSFileSystem = class {
       strictPermissions: config.strictPermissions ?? false,
       sabSize: config.sabSize ?? DEFAULT_SAB_SIZE,
       debug: config.debug ?? false,
-      swScope: config.swScope
+      swScope: config.swScope,
+      limits: config.limits
     };
     this.tabId = crypto.randomUUID();
     this.ns = ns;
@@ -1473,7 +1474,8 @@ var VFSFileSystem = class {
         gid: this.config.gid,
         umask: this.config.umask,
         strictPermissions: this.config.strictPermissions,
-        debug: this.config.debug
+        debug: this.config.debug,
+        limits: this.config.limits
       }
     });
   }
@@ -2193,6 +2195,13 @@ var VFSEngine = class {
   superblockDirty = false;
   // Free inode hint — skip O(n) scan
   freeInodeHint = 0;
+  // Configurable upper bounds
+  maxInodes = 4e6;
+  maxBlocks = 4e6;
+  maxPathTable = 256 * 1024 * 1024;
+  // 256MB
+  maxVFSSize = 100 * 1024 * 1024 * 1024;
+  // 100GB
   init(handle, opts) {
     this.handle = handle;
     this.processUid = opts?.uid ?? 0;
@@ -2200,11 +2209,23 @@ var VFSEngine = class {
     this.umask = opts?.umask ?? DEFAULT_UMASK;
     this.strictPermissions = opts?.strictPermissions ?? false;
     this.debug = opts?.debug ?? false;
+    if (opts?.limits) {
+      if (opts.limits.maxInodes != null) this.maxInodes = opts.limits.maxInodes;
+      if (opts.limits.maxBlocks != null) this.maxBlocks = opts.limits.maxBlocks;
+      if (opts.limits.maxPathTable != null) this.maxPathTable = opts.limits.maxPathTable;
+      if (opts.limits.maxVFSSize != null) this.maxVFSSize = opts.limits.maxVFSSize;
+    }
     const size = handle.getSize();
     if (size === 0) {
       this.format();
     } else {
-      this.mount();
+      try {
+        this.mount();
+      } catch (err) {
+        const msg = err.message ?? String(err);
+        if (msg.startsWith("Corrupt VFS:")) throw err;
+        throw new Error(`Corrupt VFS: ${msg}`);
+      }
     }
   }
   /** Release the sync access handle (call on fatal error or shutdown) */
@@ -2271,6 +2292,18 @@ var VFSEngine = class {
     if (freeBlocks > totalBlocks) {
       throw new Error(`Corrupt VFS: free blocks (${freeBlocks}) exceeds total blocks (${totalBlocks})`);
     }
+    if (inodeCount > this.maxInodes) {
+      throw new Error(`Corrupt VFS: inode count ${inodeCount} exceeds maximum ${this.maxInodes}`);
+    }
+    if (totalBlocks > this.maxBlocks) {
+      throw new Error(`Corrupt VFS: total blocks ${totalBlocks} exceeds maximum ${this.maxBlocks}`);
+    }
+    if (fileSize > this.maxVFSSize) {
+      throw new Error(`Corrupt VFS: file size ${fileSize} exceeds maximum ${this.maxVFSSize}`);
+    }
+    if (!Number.isFinite(inodeTableOffset) || inodeTableOffset < 0 || !Number.isFinite(pathTableOffset) || pathTableOffset < 0 || !Number.isFinite(bitmapOffset) || bitmapOffset < 0 || !Number.isFinite(dataOffset) || dataOffset < 0) {
+      throw new Error(`Corrupt VFS: non-finite or negative section offset`);
+    }
     if (inodeTableOffset !== SUPERBLOCK.SIZE) {
       throw new Error(`Corrupt VFS: inode table offset ${inodeTableOffset} (expected ${SUPERBLOCK.SIZE})`);
     }
@@ -2288,7 +2321,13 @@ var VFSEngine = class {
     if (pathUsed > pathTableSize) {
       throw new Error(`Corrupt VFS: path used (${pathUsed}) exceeds path table size (${pathTableSize})`);
     }
+    if (pathTableSize > this.maxPathTable) {
+      throw new Error(`Corrupt VFS: path table size ${pathTableSize} exceeds maximum ${this.maxPathTable}`);
+    }
     const expectedMinSize = dataOffset + totalBlocks * blockSize;
+    if (expectedMinSize > this.maxVFSSize) {
+      throw new Error(`Corrupt VFS: computed layout size ${expectedMinSize} exceeds maximum ${this.maxVFSSize}`);
+    }
     if (fileSize < expectedMinSize) {
       throw new Error(`Corrupt VFS: file size ${fileSize} too small for layout (need ${expectedMinSize})`);
     }
@@ -3483,6 +3522,10 @@ var MemoryHandle = class {
     return this.buf.buffer.slice(0, this.len);
   }
   grow(minSize) {
+    const MAX_SIZE = 4 * 1024 * 1024 * 1024;
+    if (minSize > MAX_SIZE) {
+      throw new Error(`MemoryHandle: cannot grow to ${minSize} bytes (max ${MAX_SIZE})`);
+    }
     const newSize = Math.max(minSize, this.buf.length * 2);
     const newBuf = new Uint8Array(newSize);
     newBuf.set(this.buf.subarray(0, this.len));

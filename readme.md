@@ -83,6 +83,13 @@ const fs = new VFSFileSystem({
   sabSize: 4194304,       // SharedArrayBuffer size in bytes (default: 4MB)
   debug: false,           // Enable debug logging (default: false)
   swScope: undefined,     // Custom service worker scope (default: auto-scoped per root)
+  limits: {               // Upper bounds for VFS validation (prevents corrupt data from causing OOM)
+    maxInodes: 4_000_000,   // Max inode count (default: 4M)
+    maxBlocks: 4_000_000,   // Max data blocks (default: 4M)
+    maxPathTable: 256 * 1024 * 1024, // Max path table bytes (default: 256MB)
+    maxVFSSize: 100 * 1024 * 1024 * 1024, // Max .vfs.bin size (default: 100GB)
+    maxPayload: 2 * 1024 * 1024 * 1024,   // Max single SAB payload (default: 2GB)
+  },
 });
 ```
 
@@ -570,6 +577,18 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+### v3.0.18 (2026)
+
+**Features:**
+- Configurable VFS limits via `limits` option: `maxInodes`, `maxBlocks`, `maxPathTable`, `maxVFSSize`, `maxPayload`
+
+**Fixes:**
+- Pre-validate superblock before `engine.init()` to prevent hangs from corrupt values causing huge allocations
+- Add upper bounds in `mount()`: max 4M inodes, 4M blocks, 256MB path table, 100GB total VFS size
+- Ensure all mount errors are prefixed with `Corrupt VFS:` for consistent corruption fallback
+- Cap `readPayload()` at 2GB (configurable) and validate each chunk length in the multi-chunk loop to prevent OOM/infinite loops from corrupt SAB data
+- Cap `MemoryHandle.grow()` at 4GB to prevent OOM from corrupt VFS offsets on main-thread fallback
+
 ### v3.0.17 (2026)
 
 **Features:**
@@ -757,7 +776,7 @@ git clone https://github.com/componentor/fs
 cd fs
 npm install
 npm run build       # Build the library
-npm test            # Run unit tests (97 tests)
+npm test            # Run unit tests (107 tests)
 npm run benchmark:open  # Run benchmarks in browser
 ```
 

@@ -140,6 +140,19 @@ type WatchFileListener = (curr: Stats, prev: Stats) => void;
  *    Automatically selected as fallback when VFS corruption is detected in hybrid mode.
  */
 type FSMode = 'hybrid' | 'vfs' | 'opfs';
+/** Upper bounds for VFS validation. Prevents corrupt data from causing OOM/hangs. */
+interface VFSLimits {
+    /** Maximum number of inodes (default: 4,000,000) */
+    maxInodes?: number;
+    /** Maximum number of data blocks (default: 4,000,000) */
+    maxBlocks?: number;
+    /** Maximum path table size in bytes (default: 256MB) */
+    maxPathTable?: number;
+    /** Maximum total VFS file size in bytes (default: 100GB) */
+    maxVFSSize?: number;
+    /** Maximum single SAB payload size in bytes (default: 2GB) */
+    maxPayload?: number;
+}
 /** VFS configuration options */
 interface VFSConfig {
     root?: string;
@@ -158,6 +171,8 @@ interface VFSConfig {
      *  `'./opfs-fs-sw/'` (relative to the SW script URL) so it won't collide
      *  with the host application's service worker. */
     swScope?: string;
+    /** Upper bounds for VFS validation (prevents corrupt data from causing OOM/hangs). */
+    limits?: VFSLimits;
 }
 
 type AsyncRequestFn = (op: number, path: string, flags?: number, data?: Uint8Array | string | null, path2?: string, fdArgs?: Record<string, unknown>) => Promise<{
@@ -506,4 +521,4 @@ declare function getDefaultFS(): VFSFileSystem;
 /** Async init helper — avoids blocking main thread */
 declare function init(): Promise<void>;
 
-export { type Dir, type Dirent, type Encoding, FSError, type FSMode, type FSWatcher, type FileHandle, type LoadResult, type MkdirOptions, type PathLike, type ReadOptions, type ReadStreamOptions, type ReaddirOptions, type RepairResult, type RmOptions, type RmdirOptions, type Stats, type UnpackResult, type VFSConfig, VFSFileSystem, type WatchEventType, type WatchFileListener, type WatchListener, type WatchOptions, type WriteOptions, type WriteStreamOptions, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path, repairVFS, statusToError, unpackToOPFS };
+export { type Dir, type Dirent, type Encoding, FSError, type FSMode, type FSWatcher, type FileHandle, type LoadResult, type MkdirOptions, type PathLike, type ReadOptions, type ReadStreamOptions, type ReaddirOptions, type RepairResult, type RmOptions, type RmdirOptions, type Stats, type UnpackResult, type VFSConfig, VFSFileSystem, type VFSLimits, type WatchEventType, type WatchFileListener, type WatchListener, type WatchOptions, type WriteOptions, type WriteStreamOptions, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path, repairVFS, statusToError, unpackToOPFS };

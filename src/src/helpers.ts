@@ -96,6 +96,10 @@ class MemoryHandle {
   }
 
   private grow(minSize: number): void {
+    const MAX_SIZE = 4 * 1024 * 1024 * 1024; // 4GB
+    if (minSize > MAX_SIZE) {
+      throw new Error(`MemoryHandle: cannot grow to ${minSize} bytes (max ${MAX_SIZE})`);
+    }
     const newSize = Math.max(minSize, this.buf.length * 2);
     const newBuf = new Uint8Array(newSize);
     newBuf.set(this.buf.subarray(0, this.len));

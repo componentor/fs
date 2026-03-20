@@ -23,6 +23,7 @@
 import { VFSEngine } from '../vfs/engine.js';
 import { OPFSEngine } from '../opfs-engine.js';
 import { SAB_OFFSETS, SIGNAL, OP, decodeRequest, decodeSecondPath, encodeResponse } from '../protocol/opcodes.js';
+import { VFS_MAGIC, VFS_VERSION, SUPERBLOCK, INODE_SIZE } from '../vfs/layout.js';
 
 const engine = new VFSEngine();
 let opfsEngine: OPFSEngine | null = null;
@@ -608,6 +609,12 @@ function readPayload(targetSab: SharedArrayBuffer, targetCtrl: Int32Array): Uint
     return new Uint8Array(targetSab, HEADER_SIZE, chunkLen).slice();
   }
 
+  // Guard against corrupt TOTAL_LEN causing OOM
+  if (totalLen > activeLimits.maxPayload || totalLen <= 0) {
+    console.error(`[sync-relay] readPayload: totalLen=${totalLen} exceeds limit (${activeLimits.maxPayload}) or invalid`);
+    return new Uint8Array(0);
+  }
+
   // Multi-chunk: assemble full buffer
   const fullBuffer = new Uint8Array(totalLen);
   let offset = 0;
@@ -622,6 +629,10 @@ function readPayload(targetSab: SharedArrayBuffer, targetCtrl: Int32Array): Uint
     Atomics.notify(targetCtrl, 0);
     Atomics.wait(targetCtrl, 0, SIGNAL.CHUNK_ACK); // Wait for next chunk
     const nextLen = Atomics.load(targetCtrl, 3);
+    if (nextLen <= 0 || nextLen > maxChunk) {
+      console.error(`[sync-relay] readPayload: invalid nextLen=${nextLen} at offset=${offset}`);
+      return fullBuffer.slice(0, offset); // return what we have so far
+    }
     fullBuffer.set(new Uint8Array(targetSab, HEADER_SIZE, nextLen), offset);
     offset += nextLen;
   }
@@ -911,6 +922,90 @@ async function scanOPFSEntries(
   return result;
 }
 
+/**
+ * Quick superblock validation — reads only 64 bytes to detect corruption
+ * BEFORE engine.init() runs. Prevents hangs from corrupt values causing
+ * huge allocations or blocking Atomics loops.
+ * Returns null if valid, or an error description string if corrupt.
+ */
+interface ResolvedLimits {
+  maxInodes: number;
+  maxBlocks: number;
+  maxPathTable: number;
+  maxVFSSize: number;
+  maxPayload: number;
+}
+
+const DEFAULT_LIMITS: ResolvedLimits = {
+  maxInodes: 4_000_000,
+  maxBlocks: 4_000_000,
+  maxPathTable: 256 * 1024 * 1024,
+  maxVFSSize: 100 * 1024 * 1024 * 1024,
+  maxPayload: 2 * 1024 * 1024 * 1024,
+};
+
+function resolveLimits(input?: Partial<ResolvedLimits>): ResolvedLimits {
+  return { ...DEFAULT_LIMITS, ...input };
+}
+
+// Active limits for this worker instance
+let activeLimits: ResolvedLimits = { ...DEFAULT_LIMITS };
+
+function quickValidateVFS(handle: FileSystemSyncAccessHandle, fileSize: number, limits: ResolvedLimits): string | null {
+  if (fileSize < SUPERBLOCK.SIZE) return `file too small (${fileSize} bytes)`;
+
+  const buf = new Uint8Array(SUPERBLOCK.SIZE);
+  handle.read(buf, { at: 0 });
+  const v = new DataView(buf.buffer);
+
+  const magic = v.getUint32(SUPERBLOCK.MAGIC, true);
+  if (magic !== VFS_MAGIC) return `bad magic 0x${magic.toString(16)}`;
+  const version = v.getUint32(SUPERBLOCK.VERSION, true);
+  if (version !== VFS_VERSION) return `unsupported version ${version}`;
+
+  const inodeCount = v.getUint32(SUPERBLOCK.INODE_COUNT, true);
+  const blockSize = v.getUint32(SUPERBLOCK.BLOCK_SIZE, true);
+  const totalBlocks = v.getUint32(SUPERBLOCK.TOTAL_BLOCKS, true);
+  const freeBlocks = v.getUint32(SUPERBLOCK.FREE_BLOCKS, true);
+  const inodeTableOffset = v.getFloat64(SUPERBLOCK.INODE_OFFSET, true);
+  const pathTableOffset = v.getFloat64(SUPERBLOCK.PATH_OFFSET, true);
+  const dataOffset = v.getFloat64(SUPERBLOCK.DATA_OFFSET, true);
+  const bitmapOffset = v.getFloat64(SUPERBLOCK.BITMAP_OFFSET, true);
+  const pathUsed = v.getUint32(SUPERBLOCK.PATH_USED, true);
+
+  // Basic field sanity
+  if (blockSize === 0 || (blockSize & (blockSize - 1)) !== 0) return `invalid block size ${blockSize}`;
+  if (inodeCount === 0) return 'inode count is 0';
+  if (inodeCount > limits.maxInodes) return `inode count ${inodeCount} exceeds maximum ${limits.maxInodes}`;
+  if (totalBlocks > limits.maxBlocks) return `total blocks ${totalBlocks} exceeds maximum ${limits.maxBlocks}`;
+  if (freeBlocks > totalBlocks) return `free blocks (${freeBlocks}) exceeds total (${totalBlocks})`;
+
+  // Offsets must be finite positive numbers
+  if (!Number.isFinite(inodeTableOffset) || inodeTableOffset < 0 ||
+      !Number.isFinite(pathTableOffset) || pathTableOffset < 0 ||
+      !Number.isFinite(bitmapOffset) || bitmapOffset < 0 ||
+      !Number.isFinite(dataOffset) || dataOffset < 0) return 'non-finite or negative section offset';
+
+  // Section ordering
+  if (inodeTableOffset !== SUPERBLOCK.SIZE) return `inode table offset ${inodeTableOffset} (expected ${SUPERBLOCK.SIZE})`;
+  const expectedPathOffset = inodeTableOffset + inodeCount * INODE_SIZE;
+  if (pathTableOffset !== expectedPathOffset) return `path table offset ${pathTableOffset} (expected ${expectedPathOffset})`;
+  if (bitmapOffset <= pathTableOffset) return 'bitmap offset must be after path table';
+  if (dataOffset <= bitmapOffset) return 'data offset must be after bitmap';
+
+  // Path table bounds
+  const pathTableSize = bitmapOffset - pathTableOffset;
+  if (pathUsed > pathTableSize) return `path used (${pathUsed}) exceeds path table size (${pathTableSize})`;
+  if (pathTableSize > limits.maxPathTable) return `path table size ${pathTableSize} exceeds maximum ${limits.maxPathTable}`;
+
+  // File size vs declared layout
+  const expectedMinSize = dataOffset + totalBlocks * blockSize;
+  if (expectedMinSize > limits.maxVFSSize) return `computed layout size ${expectedMinSize} exceeds maximum ${limits.maxVFSSize}`;
+  if (fileSize < expectedMinSize) return `file size ${fileSize} too small for layout (need ${expectedMinSize})`;
+
+  return null;
+}
+
 async function initEngine(config: {
   root: string;
   ns: string;
@@ -921,8 +1016,10 @@ async function initEngine(config: {
   umask: number;
   strictPermissions: boolean;
   debug?: boolean;
+  limits?: Partial<ResolvedLimits>;
 }): Promise<void> {
   debug = config.debug ?? false;
+  activeLimits = resolveLimits(config.limits);
 
   // Navigate to configured OPFS root
   let rootDir = await navigator.storage.getDirectory();
@@ -937,7 +1034,20 @@ async function initEngine(config: {
   // Open VFS binary file with exclusive sync access
   const vfsFileHandle = await rootDir.getFileHandle('.vfs.bin', { create: true });
   const vfsHandle = await vfsFileHandle.createSyncAccessHandle();
-  const wasFresh = vfsHandle.getSize() === 0;
+
+  // Pre-validate vfs.bin BEFORE engine.init() to prevent hangs from corrupt data
+  // causing huge allocations or blocking Atomics loops. Throws early so the caller
+  // can offer repair instead of silently losing data.
+  const vfsSize = vfsHandle.getSize();
+  if (vfsSize > 0) {
+    const validationError = quickValidateVFS(vfsHandle, vfsSize, activeLimits);
+    if (validationError) {
+      try { vfsHandle.close(); } catch (_) {}
+      throw new Error(`Corrupt VFS: ${validationError}`);
+    }
+  }
+
+  const wasFresh = vfsSize === 0;
 
   // Initialize VFS engine — release handle on corruption/failure
   try {
@@ -947,6 +1057,7 @@ async function initEngine(config: {
       umask: config.umask,
       strictPermissions: config.strictPermissions,
       debug: config.debug,
+      limits: activeLimits,
     });
   } catch (err) {
     // Release the exclusive sync handle so it can be re-acquired
