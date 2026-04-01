@@ -1381,6 +1381,7 @@ var VFSFileSystem = class {
       const msg = e.data;
       if (msg.type === "ready") {
         this.isReady = true;
+        this.initAsyncRelay();
         this.resolveReady();
         if (!this.isFollower) {
           this.initLeaderBroker();
@@ -1405,23 +1406,6 @@ var VFSFileSystem = class {
         }
       }
     };
-    if (this.hasSAB) {
-      this.asyncWorker.postMessage({
-        type: "init-leader",
-        asyncSab: this.asyncSab,
-        wakeSab: this.sab
-      });
-    } else {
-      const mc = new MessageChannel();
-      this.asyncWorker.postMessage(
-        { type: "init-port", port: mc.port1 },
-        [mc.port1]
-      );
-      this.syncWorker.postMessage(
-        { type: "async-port", port: mc.port2 },
-        [mc.port2]
-      );
-    }
     this.acquireLeaderLock();
   }
   /** Use Web Locks API for leader election. The tab that acquires the lock is
@@ -1515,6 +1499,26 @@ var VFSFileSystem = class {
     }
     this._mode = "opfs";
     this.sendOPFSInit();
+  }
+  /** Initialize the async-relay worker. Called after sync-relay signals ready. */
+  initAsyncRelay() {
+    if (this.hasSAB) {
+      this.asyncWorker.postMessage({
+        type: "init-leader",
+        asyncSab: this.asyncSab,
+        wakeSab: this.sab
+      });
+    } else {
+      const mc = new MessageChannel();
+      this.asyncWorker.postMessage(
+        { type: "init-port", port: mc.port1 },
+        [mc.port1]
+      );
+      this.syncWorker.postMessage(
+        { type: "async-port", port: mc.port2 },
+        [mc.port2]
+      );
+    }
   }
   /** Start as leader — tell sync-relay to init VFS engine + OPFS handle */
   startAsLeader() {

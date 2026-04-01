@@ -1,8 +1,11 @@
 # Changelog
 
-## 3.0.21
+## 3.0.22
 
-- Fix sync-relay async response handshake: replace single `Atomics.wait` with polling loop to avoid race condition on multi-chunk responses
+- Fix multi-chunk signal protocol: async-relay now waits for last chunk ack before reading response, preventing signal confusion
+- Defer async-relay initialization until sync-relay is ready, eliminating startup race condition
+- Increase `Atomics.wait` timeouts from 10ms to 100ms across all relay paths
+- Replace aggressive polling loop with proper `Atomics.wait` for async response consumption
 
 ## 3.0.20
 

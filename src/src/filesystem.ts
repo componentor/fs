@@ -201,6 +201,9 @@ export class VFSFileSystem {
       const msg = e.data;
       if (msg.type === 'ready') {
         this.isReady = true;
+        // Initialize async-relay AFTER sync-relay is ready to avoid
+        // requests arriving before the leader loop is running.
+        this.initAsyncRelay();
         this.resolveReady();
         if (!this.isFollower) {
           this.initLeaderBroker();
@@ -230,25 +233,8 @@ export class VFSFileSystem {
       }
     };
 
-    if (this.hasSAB) {
-      // Initialize async relay with SAB (leader mode fast path)
-      this.asyncWorker.postMessage({
-        type: 'init-leader',
-        asyncSab: this.asyncSab,
-        wakeSab: this.sab,
-      });
-    } else {
-      // No SAB: connect async-relay ↔ sync-relay via MessagePort
-      const mc = new MessageChannel();
-      this.asyncWorker.postMessage(
-        { type: 'init-port', port: mc.port1 },
-        [mc.port1],
-      );
-      this.syncWorker.postMessage(
-        { type: 'async-port', port: mc.port2 },
-        [mc.port2],
-      );
-    }
+    // Async-relay is initialized later in the 'ready' handler to avoid
+    // requests arriving before the sync-relay's leader loop is running.
 
     // Leader election via Web Locks
     this.acquireLeaderLock();
@@ -354,6 +340,27 @@ export class VFSFileSystem {
     // Hybrid/default: fall back to OPFS-direct mode
     this._mode = 'opfs';
     this.sendOPFSInit();
+  }
+
+  /** Initialize the async-relay worker. Called after sync-relay signals ready. */
+  private initAsyncRelay(): void {
+    if (this.hasSAB) {
+      this.asyncWorker.postMessage({
+        type: 'init-leader',
+        asyncSab: this.asyncSab,
+        wakeSab: this.sab,
+      });
+    } else {
+      const mc = new MessageChannel();
+      this.asyncWorker.postMessage(
+        { type: 'init-port', port: mc.port1 },
+        [mc.port1],
+      );
+      this.syncWorker.postMessage(
+        { type: 'async-port', port: mc.port2 },
+        [mc.port2],
+      );
+    }
   }
 
   /** Start as leader — tell sync-relay to init VFS engine + OPFS handle */

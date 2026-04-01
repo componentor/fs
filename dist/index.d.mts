@@ -232,6 +232,8 @@ declare class VFSFileSystem {
      *  The readyPromise will resolve once OPFS mode is ready, but init()
      *  will reject with the corruption error to inform the caller. */
     private handleCorruptVFS;
+    /** Initialize the async-relay worker. Called after sync-relay signals ready. */
+    private initAsyncRelay;
     /** Start as leader — tell sync-relay to init VFS engine + OPFS handle */
     private startAsLeader;
     /** Start as follower — connect to leader via service worker port brokering */

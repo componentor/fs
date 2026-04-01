@@ -748,7 +748,7 @@ async function leaderLoop(): Promise<void> {
         // Wait for main thread to consume response (10ms safety timeout).
         // Main thread sets IDLE without notify — worker stays asleep until the
         // NEXT request's notify wakes it. This gives ONE wake per operation.
-        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 10);
+        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 100);
         if (waitResult === 'timed-out') {
           Atomics.store(ctrl, 0, SIGNAL.IDLE);
         }
@@ -762,16 +762,12 @@ async function leaderLoop(): Promise<void> {
         const asyncResult = handleRequest(tabId, payload.buffer as ArrayBuffer);
         writeDirectResponse(asyncSab!, asyncCtrl, asyncResult.status, asyncResult.data);
         if (asyncResult._op !== undefined) notifyOPFSSync(asyncResult._op, asyncResult._path!, asyncResult._newPath);
-        // Wait for async-relay to consume the response and reset to IDLE.
-        // For multi-chunk responses, writeResponse() handles the entire chunk
-        // handshake internally. When it returns, the async-relay has received
-        // all data but may not have set IDLE yet. Poll briefly for IDLE.
-        for (let i = 0; i < 500; i++) {
-          if (Atomics.load(asyncCtrl, 0) === SIGNAL.IDLE) break;
-          Atomics.wait(asyncCtrl, 0, Atomics.load(asyncCtrl, 0), 10);
-        }
+        // Wait for async-relay to consume response and reset to IDLE.
+        // writeResponse handles multi-chunk handshake internally; when it
+        // returns the async-relay has all data but may need one more tick
+        // to set IDLE. Use Atomics.wait with a reasonable timeout.
         if (Atomics.load(asyncCtrl, 0) !== SIGNAL.IDLE) {
-          Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
+          Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 5000);
         }
         processed = true;
         continue;
@@ -820,7 +816,7 @@ async function leaderLoopOPFS(): Promise<void> {
         const payload = readPayload(sab, ctrl);
         const reqResult = await handleRequestOPFS(tabId, payload.buffer as ArrayBuffer);
         writeDirectResponse(sab, ctrl, reqResult.status, reqResult.data);
-        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 10);
+        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 100);
         if (waitResult === 'timed-out') {
           Atomics.store(ctrl, 0, SIGNAL.IDLE);
         }
@@ -833,7 +829,7 @@ async function leaderLoopOPFS(): Promise<void> {
         const payload = readPayload(asyncSab!, asyncCtrl);
         const asyncResult = await handleRequestOPFS(tabId, payload.buffer as ArrayBuffer);
         writeDirectResponse(asyncSab!, asyncCtrl, asyncResult.status, asyncResult.data);
-        const waitResult = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 10);
+        const waitResult = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 100);
         if (waitResult === 'timed-out') {
           Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
         }
@@ -871,7 +867,7 @@ async function followerLoop(): Promise<void> {
       writeResponse(sab, ctrl, new Uint8Array(response));
       // Wait for main thread to consume response (safety timeout to prevent deadlock —
       // main thread stores IDLE without notify)
-      const result = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 10);
+      const result = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 100);
       if (result === 'timed-out') {
         Atomics.store(ctrl, 0, SIGNAL.IDLE);
       }
@@ -883,7 +879,7 @@ async function followerLoop(): Promise<void> {
       const payload = readPayload(asyncSab!, asyncCtrl);
       const response = await forwardToLeader(payload);
       writeResponse(asyncSab!, asyncCtrl, new Uint8Array(response));
-      const result = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 10);
+      const result = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 100);
       if (result === 'timed-out') {
         Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
       }

@@ -75,17 +75,31 @@ function sabRequest(requestBuf: ArrayBuffer): { status: number; data: Uint8Array
 
       sent += chunkSize;
       if (sent < requestBytes.byteLength) {
-        // Wait for sync-relay to ack chunk
+        // Wait for sync-relay to ack non-final chunk
         Atomics.wait(asyncCtrl!, 0, sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK);
       }
     }
+    // Wait for sync-relay to ack the LAST chunk before looking for response.
+    // Without this, ctrl[0] is still our SIGNAL.CHUNK and we can't distinguish
+    // it from a response CHUNK signal.
+    while (Atomics.load(asyncCtrl!, 0) === SIGNAL.CHUNK) {
+      Atomics.wait(asyncCtrl!, 0, SIGNAL.CHUNK, 100);
+    }
   }
 
-  // Wait for response from sync-relay
-  Atomics.wait(asyncCtrl!, 0, SIGNAL.REQUEST);
+  // Wait for sync-relay to write the response.
+  // After single-chunk: ctrl transitions REQUEST → RESPONSE (or CHUNK for multi-response)
+  // After multi-chunk: ctrl transitions CHUNK → CHUNK_ACK → RESPONSE (or CHUNK for multi-response)
+  // At this point ctrl[0] is NOT our CHUNK (we waited above). It's either
+  // CHUNK_ACK (sync still processing), RESPONSE (done), or CHUNK (multi-response first chunk).
+  let signal: number;
+  for (;;) {
+    signal = Atomics.load(asyncCtrl!, 0);
+    if (signal === SIGNAL.RESPONSE || signal === SIGNAL.CHUNK) break;
+    Atomics.wait(asyncCtrl!, 0, signal, 1000);
+  }
 
   // Read response (may be multi-chunk)
-  const signal = Atomics.load(asyncCtrl!, 0);
   const respChunkLen = Atomics.load(asyncCtrl!, 3);
   const respTotalLen = Number(Atomics.load(totalLenView, 0));
 

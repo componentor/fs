@@ -2690,7 +2690,7 @@ async function leaderLoop() {
         if (debug) {
           console.log(`[leaderLoop] readPayload=${(lt1 - lt0).toFixed(3)}ms handleRequest=${(lt2 - lt1).toFixed(3)}ms writeResponse=${(lt3 - lt2).toFixed(3)}ms TOTAL=${(lt3 - lt0).toFixed(3)}ms`);
         }
-        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 10);
+        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 100);
         if (waitResult === "timed-out") {
           Atomics.store(ctrl, 0, SIGNAL.IDLE);
         }
@@ -2702,12 +2702,8 @@ async function leaderLoop() {
         const asyncResult = handleRequest(tabId, payload.buffer);
         writeDirectResponse(asyncSab, asyncCtrl, asyncResult.status, asyncResult.data);
         if (asyncResult._op !== void 0) notifyOPFSSync(asyncResult._op, asyncResult._path, asyncResult._newPath);
-        for (let i = 0; i < 500; i++) {
-          if (Atomics.load(asyncCtrl, 0) === SIGNAL.IDLE) break;
-          Atomics.wait(asyncCtrl, 0, Atomics.load(asyncCtrl, 0), 10);
-        }
         if (Atomics.load(asyncCtrl, 0) !== SIGNAL.IDLE) {
-          Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
+          Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 5e3);
         }
         processed = true;
         continue;
@@ -2742,7 +2738,7 @@ async function leaderLoopOPFS() {
         const payload = readPayload(sab, ctrl);
         const reqResult = await handleRequestOPFS(tabId, payload.buffer);
         writeDirectResponse(sab, ctrl, reqResult.status, reqResult.data);
-        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 10);
+        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 100);
         if (waitResult === "timed-out") {
           Atomics.store(ctrl, 0, SIGNAL.IDLE);
         }
@@ -2753,7 +2749,7 @@ async function leaderLoopOPFS() {
         const payload = readPayload(asyncSab, asyncCtrl);
         const asyncResult = await handleRequestOPFS(tabId, payload.buffer);
         writeDirectResponse(asyncSab, asyncCtrl, asyncResult.status, asyncResult.data);
-        const waitResult = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 10);
+        const waitResult = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 100);
         if (waitResult === "timed-out") {
           Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
         }
@@ -2781,7 +2777,7 @@ async function followerLoop() {
       const payload = readPayload(sab, ctrl);
       const response = await forwardToLeader(payload);
       writeResponse(sab, ctrl, new Uint8Array(response));
-      const result = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 10);
+      const result = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 100);
       if (result === "timed-out") {
         Atomics.store(ctrl, 0, SIGNAL.IDLE);
       }
@@ -2791,7 +2787,7 @@ async function followerLoop() {
       const payload = readPayload(asyncSab, asyncCtrl);
       const response = await forwardToLeader(payload);
       writeResponse(asyncSab, asyncCtrl, new Uint8Array(response));
-      const result = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 10);
+      const result = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 100);
       if (result === "timed-out") {
         Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
       }

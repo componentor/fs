@@ -130,9 +130,16 @@ function sabRequest(requestBuf) {
         Atomics.wait(asyncCtrl, 0, sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK);
       }
     }
+    while (Atomics.load(asyncCtrl, 0) === SIGNAL.CHUNK) {
+      Atomics.wait(asyncCtrl, 0, SIGNAL.CHUNK, 100);
+    }
   }
-  Atomics.wait(asyncCtrl, 0, SIGNAL.REQUEST);
-  const signal = Atomics.load(asyncCtrl, 0);
+  let signal;
+  for (; ; ) {
+    signal = Atomics.load(asyncCtrl, 0);
+    if (signal === SIGNAL.RESPONSE || signal === SIGNAL.CHUNK) break;
+    Atomics.wait(asyncCtrl, 0, signal, 1e3);
+  }
   const respChunkLen = Atomics.load(asyncCtrl, 3);
   const respTotalLen = Number(Atomics.load(totalLenView, 0));
   let responseBytes;
