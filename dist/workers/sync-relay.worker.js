@@ -2647,6 +2647,8 @@ function writeResponse(targetSab, targetCtrl, responseData) {
     Atomics.store(targetCtrl, 0, SIGNAL.RESPONSE);
     Atomics.notify(targetCtrl, 0);
   } else {
+    const totalView = new BigUint64Array(targetSab, SAB_OFFSETS.TOTAL_LEN, 1);
+    Atomics.store(totalView, 0, BigInt(responseData.byteLength));
     let sent = 0;
     while (sent < responseData.byteLength) {
       const chunkSize = Math.min(maxChunk, responseData.byteLength - sent);
@@ -2700,8 +2702,11 @@ async function leaderLoop() {
         const asyncResult = handleRequest(tabId, payload.buffer);
         writeDirectResponse(asyncSab, asyncCtrl, asyncResult.status, asyncResult.data);
         if (asyncResult._op !== void 0) notifyOPFSSync(asyncResult._op, asyncResult._path, asyncResult._newPath);
-        const waitResult = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 10);
-        if (waitResult === "timed-out") {
+        for (let i = 0; i < 500; i++) {
+          if (Atomics.load(asyncCtrl, 0) === SIGNAL.IDLE) break;
+          Atomics.wait(asyncCtrl, 0, Atomics.load(asyncCtrl, 0), 10);
+        }
+        if (Atomics.load(asyncCtrl, 0) !== SIGNAL.IDLE) {
           Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
         }
         processed = true;

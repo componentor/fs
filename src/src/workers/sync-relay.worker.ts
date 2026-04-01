@@ -690,6 +690,8 @@ function writeResponse(targetSab: SharedArrayBuffer, targetCtrl: Int32Array, res
     Atomics.notify(targetCtrl, 0);
   } else {
     // Multi-chunk response
+    const totalView = new BigUint64Array(targetSab, SAB_OFFSETS.TOTAL_LEN, 1);
+    Atomics.store(totalView, 0, BigInt(responseData.byteLength));
     let sent = 0;
     while (sent < responseData.byteLength) {
       const chunkSize = Math.min(maxChunk, responseData.byteLength - sent);
@@ -760,8 +762,15 @@ async function leaderLoop(): Promise<void> {
         const asyncResult = handleRequest(tabId, payload.buffer as ArrayBuffer);
         writeDirectResponse(asyncSab!, asyncCtrl, asyncResult.status, asyncResult.data);
         if (asyncResult._op !== undefined) notifyOPFSSync(asyncResult._op, asyncResult._path!, asyncResult._newPath);
-        const waitResult = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 10);
-        if (waitResult === 'timed-out') {
+        // Wait for async-relay to consume the response and reset to IDLE.
+        // For multi-chunk responses, writeResponse() handles the entire chunk
+        // handshake internally. When it returns, the async-relay has received
+        // all data but may not have set IDLE yet. Poll briefly for IDLE.
+        for (let i = 0; i < 500; i++) {
+          if (Atomics.load(asyncCtrl, 0) === SIGNAL.IDLE) break;
+          Atomics.wait(asyncCtrl, 0, Atomics.load(asyncCtrl, 0), 10);
+        }
+        if (Atomics.load(asyncCtrl, 0) !== SIGNAL.IDLE) {
           Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
         }
         processed = true;
