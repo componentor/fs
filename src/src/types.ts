@@ -187,8 +187,12 @@ export interface VFSConfig {
   strictPermissions?: boolean;
   sabSize?: number;
   debug?: boolean;
+  /** URL of the service worker script. Defaults to `'./workers/service.worker.js'`
+   *  relative to `import.meta.url`. Override when the library is bundled and the
+   *  default relative URL no longer resolves to the correct location. */
+  swUrl?: string;
   /** Scope for the internal service worker registration. Defaults to
-   *  `'./opfs-fs-sw/'` (relative to the SW script URL) so it won't collide
+   *  `'./${ns}/'` (relative to the SW script URL) so it won't collide
    *  with the host application's service worker. */
   swScope?: string;
   /** Upper bounds for VFS validation (prevents corrupt data from causing OOM/hangs). */

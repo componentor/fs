@@ -114,7 +114,7 @@ export class VFSFileSystem {
 
 
   // Config (definite assignment — always set when constructor doesn't return singleton)
-  private config!: Omit<Required<VFSConfig>, 'opfsSyncRoot' | 'swScope' | 'mode' | 'limits'> & { opfsSyncRoot?: string; swScope?: string; limits?: VFSConfig['limits'] };
+  private config!: Omit<Required<VFSConfig>, 'opfsSyncRoot' | 'swUrl' | 'swScope' | 'mode' | 'limits'> & { opfsSyncRoot?: string; swUrl?: string; swScope?: string; limits?: VFSConfig['limits'] };
   private tabId!: string;
   private _mode!: FSMode;
   private corruptionError: Error | null = null;
@@ -162,6 +162,7 @@ export class VFSFileSystem {
       strictPermissions: config.strictPermissions ?? false,
       sabSize: config.sabSize ?? DEFAULT_SAB_SIZE,
       debug: config.debug ?? false,
+      swUrl: config.swUrl,
       swScope: config.swScope,
       limits: config.limits,
     };
@@ -414,9 +415,11 @@ export class VFSFileSystem {
   /** Register the VFS service worker and return the active SW */
   private async getServiceWorker(): Promise<ServiceWorker> {
     if (!this.swReg) {
-      const swUrl = new URL('./workers/service.worker.js', import.meta.url);
+      const swUrl = this.config.swUrl
+        ? new URL(this.config.swUrl, location.origin)
+        : new URL('./workers/service.worker.js', import.meta.url);
       const scope = this.config.swScope ?? new URL(`./${this.ns}/`, swUrl).href;
-      this.swReg = await navigator.serviceWorker.register(swUrl.href, { type: 'module', scope });
+      this.swReg = await navigator.serviceWorker.register(swUrl.href, { scope });
     }
     const reg = this.swReg;
 

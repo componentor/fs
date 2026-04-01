@@ -82,6 +82,7 @@ const fs = new VFSFileSystem({
   strictPermissions: false, // Enforce Unix permissions (default: false)
   sabSize: 4194304,       // SharedArrayBuffer size in bytes (default: 4MB)
   debug: false,           // Enable debug logging (default: false)
+  swUrl: undefined,       // URL of the service worker script (default: auto-resolved)
   swScope: undefined,     // Custom service worker scope (default: auto-scoped per root)
   limits: {               // Upper bounds for VFS validation (prevents corrupt data from causing OOM)
     maxInodes: 4_000_000,   // Max inode count (default: 4M)
@@ -159,6 +160,30 @@ console.log(fs.mode); // 'hybrid'
 ```
 
 `setMode()` terminates internal workers, allocates fresh shared memory, and reinitializes the filesystem in the requested mode.
+
+### Service Worker Setup (Multi-Tab)
+
+Multi-tab coordination requires a service worker that acts as a MessagePort broker between tabs. The built service worker is shipped at `dist/workers/service.worker.js`. Unlike regular workers (which are resolved by the bundler), **service workers must be served as a real file at a public URL**.
+
+Most bundlers (Vite, webpack) handle `new URL('./workers/service.worker.js', import.meta.url)` automatically, but if the default resolution doesn't work in your setup, use the `swUrl` option:
+
+```typescript
+const fs = new VFSFileSystem({
+  swUrl: '/vfs-service-worker.js', // your public URL
+});
+```
+
+**Vite example** — copy the file to `public/`:
+
+```bash
+cp node_modules/@componentor/fs/dist/workers/service.worker.js public/vfs-service-worker.js
+```
+
+```typescript
+const fs = new VFSFileSystem({ swUrl: '/vfs-service-worker.js' });
+```
+
+If you only use a single tab, the service worker is not needed — the tab always runs as the leader.
 
 ## COOP/COEP Headers
 
@@ -576,6 +601,12 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 `FileSystemObserver` requires Chrome 129+. The VFS instance must be running (observer is set up during init). Changes to files outside the configured `root` directory won't be detected.
 
 ## Changelog
+
+### v3.0.19-v3.0.20 (2026)
+
+**Features:**
+- Add `swUrl` config option to specify a custom service worker URL for multi-tab support in bundled environments where the default auto-resolved URL doesn't work
+- Remove `type: 'module'` from service worker registration (built output is plain script, not ESM)
 
 ### v3.0.18 (2026)
 

@@ -1351,6 +1351,7 @@ var VFSFileSystem = class {
       strictPermissions: config.strictPermissions ?? false,
       sabSize: config.sabSize ?? DEFAULT_SAB_SIZE,
       debug: config.debug ?? false,
+      swUrl: config.swUrl,
       swScope: config.swScope,
       limits: config.limits
     };
@@ -1560,9 +1561,9 @@ var VFSFileSystem = class {
   /** Register the VFS service worker and return the active SW */
   async getServiceWorker() {
     if (!this.swReg) {
-      const swUrl = new URL("./workers/service.worker.js", import.meta.url);
+      const swUrl = this.config.swUrl ? new URL(this.config.swUrl, location.origin) : new URL("./workers/service.worker.js", import.meta.url);
       const scope = this.config.swScope ?? new URL(`./${this.ns}/`, swUrl).href;
-      this.swReg = await navigator.serviceWorker.register(swUrl.href, { type: "module", scope });
+      this.swReg = await navigator.serviceWorker.register(swUrl.href, { scope });
     }
     const reg = this.swReg;
     if (reg.active) return reg.active;
