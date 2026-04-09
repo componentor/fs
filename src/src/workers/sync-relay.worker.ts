@@ -574,13 +574,18 @@ async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise
       result = { status: 7 };
   }
 
-  // Fallback to VfsEngine for read-only operations that failed with ENOENT.
+  // Fallback to VfsEngine for read-only operations that failed in OPFS.
   // OPFS doesn't support symlinks, so paths through pnpm symlinks resolve in
   // VfsEngine (which has the symlink→target mapping) but not in OPFSEngine.
   // This handles: readdir, stat, lstat, read, exists, access, realpath, readlink
+  //
+  // For most ops, OPFS returns ENOENT (status=1) when path not found.
+  // But EXISTS is special: it returns OK (status=0) with data=[0] for non-existent paths.
+  // So we also trigger fallback for EXISTS when the result indicates "not found".
   const ENOENT_STATUS = 1; // CODE_TO_STATUS.ENOENT
   const READ_OPS = [OP.READ, OP.STAT, OP.LSTAT, OP.READDIR, OP.EXISTS, OP.ACCESS, OP.REALPATH, OP.READLINK];
-  if (result.status === ENOENT_STATUS && READ_OPS.includes(op)) {
+  const isExistsNotFound = op === OP.EXISTS && result.status === 0 && result.data instanceof Uint8Array && result.data[0] === 0;
+  if ((result.status === ENOENT_STATUS || isExistsNotFound) && READ_OPS.includes(op)) {
     const vfsResult = (() => {
       switch (op) {
         case OP.READ: return engine.read(path);

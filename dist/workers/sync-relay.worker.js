@@ -2587,7 +2587,8 @@ async function handleRequestOPFS(reqTabId, buffer) {
   }
   const ENOENT_STATUS = 1;
   const READ_OPS = [OP.READ, OP.STAT, OP.LSTAT, OP.READDIR, OP.EXISTS, OP.ACCESS, OP.REALPATH, OP.READLINK];
-  if (result.status === ENOENT_STATUS && READ_OPS.includes(op)) {
+  const isExistsNotFound = op === OP.EXISTS && result.status === 0 && result.data instanceof Uint8Array && result.data[0] === 0;
+  if ((result.status === ENOENT_STATUS || isExistsNotFound) && READ_OPS.includes(op)) {
     const vfsResult = (() => {
       switch (op) {
         case OP.READ:
@@ -3259,4 +3260,4 @@ self.onmessage = async (e) => {
     return;
   }
 };
-//# sourceMappingURL=sync-relay.worker.js.map// FORCE_CACHE_BUST_1775761372
+//# sourceMappingURL=sync-relay.worker.js.map
