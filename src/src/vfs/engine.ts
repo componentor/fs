@@ -757,6 +757,17 @@ export class VFSEngine {
 
   /** Resolve symlinks in intermediate path components */
   private resolvePathComponents(path: string, followLast: boolean = true, depth: number = 0): number | undefined {
+    const result = this.resolvePathFull(path, followLast, depth);
+    return result?.idx;
+  }
+
+  /**
+   * Resolve a path following symlinks, returning both the inode index AND the
+   * fully resolved path. This is needed by readdir: when listing a symlinked
+   * directory, we must search for children under the resolved target path
+   * (where files actually exist in pathIndex), not under the symlink path.
+   */
+  private resolvePathFull(path: string, followLast: boolean = true, depth: number = 0): { idx: number; resolvedPath: string } | undefined {
     if (depth > MAX_SYMLINK_DEPTH) return undefined; // ELOOP
 
     const parts = path.split('/').filter(Boolean);
@@ -775,19 +786,21 @@ export class VFSEngine {
         const resolved = target.startsWith('/') ? target : this.resolveRelative(current, target);
 
         if (isLast) {
-          // Use resolvePathComponents (not resolvePath) so intermediate symlinks
+          // Use resolvePathFull (not resolvePath) so intermediate symlinks
           // in the resolved target path are also followed
-          return this.resolvePathComponents(resolved, true, depth + 1);
+          return this.resolvePathFull(resolved, true, depth + 1);
         }
 
         // Reconstruct remaining path with resolved symlink
         const remaining = parts.slice(i + 1).join('/');
         const newPath = resolved + (remaining ? '/' + remaining : '');
-        return this.resolvePathComponents(newPath, followLast, depth + 1);
+        return this.resolvePathFull(newPath, followLast, depth + 1);
       }
     }
 
-    return this.pathIndex.get(current);
+    const finalIdx = this.pathIndex.get(current);
+    if (finalIdx === undefined) return undefined;
+    return { idx: finalIdx, resolvedPath: current };
   }
 
   private resolveRelative(from: string, target: string): string {
@@ -1172,14 +1185,16 @@ export class VFSEngine {
   // ---- READDIR ----
   readdir(path: string, flags: number = 0): { status: number; data: Uint8Array | null } {
     path = this.normalizePath(path);
-    const idx = this.resolvePathComponents(path, true);
-    if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    const resolved = this.resolvePathFull(path, true);
+    if (!resolved) return { status: CODE_TO_STATUS.ENOENT, data: null };
 
-    const inode = this.readInode(idx);
+    const inode = this.readInode(resolved.idx);
     if (inode.type !== INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTDIR, data: null };
 
     const withFileTypes = (flags & 1) !== 0;
-    const children = this.getDirectChildren(path);
+    // Use the resolved path for child lookup — when path is a symlink,
+    // the actual children are stored under the target path in pathIndex.
+    const children = this.getDirectChildren(resolved.resolvedPath);
 
     if (withFileTypes) {
       // Encode as: count(u32) + entries[name_len(u16) + name(bytes) + type(u8)]

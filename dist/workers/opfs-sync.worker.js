@@ -3,9 +3,25 @@ var serverPort;
 var mirrorRoot;
 function normalizePath(p) {
   if (p.charCodeAt(0) !== 47) p = "/" + p;
-  if (p.length > 1 && p.charCodeAt(p.length - 1) === 47) p = p.slice(0, -1);
   if (p.indexOf("//") !== -1) p = p.replace(/\/\/+/g, "/");
-  return p;
+  if (p.indexOf("/.") !== -1) {
+    const parts = p.split("/");
+    const resolved = [];
+    for (const part of parts) {
+      if (part === "." || part === "") continue;
+      if (part === "..") {
+        resolved.pop();
+        continue;
+      }
+      resolved.push(part);
+    }
+    p = "/" + resolved.join("/");
+  }
+  if (p.length > 1 && p.charCodeAt(p.length - 1) === 47) p = p.slice(0, -1);
+  return p || "/";
+}
+function pathSegments(p) {
+  return normalizePath(p).split("/").filter(Boolean);
 }
 var pendingPaths = /* @__PURE__ */ new Set();
 var completedPaths = /* @__PURE__ */ new Map();
@@ -92,7 +108,7 @@ async function processNext() {
   processNext();
 }
 async function ensureParentDirs(path) {
-  const parts = path.split("/").filter(Boolean);
+  const parts = pathSegments(path);
   parts.pop();
   let dir = mirrorRoot;
   for (const part of parts) {
@@ -101,8 +117,8 @@ async function ensureParentDirs(path) {
   return dir;
 }
 function basename(path) {
-  const parts = path.split("/");
-  return parts[parts.length - 1];
+  const parts = pathSegments(path);
+  return parts[parts.length - 1] || "";
 }
 async function writeToOPFS(path, data) {
   const dir = await ensureParentDirs(path);
@@ -126,8 +142,7 @@ async function deleteFromOPFS(path) {
 }
 async function mkdirInOPFS(path) {
   let dir = mirrorRoot;
-  const parts = path.split("/").filter(Boolean);
-  for (const part of parts) {
+  for (const part of pathSegments(path)) {
     dir = await dir.getDirectoryHandle(part, { create: true });
   }
 }
@@ -153,7 +168,7 @@ async function renameInOPFS(oldPath, newPath) {
   }
 }
 async function navigateToParent(path) {
-  const parts = path.split("/").filter(Boolean);
+  const parts = pathSegments(path);
   parts.pop();
   let dir = mirrorRoot;
   for (const part of parts) {

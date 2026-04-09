@@ -653,6 +653,16 @@ var VFSEngine = class {
   }
   /** Resolve symlinks in intermediate path components */
   resolvePathComponents(path, followLast = true, depth = 0) {
+    const result = this.resolvePathFull(path, followLast, depth);
+    return result?.idx;
+  }
+  /**
+   * Resolve a path following symlinks, returning both the inode index AND the
+   * fully resolved path. This is needed by readdir: when listing a symlinked
+   * directory, we must search for children under the resolved target path
+   * (where files actually exist in pathIndex), not under the symlink path.
+   */
+  resolvePathFull(path, followLast = true, depth = 0) {
     if (depth > MAX_SYMLINK_DEPTH) return void 0;
     const parts = path.split("/").filter(Boolean);
     let current = "/";
@@ -666,14 +676,16 @@ var VFSEngine = class {
         const target = decoder.decode(this.readData(inode.firstBlock, inode.blockCount, inode.size));
         const resolved = target.startsWith("/") ? target : this.resolveRelative(current, target);
         if (isLast) {
-          return this.resolvePathComponents(resolved, true, depth + 1);
+          return this.resolvePathFull(resolved, true, depth + 1);
         }
         const remaining = parts.slice(i + 1).join("/");
         const newPath = resolved + (remaining ? "/" + remaining : "");
-        return this.resolvePathComponents(newPath, followLast, depth + 1);
+        return this.resolvePathFull(newPath, followLast, depth + 1);
       }
     }
-    return this.pathIndex.get(current);
+    const finalIdx = this.pathIndex.get(current);
+    if (finalIdx === void 0) return void 0;
+    return { idx: finalIdx, resolvedPath: current };
   }
   resolveRelative(from, target) {
     const dir = from.substring(0, from.lastIndexOf("/")) || "/";
@@ -962,12 +974,12 @@ var VFSEngine = class {
   // ---- READDIR ----
   readdir(path, flags = 0) {
     path = this.normalizePath(path);
-    const idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
-    const inode = this.readInode(idx);
+    const resolved = this.resolvePathFull(path, true);
+    if (!resolved) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    const inode = this.readInode(resolved.idx);
     if (inode.type !== INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTDIR, data: null };
     const withFileTypes = (flags & 1) !== 0;
-    const children = this.getDirectChildren(path);
+    const children = this.getDirectChildren(resolved.resolvedPath);
     if (withFileTypes) {
       let totalSize2 = 4;
       const entries = [];
@@ -2572,6 +2584,35 @@ async function handleRequestOPFS(reqTabId, buffer) {
       break;
     default:
       result = { status: 7 };
+  }
+  const ENOENT_STATUS = 1;
+  const READ_OPS = [OP.READ, OP.STAT, OP.LSTAT, OP.READDIR, OP.EXISTS, OP.ACCESS, OP.REALPATH, OP.READLINK];
+  if (result.status === ENOENT_STATUS && READ_OPS.includes(op)) {
+    const vfsResult = (() => {
+      switch (op) {
+        case OP.READ:
+          return engine.read(path);
+        case OP.STAT:
+          return engine.stat(path);
+        case OP.LSTAT:
+          return engine.lstat(path);
+        case OP.READDIR:
+          return engine.readdir(path, flags);
+        case OP.EXISTS:
+          return engine.exists(path);
+        case OP.ACCESS:
+          return engine.access(path, flags);
+        case OP.REALPATH:
+          return engine.realpath(path);
+        case OP.READLINK:
+          return engine.readlink(path);
+        default:
+          return null;
+      }
+    })();
+    if (vfsResult && vfsResult.status !== ENOENT_STATUS) {
+      result = vfsResult;
+    }
   }
   const ret = {
     status: result.status,

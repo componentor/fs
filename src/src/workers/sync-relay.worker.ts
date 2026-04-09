@@ -574,6 +574,31 @@ async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise
       result = { status: 7 };
   }
 
+  // Fallback to VfsEngine for read-only operations that failed with ENOENT.
+  // OPFS doesn't support symlinks, so paths through pnpm symlinks resolve in
+  // VfsEngine (which has the symlink→target mapping) but not in OPFSEngine.
+  // This handles: readdir, stat, lstat, read, exists, access, realpath, readlink
+  const ENOENT_STATUS = 1; // CODE_TO_STATUS.ENOENT
+  const READ_OPS = [OP.READ, OP.STAT, OP.LSTAT, OP.READDIR, OP.EXISTS, OP.ACCESS, OP.REALPATH, OP.READLINK];
+  if (result.status === ENOENT_STATUS && READ_OPS.includes(op)) {
+    const vfsResult = (() => {
+      switch (op) {
+        case OP.READ: return engine.read(path);
+        case OP.STAT: return engine.stat(path);
+        case OP.LSTAT: return engine.lstat(path);
+        case OP.READDIR: return engine.readdir(path, flags);
+        case OP.EXISTS: return engine.exists(path);
+        case OP.ACCESS: return engine.access(path, flags);
+        case OP.REALPATH: return engine.realpath(path);
+        case OP.READLINK: return engine.readlink(path);
+        default: return null;
+      }
+    })();
+    if (vfsResult && vfsResult.status !== ENOENT_STATUS) {
+      result = vfsResult;
+    }
+  }
+
   const ret: { status: number; data?: Uint8Array; _op?: number; _path?: string; _newPath?: string } = {
     status: result.status,
     data: result.data instanceof Uint8Array ? result.data : undefined,

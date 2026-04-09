@@ -17,12 +17,28 @@ interface SyncEvent {
 let serverPort: MessagePort;
 let mirrorRoot: FileSystemDirectoryHandle;
 
-// Normalize path: ensure leading /, collapse //, strip trailing /
+// Normalize path: resolve "." and "..", ensure leading /, collapse //, strip trailing /
 function normalizePath(p: string): string {
   if (p.charCodeAt(0) !== 47) p = '/' + p;
-  if (p.length > 1 && p.charCodeAt(p.length - 1) === 47) p = p.slice(0, -1);
   if (p.indexOf('//') !== -1) p = p.replace(/\/\/+/g, '/');
-  return p;
+  // Resolve "." and ".." segments
+  if (p.indexOf('/.') !== -1) {
+    const parts = p.split('/');
+    const resolved: string[] = [];
+    for (const part of parts) {
+      if (part === '.' || part === '') continue;
+      if (part === '..') { resolved.pop(); continue; }
+      resolved.push(part);
+    }
+    p = '/' + resolved.join('/');
+  }
+  if (p.length > 1 && p.charCodeAt(p.length - 1) === 47) p = p.slice(0, -1);
+  return p || '/';
+}
+
+// Split a normalized path into segments safe for OPFS (no empty, ".", or ".." entries)
+function pathSegments(p: string): string[] {
+  return normalizePath(p).split('/').filter(Boolean);
 }
 
 // Echo suppression — two structures:
@@ -152,7 +168,7 @@ async function processNext(): Promise<void> {
 }
 
 async function ensureParentDirs(path: string): Promise<FileSystemDirectoryHandle> {
-  const parts = path.split('/').filter(Boolean);
+  const parts = pathSegments(path);
   parts.pop(); // Remove filename
 
   let dir = mirrorRoot;
@@ -163,8 +179,8 @@ async function ensureParentDirs(path: string): Promise<FileSystemDirectoryHandle
 }
 
 function basename(path: string): string {
-  const parts = path.split('/');
-  return parts[parts.length - 1];
+  const parts = pathSegments(path);
+  return parts[parts.length - 1] || '';
 }
 
 async function writeToOPFS(path: string, data: ArrayBuffer): Promise<void> {
@@ -194,8 +210,7 @@ async function deleteFromOPFS(path: string): Promise<void> {
 
 async function mkdirInOPFS(path: string): Promise<void> {
   let dir = mirrorRoot;
-  const parts = path.split('/').filter(Boolean);
-  for (const part of parts) {
+  for (const part of pathSegments(path)) {
     dir = await dir.getDirectoryHandle(part, { create: true });
   }
 }
@@ -226,7 +241,7 @@ async function renameInOPFS(oldPath: string, newPath: string): Promise<void> {
 }
 
 async function navigateToParent(path: string): Promise<FileSystemDirectoryHandle> {
-  const parts = path.split('/').filter(Boolean);
+  const parts = pathSegments(path);
   parts.pop();
 
   let dir = mirrorRoot;
