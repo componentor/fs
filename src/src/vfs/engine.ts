@@ -1066,10 +1066,14 @@ export class VFSEngine {
     return this.encodeStatResponse(idx);
   }
 
-  // ---- LSTAT (no symlink follow) ----
+  // ---- LSTAT (no symlink follow for the FINAL component) ----
   lstat(path: string): { status: number; data: Uint8Array | null } {
     path = this.normalizePath(path);
-    const idx = this.pathIndex.get(path);
+    // Use resolvePathComponents with followLast=false — follows intermediate
+    // symlinks but returns the symlink inode itself for the last component.
+    // Direct pathIndex.get(path) fails for paths through symlinked directories
+    // because children are stored under the symlink target path in pathIndex.
+    const idx = this.resolvePathComponents(path, false);
     if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT, data: null };
 
     return this.encodeStatResponse(idx);

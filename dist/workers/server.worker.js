@@ -884,10 +884,10 @@ var VFSEngine = class {
     if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
     return this.encodeStatResponse(idx);
   }
-  // ---- LSTAT (no symlink follow) ----
+  // ---- LSTAT (no symlink follow for the FINAL component) ----
   lstat(path) {
     path = this.normalizePath(path);
-    const idx = this.pathIndex.get(path);
+    const idx = this.resolvePathComponents(path, false);
     if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
     return this.encodeStatResponse(idx);
   }
