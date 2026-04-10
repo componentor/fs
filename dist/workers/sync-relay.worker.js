@@ -938,8 +938,7 @@ var VFSEngine = class {
     const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
     this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
     this.commitPending();
-    const pathBytes = encoder.encode(path);
-    return { status: 0, data: pathBytes };
+    return { status: 0, data: null };
   }
   mkdirRecursive(path) {
     const parts = path.split("/").filter(Boolean);
@@ -1684,10 +1683,20 @@ var OPFSEngine = class {
     if (recursive) {
       const parts = path.split("/").filter(Boolean);
       let dir = this.rootDir;
+      let firstCreated = null;
+      let current = "";
       for (const part of parts) {
-        dir = await dir.getDirectoryHandle(part, { create: true });
+        current += "/" + part;
+        let existed = true;
+        try {
+          dir = await dir.getDirectoryHandle(part);
+        } catch {
+          existed = false;
+          dir = await dir.getDirectoryHandle(part, { create: true });
+        }
+        if (!existed && !firstCreated) firstCreated = current;
       }
-      return { status: OK, data: encoder2.encode(path) };
+      return { status: OK, data: firstCreated ? encoder2.encode(firstCreated) : null };
     }
     const nav = await this.navigateToParent(path);
     if (!nav) return { status: ENOENT, data: null };
@@ -1698,7 +1707,7 @@ var OPFSEngine = class {
       } catch {
       }
       await nav.dir.getDirectoryHandle(nav.name, { create: true });
-      return { status: OK, data: encoder2.encode(path) };
+      return { status: OK, data: null };
     } catch {
       return { status: ENOENT, data: null };
     }

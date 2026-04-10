@@ -1,8 +1,8 @@
 /**
  * createWriteStream Tests
  *
- * Tests the WritableStream returned by createWriteStream using a mock
- * that verifies fd-based write positioning behavior.
+ * Tests the Node.js-compatible writable stream returned by createWriteStream,
+ * verifying fd-based write positioning behavior via a mock.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -64,9 +64,19 @@ function createMockHandle(existingData?: Uint8Array): {
 }
 
 /**
- * Helper: creates a createWriteStream function with a mocked promises.open.
- * Returns the stream and the mock handle for assertions.
+ * Helper: dynamically import the real createWriteStream from VFSFileSystem
+ * prototype and call it with a mocked promises.open context.
  */
+async function getCreateWriteStream() {
+  const mod = await import('../src/filesystem.js');
+  const proto = mod.VFSFileSystem.prototype;
+  return proto.createWriteStream as (
+    this: { promises: { open: (...args: unknown[]) => Promise<unknown> } },
+    filePath: string,
+    options?: unknown,
+  ) => import('../src/types.js').FSWriteStream;
+}
+
 function setup(opts?: {
   flags?: string;
   start?: number;
@@ -75,187 +85,216 @@ function setup(opts?: {
 }) {
   const mock = createMockHandle(opts?.existingData);
 
-  // We create a minimal object that mimics VFSFileSystem just enough
-  // to call createWriteStream. We import the actual method by extracting
-  // it from the class prototype.
-
   const fakeFs = {
     promises: {
       open: vi.fn().mockResolvedValue(mock.handle),
     },
   };
 
-  // Dynamically import and bind createWriteStream
-  // Since VFSFileSystem constructor does heavy work, we'll replicate the
-  // method logic inline — it only depends on this.promises.open.
-  const createWriteStream = (filePath: string, options?: any) => {
-    const optsParsed = typeof options === 'string' ? { encoding: options } : options;
-    let position = optsParsed?.start ?? 0;
-    let handle: FileHandle | null = null;
-
-    return new WritableStream<Uint8Array>({
-      write: async (chunk) => {
-        if (!handle) {
-          handle = await fakeFs.promises.open(filePath, optsParsed?.flags ?? 'w');
-        }
-        const { bytesWritten } = await handle.write(chunk, 0, chunk.byteLength, position);
-        position += bytesWritten;
-      },
-      close: async () => {
-        if (handle) {
-          if (optsParsed?.flush) {
-            await handle.sync();
-          }
-          await handle.close();
-          handle = null;
-        }
-      },
-      abort: async () => {
-        if (handle) {
-          await handle.close();
-          handle = null;
-        }
-      },
-    });
-  };
-
-  return { createWriteStream, mock, fakeFs };
+  return { mock, fakeFs };
 }
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 describe('createWriteStream', () => {
-  it('should write data correctly', async () => {
-    const { createWriteStream, mock } = setup();
-    const stream = createWriteStream('/test.txt');
-    const writer = stream.getWriter();
+  let createWriteStream: Awaited<ReturnType<typeof getCreateWriteStream>>;
 
-    await writer.write(encoder.encode('hello '));
-    await writer.write(encoder.encode('world'));
-    await writer.close();
+  beforeEach(async () => {
+    createWriteStream = await getCreateWriteStream();
+  });
+
+  it('should write data correctly', async () => {
+    const { mock, fakeFs } = setup();
+    const stream = createWriteStream.call(fakeFs, '/test.txt');
+
+    await new Promise<void>((resolve) => {
+      stream.write('hello ', () => {
+        stream.write('world', () => {
+          stream.end(() => resolve());
+        });
+      });
+    });
 
     expect(decoder.decode(mock.getBuffer())).toBe('hello world');
     expect(mock.closed).toBe(true);
   });
 
   it('should write at correct position when start option is provided', async () => {
-    const { createWriteStream, mock } = setup({
+    const { mock, fakeFs } = setup({
       start: 5,
       existingData: encoder.encode('AAAAAAAAAA'), // 10 A's
     });
-    const stream = createWriteStream('/test.txt', { start: 5 });
-    const writer = stream.getWriter();
+    const stream = createWriteStream.call(fakeFs, '/test.txt', { start: 5 });
 
-    await writer.write(encoder.encode('BBBBB'));
-    await writer.close();
+    await new Promise<void>((resolve) => {
+      stream.write('BBBBB', () => {
+        stream.end(() => resolve());
+      });
+    });
 
-    // First 5 bytes should be unchanged, next 5 replaced
     expect(decoder.decode(mock.getBuffer())).toBe('AAAAABBBBB');
     expect(mock.closed).toBe(true);
   });
 
   it('should append when flags is "a"', async () => {
-    const { createWriteStream, mock, fakeFs } = setup({ flags: 'a' });
-    const stream = createWriteStream('/test.txt', { flags: 'a' });
-    const writer = stream.getWriter();
+    const { mock, fakeFs } = setup({ flags: 'a' });
+    const stream = createWriteStream.call(fakeFs, '/test.txt', { flags: 'a' });
 
-    await writer.write(encoder.encode('data'));
-    await writer.close();
+    await new Promise<void>((resolve) => {
+      stream.write('data', () => {
+        stream.end(() => resolve());
+      });
+    });
 
-    // Verify open was called with 'a' flag
     expect(fakeFs.promises.open).toHaveBeenCalledWith('/test.txt', 'a');
     expect(decoder.decode(mock.getBuffer())).toBe('data');
     expect(mock.closed).toBe(true);
   });
 
   it('should open with "w" flag by default', async () => {
-    const { createWriteStream, fakeFs } = setup();
-    const stream = createWriteStream('/test.txt');
-    const writer = stream.getWriter();
+    const { fakeFs } = setup();
+    const stream = createWriteStream.call(fakeFs, '/test.txt');
 
-    await writer.write(encoder.encode('x'));
-    await writer.close();
+    await new Promise<void>((resolve) => {
+      stream.write('x', () => {
+        stream.end(() => resolve());
+      });
+    });
 
     expect(fakeFs.promises.open).toHaveBeenCalledWith('/test.txt', 'w');
   });
 
-  it('should close the handle on stream close', async () => {
-    const { createWriteStream, mock } = setup();
-    const stream = createWriteStream('/test.txt');
-    const writer = stream.getWriter();
+  it('should close the handle on end', async () => {
+    const { mock, fakeFs } = setup();
+    const stream = createWriteStream.call(fakeFs, '/test.txt');
 
-    await writer.write(encoder.encode('test'));
-    expect(mock.closed).toBe(false);
-
-    await writer.close();
-    expect(mock.closed).toBe(true);
+    await new Promise<void>((resolve) => {
+      stream.write('test', () => {
+        expect(mock.closed).toBe(false);
+        stream.end(() => {
+          expect(mock.closed).toBe(true);
+          resolve();
+        });
+      });
+    });
   });
 
-  it('should close the handle on abort', async () => {
-    const { createWriteStream, mock } = setup();
-    const stream = createWriteStream('/test.txt');
-    const writer = stream.getWriter();
+  it('should close the handle on destroy', async () => {
+    const { mock, fakeFs } = setup();
+    const stream = createWriteStream.call(fakeFs, '/test.txt');
 
-    await writer.write(encoder.encode('test'));
-    expect(mock.closed).toBe(false);
-
-    await writer.abort();
-    expect(mock.closed).toBe(true);
+    await new Promise<void>((resolve) => {
+      stream.write('test', () => {
+        expect(mock.closed).toBe(false);
+        stream.on('close', () => {
+          expect(mock.closed).toBe(true);
+          resolve();
+        });
+        stream.destroy();
+      });
+    });
   });
 
   it('should sync before close when flush option is true', async () => {
-    const { createWriteStream, mock } = setup({ flush: true });
-    const stream = createWriteStream('/test.txt', { flush: true });
-    const writer = stream.getWriter();
+    const { mock, fakeFs } = setup({ flush: true });
+    const stream = createWriteStream.call(fakeFs, '/test.txt', { flush: true });
 
-    await writer.write(encoder.encode('data'));
-    expect(mock.synced).toBe(false);
-
-    await writer.close();
-    expect(mock.synced).toBe(true);
-    expect(mock.closed).toBe(true);
+    await new Promise<void>((resolve) => {
+      stream.write('data', () => {
+        expect(mock.synced).toBe(false);
+        stream.end(() => {
+          expect(mock.synced).toBe(true);
+          expect(mock.closed).toBe(true);
+          resolve();
+        });
+      });
+    });
   });
 
   it('should not sync on close when flush option is false', async () => {
-    const { createWriteStream, mock } = setup();
-    const stream = createWriteStream('/test.txt');
-    const writer = stream.getWriter();
+    const { mock, fakeFs } = setup();
+    const stream = createWriteStream.call(fakeFs, '/test.txt');
 
-    await writer.write(encoder.encode('data'));
-    await writer.close();
-
-    expect(mock.synced).toBe(false);
-    expect(mock.closed).toBe(true);
+    await new Promise<void>((resolve) => {
+      stream.write('data', () => {
+        stream.end(() => {
+          expect(mock.synced).toBe(false);
+          expect(mock.closed).toBe(true);
+          resolve();
+        });
+      });
+    });
   });
 
   it('should track position correctly across multiple writes', async () => {
-    const { createWriteStream, mock } = setup({ start: 2 });
-    const stream = createWriteStream('/test.txt', { start: 2 });
-    const writer = stream.getWriter();
+    const { mock, fakeFs } = setup({ start: 2 });
+    const stream = createWriteStream.call(fakeFs, '/test.txt', { start: 2 });
 
-    // Write at position 2
-    await writer.write(encoder.encode('AB'));
-    // Should now be at position 4
-    await writer.write(encoder.encode('CD'));
-    // Should now be at position 6
-    await writer.close();
+    await new Promise<void>((resolve) => {
+      stream.write('AB', () => {
+        stream.write('CD', () => {
+          stream.end(() => resolve());
+        });
+      });
+    });
 
     const result = mock.getBuffer();
-    // Positions 0-1 are zero bytes, 2-5 are ABCD
     expect(result[2]).toBe(65); // 'A'
     expect(result[3]).toBe(66); // 'B'
     expect(result[4]).toBe(67); // 'C'
     expect(result[5]).toBe(68); // 'D'
   });
 
-  it('should handle close without any writes gracefully', async () => {
-    const { createWriteStream, mock } = setup();
-    const stream = createWriteStream('/test.txt');
-    const writer = stream.getWriter();
+  it('should handle end without any writes gracefully', async () => {
+    const { mock, fakeFs } = setup();
+    const stream = createWriteStream.call(fakeFs, '/test.txt');
 
-    // Close without writing — handle was never opened
-    await writer.close();
-    expect(mock.closed).toBe(false); // handle was never opened
+    await new Promise<void>((resolve) => {
+      stream.end(() => resolve());
+    });
+
+    // Handle was never opened, so it shouldn't be closed
+    expect(mock.closed).toBe(false);
+  });
+
+  it('should have a path property', () => {
+    const { fakeFs } = setup();
+    const stream = createWriteStream.call(fakeFs, '/my/file.txt');
+    expect(stream.path).toBe('/my/file.txt');
+  });
+
+  it('should track bytesWritten', async () => {
+    const { fakeFs } = setup();
+    const stream = createWriteStream.call(fakeFs, '/test.txt');
+
+    expect(stream.bytesWritten).toBe(0);
+
+    await new Promise<void>((resolve) => {
+      stream.write('hello', () => {
+        expect(stream.bytesWritten).toBe(5);
+        stream.write('!!', () => {
+          expect(stream.bytesWritten).toBe(7);
+          stream.end(() => resolve());
+        });
+      });
+    });
+  });
+
+  it('should emit finish and close events on end', async () => {
+    const { fakeFs } = setup();
+    const stream = createWriteStream.call(fakeFs, '/test.txt');
+    const finishFn = vi.fn();
+    const closeFn = vi.fn();
+
+    stream.on('finish', finishFn);
+    stream.on('close', closeFn);
+
+    await new Promise<void>((resolve) => {
+      stream.end(() => resolve());
+    });
+
+    expect(finishFn).toHaveBeenCalledTimes(1);
+    expect(closeFn).toHaveBeenCalledTimes(1);
   });
 });

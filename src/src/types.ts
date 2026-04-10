@@ -8,6 +8,7 @@ export type Encoding = 'utf8' | 'utf-8' | 'ascii' | 'base64' | 'hex' | 'binary' 
 export interface ReadOptions {
   encoding?: Encoding | null;
   flag?: string;
+  signal?: AbortSignal;
 }
 
 export interface WriteOptions {
@@ -15,6 +16,7 @@ export interface WriteOptions {
   mode?: number;
   flag?: string;
   flush?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface MkdirOptions {
@@ -29,6 +31,8 @@ export interface RmdirOptions {
 export interface RmOptions {
   recursive?: boolean;
   force?: boolean;
+  maxRetries?: number;
+  retryDelay?: number;
 }
 
 export interface CpOptions {
@@ -112,6 +116,10 @@ export interface Stats {
   mtime: Date;
   ctime: Date;
   birthtime: Date;
+  atimeNs: number;
+  mtimeNs: number;
+  ctimeNs: number;
+  birthtimeNs: number;
 }
 
 export interface Dirent {
@@ -144,7 +152,34 @@ export interface GlobOptions {
   exclude?: (path: string) => boolean;
 }
 
-export type PathLike = string;
+export type PathLike = string | Uint8Array | URL;
+
+export interface OpenAsBlobOptions {
+  type?: string;
+}
+
+export interface FSReadStream {
+  /** The file path being read. */
+  path: string;
+  /** Total bytes read so far. */
+  bytesRead: number;
+  /** Whether the stream is still readable. */
+  readable: boolean;
+
+  on(event: string, fn: (...args: unknown[]) => void): this;
+  addListener(event: string, fn: (...args: unknown[]) => void): this;
+  once(event: string, fn: (...args: unknown[]) => void): this;
+  off(event: string, fn: (...args: unknown[]) => void): this;
+  removeListener(event: string, fn: (...args: unknown[]) => void): this;
+  removeAllListeners(event?: string): this;
+  emit(event: string, ...args: unknown[]): boolean;
+
+  pipe<T>(dest: T): T;
+  pause(): this;
+  resume(): this;
+  read(size?: number): Uint8Array | null;
+  destroy(err?: Error): this;
+}
 
 export interface ReadStreamOptions {
   flags?: string;
@@ -170,6 +205,20 @@ export interface WriteStreamOptions {
   flush?: boolean;
 }
 
+export interface FSWriteStream {
+  writable: boolean;
+  bytesWritten: number;
+  path: string;
+  write(chunk: string | Uint8Array, encodingOrCb?: string | Function, cb?: Function): boolean;
+  end(chunk?: string | Uint8Array | Function, encodingOrCb?: string | Function, cb?: Function): this;
+  on(event: string, fn: Function): this;
+  once(event: string, fn: Function): this;
+  off(event: string, fn: Function): this;
+  removeListener(event: string, fn: Function): this;
+  destroy(err?: Error): this;
+  emit(event: string, ...args: unknown[]): boolean;
+}
+
 export interface WatchOptions {
   persistent?: boolean;
   recursive?: boolean;
@@ -192,13 +241,19 @@ export interface FileHandle {
   read(buffer: Uint8Array, offset?: number, length?: number, position?: number | null): Promise<{ bytesRead: number; buffer: Uint8Array }>;
   write(buffer: Uint8Array, offset?: number, length?: number, position?: number | null): Promise<{ bytesWritten: number; buffer: Uint8Array }>;
   write(string: string, position?: number, encoding?: string): Promise<{ bytesWritten: number; buffer: Uint8Array }>;
+  readv(buffers: Uint8Array[], position?: number | null): Promise<{ bytesRead: number; buffers: Uint8Array[] }>;
+  writev(buffers: Uint8Array[], position?: number | null): Promise<{ bytesWritten: number; buffers: Uint8Array[] }>;
   readFile(options?: ReadOptions | Encoding | null): Promise<Uint8Array | string>;
   writeFile(data: Uint8Array | string, options?: WriteOptions | Encoding): Promise<void>;
   truncate(len?: number): Promise<void>;
   stat(): Promise<Stats>;
+  appendFile(data: string | Uint8Array, options?: WriteOptions | Encoding): Promise<void>;
+  chmod(mode: number): Promise<void>;
+  chown(uid: number, gid: number): Promise<void>;
   sync(): Promise<void>;
   datasync(): Promise<void>;
   close(): Promise<void>;
+  [Symbol.asyncDispose](): Promise<void>;
 }
 
 export interface Dir {

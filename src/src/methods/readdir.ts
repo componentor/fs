@@ -33,19 +33,24 @@ function readdirRecursiveSync(
   syncRequest: SyncRequestFn,
   basePath: string,
   prefix: string,
-  withFileTypes: boolean
+  withFileTypes: boolean,
+  rootPath?: string
 ): (string | Dirent)[] {
   // Always read dirents so we can detect directories
   const entries = readdirBaseSync(syncRequest, basePath, true) as Dirent[];
   const results: (string | Dirent)[] = [];
+  const effectiveRoot = rootPath ?? basePath;
 
   for (const entry of entries) {
     const relativePath = prefix ? prefix + '/' + entry.name : entry.name;
 
     if (withFileTypes) {
+      const parentPath = prefix || effectiveRoot;
       // Return a Dirent with the relative path as the name
       results.push({
         name: relativePath,
+        parentPath,
+        path: parentPath,
         isFile: entry.isFile,
         isDirectory: entry.isDirectory,
         isBlockDevice: entry.isBlockDevice,
@@ -61,7 +66,7 @@ function readdirRecursiveSync(
     if (entry.isDirectory()) {
       const childPath = basePath + '/' + entry.name;
       results.push(
-        ...readdirRecursiveSync(syncRequest, childPath, relativePath, withFileTypes)
+        ...readdirRecursiveSync(syncRequest, childPath, relativePath, withFileTypes, effectiveRoot)
       );
     }
   }
@@ -73,17 +78,22 @@ async function readdirRecursiveAsync(
   asyncRequest: AsyncRequestFn,
   basePath: string,
   prefix: string,
-  withFileTypes: boolean
+  withFileTypes: boolean,
+  rootPath?: string
 ): Promise<(string | Dirent)[]> {
   const entries = (await readdirBaseAsync(asyncRequest, basePath, true)) as Dirent[];
   const results: (string | Dirent)[] = [];
+  const effectiveRoot = rootPath ?? basePath;
 
   for (const entry of entries) {
     const relativePath = prefix ? prefix + '/' + entry.name : entry.name;
 
     if (withFileTypes) {
+      const parentPath = prefix || effectiveRoot;
       results.push({
         name: relativePath,
+        parentPath,
+        path: parentPath,
         isFile: entry.isFile,
         isDirectory: entry.isDirectory,
         isBlockDevice: entry.isBlockDevice,
@@ -99,7 +109,7 @@ async function readdirRecursiveAsync(
     if (entry.isDirectory()) {
       const childPath = basePath + '/' + entry.name;
       const children = await readdirRecursiveAsync(
-        asyncRequest, childPath, relativePath, withFileTypes
+        asyncRequest, childPath, relativePath, withFileTypes, effectiveRoot
       );
       results.push(...children);
     }

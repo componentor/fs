@@ -3,6 +3,25 @@
  * No Node.js dependencies.
  */
 
+import type { PathLike } from './types.js';
+
+/**
+ * Normalize a PathLike value (string, Uint8Array, or URL) to a plain string.
+ * Mirrors Node.js behaviour: Buffer/Uint8Array is decoded as UTF-8,
+ * URL must use the file: protocol and the pathname is used.
+ */
+export function toPathString(p: PathLike): string {
+  if (typeof p === 'string') return p;
+  if (p instanceof Uint8Array) return new TextDecoder().decode(p);
+  if (typeof URL !== 'undefined' && p instanceof URL) {
+    if (p.protocol !== 'file:') {
+      throw new TypeError('The URL must use the file: protocol');
+    }
+    return decodeURIComponent(p.pathname);
+  }
+  return String(p);
+}
+
 export const sep = '/';
 export const delimiter = ':';
 

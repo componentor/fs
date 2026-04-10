@@ -264,10 +264,20 @@ export class OPFSEngine {
     if (recursive) {
       const parts = path.split('/').filter(Boolean);
       let dir = this.rootDir;
+      let firstCreated: string | null = null;
+      let current = '';
       for (const part of parts) {
-        dir = await dir.getDirectoryHandle(part, { create: true });
+        current += '/' + part;
+        let existed = true;
+        try {
+          dir = await dir.getDirectoryHandle(part);
+        } catch {
+          existed = false;
+          dir = await dir.getDirectoryHandle(part, { create: true });
+        }
+        if (!existed && !firstCreated) firstCreated = current;
       }
-      return { status: OK, data: encoder.encode(path) };
+      return { status: OK, data: firstCreated ? encoder.encode(firstCreated) : null };
     }
 
     const nav = await this.navigateToParent(path);
@@ -281,7 +291,8 @@ export class OPFSEngine {
         // doesn't exist — create it
       }
       await nav.dir.getDirectoryHandle(nav.name, { create: true });
-      return { status: OK, data: encoder.encode(path) };
+      // Non-recursive mkdir returns undefined (null data) per Node.js spec
+      return { status: OK, data: null };
     } catch {
       return { status: ENOENT, data: null };
     }

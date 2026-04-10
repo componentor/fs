@@ -18,6 +18,7 @@
  */
 
 export { VFSFileSystem } from './filesystem.js';
+export { NodeReadable, NodeWritable, SimpleEventEmitter } from './node-streams.js';
 export { constants } from './constants.js';
 export { FSError, createError, statusToError } from './errors.js';
 export { unpackToOPFS, loadFromOPFS, repairVFS } from './helpers.js';
@@ -50,6 +51,9 @@ export type {
   WatchFileListener,
   ReadStreamOptions,
   WriteStreamOptions,
+  FSReadStream,
+  FSWriteStream,
+  OpenAsBlobOptions,
 } from './types.js';
 
 import { VFSFileSystem } from './filesystem.js';

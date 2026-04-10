@@ -6,12 +6,14 @@ type Encoding = 'utf8' | 'utf-8' | 'ascii' | 'base64' | 'hex' | 'binary' | 'lati
 interface ReadOptions {
     encoding?: Encoding | null;
     flag?: string;
+    signal?: AbortSignal;
 }
 interface WriteOptions {
     encoding?: Encoding;
     mode?: number;
     flag?: string;
     flush?: boolean;
+    signal?: AbortSignal;
 }
 interface MkdirOptions {
     recursive?: boolean;
@@ -23,6 +25,8 @@ interface RmdirOptions {
 interface RmOptions {
     recursive?: boolean;
     force?: boolean;
+    maxRetries?: number;
+    retryDelay?: number;
 }
 interface CpOptions {
     /** Dereference symlinks (default: false) */
@@ -101,6 +105,10 @@ interface Stats {
     mtime: Date;
     ctime: Date;
     birthtime: Date;
+    atimeNs: number;
+    mtimeNs: number;
+    ctimeNs: number;
+    birthtimeNs: number;
 }
 interface Dirent {
     name: string;
@@ -129,7 +137,30 @@ interface GlobOptions {
     cwd?: string;
     exclude?: (path: string) => boolean;
 }
-type PathLike = string;
+type PathLike = string | Uint8Array | URL;
+interface OpenAsBlobOptions {
+    type?: string;
+}
+interface FSReadStream {
+    /** The file path being read. */
+    path: string;
+    /** Total bytes read so far. */
+    bytesRead: number;
+    /** Whether the stream is still readable. */
+    readable: boolean;
+    on(event: string, fn: (...args: unknown[]) => void): this;
+    addListener(event: string, fn: (...args: unknown[]) => void): this;
+    once(event: string, fn: (...args: unknown[]) => void): this;
+    off(event: string, fn: (...args: unknown[]) => void): this;
+    removeListener(event: string, fn: (...args: unknown[]) => void): this;
+    removeAllListeners(event?: string): this;
+    emit(event: string, ...args: unknown[]): boolean;
+    pipe<T>(dest: T): T;
+    pause(): this;
+    resume(): this;
+    read(size?: number): Uint8Array | null;
+    destroy(err?: Error): this;
+}
 interface ReadStreamOptions {
     flags?: string;
     encoding?: Encoding | null;
@@ -151,6 +182,19 @@ interface WriteStreamOptions {
     start?: number;
     highWaterMark?: number;
     flush?: boolean;
+}
+interface FSWriteStream {
+    writable: boolean;
+    bytesWritten: number;
+    path: string;
+    write(chunk: string | Uint8Array, encodingOrCb?: string | Function, cb?: Function): boolean;
+    end(chunk?: string | Uint8Array | Function, encodingOrCb?: string | Function, cb?: Function): this;
+    on(event: string, fn: Function): this;
+    once(event: string, fn: Function): this;
+    off(event: string, fn: Function): this;
+    removeListener(event: string, fn: Function): this;
+    destroy(err?: Error): this;
+    emit(event: string, ...args: unknown[]): boolean;
 }
 interface WatchOptions {
     persistent?: boolean;
@@ -180,13 +224,25 @@ interface FileHandle {
         bytesWritten: number;
         buffer: Uint8Array;
     }>;
+    readv(buffers: Uint8Array[], position?: number | null): Promise<{
+        bytesRead: number;
+        buffers: Uint8Array[];
+    }>;
+    writev(buffers: Uint8Array[], position?: number | null): Promise<{
+        bytesWritten: number;
+        buffers: Uint8Array[];
+    }>;
     readFile(options?: ReadOptions | Encoding | null): Promise<Uint8Array | string>;
     writeFile(data: Uint8Array | string, options?: WriteOptions | Encoding): Promise<void>;
     truncate(len?: number): Promise<void>;
     stat(): Promise<Stats>;
+    appendFile(data: string | Uint8Array, options?: WriteOptions | Encoding): Promise<void>;
+    chmod(mode: number): Promise<void>;
+    chown(uid: number, gid: number): Promise<void>;
     sync(): Promise<void>;
     datasync(): Promise<void>;
     close(): Promise<void>;
+    [Symbol.asyncDispose](): Promise<void>;
 }
 interface Dir {
     path: string;
@@ -321,49 +377,79 @@ declare class VFSFileSystem {
     /** Send a sync request via SAB and wait for response */
     private syncRequest;
     private asyncRequest;
-    readFileSync(filePath: string, options?: ReadOptions | Encoding | null): string | Uint8Array;
-    writeFileSync(filePath: string, data: string | Uint8Array, options?: WriteOptions | Encoding): void;
-    appendFileSync(filePath: string, data: string | Uint8Array, options?: WriteOptions | Encoding): void;
-    existsSync(filePath: string): boolean;
-    mkdirSync(filePath: string, options?: MkdirOptions | number): string | undefined;
-    rmdirSync(filePath: string, options?: RmdirOptions): void;
-    rmSync(filePath: string, options?: RmOptions): void;
-    unlinkSync(filePath: string): void;
-    readdirSync(filePath: string, options?: ReaddirOptions | Encoding | null): string[] | Dirent[];
+    readFileSync(filePath: PathLike, options?: ReadOptions | Encoding | null): string | Uint8Array;
+    writeFileSync(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): void;
+    appendFileSync(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): void;
+    existsSync(filePath: PathLike): boolean;
+    mkdirSync(filePath: PathLike, options?: MkdirOptions | number): string | undefined;
+    rmdirSync(filePath: PathLike, options?: RmdirOptions): void;
+    rmSync(filePath: PathLike, options?: RmOptions): void;
+    unlinkSync(filePath: PathLike): void;
+    readdirSync(filePath: PathLike, options?: ReaddirOptions | Encoding | null): string[] | Dirent[];
     globSync(pattern: string, options?: GlobOptions): string[];
-    statSync(filePath: string, options?: StatOptions): Stats | BigIntStats;
-    lstatSync(filePath: string, options?: StatOptions): Stats | BigIntStats;
-    renameSync(oldPath: string, newPath: string): void;
-    copyFileSync(src: string, dest: string, mode?: number): void;
-    cpSync(src: string, dest: string, options?: CpOptions): void;
-    cp(src: string, dest: string, options?: CpOptions): Promise<void>;
-    truncateSync(filePath: string, len?: number): void;
-    accessSync(filePath: string, mode?: number): void;
-    realpathSync(filePath: string): string;
-    chmodSync(filePath: string, mode: number): void;
-    chownSync(filePath: string, uid: number, gid: number): void;
-    utimesSync(filePath: string, atime: Date | number, mtime: Date | number): void;
-    symlinkSync(target: string, linkPath: string, type?: string | null): void;
-    readlinkSync(filePath: string, options?: {
+    statSync(filePath: PathLike, options?: StatOptions): Stats | BigIntStats;
+    lstatSync(filePath: PathLike, options?: StatOptions): Stats | BigIntStats;
+    renameSync(oldPath: PathLike, newPath: PathLike): void;
+    copyFileSync(src: PathLike, dest: PathLike, mode?: number): void;
+    cpSync(src: PathLike, dest: PathLike, options?: CpOptions): void;
+    private _cpAsync;
+    truncateSync(filePath: PathLike, len?: number): void;
+    accessSync(filePath: PathLike, mode?: number): void;
+    realpathSync(filePath: PathLike): string;
+    chmodSync(filePath: PathLike, mode: number): void;
+    /** Like chmodSync but operates on the symlink itself. In this VFS, delegates to chmodSync. */
+    lchmodSync(filePath: string, mode: number): void;
+    /** chmod on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
+    fchmodSync(_fd: number, _mode: number): void;
+    chownSync(filePath: PathLike, uid: number, gid: number): void;
+    /** Like chownSync but operates on the symlink itself. In this VFS, delegates to chownSync. */
+    lchownSync(filePath: string, uid: number, gid: number): void;
+    /** chown on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
+    fchownSync(_fd: number, _uid: number, _gid: number): void;
+    utimesSync(filePath: PathLike, atime: Date | number, mtime: Date | number): void;
+    /** Like utimesSync but operates on the symlink itself. In this VFS, delegates to utimesSync. */
+    lutimesSync(filePath: string, atime: Date | number, mtime: Date | number): void;
+    symlinkSync(target: PathLike, linkPath: PathLike, type?: string | null): void;
+    readlinkSync(filePath: PathLike, options?: {
         encoding?: string | null;
     } | string | null): string | Uint8Array;
-    linkSync(existingPath: string, newPath: string): void;
+    linkSync(existingPath: PathLike, newPath: PathLike): void;
     mkdtempSync(prefix: string): string;
-    openSync(filePath: string, flags?: string | number, mode?: number): number;
+    openSync(filePath: PathLike, flags?: string | number, mode?: number): number;
     closeSync(fd: number): void;
-    readSync(fd: number, buffer: Uint8Array, offset?: number, length?: number, position?: number | null): number;
-    writeSync(fd: number, bufferOrString: Uint8Array | string, offsetOrPosition?: number, lengthOrEncoding?: number | string, position?: number | null): number;
+    readSync(fd: number, bufferOrOptions: Uint8Array | {
+        buffer: Uint8Array;
+        offset?: number;
+        length?: number;
+        position?: number | null;
+    }, offsetOrOptions?: number | {
+        offset?: number;
+        length?: number;
+        position?: number | null;
+    }, length?: number, position?: number | null): number;
+    writeSync(fd: number, bufferOrString: Uint8Array | string, offsetOrPositionOrOptions?: number | {
+        offset?: number;
+        length?: number;
+        position?: number | null;
+    }, lengthOrEncoding?: number | string, position?: number | null): number;
     fstatSync(fd: number): Stats;
     ftruncateSync(fd: number, len?: number): void;
     fdatasyncSync(fd: number): void;
+    readvSync(fd: number, buffers: Uint8Array[], position?: number | null): number;
+    writevSync(fd: number, buffers: Uint8Array[], position?: number | null): number;
+    readv(fd: number, buffers: Uint8Array[], position: number | null | undefined, callback: (err: Error | null, bytesRead?: number, buffers?: Uint8Array[]) => void): void;
+    readv(fd: number, buffers: Uint8Array[], callback: (err: Error | null, bytesRead?: number, buffers?: Uint8Array[]) => void): void;
+    writev(fd: number, buffers: Uint8Array[], position: number | null | undefined, callback: (err: Error | null, bytesWritten?: number, buffers?: Uint8Array[]) => void): void;
+    writev(fd: number, buffers: Uint8Array[], callback: (err: Error | null, bytesWritten?: number, buffers?: Uint8Array[]) => void): void;
     statfsSync(_path?: string): StatFs;
     statfs(path: string, callback: (err: Error | null, stats?: StatFs) => void): void;
     statfs(path: string): Promise<StatFs>;
-    watch(filePath: string, options?: WatchOptions | Encoding, listener?: WatchListener): FSWatcher;
-    watchFile(filePath: string, optionsOrListener?: WatchFileOptions | WatchFileListener, listener?: WatchFileListener): void;
-    unwatchFile(filePath: string, listener?: WatchFileListener): void;
-    createReadStream(filePath: string, options?: ReadStreamOptions | string): ReadableStream<Uint8Array>;
-    createWriteStream(filePath: string, options?: WriteStreamOptions | string): WritableStream<Uint8Array>;
+    watch(filePath: PathLike, options?: WatchOptions | Encoding, listener?: WatchListener): FSWatcher;
+    watchFile(filePath: PathLike, optionsOrListener?: WatchFileOptions | WatchFileListener, listener?: WatchFileListener): void;
+    unwatchFile(filePath: PathLike, listener?: WatchFileListener): void;
+    openAsBlob(filePath: string, options?: OpenAsBlobOptions): Promise<Blob>;
+    createReadStream(filePath: PathLike, options?: ReadStreamOptions | string): FSReadStream;
+    createWriteStream(filePath: PathLike, options?: WriteStreamOptions | string): FSWriteStream;
     flushSync(): void;
     purgeSync(): void;
     /** The current filesystem mode. Changes to 'opfs' on corruption fallback. */
@@ -381,44 +467,167 @@ declare class VFSFileSystem {
      *
      *  Returns a Promise that resolves when the new mode is ready. */
     setMode(newMode: FSMode): Promise<void>;
+    readFile(filePath: string, callback: (err: Error | null, data?: Uint8Array | string) => void): void;
+    readFile(filePath: string, options: ReadOptions | Encoding | null, callback: (err: Error | null, data?: Uint8Array | string) => void): void;
+    writeFile(filePath: string, data: string | Uint8Array, callback: (err: Error | null) => void): void;
+    writeFile(filePath: string, data: string | Uint8Array, options: WriteOptions | Encoding, callback: (err: Error | null) => void): void;
+    appendFile(filePath: string, data: string | Uint8Array, callback: (err: Error | null) => void): void;
+    appendFile(filePath: string, data: string | Uint8Array, options: WriteOptions | Encoding, callback: (err: Error | null) => void): void;
+    mkdir(filePath: string, callback: (err: Error | null, path?: string) => void): void;
+    mkdir(filePath: string, options: MkdirOptions | number, callback: (err: Error | null, path?: string) => void): void;
+    rmdir(filePath: string, callback: (err: Error | null) => void): void;
+    rmdir(filePath: string, options: RmdirOptions, callback: (err: Error | null) => void): void;
+    rm(filePath: string, callback: (err: Error | null) => void): void;
+    rm(filePath: string, options: RmOptions, callback: (err: Error | null) => void): void;
+    unlink(filePath: string, callback: (err: Error | null) => void): void;
+    readdir(filePath: string, callback: (err: Error | null, files?: string[] | Dirent[]) => void): void;
+    readdir(filePath: string, options: ReaddirOptions | Encoding | null, callback: (err: Error | null, files?: string[] | Dirent[]) => void): void;
+    stat(filePath: string, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
+    stat(filePath: string, options: StatOptions, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
+    lstat(filePath: string, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
+    lstat(filePath: string, options: StatOptions, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
+    access(filePath: string, callback: (err: Error | null) => void): void;
+    access(filePath: string, mode: number, callback: (err: Error | null) => void): void;
+    rename(oldPath: string, newPath: string, callback: (err: Error | null) => void): void;
+    copyFile(src: string, dest: string, callback: (err: Error | null) => void): void;
+    copyFile(src: string, dest: string, mode: number, callback: (err: Error | null) => void): void;
+    truncate(filePath: string, callback: (err: Error | null) => void): void;
+    truncate(filePath: string, len: number, callback: (err: Error | null) => void): void;
+    realpath(filePath: string, callback: (err: Error | null, resolvedPath?: string) => void): void;
+    chmod(filePath: string, mode: number, callback: (err: Error | null) => void): void;
+    chown(filePath: string, uid: number, gid: number, callback: (err: Error | null) => void): void;
+    utimes(filePath: string, atime: Date | number, mtime: Date | number, callback: (err: Error | null) => void): void;
+    symlink(target: string, linkPath: string, callback: (err: Error | null) => void): void;
+    symlink(target: string, linkPath: string, type: string | null, callback: (err: Error | null) => void): void;
+    readlink(filePath: string, callback: (err: Error | null, linkString?: string | Uint8Array) => void): void;
+    readlink(filePath: string, options: {
+        encoding?: string | null;
+    } | string | null, callback: (err: Error | null, linkString?: string | Uint8Array) => void): void;
+    link(existingPath: string, newPath: string, callback: (err: Error | null) => void): void;
+    open(filePath: string, flags: string | number, callback: (err: Error | null, fd?: number) => void): void;
+    open(filePath: string, flags: string | number, mode: number, callback: (err: Error | null, fd?: number) => void): void;
+    mkdtemp(prefix: string, callback: (err: Error | null, folder?: string) => void): void;
+    cp(src: string, dest: string, callback: (err: Error | null) => void): void;
+    cp(src: string, dest: string, options: CpOptions, callback: (err: Error | null) => void): void;
+    exists(filePath: string, callback: (exists: boolean) => void): void;
 }
 declare class VFSPromises {
     private _async;
     private _ns;
     constructor(asyncRequest: AsyncRequestFn, ns: string);
-    readFile(filePath: string, options?: ReadOptions | Encoding | null): Promise<string | Uint8Array<ArrayBufferLike>>;
-    writeFile(filePath: string, data: string | Uint8Array, options?: WriteOptions | Encoding): Promise<void>;
-    appendFile(filePath: string, data: string | Uint8Array, options?: WriteOptions | Encoding): Promise<void>;
-    mkdir(filePath: string, options?: MkdirOptions | number): Promise<string | undefined>;
-    rmdir(filePath: string, options?: RmdirOptions): Promise<void>;
-    rm(filePath: string, options?: RmOptions): Promise<void>;
-    unlink(filePath: string): Promise<void>;
-    readdir(filePath: string, options?: ReaddirOptions | Encoding | null): Promise<string[] | Dirent[]>;
+    readFile(filePath: PathLike, options?: ReadOptions | Encoding | null): Promise<string | Uint8Array<ArrayBufferLike>>;
+    writeFile(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): Promise<void>;
+    appendFile(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): Promise<void>;
+    mkdir(filePath: PathLike, options?: MkdirOptions | number): Promise<string | undefined>;
+    rmdir(filePath: PathLike, options?: RmdirOptions): Promise<void>;
+    rm(filePath: PathLike, options?: RmOptions): Promise<void>;
+    unlink(filePath: PathLike): Promise<void>;
+    readdir(filePath: PathLike, options?: ReaddirOptions | Encoding | null): Promise<string[] | Dirent[]>;
     glob(pattern: string, options?: GlobOptions): Promise<string[]>;
-    stat(filePath: string, options?: StatOptions): Promise<BigIntStats | Stats>;
-    lstat(filePath: string, options?: StatOptions): Promise<BigIntStats | Stats>;
-    access(filePath: string, mode?: number): Promise<void>;
-    rename(oldPath: string, newPath: string): Promise<void>;
-    copyFile(src: string, dest: string, mode?: number): Promise<void>;
-    cp(src: string, dest: string, options?: CpOptions): Promise<void>;
-    truncate(filePath: string, len?: number): Promise<void>;
-    realpath(filePath: string): Promise<string>;
-    exists(filePath: string): Promise<boolean>;
-    chmod(filePath: string, mode: number): Promise<void>;
-    chown(filePath: string, uid: number, gid: number): Promise<void>;
-    utimes(filePath: string, atime: Date | number, mtime: Date | number): Promise<void>;
-    symlink(target: string, linkPath: string, type?: string | null): Promise<void>;
-    readlink(filePath: string, options?: {
+    stat(filePath: PathLike, options?: StatOptions): Promise<BigIntStats | Stats>;
+    lstat(filePath: PathLike, options?: StatOptions): Promise<BigIntStats | Stats>;
+    access(filePath: PathLike, mode?: number): Promise<void>;
+    rename(oldPath: PathLike, newPath: PathLike): Promise<void>;
+    copyFile(src: PathLike, dest: PathLike, mode?: number): Promise<void>;
+    cp(src: PathLike, dest: PathLike, options?: CpOptions): Promise<void>;
+    truncate(filePath: PathLike, len?: number): Promise<void>;
+    realpath(filePath: PathLike): Promise<string>;
+    exists(filePath: PathLike): Promise<boolean>;
+    chmod(filePath: PathLike, mode: number): Promise<void>;
+    /** Like chmod but operates on the symlink itself. In this VFS, delegates to chmod. */
+    lchmod(filePath: string, mode: number): Promise<void>;
+    /** chmod on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
+    fchmod(_fd: number, _mode: number): Promise<void>;
+    chown(filePath: PathLike, uid: number, gid: number): Promise<void>;
+    /** Like chown but operates on the symlink itself. In this VFS, delegates to chown. */
+    lchown(filePath: string, uid: number, gid: number): Promise<void>;
+    /** chown on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
+    fchown(_fd: number, _uid: number, _gid: number): Promise<void>;
+    utimes(filePath: PathLike, atime: Date | number, mtime: Date | number): Promise<void>;
+    /** Like utimes but operates on the symlink itself. In this VFS, delegates to utimes. */
+    lutimes(filePath: string, atime: Date | number, mtime: Date | number): Promise<void>;
+    symlink(target: PathLike, linkPath: PathLike, type?: string | null): Promise<void>;
+    readlink(filePath: PathLike, options?: {
         encoding?: string | null;
     } | string | null): Promise<string | Uint8Array<ArrayBufferLike>>;
-    link(existingPath: string, newPath: string): Promise<void>;
-    open(filePath: string, flags?: string | number, mode?: number): Promise<FileHandle>;
-    opendir(filePath: string): Promise<Dir>;
+    link(existingPath: PathLike, newPath: PathLike): Promise<void>;
+    open(filePath: PathLike, flags?: string | number, mode?: number): Promise<FileHandle>;
+    opendir(filePath: PathLike): Promise<Dir>;
     mkdtemp(prefix: string): Promise<string>;
+    openAsBlob(filePath: string, options?: OpenAsBlobOptions): Promise<Blob>;
     statfs(path: string): Promise<StatFs>;
     watch(filePath: string, options?: WatchOptions): AsyncIterable<WatchEventType>;
     flush(): Promise<void>;
     purge(): Promise<void>;
+}
+
+/**
+ * Minimal Node.js-compatible stream classes for use in browser/OPFS environments.
+ *
+ * These do NOT depend on Node.js built-ins — they provide just enough API surface
+ * for libraries that expect `.on('data')`, `.pipe()`, `.write()`, `.end()`, etc.
+ */
+type Listener = (...args: unknown[]) => void;
+declare class SimpleEventEmitter {
+    private _listeners;
+    private _onceSet;
+    on(event: string, fn: Listener): this;
+    addListener(event: string, fn: Listener): this;
+    once(event: string, fn: Listener): this;
+    off(event: string, fn: Listener): this;
+    removeListener(event: string, fn: Listener): this;
+    removeAllListeners(event?: string): this;
+    emit(event: string, ...args: unknown[]): boolean;
+    listenerCount(event: string): number;
+}
+declare class NodeReadable extends SimpleEventEmitter {
+    private _readFn;
+    private _paused;
+    private _destroyed;
+    private _ended;
+    private _reading;
+    private _readBuffer;
+    /** Whether the stream is still readable (not ended or destroyed). */
+    readable: boolean;
+    /** The file path this stream reads from (set externally). */
+    path: string;
+    /** Total bytes read so far. */
+    bytesRead: number;
+    /** Optional cleanup callback invoked on destroy (e.g. close file handle). */
+    private _destroyFn;
+    constructor(_readFn: () => Promise<{
+        done: boolean;
+        value?: Uint8Array;
+    }>, destroyFn?: () => Promise<void>);
+    on(event: string, fn: Listener): this;
+    pause(): this;
+    resume(): this;
+    /**
+     * Non-flowing read — returns the last buffered chunk or null.
+     * Node.js has a complex buffer system; we keep it simple here.
+     */
+    read(_size?: number): Uint8Array | null;
+    /** Destroy the stream, optionally with an error. */
+    destroy(err?: Error): this;
+    pipe<T extends NodeWritable | WritableStream<Uint8Array>>(dest: T): T;
+    private _drain;
+}
+declare class NodeWritable extends SimpleEventEmitter {
+    private _writeFn;
+    private _closeFn;
+    /** Total bytes written so far. */
+    bytesWritten: number;
+    /** The file path this stream was created for. */
+    readonly path: string;
+    /** Whether this stream is still writable. */
+    writable: boolean;
+    private _destroyed;
+    private _finished;
+    private _writing;
+    constructor(path: string, _writeFn: (chunk: Uint8Array) => Promise<void>, _closeFn: () => Promise<void>);
+    write(chunk: string | Uint8Array, encodingOrCb?: string | ((...args: unknown[]) => void), cb?: (...args: unknown[]) => void): boolean;
+    end(chunk?: string | Uint8Array | ((...args: unknown[]) => void), encodingOrCb?: string | ((...args: unknown[]) => void), cb?: (...args: unknown[]) => void): this;
+    destroy(err?: Error): this;
 }
 
 /**
@@ -439,7 +648,13 @@ declare const constants: {
     readonly O_EXCL: 128;
     readonly O_TRUNC: 512;
     readonly O_APPEND: 1024;
+    readonly O_NOCTTY: 256;
+    readonly O_NONBLOCK: 2048;
     readonly O_SYNC: 4096;
+    readonly O_DSYNC: 4096;
+    readonly O_DIRECTORY: 65536;
+    readonly O_NOFOLLOW: 131072;
+    readonly O_NOATIME: 262144;
     readonly S_IFMT: 61440;
     readonly S_IFREG: 32768;
     readonly S_IFDIR: 16384;
@@ -560,6 +775,13 @@ declare function repairVFS(root?: string, fs?: FsLike): Promise<RepairResult>;
  * POSIX path utilities (browser-compatible).
  * No Node.js dependencies.
  */
+
+/**
+ * Normalize a PathLike value (string, Uint8Array, or URL) to a plain string.
+ * Mirrors Node.js behaviour: Buffer/Uint8Array is decoded as UTF-8,
+ * URL must use the file: protocol and the pathname is used.
+ */
+declare function toPathString(p: PathLike): string;
 declare const sep = "/";
 declare const delimiter = ":";
 declare function normalize(p: string): string;
@@ -597,8 +819,9 @@ declare const path_parse: typeof parse;
 declare const path_relative: typeof relative;
 declare const path_resolve: typeof resolve;
 declare const path_sep: typeof sep;
+declare const path_toPathString: typeof toPathString;
 declare namespace path {
-  export { path_basename as basename, path_delimiter as delimiter, path_dirname as dirname, path_extname as extname, path_format as format, path_isAbsolute as isAbsolute, path_join as join, path_normalize as normalize, path_parse as parse, path_relative as relative, path_resolve as resolve, path_sep as sep };
+  export { path_basename as basename, path_delimiter as delimiter, path_dirname as dirname, path_extname as extname, path_format as format, path_isAbsolute as isAbsolute, path_join as join, path_normalize as normalize, path_parse as parse, path_relative as relative, path_resolve as resolve, path_sep as sep, path_toPathString as toPathString };
 }
 
 /** Create a configured VFS instance */
@@ -608,4 +831,4 @@ declare function getDefaultFS(): VFSFileSystem;
 /** Async init helper — avoids blocking main thread */
 declare function init(): Promise<void>;
 
-export { type BigIntStats, type CpOptions, type Dir, type Dirent, type Encoding, FSError, type FSMode, type FSWatcher, type FileHandle, type LoadResult, type MkdirOptions, type PathLike, type ReadOptions, type ReadStreamOptions, type ReaddirOptions, type RepairResult, type RmOptions, type RmdirOptions, type StatFs, type StatOptions, type Stats, type UnpackResult, type VFSConfig, VFSFileSystem, type VFSLimits, type WatchEventType, type WatchFileListener, type WatchListener, type WatchOptions, type WriteOptions, type WriteStreamOptions, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path, repairVFS, statusToError, unpackToOPFS };
+export { type BigIntStats, type CpOptions, type Dir, type Dirent, type Encoding, FSError, type FSMode, type FSReadStream, type FSWatcher, type FSWriteStream, type FileHandle, type LoadResult, type MkdirOptions, NodeReadable, NodeWritable, type OpenAsBlobOptions, type PathLike, type ReadOptions, type ReadStreamOptions, type ReaddirOptions, type RepairResult, type RmOptions, type RmdirOptions, SimpleEventEmitter, type StatFs, type StatOptions, type Stats, type UnpackResult, type VFSConfig, VFSFileSystem, type VFSLimits, type WatchEventType, type WatchFileListener, type WatchListener, type WatchOptions, type WriteOptions, type WriteStreamOptions, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path, repairVFS, statusToError, unpackToOPFS };

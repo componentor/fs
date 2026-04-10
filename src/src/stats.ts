@@ -47,7 +47,7 @@ export function decodeStats(data: Uint8Array): Stats {
     isSymbolicLink: () => isSymlink,
     isFIFO: () => false,
     isSocket: () => false,
-    dev: 0,
+    dev: 1,
     ino,
     mode,
     nlink,
@@ -65,6 +65,10 @@ export function decodeStats(data: Uint8Array): Stats {
     mtime: new Date(mtimeMs),
     ctime: new Date(ctimeMs),
     birthtime: new Date(ctimeMs),
+    atimeNs: atimeMs * 1_000_000,
+    mtimeNs: mtimeMs * 1_000_000,
+    ctimeNs: ctimeMs * 1_000_000,
+    birthtimeNs: ctimeMs * 1_000_000,
   };
 }
 
@@ -101,7 +105,7 @@ export function decodeStatsBigInt(data: Uint8Array): BigIntStats {
     isSymbolicLink: () => isSymlink,
     isFIFO: () => false,
     isSocket: () => false,
-    dev: 0n,
+    dev: 1n,
     ino: BigInt(ino),
     mode: BigInt(mode),
     nlink: BigInt(nlink),

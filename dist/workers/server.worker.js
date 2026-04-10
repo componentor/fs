@@ -938,8 +938,7 @@ var VFSEngine = class {
     const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
     this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
     this.commitPending();
-    const pathBytes = encoder.encode(path);
-    return { status: 0, data: pathBytes };
+    return { status: 0, data: null };
   }
   mkdirRecursive(path) {
     const parts = path.split("/").filter(Boolean);

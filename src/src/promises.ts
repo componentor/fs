@@ -31,6 +31,7 @@ export const link = promises.link.bind(promises);
 export const open = promises.open.bind(promises);
 export const opendir = promises.opendir.bind(promises);
 export const mkdtemp = promises.mkdtemp.bind(promises);
+export const openAsBlob = promises.openAsBlob.bind(promises);
 export const statfs = promises.statfs.bind(promises);
 export const flush = promises.flush.bind(promises);
 export const purge = promises.purge.bind(promises);

@@ -4,6 +4,278 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
+// src/node-streams.ts
+var SimpleEventEmitter = class {
+  _listeners = /* @__PURE__ */ new Map();
+  _onceSet = /* @__PURE__ */ new WeakSet();
+  on(event, fn) {
+    let arr = this._listeners.get(event);
+    if (!arr) {
+      arr = [];
+      this._listeners.set(event, arr);
+    }
+    arr.push(fn);
+    return this;
+  }
+  addListener(event, fn) {
+    return this.on(event, fn);
+  }
+  once(event, fn) {
+    this._onceSet.add(fn);
+    return this.on(event, fn);
+  }
+  off(event, fn) {
+    const arr = this._listeners.get(event);
+    if (arr) {
+      const idx = arr.indexOf(fn);
+      if (idx !== -1) arr.splice(idx, 1);
+    }
+    return this;
+  }
+  removeListener(event, fn) {
+    return this.off(event, fn);
+  }
+  removeAllListeners(event) {
+    if (event !== void 0) {
+      this._listeners.delete(event);
+    } else {
+      this._listeners.clear();
+    }
+    return this;
+  }
+  emit(event, ...args) {
+    const arr = this._listeners.get(event);
+    if (!arr || arr.length === 0) return false;
+    const copy = arr.slice();
+    for (const fn of copy) {
+      if (this._onceSet.has(fn)) {
+        this._onceSet.delete(fn);
+        this.off(event, fn);
+      }
+      fn(...args);
+    }
+    return true;
+  }
+  listenerCount(event) {
+    return this._listeners.get(event)?.length ?? 0;
+  }
+};
+var NodeReadable = class extends SimpleEventEmitter {
+  constructor(_readFn, destroyFn) {
+    super();
+    this._readFn = _readFn;
+    if (destroyFn) this._destroyFn = destroyFn;
+  }
+  _paused = true;
+  _destroyed = false;
+  _ended = false;
+  _reading = false;
+  _readBuffer = null;
+  /** Whether the stream is still readable (not ended or destroyed). */
+  readable = true;
+  /** The file path this stream reads from (set externally). */
+  path = "";
+  /** Total bytes read so far. */
+  bytesRead = 0;
+  /** Optional cleanup callback invoked on destroy (e.g. close file handle). */
+  _destroyFn = null;
+  // ---- Flow control (override on to auto-resume) ----
+  on(event, fn) {
+    super.on(event, fn);
+    if (event === "data" && this._paused) {
+      this.resume();
+    }
+    return this;
+  }
+  pause() {
+    this._paused = true;
+    return this;
+  }
+  resume() {
+    if (this._destroyed || this._ended) return this;
+    this._paused = false;
+    this._drain();
+    return this;
+  }
+  /**
+   * Non-flowing read — returns the last buffered chunk or null.
+   * Node.js has a complex buffer system; we keep it simple here.
+   */
+  read(_size) {
+    const buf = this._readBuffer;
+    this._readBuffer = null;
+    return buf;
+  }
+  /** Destroy the stream, optionally with an error. */
+  destroy(err) {
+    if (this._destroyed) return this;
+    this._destroyed = true;
+    this.readable = false;
+    if (err) {
+      this.emit("error", err);
+    }
+    if (this._destroyFn) {
+      this._destroyFn().then(
+        () => this.emit("close"),
+        () => this.emit("close")
+      );
+    } else {
+      this.emit("close");
+    }
+    return this;
+  }
+  // ---- pipe ----
+  pipe(dest) {
+    if (isNodeWritableInstance(dest)) {
+      this.on("data", (chunk) => {
+        dest.write(chunk);
+      });
+      this.on("end", () => {
+        if (typeof dest.end === "function") {
+          dest.end();
+        }
+      });
+      this.on("error", (err) => {
+        if (typeof dest.destroy === "function") {
+          dest.destroy(err);
+        }
+      });
+    } else {
+      const writer = dest.getWriter();
+      this.on("data", (chunk) => {
+        writer.write(chunk);
+      });
+      this.on("end", () => {
+        writer.close();
+      });
+      this.on("error", (err) => {
+        writer.abort(err);
+      });
+    }
+    if (this._paused) {
+      this.resume();
+    }
+    return dest;
+  }
+  // ---- Internal ----
+  async _drain() {
+    if (this._reading || this._destroyed || this._ended) return;
+    this._reading = true;
+    try {
+      while (!this._paused && !this._destroyed && !this._ended) {
+        const result = await this._readFn();
+        if (this._destroyed) break;
+        if (result.done || !result.value || result.value.byteLength === 0) {
+          this._ended = true;
+          this.readable = false;
+          this.emit("end");
+          this.emit("close");
+          break;
+        }
+        this.bytesRead += result.value.byteLength;
+        this._readBuffer = result.value;
+        this.emit("data", result.value);
+      }
+    } catch (err) {
+      if (!this._destroyed) {
+        this.destroy(err);
+      }
+    } finally {
+      this._reading = false;
+    }
+  }
+};
+var NodeWritable = class extends SimpleEventEmitter {
+  constructor(path, _writeFn, _closeFn) {
+    super();
+    this._writeFn = _writeFn;
+    this._closeFn = _closeFn;
+    this.path = path;
+  }
+  /** Total bytes written so far. */
+  bytesWritten = 0;
+  /** The file path this stream was created for. */
+  path;
+  /** Whether this stream is still writable. */
+  writable = true;
+  _destroyed = false;
+  _finished = false;
+  _writing = false;
+  // -- public API -----------------------------------------------------------
+  write(chunk, encodingOrCb, cb) {
+    const callback = typeof encodingOrCb === "function" ? encodingOrCb : cb;
+    if (this._destroyed || this._finished) {
+      const err = new Error("write after end");
+      if (callback) callback(err);
+      return false;
+    }
+    const data = typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk;
+    this._writing = true;
+    this._writeFn(data).then(() => {
+      this.bytesWritten += data.byteLength;
+      this._writing = false;
+      if (callback) callback();
+      this.emit("drain");
+    }).catch((err) => {
+      this._writing = false;
+      if (callback) callback(err);
+      this.emit("error", err);
+    });
+    return true;
+  }
+  end(chunk, encodingOrCb, cb) {
+    let callback;
+    let finalChunk;
+    if (typeof chunk === "function") {
+      callback = chunk;
+      finalChunk = void 0;
+    } else {
+      finalChunk = chunk;
+      if (typeof encodingOrCb === "function") {
+        callback = encodingOrCb;
+      } else {
+        callback = cb;
+      }
+    }
+    if (this._finished) {
+      if (callback) callback();
+      return this;
+    }
+    this.writable = false;
+    const finish = () => {
+      this._closeFn().then(() => {
+        this._finished = true;
+        this.emit("finish");
+        this.emit("close");
+        if (callback) callback();
+      }).catch((err) => {
+        this.emit("error", err);
+        if (callback) callback(err);
+      });
+    };
+    if (finalChunk !== void 0 && finalChunk !== null) {
+      this.write(finalChunk, void 0, () => finish());
+    } else {
+      finish();
+    }
+    return this;
+  }
+  destroy(err) {
+    if (this._destroyed) return this;
+    this._destroyed = true;
+    this.writable = false;
+    this._closeFn().catch(() => {
+    }).finally(() => {
+      if (err) this.emit("error", err);
+      this.emit("close");
+    });
+    return this;
+  }
+};
+function isNodeWritableInstance(obj) {
+  return obj !== null && typeof obj === "object" && typeof obj.write === "function" && !("getWriter" in obj);
+}
+
 // src/protocol/opcodes.ts
 var OP = {
   READ: 1,
@@ -279,7 +551,7 @@ function decodeStats(data) {
     isSymbolicLink: () => isSymlink,
     isFIFO: () => false,
     isSocket: () => false,
-    dev: 0,
+    dev: 1,
     ino,
     mode,
     nlink,
@@ -296,7 +568,11 @@ function decodeStats(data) {
     atime: new Date(atimeMs),
     mtime: new Date(mtimeMs),
     ctime: new Date(ctimeMs),
-    birthtime: new Date(ctimeMs)
+    birthtime: new Date(ctimeMs),
+    atimeNs: atimeMs * 1e6,
+    mtimeNs: mtimeMs * 1e6,
+    ctimeNs: ctimeMs * 1e6,
+    birthtimeNs: ctimeMs * 1e6
   };
 }
 function decodeStatsBigInt(data) {
@@ -325,7 +601,7 @@ function decodeStatsBigInt(data) {
     isSymbolicLink: () => isSymlink,
     isFIFO: () => false,
     isSocket: () => false,
-    dev: 0n,
+    dev: 1n,
     ino: BigInt(ino),
     mode: BigInt(mode),
     nlink: BigInt(nlink),
@@ -413,7 +689,13 @@ var constants = {
   O_EXCL: 128,
   O_TRUNC: 512,
   O_APPEND: 1024,
+  O_NOCTTY: 256,
+  O_NONBLOCK: 2048,
   O_SYNC: 4096,
+  O_DSYNC: 4096,
+  O_DIRECTORY: 65536,
+  O_NOFOLLOW: 131072,
+  O_NOATIME: 262144,
   // File type constants
   S_IFMT: 61440,
   S_IFREG: 32768,
@@ -481,29 +763,53 @@ function closeSync(syncRequest, fd) {
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "close", String(fd));
 }
-function readSync(syncRequest, fd, buffer, offset = 0, length = buffer.byteLength, position = null) {
+function readSync(syncRequest, fd, bufferOrOptions, offsetOrOptions, length, position) {
+  let buffer;
+  let off, len, pos;
+  if (bufferOrOptions instanceof Uint8Array) {
+    buffer = bufferOrOptions;
+    if (offsetOrOptions != null && typeof offsetOrOptions === "object") {
+      off = offsetOrOptions.offset ?? 0;
+      len = offsetOrOptions.length ?? buffer.byteLength;
+      pos = offsetOrOptions.position ?? null;
+    } else {
+      off = offsetOrOptions ?? 0;
+      len = length ?? buffer.byteLength;
+      pos = position ?? null;
+    }
+  } else {
+    buffer = bufferOrOptions.buffer;
+    off = bufferOrOptions.offset ?? 0;
+    len = bufferOrOptions.length ?? buffer.byteLength;
+    pos = bufferOrOptions.position ?? null;
+  }
   const fdBuf = new Uint8Array(16);
   const dv = new DataView(fdBuf.buffer);
   dv.setUint32(0, fd, true);
-  dv.setUint32(4, length, true);
-  dv.setFloat64(8, position ?? -1, true);
+  dv.setUint32(4, len, true);
+  dv.setFloat64(8, pos ?? -1, true);
   const buf = encodeRequest(OP.FREAD, "", 0, fdBuf);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "read", String(fd));
   if (data) {
-    buffer.set(data.subarray(0, Math.min(data.byteLength, length)), offset);
+    buffer.set(data.subarray(0, Math.min(data.byteLength, len)), off);
     return data.byteLength;
   }
   return 0;
 }
-function writeSyncFd(syncRequest, fd, bufferOrString, offsetOrPosition, lengthOrEncoding, position) {
+function writeSyncFd(syncRequest, fd, bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position) {
   let writeData;
   let pos;
   if (typeof bufferOrString === "string") {
     writeData = encoder2.encode(bufferOrString);
-    pos = offsetOrPosition != null ? offsetOrPosition : null;
+    pos = offsetOrPositionOrOptions != null && typeof offsetOrPositionOrOptions === "number" ? offsetOrPositionOrOptions : null;
+  } else if (offsetOrPositionOrOptions != null && typeof offsetOrPositionOrOptions === "object") {
+    const offset = offsetOrPositionOrOptions.offset ?? 0;
+    const length = offsetOrPositionOrOptions.length ?? bufferOrString.byteLength;
+    pos = offsetOrPositionOrOptions.position ?? null;
+    writeData = bufferOrString.subarray(offset, offset + length);
   } else {
-    const offset = offsetOrPosition ?? 0;
+    const offset = offsetOrPositionOrOptions ?? 0;
     const length = lengthOrEncoding != null ? lengthOrEncoding : bufferOrString.byteLength;
     pos = position ?? null;
     writeData = bufferOrString.subarray(offset, offset + length);
@@ -550,24 +856,49 @@ async function open(asyncRequest, filePath, flags, _mode) {
 function createFileHandle(fd, asyncRequest) {
   return {
     fd,
-    async read(buffer, offset = 0, length = buffer.byteLength, position = null) {
-      const { status, data } = await asyncRequest(OP.FREAD, "", 0, null, void 0, { fd, length, position: position ?? -1 });
+    async read(bufferOrOptions, offsetOrOptions, length, position) {
+      let buffer;
+      let off, len, pos;
+      if (bufferOrOptions instanceof Uint8Array) {
+        buffer = bufferOrOptions;
+        if (offsetOrOptions != null && typeof offsetOrOptions === "object") {
+          off = offsetOrOptions.offset ?? 0;
+          len = offsetOrOptions.length ?? buffer.byteLength;
+          pos = offsetOrOptions.position ?? null;
+        } else {
+          off = offsetOrOptions ?? 0;
+          len = length ?? buffer.byteLength;
+          pos = position ?? null;
+        }
+      } else {
+        buffer = bufferOrOptions.buffer;
+        off = bufferOrOptions.offset ?? 0;
+        len = bufferOrOptions.length ?? buffer.byteLength;
+        pos = bufferOrOptions.position ?? null;
+      }
+      const { status, data } = await asyncRequest(OP.FREAD, "", 0, null, void 0, { fd, length: len, position: pos ?? -1 });
       if (status !== 0) throw statusToError(status, "read", String(fd));
       const bytesRead = data ? data.byteLength : 0;
-      if (data) buffer.set(data.subarray(0, Math.min(bytesRead, length)), offset);
+      if (data) buffer.set(data.subarray(0, Math.min(bytesRead, len)), off);
       return { bytesRead, buffer };
     },
-    async write(bufferOrString, offsetOrPosition, lengthOrEncoding, position) {
+    async write(bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position) {
       let writeData;
       let pos;
       let resultBuffer;
       if (typeof bufferOrString === "string") {
         resultBuffer = encoder2.encode(bufferOrString);
         writeData = resultBuffer;
-        pos = offsetOrPosition != null ? offsetOrPosition : -1;
+        pos = offsetOrPositionOrOptions != null && typeof offsetOrPositionOrOptions === "number" ? offsetOrPositionOrOptions : -1;
+      } else if (offsetOrPositionOrOptions != null && typeof offsetOrPositionOrOptions === "object") {
+        resultBuffer = bufferOrString;
+        const offset = offsetOrPositionOrOptions.offset ?? 0;
+        const length = offsetOrPositionOrOptions.length ?? bufferOrString.byteLength;
+        pos = offsetOrPositionOrOptions.position != null ? offsetOrPositionOrOptions.position : -1;
+        writeData = bufferOrString.subarray(offset, offset + length);
       } else {
         resultBuffer = bufferOrString;
-        const offset = offsetOrPosition ?? 0;
+        const offset = offsetOrPositionOrOptions ?? 0;
         const length = lengthOrEncoding != null ? lengthOrEncoding : bufferOrString.byteLength;
         pos = position != null ? position : -1;
         writeData = bufferOrString.subarray(offset, offset + length);
@@ -576,6 +907,27 @@ function createFileHandle(fd, asyncRequest) {
       if (status !== 0) throw statusToError(status, "write", String(fd));
       const bytesWritten = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
       return { bytesWritten, buffer: resultBuffer };
+    },
+    async readv(buffers, position) {
+      let totalRead = 0;
+      let pos = position ?? null;
+      for (const buf of buffers) {
+        const { bytesRead } = await this.read(buf, 0, buf.byteLength, pos);
+        totalRead += bytesRead;
+        if (pos !== null) pos += bytesRead;
+        if (bytesRead < buf.byteLength) break;
+      }
+      return { bytesRead: totalRead, buffers };
+    },
+    async writev(buffers, position) {
+      let totalWritten = 0;
+      let pos = position ?? null;
+      for (const buf of buffers) {
+        const { bytesWritten } = await this.write(buf, 0, buf.byteLength, pos);
+        totalWritten += bytesWritten;
+        if (pos !== null) pos += bytesWritten;
+      }
+      return { bytesWritten: totalWritten, buffers };
     },
     async readFile(options) {
       const encoding = typeof options === "string" ? options : options?.encoding;
@@ -599,6 +951,16 @@ function createFileHandle(fd, asyncRequest) {
       if (status !== 0) throw statusToError(status, "fstat", String(fd));
       return decodeStats(data);
     },
+    async appendFile(data, _options) {
+      const encoded = typeof data === "string" ? encoder2.encode(data) : data;
+      const st = await this.stat();
+      const { status } = await asyncRequest(OP.FWRITE, "", 0, null, void 0, { fd, data: encoded, position: st.size });
+      if (status !== 0) throw statusToError(status, "write", String(fd));
+    },
+    async chmod(_mode) {
+    },
+    async chown(_uid, _gid) {
+    },
     async sync() {
       await asyncRequest(OP.FSYNC, "");
     },
@@ -608,6 +970,9 @@ function createFileHandle(fd, asyncRequest) {
     async close() {
       const { status } = await asyncRequest(OP.CLOSE, "", 0, null, void 0, { fd });
       if (status !== 0) throw statusToError(status, "close", String(fd));
+    },
+    [Symbol.asyncDispose]() {
+      return this.close();
     }
   };
 }
@@ -714,6 +1079,10 @@ new TextDecoder();
 function readFileSync(syncRequest, filePath, options) {
   const encoding = typeof options === "string" ? options : options?.encoding;
   const flag = typeof options === "string" ? void 0 : options?.flag;
+  const signal = typeof options === "string" ? void 0 : options?.signal;
+  if (signal?.aborted) {
+    throw new DOMException("The operation was aborted", "AbortError");
+  }
   if (!flag || flag === "r") {
     const buf = encodeRequest(OP.READ, filePath);
     const { status, data } = syncRequest(buf);
@@ -757,8 +1126,13 @@ function readFileSync(syncRequest, filePath, options) {
 async function readFile(asyncRequest, filePath, options) {
   const encoding = typeof options === "string" ? options : options?.encoding;
   const flag = typeof options === "string" ? void 0 : options?.flag;
+  const signal = typeof options === "string" ? void 0 : options?.signal;
+  if (signal?.aborted) {
+    throw new DOMException("The operation was aborted", "AbortError");
+  }
   if (!flag || flag === "r") {
     const { status, data } = await asyncRequest(OP.READ, filePath);
+    if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
     if (status !== 0) throw statusToError(status, "read", filePath);
     const result = data ?? new Uint8Array(0);
     if (encoding) return decodeBuffer(result, encoding);
@@ -767,6 +1141,7 @@ async function readFile(asyncRequest, filePath, options) {
   const handle = await open(asyncRequest, filePath, flag);
   try {
     const result = await handle.readFile(encoding ? encoding : void 0);
+    if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
     return result;
   } finally {
     await handle.close();
@@ -779,6 +1154,10 @@ function writeFileSync(syncRequest, filePath, data, options) {
   const opts = typeof options === "string" ? { encoding: options } : options;
   const encoded = typeof data === "string" ? opts?.encoding ? encodeString(data, opts.encoding) : encoder3.encode(data) : data;
   const flag = opts?.flag;
+  const signal = opts?.signal;
+  if (signal?.aborted) {
+    throw new DOMException("The operation was aborted", "AbortError");
+  }
   if (!flag || flag === "w") {
     const flags = opts?.flush === true ? 1 : 0;
     const buf = encodeRequest(OP.WRITE, filePath, flags, encoded);
@@ -797,15 +1176,21 @@ async function writeFile(asyncRequest, filePath, data, options) {
   const opts = typeof options === "string" ? { encoding: options } : options;
   const encoded = typeof data === "string" ? opts?.encoding ? encodeString(data, opts.encoding) : encoder3.encode(data) : data;
   const flag = opts?.flag;
+  const signal = opts?.signal;
+  if (signal?.aborted) {
+    throw new DOMException("The operation was aborted", "AbortError");
+  }
   if (!flag || flag === "w") {
     const flags = opts?.flush === true ? 1 : 0;
     const { status } = await asyncRequest(OP.WRITE, filePath, flags, encoded);
+    if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
     if (status !== 0) throw statusToError(status, "write", filePath);
     return;
   }
   const handle = await open(asyncRequest, filePath, flag);
   try {
     await handle.writeFile(encoded);
+    if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
   } finally {
     await handle.close();
   }
@@ -868,7 +1253,11 @@ async function rmdir(asyncRequest, filePath, options) {
 }
 
 // src/methods/rm.ts
-function rmSync(syncRequest, filePath, options) {
+var RETRYABLE_CODES = /* @__PURE__ */ new Set(["EBUSY", "ENOTEMPTY", "EPERM"]);
+function isRetryable(e) {
+  return e instanceof FSError && RETRYABLE_CODES.has(e.code);
+}
+function rmSyncCore(syncRequest, filePath, options) {
   const flags = (options?.recursive ? 1 : 0) | (options?.force ? 2 : 0);
   const buf = encodeRequest(OP.UNLINK, filePath, flags);
   const { status } = syncRequest(buf);
@@ -886,7 +1275,24 @@ function rmSync(syncRequest, filePath, options) {
     throw statusToError(status, "rm", filePath);
   }
 }
-async function rm(asyncRequest, filePath, options) {
+function rmSync(syncRequest, filePath, options) {
+  const maxRetries = options?.maxRetries ?? 0;
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      rmSyncCore(syncRequest, filePath, options);
+      return;
+    } catch (e) {
+      lastError = e;
+      if (attempt < maxRetries && isRetryable(e)) {
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastError;
+}
+async function rmAsyncCore(asyncRequest, filePath, options) {
   const flags = (options?.recursive ? 1 : 0) | (options?.force ? 2 : 0);
   const { status } = await asyncRequest(OP.UNLINK, filePath, flags);
   if (status === 3) {
@@ -901,6 +1307,28 @@ async function rm(asyncRequest, filePath, options) {
     if (options?.force && status === 1) return;
     throw statusToError(status, "rm", filePath);
   }
+}
+function delay(ms) {
+  return new Promise((resolve2) => setTimeout(resolve2, ms));
+}
+async function rm(asyncRequest, filePath, options) {
+  const maxRetries = options?.maxRetries ?? 0;
+  const retryDelay = options?.retryDelay ?? 100;
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      await rmAsyncCore(asyncRequest, filePath, options);
+      return;
+    } catch (e) {
+      lastError = e;
+      if (attempt < maxRetries && isRetryable(e)) {
+        await delay(retryDelay);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastError;
 }
 
 // src/methods/unlink.ts
@@ -930,14 +1358,18 @@ async function readdirBaseAsync(asyncRequest, filePath, withFileTypes) {
   if (!data) return [];
   return withFileTypes ? decodeDirents(data, filePath) : decodeNames(data);
 }
-function readdirRecursiveSync(syncRequest, basePath, prefix, withFileTypes) {
+function readdirRecursiveSync(syncRequest, basePath, prefix, withFileTypes, rootPath) {
   const entries = readdirBaseSync(syncRequest, basePath, true);
   const results = [];
+  const effectiveRoot = rootPath ?? basePath;
   for (const entry of entries) {
     const relativePath = prefix ? prefix + "/" + entry.name : entry.name;
     if (withFileTypes) {
+      const parentPath = prefix || effectiveRoot;
       results.push({
         name: relativePath,
+        parentPath,
+        path: parentPath,
         isFile: entry.isFile,
         isDirectory: entry.isDirectory,
         isBlockDevice: entry.isBlockDevice,
@@ -952,20 +1384,24 @@ function readdirRecursiveSync(syncRequest, basePath, prefix, withFileTypes) {
     if (entry.isDirectory()) {
       const childPath = basePath + "/" + entry.name;
       results.push(
-        ...readdirRecursiveSync(syncRequest, childPath, relativePath, withFileTypes)
+        ...readdirRecursiveSync(syncRequest, childPath, relativePath, withFileTypes, effectiveRoot)
       );
     }
   }
   return results;
 }
-async function readdirRecursiveAsync(asyncRequest, basePath, prefix, withFileTypes) {
+async function readdirRecursiveAsync(asyncRequest, basePath, prefix, withFileTypes, rootPath) {
   const entries = await readdirBaseAsync(asyncRequest, basePath, true);
   const results = [];
+  const effectiveRoot = rootPath ?? basePath;
   for (const entry of entries) {
     const relativePath = prefix ? prefix + "/" + entry.name : entry.name;
     if (withFileTypes) {
+      const parentPath = prefix || effectiveRoot;
       results.push({
         name: relativePath,
+        parentPath,
+        path: parentPath,
         isFile: entry.isFile,
         isDirectory: entry.isDirectory,
         isBlockDevice: entry.isBlockDevice,
@@ -983,7 +1419,8 @@ async function readdirRecursiveAsync(asyncRequest, basePath, prefix, withFileTyp
         asyncRequest,
         childPath,
         relativePath,
-        withFileTypes
+        withFileTypes,
+        effectiveRoot
       );
       results.push(...children);
     }
@@ -1270,8 +1707,20 @@ __export(path_exports, {
   parse: () => parse,
   relative: () => relative,
   resolve: () => resolve,
-  sep: () => sep
+  sep: () => sep,
+  toPathString: () => toPathString
 });
+function toPathString(p) {
+  if (typeof p === "string") return p;
+  if (p instanceof Uint8Array) return new TextDecoder().decode(p);
+  if (typeof URL !== "undefined" && p instanceof URL) {
+    if (p.protocol !== "file:") {
+      throw new TypeError("The URL must use the file: protocol");
+    }
+    return decodeURIComponent(p.pathname);
+  }
+  return String(p);
+}
 var sep = "/";
 var delimiter = ":";
 function normalize(p) {
@@ -2289,101 +2738,103 @@ var VFSFileSystem = class {
   }
   // ========== Sync API ==========
   readFileSync(filePath, options) {
-    return readFileSync(this._sync, filePath, options);
+    return readFileSync(this._sync, toPathString(filePath), options);
   }
   writeFileSync(filePath, data, options) {
-    writeFileSync(this._sync, filePath, data, options);
+    writeFileSync(this._sync, toPathString(filePath), data, options);
   }
   appendFileSync(filePath, data, options) {
-    appendFileSync(this._sync, filePath, data);
+    appendFileSync(this._sync, toPathString(filePath), data);
   }
   existsSync(filePath) {
-    return existsSync(this._sync, filePath);
+    return existsSync(this._sync, toPathString(filePath));
   }
   mkdirSync(filePath, options) {
-    return mkdirSync(this._sync, filePath, options);
+    return mkdirSync(this._sync, toPathString(filePath), options);
   }
   rmdirSync(filePath, options) {
-    rmdirSync(this._sync, filePath, options);
+    rmdirSync(this._sync, toPathString(filePath), options);
   }
   rmSync(filePath, options) {
-    rmSync(this._sync, filePath, options);
+    rmSync(this._sync, toPathString(filePath), options);
   }
   unlinkSync(filePath) {
-    unlinkSync(this._sync, filePath);
+    unlinkSync(this._sync, toPathString(filePath));
   }
   readdirSync(filePath, options) {
-    return readdirSync(this._sync, filePath, options);
+    return readdirSync(this._sync, toPathString(filePath), options);
   }
   globSync(pattern, options) {
     return globSync(this._sync, pattern, options);
   }
   statSync(filePath, options) {
-    return statSync(this._sync, filePath, options);
+    return statSync(this._sync, toPathString(filePath), options);
   }
   lstatSync(filePath, options) {
-    return lstatSync(this._sync, filePath, options);
+    return lstatSync(this._sync, toPathString(filePath), options);
   }
   renameSync(oldPath, newPath) {
-    renameSync(this._sync, oldPath, newPath);
+    renameSync(this._sync, toPathString(oldPath), toPathString(newPath));
   }
   copyFileSync(src, dest, mode) {
-    copyFileSync(this._sync, src, dest, mode);
+    copyFileSync(this._sync, toPathString(src), toPathString(dest), mode);
   }
   cpSync(src, dest, options) {
+    const srcPath = toPathString(src);
+    const destPath = toPathString(dest);
     const force = options?.force !== false;
     const errorOnExist = options?.errorOnExist ?? false;
     const dereference = options?.dereference ?? false;
     const preserveTimestamps = options?.preserveTimestamps ?? false;
-    const srcStat = dereference ? this.statSync(src) : this.lstatSync(src);
+    const srcStat = dereference ? this.statSync(srcPath) : this.lstatSync(srcPath);
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
-        throw createError("EISDIR", "cp", src);
+        throw createError("EISDIR", "cp", srcPath);
       }
       try {
-        this.mkdirSync(dest, { recursive: true });
+        this.mkdirSync(destPath, { recursive: true });
       } catch (e) {
         if (e.code !== "EEXIST") throw e;
       }
-      const entries = this.readdirSync(src, { withFileTypes: true });
+      const entries = this.readdirSync(srcPath, { withFileTypes: true });
       for (const entry of entries) {
-        const srcChild = join(src, entry.name);
-        const destChild = join(dest, entry.name);
+        const srcChild = join(srcPath, entry.name);
+        const destChild = join(destPath, entry.name);
         this.cpSync(srcChild, destChild, options);
       }
     } else if (srcStat.isSymbolicLink() && !dereference) {
-      const target = this.readlinkSync(src);
+      const target = this.readlinkSync(srcPath);
       let destExists = false;
       try {
-        this.lstatSync(dest);
+        this.lstatSync(destPath);
         destExists = true;
       } catch {
       }
       if (destExists) {
-        if (errorOnExist) throw createError("EEXIST", "cp", dest);
+        if (errorOnExist) throw createError("EEXIST", "cp", destPath);
         if (!force) return;
-        this.unlinkSync(dest);
+        this.unlinkSync(destPath);
       }
-      this.symlinkSync(target, dest);
+      this.symlinkSync(target, destPath);
     } else {
       let destExists = false;
       try {
-        this.lstatSync(dest);
+        this.lstatSync(destPath);
         destExists = true;
       } catch {
       }
       if (destExists) {
-        if (errorOnExist) throw createError("EEXIST", "cp", dest);
+        if (errorOnExist) throw createError("EEXIST", "cp", destPath);
         if (!force) return;
       }
-      this.copyFileSync(src, dest, errorOnExist ? constants.COPYFILE_EXCL : 0);
+      this.copyFileSync(srcPath, destPath, errorOnExist ? constants.COPYFILE_EXCL : 0);
     }
     if (preserveTimestamps) {
-      const st = this.statSync(src);
-      this.utimesSync(dest, st.atime, st.mtime);
+      const st = this.statSync(srcPath);
+      this.utimesSync(destPath, st.atime, st.mtime);
     }
   }
-  async cp(src, dest, options) {
+  async _cpAsync(src, dest, options) {
     const force = options?.force !== false;
     const errorOnExist = options?.errorOnExist ?? false;
     const dereference = options?.dereference ?? false;
@@ -2402,7 +2853,7 @@ var VFSFileSystem = class {
       for (const entry of entries) {
         const srcChild = join(src, entry.name);
         const destChild = join(dest, entry.name);
-        await this.cp(srcChild, destChild, options);
+        await this._cpAsync(srcChild, destChild, options);
       }
     } else if (srcStat.isSymbolicLink() && !dereference) {
       const target = await this.promises.readlink(src);
@@ -2437,47 +2888,65 @@ var VFSFileSystem = class {
     }
   }
   truncateSync(filePath, len) {
-    truncateSync(this._sync, filePath, len);
+    truncateSync(this._sync, toPathString(filePath), len);
   }
   accessSync(filePath, mode) {
-    accessSync(this._sync, filePath, mode);
+    accessSync(this._sync, toPathString(filePath), mode);
   }
   realpathSync(filePath) {
-    return realpathSync(this._sync, filePath);
+    return realpathSync(this._sync, toPathString(filePath));
   }
   chmodSync(filePath, mode) {
+    chmodSync(this._sync, toPathString(filePath), mode);
+  }
+  /** Like chmodSync but operates on the symlink itself. In this VFS, delegates to chmodSync. */
+  lchmodSync(filePath, mode) {
     chmodSync(this._sync, filePath, mode);
   }
+  /** chmod on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
+  fchmodSync(_fd, _mode) {
+  }
   chownSync(filePath, uid, gid) {
+    chownSync(this._sync, toPathString(filePath), uid, gid);
+  }
+  /** Like chownSync but operates on the symlink itself. In this VFS, delegates to chownSync. */
+  lchownSync(filePath, uid, gid) {
     chownSync(this._sync, filePath, uid, gid);
   }
+  /** chown on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
+  fchownSync(_fd, _uid, _gid) {
+  }
   utimesSync(filePath, atime, mtime) {
+    utimesSync(this._sync, toPathString(filePath), atime, mtime);
+  }
+  /** Like utimesSync but operates on the symlink itself. In this VFS, delegates to utimesSync. */
+  lutimesSync(filePath, atime, mtime) {
     utimesSync(this._sync, filePath, atime, mtime);
   }
   symlinkSync(target, linkPath, type) {
-    symlinkSync(this._sync, target, linkPath);
+    symlinkSync(this._sync, toPathString(target), toPathString(linkPath));
   }
   readlinkSync(filePath, options) {
-    return readlinkSync(this._sync, filePath, options);
+    return readlinkSync(this._sync, toPathString(filePath), options);
   }
   linkSync(existingPath, newPath) {
-    linkSync(this._sync, existingPath, newPath);
+    linkSync(this._sync, toPathString(existingPath), toPathString(newPath));
   }
   mkdtempSync(prefix) {
     return mkdtempSync(this._sync, prefix);
   }
   // ---- File descriptor sync methods ----
   openSync(filePath, flags = "r", mode) {
-    return openSync(this._sync, filePath, flags);
+    return openSync(this._sync, toPathString(filePath), flags);
   }
   closeSync(fd) {
     closeSync(this._sync, fd);
   }
-  readSync(fd, buffer, offset = 0, length = buffer.byteLength, position = null) {
-    return readSync(this._sync, fd, buffer, offset, length, position);
+  readSync(fd, bufferOrOptions, offsetOrOptions, length, position) {
+    return readSync(this._sync, fd, bufferOrOptions, offsetOrOptions, length, position);
   }
-  writeSync(fd, bufferOrString, offsetOrPosition, lengthOrEncoding, position) {
-    return writeSyncFd(this._sync, fd, bufferOrString, offsetOrPosition, lengthOrEncoding, position);
+  writeSync(fd, bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position) {
+    return writeSyncFd(this._sync, fd, bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position);
   }
   fstatSync(fd) {
     return fstatSync(this._sync, fd);
@@ -2487,6 +2956,62 @@ var VFSFileSystem = class {
   }
   fdatasyncSync(fd) {
     fdatasyncSync(this._sync, fd);
+  }
+  // ---- Vector I/O methods ----
+  readvSync(fd, buffers, position) {
+    let totalRead = 0;
+    let pos = position ?? null;
+    for (const buf of buffers) {
+      const bytesRead = this.readSync(fd, buf, 0, buf.byteLength, pos);
+      totalRead += bytesRead;
+      if (pos !== null) pos += bytesRead;
+      if (bytesRead < buf.byteLength) break;
+    }
+    return totalRead;
+  }
+  writevSync(fd, buffers, position) {
+    let totalWritten = 0;
+    let pos = position ?? null;
+    for (const buf of buffers) {
+      const bytesWritten = this.writeSync(fd, buf, 0, buf.byteLength, pos);
+      totalWritten += bytesWritten;
+      if (pos !== null) pos += bytesWritten;
+    }
+    return totalWritten;
+  }
+  readv(fd, buffers, positionOrCallback, callback) {
+    let pos;
+    let cb;
+    if (typeof positionOrCallback === "function") {
+      pos = void 0;
+      cb = positionOrCallback;
+    } else {
+      pos = positionOrCallback;
+      cb = callback;
+    }
+    try {
+      const bytesRead = this.readvSync(fd, buffers, pos);
+      cb(null, bytesRead, buffers);
+    } catch (err) {
+      cb(err);
+    }
+  }
+  writev(fd, buffers, positionOrCallback, callback) {
+    let pos;
+    let cb;
+    if (typeof positionOrCallback === "function") {
+      pos = void 0;
+      cb = positionOrCallback;
+    } else {
+      pos = positionOrCallback;
+      cb = callback;
+    }
+    try {
+      const bytesWritten = this.writevSync(fd, buffers, pos);
+      cb(null, bytesWritten, buffers);
+    } catch (err) {
+      cb(err);
+    }
   }
   // ---- statfs methods ----
   statfsSync(_path) {
@@ -2515,22 +3040,29 @@ var VFSFileSystem = class {
   }
   // ---- Watch methods ----
   watch(filePath, options, listener) {
-    return watch(this.ns, filePath, options, listener);
+    return watch(this.ns, toPathString(filePath), options, listener);
   }
   watchFile(filePath, optionsOrListener, listener) {
-    watchFile(this.ns, this._sync, filePath, optionsOrListener, listener);
+    watchFile(this.ns, this._sync, toPathString(filePath), optionsOrListener, listener);
   }
   unwatchFile(filePath, listener) {
-    unwatchFile(this.ns, filePath, listener);
+    unwatchFile(this.ns, toPathString(filePath), listener);
+  }
+  // ---- openAsBlob (Node.js 19+) ----
+  async openAsBlob(filePath, options) {
+    const data = await this.promises.readFile(filePath);
+    const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(data);
+    return new Blob([bytes], { type: options?.type ?? "" });
   }
   // ---- Stream methods ----
   createReadStream(filePath, options) {
-    const opts = typeof options === "string" ? { encoding: options } : options;
+    const opts = typeof options === "string" ? { } : options;
     const start = opts?.start ?? 0;
     const end = opts?.end;
     const highWaterMark = opts?.highWaterMark ?? 64 * 1024;
     let position = start;
     let handle = null;
+    let finished = false;
     const cleanup = async () => {
       if (handle) {
         try {
@@ -2540,69 +3072,57 @@ var VFSFileSystem = class {
         handle = null;
       }
     };
-    return new ReadableStream({
-      pull: async (controller) => {
-        try {
-          if (!handle) {
-            handle = await this.promises.open(filePath, opts?.flags ?? "r");
-          }
-          const readLen = end !== void 0 ? Math.min(highWaterMark, end - position + 1) : highWaterMark;
-          if (readLen <= 0) {
-            await cleanup();
-            controller.close();
-            return;
-          }
-          const buffer = new Uint8Array(readLen);
-          const { bytesRead } = await handle.read(buffer, 0, readLen, position);
-          if (bytesRead === 0) {
-            await cleanup();
-            controller.close();
-            return;
-          }
-          controller.enqueue(buffer.subarray(0, bytesRead));
-          position += bytesRead;
-          if (end !== void 0 && position > end) {
-            await cleanup();
-            controller.close();
-          }
-        } catch (err) {
-          await cleanup();
-          controller.error(err);
-        }
-      },
-      cancel: async () => {
-        await cleanup();
+    const readFn = async () => {
+      if (finished) return { done: true };
+      if (!handle) {
+        handle = await this.promises.open(toPathString(filePath), opts?.flags ?? "r");
       }
-    });
+      const readLen = end !== void 0 ? Math.min(highWaterMark, end - position + 1) : highWaterMark;
+      if (readLen <= 0) {
+        finished = true;
+        await cleanup();
+        return { done: true };
+      }
+      const buffer = new Uint8Array(readLen);
+      const { bytesRead } = await handle.read(buffer, 0, readLen, position);
+      if (bytesRead === 0) {
+        finished = true;
+        await cleanup();
+        return { done: true };
+      }
+      position += bytesRead;
+      if (end !== void 0 && position > end) {
+        finished = true;
+        await cleanup();
+        return { done: false, value: buffer.subarray(0, bytesRead) };
+      }
+      return { done: false, value: buffer.subarray(0, bytesRead) };
+    };
+    const stream = new NodeReadable(readFn, cleanup);
+    stream.path = toPathString(filePath);
+    return stream;
   }
   createWriteStream(filePath, options) {
     const opts = typeof options === "string" ? { } : options;
     let position = opts?.start ?? 0;
     let handle = null;
-    return new WritableStream({
-      write: async (chunk) => {
-        if (!handle) {
-          handle = await this.promises.open(filePath, opts?.flags ?? "w");
-        }
-        const { bytesWritten } = await handle.write(chunk, 0, chunk.byteLength, position);
-        position += bytesWritten;
-      },
-      close: async () => {
-        if (handle) {
-          if (opts?.flush) {
-            await handle.sync();
-          }
-          await handle.close();
-          handle = null;
-        }
-      },
-      abort: async () => {
-        if (handle) {
-          await handle.close();
-          handle = null;
-        }
+    const writeFn = async (chunk) => {
+      if (!handle) {
+        handle = await this.promises.open(toPathString(filePath), opts?.flags ?? "w");
       }
-    });
+      const { bytesWritten } = await handle.write(chunk, 0, chunk.byteLength, position);
+      position += bytesWritten;
+    };
+    const closeFn = async () => {
+      if (handle) {
+        if (opts?.flush) {
+          await handle.sync();
+        }
+        await handle.close();
+        handle = null;
+      }
+    };
+    return new NodeWritable(toPathString(filePath), writeFn, closeFn);
   }
   // ---- Utility methods ----
   flushSync() {
@@ -2708,6 +3228,192 @@ var VFSFileSystem = class {
     }
     return this.readyPromise;
   }
+  readFile(filePath, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    this.promises.readFile(filePath, opts).then(
+      (result) => cb(null, result),
+      (err) => cb(err)
+    );
+  }
+  writeFile(filePath, data, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    this.promises.writeFile(filePath, data, opts).then(
+      () => cb(null),
+      (err) => cb(err)
+    );
+  }
+  appendFile(filePath, data, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    this.promises.appendFile(filePath, data, opts).then(
+      () => cb(null),
+      (err) => cb(err)
+    );
+  }
+  mkdir(filePath, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    this.promises.mkdir(filePath, opts).then(
+      (result) => cb(null, result),
+      (err) => cb(err)
+    );
+  }
+  rmdir(filePath, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    this.promises.rmdir(filePath, opts).then(
+      () => cb(null),
+      (err) => cb(err)
+    );
+  }
+  rm(filePath, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    this.promises.rm(filePath, opts).then(
+      () => cb(null),
+      (err) => cb(err)
+    );
+  }
+  unlink(filePath, callback) {
+    this.promises.unlink(filePath).then(
+      () => callback(null),
+      (err) => callback(err)
+    );
+  }
+  readdir(filePath, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    this.promises.readdir(filePath, opts).then(
+      (result) => cb(null, result),
+      (err) => cb(err)
+    );
+  }
+  stat(filePath, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    this.promises.stat(filePath, opts).then(
+      (result) => cb(null, result),
+      (err) => cb(err)
+    );
+  }
+  lstat(filePath, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    this.promises.lstat(filePath, opts).then(
+      (result) => cb(null, result),
+      (err) => cb(err)
+    );
+  }
+  access(filePath, modeOrCallback, callback) {
+    const cb = typeof modeOrCallback === "function" ? modeOrCallback : callback;
+    const mode = typeof modeOrCallback === "function" ? void 0 : modeOrCallback;
+    this.promises.access(filePath, mode).then(
+      () => cb(null),
+      (err) => cb(err)
+    );
+  }
+  rename(oldPath, newPath, callback) {
+    this.promises.rename(oldPath, newPath).then(
+      () => callback(null),
+      (err) => callback(err)
+    );
+  }
+  copyFile(src, dest, modeOrCallback, callback) {
+    const cb = typeof modeOrCallback === "function" ? modeOrCallback : callback;
+    const mode = typeof modeOrCallback === "function" ? void 0 : modeOrCallback;
+    this.promises.copyFile(src, dest, mode).then(
+      () => cb(null),
+      (err) => cb(err)
+    );
+  }
+  truncate(filePath, lenOrCallback, callback) {
+    const cb = typeof lenOrCallback === "function" ? lenOrCallback : callback;
+    const len = typeof lenOrCallback === "function" ? void 0 : lenOrCallback;
+    this.promises.truncate(filePath, len).then(
+      () => cb(null),
+      (err) => cb(err)
+    );
+  }
+  realpath(filePath, callback) {
+    this.promises.realpath(filePath).then(
+      (result) => callback(null, result),
+      (err) => callback(err)
+    );
+  }
+  chmod(filePath, mode, callback) {
+    this.promises.chmod(filePath, mode).then(
+      () => callback(null),
+      (err) => callback(err)
+    );
+  }
+  chown(filePath, uid, gid, callback) {
+    this.promises.chown(filePath, uid, gid).then(
+      () => callback(null),
+      (err) => callback(err)
+    );
+  }
+  utimes(filePath, atime, mtime, callback) {
+    this.promises.utimes(filePath, atime, mtime).then(
+      () => callback(null),
+      (err) => callback(err)
+    );
+  }
+  symlink(target, linkPath, typeOrCallback, callback) {
+    const cb = typeof typeOrCallback === "function" ? typeOrCallback : callback;
+    const type = typeof typeOrCallback === "function" ? void 0 : typeOrCallback;
+    this.promises.symlink(target, linkPath, type).then(
+      () => cb(null),
+      (err) => cb(err)
+    );
+  }
+  readlink(filePath, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    this.promises.readlink(filePath, opts).then(
+      (result) => cb(null, result),
+      (err) => cb(err)
+    );
+  }
+  link(existingPath, newPath, callback) {
+    this.promises.link(existingPath, newPath).then(
+      () => callback(null),
+      (err) => callback(err)
+    );
+  }
+  open(filePath, flags, modeOrCallback, callback) {
+    const cb = typeof modeOrCallback === "function" ? modeOrCallback : callback;
+    const mode = typeof modeOrCallback === "function" ? void 0 : modeOrCallback;
+    this.promises.open(filePath, flags, mode).then(
+      (handle) => cb(null, handle.fd),
+      (err) => cb(err)
+    );
+  }
+  mkdtemp(prefix, callback) {
+    this.promises.mkdtemp(prefix).then(
+      (result) => callback(null, result),
+      (err) => callback(err)
+    );
+  }
+  cp(src, dest, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    if (cb) {
+      this._cpAsync(src, dest, opts).then(
+        () => cb(null),
+        (err) => cb(err)
+      );
+      return;
+    }
+    return this._cpAsync(src, dest, opts);
+  }
+  exists(filePath, callback) {
+    this.promises.exists(filePath).then(
+      (result) => callback(result),
+      () => callback(false)
+    );
+  }
 };
 var VFSPromises = class {
   _async;
@@ -2717,135 +3423,160 @@ var VFSPromises = class {
     this._ns = ns;
   }
   readFile(filePath, options) {
-    return readFile(this._async, filePath, options);
+    return readFile(this._async, toPathString(filePath), options);
   }
   writeFile(filePath, data, options) {
-    return writeFile(this._async, filePath, data, options);
+    return writeFile(this._async, toPathString(filePath), data, options);
   }
   appendFile(filePath, data, options) {
-    return appendFile(this._async, filePath, data);
+    return appendFile(this._async, toPathString(filePath), data);
   }
   mkdir(filePath, options) {
-    return mkdir(this._async, filePath, options);
+    return mkdir(this._async, toPathString(filePath), options);
   }
   rmdir(filePath, options) {
-    return rmdir(this._async, filePath, options);
+    return rmdir(this._async, toPathString(filePath), options);
   }
   rm(filePath, options) {
-    return rm(this._async, filePath, options);
+    return rm(this._async, toPathString(filePath), options);
   }
   unlink(filePath) {
-    return unlink(this._async, filePath);
+    return unlink(this._async, toPathString(filePath));
   }
   readdir(filePath, options) {
-    return readdir(this._async, filePath, options);
+    return readdir(this._async, toPathString(filePath), options);
   }
   glob(pattern, options) {
     return glob(this._async, pattern, options);
   }
   stat(filePath, options) {
-    return stat(this._async, filePath, options);
+    return stat(this._async, toPathString(filePath), options);
   }
   lstat(filePath, options) {
-    return lstat(this._async, filePath, options);
+    return lstat(this._async, toPathString(filePath), options);
   }
   access(filePath, mode) {
-    return access(this._async, filePath, mode);
+    return access(this._async, toPathString(filePath), mode);
   }
   rename(oldPath, newPath) {
-    return rename(this._async, oldPath, newPath);
+    return rename(this._async, toPathString(oldPath), toPathString(newPath));
   }
   copyFile(src, dest, mode) {
-    return copyFile(this._async, src, dest, mode);
+    return copyFile(this._async, toPathString(src), toPathString(dest), mode);
   }
   async cp(src, dest, options) {
+    const srcPath = toPathString(src);
+    const destPath = toPathString(dest);
     const force = options?.force !== false;
     const errorOnExist = options?.errorOnExist ?? false;
     const dereference = options?.dereference ?? false;
     const preserveTimestamps = options?.preserveTimestamps ?? false;
-    const srcStat = dereference ? await this.stat(src) : await this.lstat(src);
+    const srcStat = dereference ? await this.stat(srcPath) : await this.lstat(srcPath);
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
-        throw createError("EISDIR", "cp", src);
+        throw createError("EISDIR", "cp", srcPath);
       }
       try {
-        await this.mkdir(dest, { recursive: true });
+        await this.mkdir(destPath, { recursive: true });
       } catch (e) {
         if (e.code !== "EEXIST") throw e;
       }
-      const entries = await this.readdir(src, { withFileTypes: true });
+      const entries = await this.readdir(srcPath, { withFileTypes: true });
       for (const entry of entries) {
-        const srcChild = join(src, entry.name);
-        const destChild = join(dest, entry.name);
+        const srcChild = join(srcPath, entry.name);
+        const destChild = join(destPath, entry.name);
         await this.cp(srcChild, destChild, options);
       }
     } else if (srcStat.isSymbolicLink() && !dereference) {
-      const target = await this.readlink(src);
+      const target = await this.readlink(srcPath);
       let destExists = false;
       try {
-        await this.lstat(dest);
+        await this.lstat(destPath);
         destExists = true;
       } catch {
       }
       if (destExists) {
-        if (errorOnExist) throw createError("EEXIST", "cp", dest);
+        if (errorOnExist) throw createError("EEXIST", "cp", destPath);
         if (!force) return;
-        await this.unlink(dest);
+        await this.unlink(destPath);
       }
-      await this.symlink(target, dest);
+      await this.symlink(target, destPath);
     } else {
       let destExists = false;
       try {
-        await this.lstat(dest);
+        await this.lstat(destPath);
         destExists = true;
       } catch {
       }
       if (destExists) {
-        if (errorOnExist) throw createError("EEXIST", "cp", dest);
+        if (errorOnExist) throw createError("EEXIST", "cp", destPath);
         if (!force) return;
       }
-      await this.copyFile(src, dest, errorOnExist ? constants.COPYFILE_EXCL : 0);
+      await this.copyFile(srcPath, destPath, errorOnExist ? constants.COPYFILE_EXCL : 0);
     }
     if (preserveTimestamps) {
-      const st = await this.stat(src);
-      await this.utimes(dest, st.atime, st.mtime);
+      const st = await this.stat(srcPath);
+      await this.utimes(destPath, st.atime, st.mtime);
     }
   }
   truncate(filePath, len) {
-    return truncate(this._async, filePath, len);
+    return truncate(this._async, toPathString(filePath), len);
   }
   realpath(filePath) {
-    return realpath(this._async, filePath);
+    return realpath(this._async, toPathString(filePath));
   }
   exists(filePath) {
-    return exists(this._async, filePath);
+    return exists(this._async, toPathString(filePath));
   }
   chmod(filePath, mode) {
+    return chmod(this._async, toPathString(filePath), mode);
+  }
+  /** Like chmod but operates on the symlink itself. In this VFS, delegates to chmod. */
+  lchmod(filePath, mode) {
     return chmod(this._async, filePath, mode);
   }
+  /** chmod on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
+  async fchmod(_fd, _mode) {
+  }
   chown(filePath, uid, gid) {
+    return chown(this._async, toPathString(filePath), uid, gid);
+  }
+  /** Like chown but operates on the symlink itself. In this VFS, delegates to chown. */
+  lchown(filePath, uid, gid) {
     return chown(this._async, filePath, uid, gid);
   }
+  /** chown on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
+  async fchown(_fd, _uid, _gid) {
+  }
   utimes(filePath, atime, mtime) {
+    return utimes(this._async, toPathString(filePath), atime, mtime);
+  }
+  /** Like utimes but operates on the symlink itself. In this VFS, delegates to utimes. */
+  lutimes(filePath, atime, mtime) {
     return utimes(this._async, filePath, atime, mtime);
   }
   symlink(target, linkPath, type) {
-    return symlink(this._async, target, linkPath);
+    return symlink(this._async, toPathString(target), toPathString(linkPath));
   }
   readlink(filePath, options) {
-    return readlink(this._async, filePath, options);
+    return readlink(this._async, toPathString(filePath), options);
   }
   link(existingPath, newPath) {
-    return link(this._async, existingPath, newPath);
+    return link(this._async, toPathString(existingPath), toPathString(newPath));
   }
   open(filePath, flags, mode) {
-    return open(this._async, filePath, flags);
+    return open(this._async, toPathString(filePath), flags);
   }
   opendir(filePath) {
-    return opendir(this._async, filePath);
+    return opendir(this._async, toPathString(filePath));
   }
   mkdtemp(prefix) {
     return mkdtemp(this._async, prefix);
+  }
+  async openAsBlob(filePath, options) {
+    const data = await this.readFile(filePath);
+    const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(data);
+    return new Blob([bytes], { type: options?.type ?? "" });
   }
   async statfs(path) {
     return {
@@ -3699,8 +4430,7 @@ var VFSEngine = class {
     const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
     this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
     this.commitPending();
-    const pathBytes = encoder10.encode(path);
-    return { status: 0, data: pathBytes };
+    return { status: 0, data: null };
   }
   mkdirRecursive(path) {
     const parts = path.split("/").filter(Boolean);
@@ -4545,6 +5275,6 @@ function init() {
   return getDefaultFS().init();
 }
 
-export { FSError, VFSFileSystem, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path_exports as path, repairVFS, statusToError, unpackToOPFS };
+export { FSError, NodeReadable, NodeWritable, SimpleEventEmitter, VFSFileSystem, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path_exports as path, repairVFS, statusToError, unpackToOPFS };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map

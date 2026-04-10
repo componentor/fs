@@ -14,8 +14,9 @@ import type {
   Encoding, ReadOptions, WriteOptions, MkdirOptions, RmdirOptions, RmOptions, CpOptions,
   ReaddirOptions, StatOptions, Stats, BigIntStats, StatFs, Dirent, VFSConfig, FSMode, FileHandle, GlobOptions,
   WatchOptions, WatchFileOptions, WatchEventType, FSWatcher, WatchListener, WatchFileListener,
-  ReadStreamOptions, WriteStreamOptions,
+  ReadStreamOptions, WriteStreamOptions, FSReadStream, FSWriteStream, OpenAsBlobOptions, PathLike,
 } from './types.js';
+import { NodeReadable, NodeWritable } from './node-streams.js';
 import type { SyncRequestFn, AsyncRequestFn } from './methods/context.js';
 import { SAB_OFFSETS, SIGNAL, OP, encodeRequest, decodeResponse } from './protocol/opcodes.js';
 
@@ -50,7 +51,7 @@ import {
 import { opendir as _opendir } from './methods/opendir.js';
 import { watch as _watch, watchFile as _watchFile, unwatchFile as _unwatchFile, watchAsync as _watchAsync } from './methods/watch.js';
 import { globSync as _globSync, glob as _glob } from './methods/glob.js';
-import { join as pathJoin } from './path.js';
+import { join as pathJoin, toPathString } from './path.js';
 import { createError } from './errors.js';
 import { constants } from './constants.js';
 
@@ -740,117 +741,114 @@ export class VFSFileSystem {
 
   // ========== Sync API ==========
 
-  readFileSync(filePath: string, options?: ReadOptions | Encoding | null): string | Uint8Array {
-    return _readFileSync(this._sync, filePath, options);
+  readFileSync(filePath: PathLike, options?: ReadOptions | Encoding | null): string | Uint8Array {
+    return _readFileSync(this._sync, toPathString(filePath), options);
   }
 
-  writeFileSync(filePath: string, data: string | Uint8Array, options?: WriteOptions | Encoding): void {
-    _writeFileSync(this._sync, filePath, data, options);
+  writeFileSync(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): void {
+    _writeFileSync(this._sync, toPathString(filePath), data, options);
   }
 
-  appendFileSync(filePath: string, data: string | Uint8Array, options?: WriteOptions | Encoding): void {
-    _appendFileSync(this._sync, filePath, data, options);
+  appendFileSync(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): void {
+    _appendFileSync(this._sync, toPathString(filePath), data, options);
   }
 
-  existsSync(filePath: string): boolean {
-    return _existsSync(this._sync, filePath);
+  existsSync(filePath: PathLike): boolean {
+    return _existsSync(this._sync, toPathString(filePath));
   }
 
-  mkdirSync(filePath: string, options?: MkdirOptions | number): string | undefined {
-    return _mkdirSync(this._sync, filePath, options);
+  mkdirSync(filePath: PathLike, options?: MkdirOptions | number): string | undefined {
+    return _mkdirSync(this._sync, toPathString(filePath), options);
   }
 
-  rmdirSync(filePath: string, options?: RmdirOptions): void {
-    _rmdirSync(this._sync, filePath, options);
+  rmdirSync(filePath: PathLike, options?: RmdirOptions): void {
+    _rmdirSync(this._sync, toPathString(filePath), options);
   }
 
-  rmSync(filePath: string, options?: RmOptions): void {
-    _rmSync(this._sync, filePath, options);
+  rmSync(filePath: PathLike, options?: RmOptions): void {
+    _rmSync(this._sync, toPathString(filePath), options);
   }
 
-  unlinkSync(filePath: string): void {
-    _unlinkSync(this._sync, filePath);
+  unlinkSync(filePath: PathLike): void {
+    _unlinkSync(this._sync, toPathString(filePath));
   }
 
-  readdirSync(filePath: string, options?: ReaddirOptions | Encoding | null): string[] | Dirent[] {
-    return _readdirSync(this._sync, filePath, options);
+  readdirSync(filePath: PathLike, options?: ReaddirOptions | Encoding | null): string[] | Dirent[] {
+    return _readdirSync(this._sync, toPathString(filePath), options);
   }
 
   globSync(pattern: string, options?: GlobOptions): string[] {
     return _globSync(this._sync, pattern, options);
   }
 
-  statSync(filePath: string, options?: StatOptions): Stats | BigIntStats {
-    return _statSync(this._sync, filePath, options);
+  statSync(filePath: PathLike, options?: StatOptions): Stats | BigIntStats {
+    return _statSync(this._sync, toPathString(filePath), options);
   }
 
-  lstatSync(filePath: string, options?: StatOptions): Stats | BigIntStats {
-    return _lstatSync(this._sync, filePath, options);
+  lstatSync(filePath: PathLike, options?: StatOptions): Stats | BigIntStats {
+    return _lstatSync(this._sync, toPathString(filePath), options);
   }
 
-  renameSync(oldPath: string, newPath: string): void {
-    _renameSync(this._sync, oldPath, newPath);
+  renameSync(oldPath: PathLike, newPath: PathLike): void {
+    _renameSync(this._sync, toPathString(oldPath), toPathString(newPath));
   }
 
-  copyFileSync(src: string, dest: string, mode?: number): void {
-    _copyFileSync(this._sync, src, dest, mode);
+  copyFileSync(src: PathLike, dest: PathLike, mode?: number): void {
+    _copyFileSync(this._sync, toPathString(src), toPathString(dest), mode);
   }
 
-  cpSync(src: string, dest: string, options?: CpOptions): void {
+  cpSync(src: PathLike, dest: PathLike, options?: CpOptions): void {
+    const srcPath = toPathString(src);
+    const destPath = toPathString(dest);
     const force = options?.force !== false;          // default true
     const errorOnExist = options?.errorOnExist ?? false;
     const dereference = options?.dereference ?? false;
     const preserveTimestamps = options?.preserveTimestamps ?? false;
 
-    const srcStat = dereference ? this.statSync(src) : this.lstatSync(src);
+    const srcStat = dereference ? this.statSync(srcPath) : this.lstatSync(srcPath);
 
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
-        throw createError('EISDIR', 'cp', src);
+        throw createError('EISDIR', 'cp', srcPath);
       }
-      // Create destination directory
       try {
-        this.mkdirSync(dest, { recursive: true });
+        this.mkdirSync(destPath, { recursive: true });
       } catch (e: any) {
         if (e.code !== 'EEXIST') throw e;
       }
-      // Copy each entry
-      const entries = this.readdirSync(src, { withFileTypes: true }) as Dirent[];
+      const entries = this.readdirSync(srcPath, { withFileTypes: true }) as Dirent[];
       for (const entry of entries) {
-        const srcChild = pathJoin(src, entry.name);
-        const destChild = pathJoin(dest, entry.name);
+        const srcChild = pathJoin(srcPath, entry.name);
+        const destChild = pathJoin(destPath, entry.name);
         this.cpSync(srcChild, destChild, options);
       }
     } else if (srcStat.isSymbolicLink() && !dereference) {
-      // Copy symlink itself
-      const target = this.readlinkSync(src) as string;
-      // Check if dest exists
+      const target = this.readlinkSync(srcPath) as string;
       let destExists = false;
-      try { this.lstatSync(dest); destExists = true; } catch {}
+      try { this.lstatSync(destPath); destExists = true; } catch {}
       if (destExists) {
-        if (errorOnExist) throw createError('EEXIST', 'cp', dest);
+        if (errorOnExist) throw createError('EEXIST', 'cp', destPath);
         if (!force) return;
-        this.unlinkSync(dest);
+        this.unlinkSync(destPath);
       }
-      this.symlinkSync(target, dest);
+      this.symlinkSync(target, destPath);
     } else {
-      // File (or dereferenced symlink)
       let destExists = false;
-      try { this.lstatSync(dest); destExists = true; } catch {}
+      try { this.lstatSync(destPath); destExists = true; } catch {}
       if (destExists) {
-        if (errorOnExist) throw createError('EEXIST', 'cp', dest);
+        if (errorOnExist) throw createError('EEXIST', 'cp', destPath);
         if (!force) return;
       }
-      this.copyFileSync(src, dest, errorOnExist ? constants.COPYFILE_EXCL : 0);
+      this.copyFileSync(srcPath, destPath, errorOnExist ? constants.COPYFILE_EXCL : 0);
     }
 
     if (preserveTimestamps) {
-      const st = this.statSync(src);
-      this.utimesSync(dest, st.atime, st.mtime);
+      const st = this.statSync(srcPath);
+      this.utimesSync(destPath, st.atime, st.mtime);
     }
   }
 
-  async cp(src: string, dest: string, options?: CpOptions): Promise<void> {
+  private async _cpAsync(src: string, dest: string, options?: CpOptions): Promise<void> {
     const force = options?.force !== false;
     const errorOnExist = options?.errorOnExist ?? false;
     const dereference = options?.dereference ?? false;
@@ -873,7 +871,7 @@ export class VFSFileSystem {
       for (const entry of entries) {
         const srcChild = pathJoin(src, entry.name);
         const destChild = pathJoin(dest, entry.name);
-        await this.cp(srcChild, destChild, options);
+        await this._cpAsync(srcChild, destChild, options);
       }
     } else if (srcStat.isSymbolicLink() && !dereference) {
       const target = await this.promises.readlink(src) as string;
@@ -901,40 +899,65 @@ export class VFSFileSystem {
     }
   }
 
-  truncateSync(filePath: string, len?: number): void {
-    _truncateSync(this._sync, filePath, len);
+  truncateSync(filePath: PathLike, len?: number): void {
+    _truncateSync(this._sync, toPathString(filePath), len);
   }
 
-  accessSync(filePath: string, mode?: number): void {
-    _accessSync(this._sync, filePath, mode);
+  accessSync(filePath: PathLike, mode?: number): void {
+    _accessSync(this._sync, toPathString(filePath), mode);
   }
 
-  realpathSync(filePath: string): string {
-    return _realpathSync(this._sync, filePath);
+  realpathSync(filePath: PathLike): string {
+    return _realpathSync(this._sync, toPathString(filePath));
   }
 
-  chmodSync(filePath: string, mode: number): void {
+  chmodSync(filePath: PathLike, mode: number): void {
+    _chmodSync(this._sync, toPathString(filePath), mode);
+  }
+
+  /** Like chmodSync but operates on the symlink itself. In this VFS, delegates to chmodSync. */
+  lchmodSync(filePath: string, mode: number): void {
     _chmodSync(this._sync, filePath, mode);
   }
 
-  chownSync(filePath: string, uid: number, gid: number): void {
+  /** chmod on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
+  fchmodSync(_fd: number, _mode: number): void {
+    // No-op: fd-based permission changes are not supported in this OPFS VFS.
+  }
+
+  chownSync(filePath: PathLike, uid: number, gid: number): void {
+    _chownSync(this._sync, toPathString(filePath), uid, gid);
+  }
+
+  /** Like chownSync but operates on the symlink itself. In this VFS, delegates to chownSync. */
+  lchownSync(filePath: string, uid: number, gid: number): void {
     _chownSync(this._sync, filePath, uid, gid);
   }
 
-  utimesSync(filePath: string, atime: Date | number, mtime: Date | number): void {
+  /** chown on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
+  fchownSync(_fd: number, _uid: number, _gid: number): void {
+    // No-op: fd-based permission changes are not supported in this OPFS VFS.
+  }
+
+  utimesSync(filePath: PathLike, atime: Date | number, mtime: Date | number): void {
+    _utimesSync(this._sync, toPathString(filePath), atime, mtime);
+  }
+
+  /** Like utimesSync but operates on the symlink itself. In this VFS, delegates to utimesSync. */
+  lutimesSync(filePath: string, atime: Date | number, mtime: Date | number): void {
     _utimesSync(this._sync, filePath, atime, mtime);
   }
 
-  symlinkSync(target: string, linkPath: string, type?: string | null): void {
-    _symlinkSync(this._sync, target, linkPath, type);
+  symlinkSync(target: PathLike, linkPath: PathLike, type?: string | null): void {
+    _symlinkSync(this._sync, toPathString(target), toPathString(linkPath), type);
   }
 
-  readlinkSync(filePath: string, options?: { encoding?: string | null } | string | null): string | Uint8Array {
-    return _readlinkSync(this._sync, filePath, options);
+  readlinkSync(filePath: PathLike, options?: { encoding?: string | null } | string | null): string | Uint8Array {
+    return _readlinkSync(this._sync, toPathString(filePath), options);
   }
 
-  linkSync(existingPath: string, newPath: string): void {
-    _linkSync(this._sync, existingPath, newPath);
+  linkSync(existingPath: PathLike, newPath: PathLike): void {
+    _linkSync(this._sync, toPathString(existingPath), toPathString(newPath));
   }
 
   mkdtempSync(prefix: string): string {
@@ -943,20 +966,32 @@ export class VFSFileSystem {
 
   // ---- File descriptor sync methods ----
 
-  openSync(filePath: string, flags: string | number = 'r', mode?: number): number {
-    return _openSync(this._sync, filePath, flags, mode);
+  openSync(filePath: PathLike, flags: string | number = 'r', mode?: number): number {
+    return _openSync(this._sync, toPathString(filePath), flags, mode);
   }
 
   closeSync(fd: number): void {
     _closeSync(this._sync, fd);
   }
 
-  readSync(fd: number, buffer: Uint8Array, offset = 0, length = buffer.byteLength, position: number | null = null): number {
-    return _readSync(this._sync, fd, buffer, offset, length, position);
+  readSync(
+    fd: number,
+    bufferOrOptions: Uint8Array | { buffer: Uint8Array; offset?: number; length?: number; position?: number | null },
+    offsetOrOptions?: number | { offset?: number; length?: number; position?: number | null },
+    length?: number,
+    position?: number | null
+  ): number {
+    return _readSync(this._sync, fd, bufferOrOptions, offsetOrOptions, length, position);
   }
 
-  writeSync(fd: number, bufferOrString: Uint8Array | string, offsetOrPosition?: number, lengthOrEncoding?: number | string, position?: number | null): number {
-    return _writeSyncFd(this._sync, fd, bufferOrString, offsetOrPosition, lengthOrEncoding, position);
+  writeSync(
+    fd: number,
+    bufferOrString: Uint8Array | string,
+    offsetOrPositionOrOptions?: number | { offset?: number; length?: number; position?: number | null },
+    lengthOrEncoding?: number | string,
+    position?: number | null
+  ): number {
+    return _writeSyncFd(this._sync, fd, bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position);
   }
 
   fstatSync(fd: number): Stats {
@@ -969,6 +1004,71 @@ export class VFSFileSystem {
 
   fdatasyncSync(fd: number): void {
     _fdatasyncSync(this._sync, fd);
+  }
+
+  // ---- Vector I/O methods ----
+
+  readvSync(fd: number, buffers: Uint8Array[], position?: number | null): number {
+    let totalRead = 0;
+    let pos = position ?? null;
+    for (const buf of buffers) {
+      const bytesRead = this.readSync(fd, buf, 0, buf.byteLength, pos);
+      totalRead += bytesRead;
+      if (pos !== null) pos += bytesRead;
+      if (bytesRead < buf.byteLength) break; // short read = EOF
+    }
+    return totalRead;
+  }
+
+  writevSync(fd: number, buffers: Uint8Array[], position?: number | null): number {
+    let totalWritten = 0;
+    let pos = position ?? null;
+    for (const buf of buffers) {
+      const bytesWritten = this.writeSync(fd, buf, 0, buf.byteLength, pos);
+      totalWritten += bytesWritten;
+      if (pos !== null) pos += bytesWritten;
+    }
+    return totalWritten;
+  }
+
+  readv(fd: number, buffers: Uint8Array[], position: number | null | undefined, callback: (err: Error | null, bytesRead?: number, buffers?: Uint8Array[]) => void): void;
+  readv(fd: number, buffers: Uint8Array[], callback: (err: Error | null, bytesRead?: number, buffers?: Uint8Array[]) => void): void;
+  readv(fd: number, buffers: Uint8Array[], positionOrCallback: number | null | undefined | ((err: Error | null, bytesRead?: number, buffers?: Uint8Array[]) => void), callback?: (err: Error | null, bytesRead?: number, buffers?: Uint8Array[]) => void): void {
+    let pos: number | null | undefined;
+    let cb: (err: Error | null, bytesRead?: number, buffers?: Uint8Array[]) => void;
+    if (typeof positionOrCallback === 'function') {
+      pos = undefined;
+      cb = positionOrCallback;
+    } else {
+      pos = positionOrCallback;
+      cb = callback!;
+    }
+    try {
+      const bytesRead = this.readvSync(fd, buffers, pos);
+      cb(null, bytesRead, buffers);
+    } catch (err: any) {
+      cb(err);
+    }
+  }
+
+  writev(fd: number, buffers: Uint8Array[], position: number | null | undefined, callback: (err: Error | null, bytesWritten?: number, buffers?: Uint8Array[]) => void): void;
+  writev(fd: number, buffers: Uint8Array[], callback: (err: Error | null, bytesWritten?: number, buffers?: Uint8Array[]) => void): void;
+  writev(fd: number, buffers: Uint8Array[], positionOrCallback: number | null | undefined | ((err: Error | null, bytesWritten?: number, buffers?: Uint8Array[]) => void), callback?: (err: Error | null, bytesWritten?: number, buffers?: Uint8Array[]) => void): void {
+    let pos: number | null | undefined;
+    let cb: (err: Error | null, bytesWritten?: number, buffers?: Uint8Array[]) => void;
+    if (typeof positionOrCallback === 'function') {
+      pos = undefined;
+      cb = positionOrCallback;
+    } else {
+      pos = positionOrCallback;
+      cb = callback!;
+    }
+    try {
+      const bytesWritten = this.writevSync(fd, buffers, pos);
+      cb(null, bytesWritten, buffers);
+    } catch (err: any) {
+      cb(err);
+    }
   }
 
   // ---- statfs methods ----
@@ -998,21 +1098,29 @@ export class VFSFileSystem {
 
   // ---- Watch methods ----
 
-  watch(filePath: string, options?: WatchOptions | Encoding, listener?: WatchListener): FSWatcher {
-    return _watch(this.ns, filePath, options, listener);
+  watch(filePath: PathLike, options?: WatchOptions | Encoding, listener?: WatchListener): FSWatcher {
+    return _watch(this.ns, toPathString(filePath), options, listener);
   }
 
-  watchFile(filePath: string, optionsOrListener?: WatchFileOptions | WatchFileListener, listener?: WatchFileListener): void {
-    _watchFile(this.ns, this._sync, filePath, optionsOrListener, listener);
+  watchFile(filePath: PathLike, optionsOrListener?: WatchFileOptions | WatchFileListener, listener?: WatchFileListener): void {
+    _watchFile(this.ns, this._sync, toPathString(filePath), optionsOrListener, listener);
   }
 
-  unwatchFile(filePath: string, listener?: WatchFileListener): void {
-    _unwatchFile(this.ns, filePath, listener);
+  unwatchFile(filePath: PathLike, listener?: WatchFileListener): void {
+    _unwatchFile(this.ns, toPathString(filePath), listener);
+  }
+
+  // ---- openAsBlob (Node.js 19+) ----
+
+  async openAsBlob(filePath: string, options?: OpenAsBlobOptions): Promise<Blob> {
+    const data = await this.promises.readFile(filePath);
+    const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(data as string);
+    return new Blob([bytes as BlobPart], { type: options?.type ?? '' });
   }
 
   // ---- Stream methods ----
 
-  createReadStream(filePath: string, options?: ReadStreamOptions | string): ReadableStream<Uint8Array> {
+  createReadStream(filePath: PathLike, options?: ReadStreamOptions | string): FSReadStream {
     const opts = typeof options === 'string' ? { encoding: options as Encoding } : options;
     const start = opts?.start ?? 0;
     const end = opts?.end;
@@ -1020,6 +1128,7 @@ export class VFSFileSystem {
 
     let position = start;
     let handle: import('./types.js').FileHandle | null = null;
+    let finished = false;
 
     const cleanup = async () => {
       if (handle) {
@@ -1028,80 +1137,74 @@ export class VFSFileSystem {
       }
     };
 
-    return new ReadableStream<Uint8Array>({
-      pull: async (controller) => {
-        try {
-          // Lazily open the file on first pull
-          if (!handle) {
-            handle = await this.promises.open(filePath, opts?.flags ?? 'r');
-          }
+    const readFn = async (): Promise<{ done: boolean; value?: Uint8Array }> => {
+      if (finished) return { done: true };
 
-          const readLen = end !== undefined
-            ? Math.min(highWaterMark, end - position + 1)
-            : highWaterMark;
+      // Lazily open the file on first read
+      if (!handle) {
+        handle = await this.promises.open(toPathString(filePath), opts?.flags ?? 'r');
+      }
 
-          if (readLen <= 0) {
-            await cleanup();
-            controller.close();
-            return;
-          }
+      const readLen = end !== undefined
+        ? Math.min(highWaterMark, end - position + 1)
+        : highWaterMark;
 
-          const buffer = new Uint8Array(readLen);
-          const { bytesRead } = await handle.read(buffer, 0, readLen, position);
-
-          if (bytesRead === 0) {
-            await cleanup();
-            controller.close();
-            return;
-          }
-
-          controller.enqueue(buffer.subarray(0, bytesRead));
-          position += bytesRead;
-
-          if (end !== undefined && position > end) {
-            await cleanup();
-            controller.close();
-          }
-        } catch (err) {
-          await cleanup();
-          controller.error(err);
-        }
-      },
-      cancel: async () => {
+      if (readLen <= 0) {
+        finished = true;
         await cleanup();
-      },
-    });
+        return { done: true };
+      }
+
+      const buffer = new Uint8Array(readLen);
+      const { bytesRead } = await handle.read(buffer, 0, readLen, position);
+
+      if (bytesRead === 0) {
+        finished = true;
+        await cleanup();
+        return { done: true };
+      }
+
+      position += bytesRead;
+
+      if (end !== undefined && position > end) {
+        finished = true;
+        await cleanup();
+        return { done: false, value: buffer.subarray(0, bytesRead) };
+      }
+
+      return { done: false, value: buffer.subarray(0, bytesRead) };
+    };
+
+    const stream = new NodeReadable(readFn, cleanup) as unknown as FSReadStream;
+    (stream as unknown as NodeReadable).path = toPathString(filePath);
+
+    return stream;
   }
 
-  createWriteStream(filePath: string, options?: WriteStreamOptions | string): WritableStream<Uint8Array> {
+  createWriteStream(filePath: PathLike, options?: WriteStreamOptions | string): FSWriteStream {
     const opts = typeof options === 'string' ? { encoding: options as Encoding } : options;
     let position = opts?.start ?? 0;
     let handle: FileHandle | null = null;
 
-    return new WritableStream<Uint8Array>({
-      write: async (chunk) => {
-        if (!handle) {
-          handle = await this.promises.open(filePath, opts?.flags ?? 'w');
+    const writeFn = async (chunk: Uint8Array): Promise<void> => {
+      if (!handle) {
+        handle = await this.promises.open(toPathString(filePath), opts?.flags ?? 'w');
+      }
+      const { bytesWritten } = await handle.write(chunk, 0, chunk.byteLength, position);
+      position += bytesWritten;
+    };
+
+    const closeFn = async (): Promise<void> => {
+      if (handle) {
+        if (opts?.flush) {
+          await handle.sync();
         }
-        const { bytesWritten } = await handle.write(chunk, 0, chunk.byteLength, position);
-        position += bytesWritten;
-      },
-      close: async () => {
-        if (handle) {
-          if (opts?.flush) {
-            await handle.sync();
-          }
-          await handle.close();
-          handle = null;
-        }
-      },
-      abort: async () => {
-        if (handle) {
-          await handle.close();
-          handle = null;
-        }
-      },
-    });
+        await handle.close();
+        handle = null;
+      }
+    };
+
+    return new NodeWritable(toPathString(filePath), writeFn, closeFn) as unknown as FSWriteStream;
   }
 
   // ---- Utility methods ----
@@ -1227,6 +1330,254 @@ export class VFSFileSystem {
 
     return this.readyPromise;
   }
+
+  // ========== Callback API ==========
+  // Node.js-style callback overloads for all async operations.
+  // These delegate to this.promises.* and adapt the result to (err, result) callbacks.
+
+  readFile(filePath: string, callback: (err: Error | null, data?: Uint8Array | string) => void): void;
+  readFile(filePath: string, options: ReadOptions | Encoding | null, callback: (err: Error | null, data?: Uint8Array | string) => void): void;
+  readFile(filePath: string, optionsOrCallback?: any, callback?: any): void {
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    this.promises.readFile(filePath, opts).then(
+      (result) => cb(null, result),
+      (err) => cb(err),
+    );
+  }
+
+  writeFile(filePath: string, data: string | Uint8Array, callback: (err: Error | null) => void): void;
+  writeFile(filePath: string, data: string | Uint8Array, options: WriteOptions | Encoding, callback: (err: Error | null) => void): void;
+  writeFile(filePath: string, data: string | Uint8Array, optionsOrCallback?: any, callback?: any): void {
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    this.promises.writeFile(filePath, data, opts).then(
+      () => cb(null),
+      (err) => cb(err),
+    );
+  }
+
+  appendFile(filePath: string, data: string | Uint8Array, callback: (err: Error | null) => void): void;
+  appendFile(filePath: string, data: string | Uint8Array, options: WriteOptions | Encoding, callback: (err: Error | null) => void): void;
+  appendFile(filePath: string, data: string | Uint8Array, optionsOrCallback?: any, callback?: any): void {
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    this.promises.appendFile(filePath, data, opts).then(
+      () => cb(null),
+      (err) => cb(err),
+    );
+  }
+
+  mkdir(filePath: string, callback: (err: Error | null, path?: string) => void): void;
+  mkdir(filePath: string, options: MkdirOptions | number, callback: (err: Error | null, path?: string) => void): void;
+  mkdir(filePath: string, optionsOrCallback?: any, callback?: any): void {
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    this.promises.mkdir(filePath, opts).then(
+      (result) => cb(null, result),
+      (err) => cb(err),
+    );
+  }
+
+  rmdir(filePath: string, callback: (err: Error | null) => void): void;
+  rmdir(filePath: string, options: RmdirOptions, callback: (err: Error | null) => void): void;
+  rmdir(filePath: string, optionsOrCallback?: any, callback?: any): void {
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    this.promises.rmdir(filePath, opts).then(
+      () => cb(null),
+      (err) => cb(err),
+    );
+  }
+
+  rm(filePath: string, callback: (err: Error | null) => void): void;
+  rm(filePath: string, options: RmOptions, callback: (err: Error | null) => void): void;
+  rm(filePath: string, optionsOrCallback?: any, callback?: any): void {
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    this.promises.rm(filePath, opts).then(
+      () => cb(null),
+      (err) => cb(err),
+    );
+  }
+
+  unlink(filePath: string, callback: (err: Error | null) => void): void {
+    this.promises.unlink(filePath).then(
+      () => callback(null),
+      (err) => callback(err),
+    );
+  }
+
+  readdir(filePath: string, callback: (err: Error | null, files?: string[] | Dirent[]) => void): void;
+  readdir(filePath: string, options: ReaddirOptions | Encoding | null, callback: (err: Error | null, files?: string[] | Dirent[]) => void): void;
+  readdir(filePath: string, optionsOrCallback?: any, callback?: any): void {
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    this.promises.readdir(filePath, opts).then(
+      (result) => cb(null, result),
+      (err) => cb(err),
+    );
+  }
+
+  stat(filePath: string, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
+  stat(filePath: string, options: StatOptions, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
+  stat(filePath: string, optionsOrCallback?: any, callback?: any): void {
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    this.promises.stat(filePath, opts).then(
+      (result) => cb(null, result),
+      (err) => cb(err),
+    );
+  }
+
+  lstat(filePath: string, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
+  lstat(filePath: string, options: StatOptions, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
+  lstat(filePath: string, optionsOrCallback?: any, callback?: any): void {
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    this.promises.lstat(filePath, opts).then(
+      (result) => cb(null, result),
+      (err) => cb(err),
+    );
+  }
+
+  access(filePath: string, callback: (err: Error | null) => void): void;
+  access(filePath: string, mode: number, callback: (err: Error | null) => void): void;
+  access(filePath: string, modeOrCallback?: any, callback?: any): void {
+    const cb = typeof modeOrCallback === 'function' ? modeOrCallback : callback;
+    const mode = typeof modeOrCallback === 'function' ? undefined : modeOrCallback;
+    this.promises.access(filePath, mode).then(
+      () => cb(null),
+      (err) => cb(err),
+    );
+  }
+
+  rename(oldPath: string, newPath: string, callback: (err: Error | null) => void): void {
+    this.promises.rename(oldPath, newPath).then(
+      () => callback(null),
+      (err) => callback(err),
+    );
+  }
+
+  copyFile(src: string, dest: string, callback: (err: Error | null) => void): void;
+  copyFile(src: string, dest: string, mode: number, callback: (err: Error | null) => void): void;
+  copyFile(src: string, dest: string, modeOrCallback?: any, callback?: any): void {
+    const cb = typeof modeOrCallback === 'function' ? modeOrCallback : callback;
+    const mode = typeof modeOrCallback === 'function' ? undefined : modeOrCallback;
+    this.promises.copyFile(src, dest, mode).then(
+      () => cb(null),
+      (err) => cb(err),
+    );
+  }
+
+  truncate(filePath: string, callback: (err: Error | null) => void): void;
+  truncate(filePath: string, len: number, callback: (err: Error | null) => void): void;
+  truncate(filePath: string, lenOrCallback?: any, callback?: any): void {
+    const cb = typeof lenOrCallback === 'function' ? lenOrCallback : callback;
+    const len = typeof lenOrCallback === 'function' ? undefined : lenOrCallback;
+    this.promises.truncate(filePath, len).then(
+      () => cb(null),
+      (err) => cb(err),
+    );
+  }
+
+  realpath(filePath: string, callback: (err: Error | null, resolvedPath?: string) => void): void {
+    this.promises.realpath(filePath).then(
+      (result) => callback(null, result),
+      (err) => callback(err),
+    );
+  }
+
+  chmod(filePath: string, mode: number, callback: (err: Error | null) => void): void {
+    this.promises.chmod(filePath, mode).then(
+      () => callback(null),
+      (err) => callback(err),
+    );
+  }
+
+  chown(filePath: string, uid: number, gid: number, callback: (err: Error | null) => void): void {
+    this.promises.chown(filePath, uid, gid).then(
+      () => callback(null),
+      (err) => callback(err),
+    );
+  }
+
+  utimes(filePath: string, atime: Date | number, mtime: Date | number, callback: (err: Error | null) => void): void {
+    this.promises.utimes(filePath, atime, mtime).then(
+      () => callback(null),
+      (err) => callback(err),
+    );
+  }
+
+  symlink(target: string, linkPath: string, callback: (err: Error | null) => void): void;
+  symlink(target: string, linkPath: string, type: string | null, callback: (err: Error | null) => void): void;
+  symlink(target: string, linkPath: string, typeOrCallback?: any, callback?: any): void {
+    const cb = typeof typeOrCallback === 'function' ? typeOrCallback : callback;
+    const type = typeof typeOrCallback === 'function' ? undefined : typeOrCallback;
+    this.promises.symlink(target, linkPath, type).then(
+      () => cb(null),
+      (err) => cb(err),
+    );
+  }
+
+  readlink(filePath: string, callback: (err: Error | null, linkString?: string | Uint8Array) => void): void;
+  readlink(filePath: string, options: { encoding?: string | null } | string | null, callback: (err: Error | null, linkString?: string | Uint8Array) => void): void;
+  readlink(filePath: string, optionsOrCallback?: any, callback?: any): void {
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    this.promises.readlink(filePath, opts).then(
+      (result) => cb(null, result),
+      (err) => cb(err),
+    );
+  }
+
+  link(existingPath: string, newPath: string, callback: (err: Error | null) => void): void {
+    this.promises.link(existingPath, newPath).then(
+      () => callback(null),
+      (err) => callback(err),
+    );
+  }
+
+  open(filePath: string, flags: string | number, callback: (err: Error | null, fd?: number) => void): void;
+  open(filePath: string, flags: string | number, mode: number, callback: (err: Error | null, fd?: number) => void): void;
+  open(filePath: string, flags: string | number, modeOrCallback?: any, callback?: any): void {
+    const cb = typeof modeOrCallback === 'function' ? modeOrCallback : callback;
+    const mode = typeof modeOrCallback === 'function' ? undefined : modeOrCallback;
+    this.promises.open(filePath, flags, mode).then(
+      (handle) => cb(null, handle.fd),
+      (err) => cb(err),
+    );
+  }
+
+  mkdtemp(prefix: string, callback: (err: Error | null, folder?: string) => void): void {
+    this.promises.mkdtemp(prefix).then(
+      (result) => callback(null, result),
+      (err) => callback(err),
+    );
+  }
+
+  cp(src: string, dest: string, callback: (err: Error | null) => void): void;
+  cp(src: string, dest: string, options: CpOptions, callback: (err: Error | null) => void): void;
+  cp(src: string, dest: string, optionsOrCallback?: any, callback?: any): void | Promise<void> {
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    if (cb) {
+      this._cpAsync(src, dest, opts).then(
+        () => cb(null),
+        (err) => cb(err),
+      );
+      return;
+    }
+    // No callback — return promise for backward compat
+    return this._cpAsync(src, dest, opts);
+  }
+
+  exists(filePath: string, callback: (exists: boolean) => void): void {
+    this.promises.exists(filePath).then(
+      (result) => callback(result),
+      () => callback(false),
+    );
+  }
 }
 
 // ========== Promises API ==========
@@ -1240,159 +1591,192 @@ class VFSPromises {
     this._ns = ns;
   }
 
-  readFile(filePath: string, options?: ReadOptions | Encoding | null) {
-    return _readFile(this._async, filePath, options);
+  readFile(filePath: PathLike, options?: ReadOptions | Encoding | null) {
+    return _readFile(this._async, toPathString(filePath), options);
   }
 
-  writeFile(filePath: string, data: string | Uint8Array, options?: WriteOptions | Encoding) {
-    return _writeFile(this._async, filePath, data, options);
+  writeFile(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding) {
+    return _writeFile(this._async, toPathString(filePath), data, options);
   }
 
-  appendFile(filePath: string, data: string | Uint8Array, options?: WriteOptions | Encoding) {
-    return _appendFile(this._async, filePath, data, options);
+  appendFile(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding) {
+    return _appendFile(this._async, toPathString(filePath), data, options);
   }
 
-  mkdir(filePath: string, options?: MkdirOptions | number) {
-    return _mkdir(this._async, filePath, options);
+  mkdir(filePath: PathLike, options?: MkdirOptions | number) {
+    return _mkdir(this._async, toPathString(filePath), options);
   }
 
-  rmdir(filePath: string, options?: RmdirOptions) {
-    return _rmdir(this._async, filePath, options);
+  rmdir(filePath: PathLike, options?: RmdirOptions) {
+    return _rmdir(this._async, toPathString(filePath), options);
   }
 
-  rm(filePath: string, options?: RmOptions) {
-    return _rm(this._async, filePath, options);
+  rm(filePath: PathLike, options?: RmOptions) {
+    return _rm(this._async, toPathString(filePath), options);
   }
 
-  unlink(filePath: string) {
-    return _unlink(this._async, filePath);
+  unlink(filePath: PathLike) {
+    return _unlink(this._async, toPathString(filePath));
   }
 
-  readdir(filePath: string, options?: ReaddirOptions | Encoding | null) {
-    return _readdir(this._async, filePath, options);
+  readdir(filePath: PathLike, options?: ReaddirOptions | Encoding | null) {
+    return _readdir(this._async, toPathString(filePath), options);
   }
 
   glob(pattern: string, options?: GlobOptions): Promise<string[]> {
     return _glob(this._async, pattern, options);
   }
 
-  stat(filePath: string, options?: StatOptions) {
-    return _stat(this._async, filePath, options);
+  stat(filePath: PathLike, options?: StatOptions) {
+    return _stat(this._async, toPathString(filePath), options);
   }
 
-  lstat(filePath: string, options?: StatOptions) {
-    return _lstat(this._async, filePath, options);
+  lstat(filePath: PathLike, options?: StatOptions) {
+    return _lstat(this._async, toPathString(filePath), options);
   }
 
-  access(filePath: string, mode?: number) {
-    return _access(this._async, filePath, mode);
+  access(filePath: PathLike, mode?: number) {
+    return _access(this._async, toPathString(filePath), mode);
   }
 
-  rename(oldPath: string, newPath: string) {
-    return _rename(this._async, oldPath, newPath);
+  rename(oldPath: PathLike, newPath: PathLike) {
+    return _rename(this._async, toPathString(oldPath), toPathString(newPath));
   }
 
-  copyFile(src: string, dest: string, mode?: number) {
-    return _copyFile(this._async, src, dest, mode);
+  copyFile(src: PathLike, dest: PathLike, mode?: number) {
+    return _copyFile(this._async, toPathString(src), toPathString(dest), mode);
   }
 
-  async cp(src: string, dest: string, options?: CpOptions): Promise<void> {
+  async cp(src: PathLike, dest: PathLike, options?: CpOptions): Promise<void> {
+    const srcPath = toPathString(src);
+    const destPath = toPathString(dest);
     const force = options?.force !== false;
     const errorOnExist = options?.errorOnExist ?? false;
     const dereference = options?.dereference ?? false;
     const preserveTimestamps = options?.preserveTimestamps ?? false;
 
     const srcStat = dereference
-      ? await this.stat(src)
-      : await this.lstat(src);
+      ? await this.stat(srcPath)
+      : await this.lstat(srcPath);
 
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
-        throw createError('EISDIR', 'cp', src);
+        throw createError('EISDIR', 'cp', srcPath);
       }
       try {
-        await this.mkdir(dest, { recursive: true });
+        await this.mkdir(destPath, { recursive: true });
       } catch (e: any) {
         if (e.code !== 'EEXIST') throw e;
       }
-      const entries = await this.readdir(src, { withFileTypes: true }) as Dirent[];
+      const entries = await this.readdir(srcPath, { withFileTypes: true }) as Dirent[];
       for (const entry of entries) {
-        const srcChild = pathJoin(src, entry.name);
-        const destChild = pathJoin(dest, entry.name);
+        const srcChild = pathJoin(srcPath, entry.name);
+        const destChild = pathJoin(destPath, entry.name);
         await this.cp(srcChild, destChild, options);
       }
     } else if (srcStat.isSymbolicLink() && !dereference) {
-      const target = await this.readlink(src) as string;
+      const target = await this.readlink(srcPath) as string;
       let destExists = false;
-      try { await this.lstat(dest); destExists = true; } catch {}
+      try { await this.lstat(destPath); destExists = true; } catch {}
       if (destExists) {
-        if (errorOnExist) throw createError('EEXIST', 'cp', dest);
+        if (errorOnExist) throw createError('EEXIST', 'cp', destPath);
         if (!force) return;
-        await this.unlink(dest);
+        await this.unlink(destPath);
       }
-      await this.symlink(target, dest);
+      await this.symlink(target, destPath);
     } else {
       let destExists = false;
-      try { await this.lstat(dest); destExists = true; } catch {}
+      try { await this.lstat(destPath); destExists = true; } catch {}
       if (destExists) {
-        if (errorOnExist) throw createError('EEXIST', 'cp', dest);
+        if (errorOnExist) throw createError('EEXIST', 'cp', destPath);
         if (!force) return;
       }
-      await this.copyFile(src, dest, errorOnExist ? constants.COPYFILE_EXCL : 0);
+      await this.copyFile(srcPath, destPath, errorOnExist ? constants.COPYFILE_EXCL : 0);
     }
 
     if (preserveTimestamps) {
-      const st = await this.stat(src);
-      await this.utimes(dest, st.atime, st.mtime);
+      const st = await this.stat(srcPath);
+      await this.utimes(destPath, st.atime, st.mtime);
     }
   }
 
-  truncate(filePath: string, len?: number) {
-    return _truncate(this._async, filePath, len);
+  truncate(filePath: PathLike, len?: number) {
+    return _truncate(this._async, toPathString(filePath), len);
   }
 
-  realpath(filePath: string) {
-    return _realpath(this._async, filePath);
+  realpath(filePath: PathLike) {
+    return _realpath(this._async, toPathString(filePath));
   }
 
-  exists(filePath: string) {
-    return _exists(this._async, filePath);
+  exists(filePath: PathLike) {
+    return _exists(this._async, toPathString(filePath));
   }
 
-  chmod(filePath: string, mode: number) {
+  chmod(filePath: PathLike, mode: number) {
+    return _chmod(this._async, toPathString(filePath), mode);
+  }
+
+  /** Like chmod but operates on the symlink itself. In this VFS, delegates to chmod. */
+  lchmod(filePath: string, mode: number) {
     return _chmod(this._async, filePath, mode);
   }
 
-  chown(filePath: string, uid: number, gid: number) {
+  /** chmod on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
+  async fchmod(_fd: number, _mode: number): Promise<void> {
+    // No-op: fd-based permission changes are not supported in this OPFS VFS.
+  }
+
+  chown(filePath: PathLike, uid: number, gid: number) {
+    return _chown(this._async, toPathString(filePath), uid, gid);
+  }
+
+  /** Like chown but operates on the symlink itself. In this VFS, delegates to chown. */
+  lchown(filePath: string, uid: number, gid: number) {
     return _chown(this._async, filePath, uid, gid);
   }
 
-  utimes(filePath: string, atime: Date | number, mtime: Date | number) {
+  /** chown on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
+  async fchown(_fd: number, _uid: number, _gid: number): Promise<void> {
+    // No-op: fd-based permission changes are not supported in this OPFS VFS.
+  }
+
+  utimes(filePath: PathLike, atime: Date | number, mtime: Date | number) {
+    return _utimes(this._async, toPathString(filePath), atime, mtime);
+  }
+
+  /** Like utimes but operates on the symlink itself. In this VFS, delegates to utimes. */
+  lutimes(filePath: string, atime: Date | number, mtime: Date | number) {
     return _utimes(this._async, filePath, atime, mtime);
   }
 
-  symlink(target: string, linkPath: string, type?: string | null) {
-    return _symlink(this._async, target, linkPath, type);
+  symlink(target: PathLike, linkPath: PathLike, type?: string | null) {
+    return _symlink(this._async, toPathString(target), toPathString(linkPath), type);
   }
 
-  readlink(filePath: string, options?: { encoding?: string | null } | string | null) {
-    return _readlink(this._async, filePath, options);
+  readlink(filePath: PathLike, options?: { encoding?: string | null } | string | null) {
+    return _readlink(this._async, toPathString(filePath), options);
   }
 
-  link(existingPath: string, newPath: string) {
-    return _link(this._async, existingPath, newPath);
+  link(existingPath: PathLike, newPath: PathLike) {
+    return _link(this._async, toPathString(existingPath), toPathString(newPath));
   }
 
-  open(filePath: string, flags?: string | number, mode?: number) {
-    return _open(this._async, filePath, flags, mode);
+  open(filePath: PathLike, flags?: string | number, mode?: number) {
+    return _open(this._async, toPathString(filePath), flags, mode);
   }
 
-  opendir(filePath: string) {
-    return _opendir(this._async, filePath);
+  opendir(filePath: PathLike) {
+    return _opendir(this._async, toPathString(filePath));
   }
 
   mkdtemp(prefix: string) {
     return _mkdtemp(this._async, prefix);
+  }
+
+  async openAsBlob(filePath: string, options?: OpenAsBlobOptions): Promise<Blob> {
+    const data = await this.readFile(filePath);
+    const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(data as string);
+    return new Blob([bytes as BlobPart], { type: options?.type ?? '' });
   }
 
   async statfs(path: string): Promise<StatFs> {

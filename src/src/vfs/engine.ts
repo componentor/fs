@@ -1142,9 +1142,8 @@ export class VFSEngine {
     this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
 
     this.commitPending();
-    // Return created path as data
-    const pathBytes = encoder.encode(path);
-    return { status: 0, data: pathBytes };
+    // Non-recursive mkdir returns undefined (null data) per Node.js spec
+    return { status: 0, data: null };
   }
 
   private mkdirRecursive(path: string): { status: number; data: Uint8Array | null } {

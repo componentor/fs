@@ -16,6 +16,10 @@ export function writeFileSync(
   const opts = typeof options === 'string' ? { encoding: options } : options;
   const encoded = typeof data === 'string' ? (opts?.encoding ? encodeString(data, opts.encoding) : encoder.encode(data)) : data;
   const flag = opts?.flag;
+  const signal = opts?.signal;
+  if (signal?.aborted) {
+    throw new DOMException('The operation was aborted', 'AbortError');
+  }
 
   // Fast path: default flag or no flag specified
   if (!flag || flag === 'w') {
@@ -44,11 +48,16 @@ export async function writeFile(
   const opts = typeof options === 'string' ? { encoding: options } : options;
   const encoded = typeof data === 'string' ? (opts?.encoding ? encodeString(data, opts.encoding) : encoder.encode(data)) : data;
   const flag = opts?.flag;
+  const signal = opts?.signal;
+  if (signal?.aborted) {
+    throw new DOMException('The operation was aborted', 'AbortError');
+  }
 
   // Fast path: default flag or no flag specified
   if (!flag || flag === 'w') {
     const flags = opts?.flush === true ? 1 : 0;
     const { status } = await asyncRequest(OP.WRITE, filePath, flags, encoded);
+    if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
     if (status !== 0) throw statusToError(status, 'write', filePath);
     return;
   }
@@ -57,6 +66,7 @@ export async function writeFile(
   const handle = await open(asyncRequest, filePath, flag);
   try {
     await handle.writeFile(encoded);
+    if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
   } finally {
     await handle.close();
   }

@@ -22,7 +22,13 @@ export const constants = {
   O_EXCL: 128,
   O_TRUNC: 512,
   O_APPEND: 1024,
+  O_NOCTTY: 256,
+  O_NONBLOCK: 2048,
   O_SYNC: 4096,
+  O_DSYNC: 4096,
+  O_DIRECTORY: 65536,
+  O_NOFOLLOW: 131072,
+  O_NOATIME: 262144,
 
   // File type constants
   S_IFMT: 0o170000,

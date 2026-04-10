@@ -14,6 +14,10 @@ export function readFileSync(
 ): string | Uint8Array {
   const encoding = typeof options === 'string' ? options : options?.encoding;
   const flag = typeof options === 'string' ? undefined : options?.flag;
+  const signal = typeof options === 'string' ? undefined : options?.signal;
+  if (signal?.aborted) {
+    throw new DOMException('The operation was aborted', 'AbortError');
+  }
 
   // Fast path: default flag or no flag specified
   if (!flag || flag === 'r') {
@@ -67,10 +71,15 @@ export async function readFile(
 ): Promise<string | Uint8Array> {
   const encoding = typeof options === 'string' ? options : options?.encoding;
   const flag = typeof options === 'string' ? undefined : options?.flag;
+  const signal = typeof options === 'string' ? undefined : options?.signal;
+  if (signal?.aborted) {
+    throw new DOMException('The operation was aborted', 'AbortError');
+  }
 
   // Fast path: default flag or no flag specified
   if (!flag || flag === 'r') {
     const { status, data } = await asyncRequest(OP.READ, filePath);
+    if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
     if (status !== 0) throw statusToError(status, 'read', filePath);
     const result = data ?? new Uint8Array(0);
     if (encoding) return decodeBuffer(result, encoding);
@@ -81,6 +90,7 @@ export async function readFile(
   const handle = await open(asyncRequest, filePath, flag);
   try {
     const result = await handle.readFile(encoding ? encoding : undefined);
+    if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
     return result;
   } finally {
     await handle.close();
