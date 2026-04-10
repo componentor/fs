@@ -74,16 +74,30 @@ export function readSync(
 export function writeSyncFd(
   syncRequest: SyncRequestFn,
   fd: number,
-  buffer: Uint8Array,
-  offset: number = 0,
-  length: number = buffer.byteLength,
-  position: number | null = null
+  bufferOrString: Uint8Array | string,
+  offsetOrPosition?: number,
+  lengthOrEncoding?: number | string,
+  position?: number | null
 ): number {
-  const writeData = buffer.subarray(offset, offset + length);
+  let writeData: Uint8Array;
+  let pos: number | null;
+
+  if (typeof bufferOrString === 'string') {
+    // writeSync(fd, string, position?, encoding?)
+    writeData = encoder.encode(bufferOrString);
+    pos = (offsetOrPosition != null) ? offsetOrPosition : null;
+    // lengthOrEncoding is encoding (ignored — always utf-8)
+  } else {
+    // writeSync(fd, buffer, offset?, length?, position?)
+    const offset = offsetOrPosition ?? 0;
+    const length = lengthOrEncoding != null ? lengthOrEncoding as number : bufferOrString.byteLength;
+    pos = position ?? null;
+    writeData = bufferOrString.subarray(offset, offset + length);
+  }
   const fdBuf = new Uint8Array(8 + writeData.byteLength);
   const dv = new DataView(fdBuf.buffer);
   dv.setUint32(0, fd, true);
-  dv.setInt32(4, position ?? -1, true);
+  dv.setInt32(4, pos ?? -1, true);
   fdBuf.set(writeData, 8);
   const buf = encodeRequest(OP.FWRITE, '', 0, fdBuf);
   const { status, data } = syncRequest(buf);
@@ -153,12 +167,27 @@ function createFileHandle(fd: number, asyncRequest: AsyncRequestFn): FileHandle 
       return { bytesRead, buffer };
     },
 
-    async write(buffer: Uint8Array, offset = 0, length = buffer.byteLength, position: number | null = null) {
-      const writeData = buffer.subarray(offset, offset + length);
-      const { status, data } = await asyncRequest(OP.FWRITE, '', 0, null, undefined, { fd, data: writeData, position: position ?? -1 });
+    async write(bufferOrString: Uint8Array | string, offsetOrPosition?: number, lengthOrEncoding?: number | string, position?: number | null) {
+      let writeData: Uint8Array;
+      let pos: number;
+      let resultBuffer: Uint8Array;
+
+      if (typeof bufferOrString === 'string') {
+        resultBuffer = encoder.encode(bufferOrString);
+        writeData = resultBuffer;
+        pos = (offsetOrPosition != null) ? offsetOrPosition : -1;
+      } else {
+        resultBuffer = bufferOrString;
+        const offset = offsetOrPosition ?? 0;
+        const length = lengthOrEncoding != null ? lengthOrEncoding as number : bufferOrString.byteLength;
+        pos = (position != null) ? position : -1;
+        writeData = bufferOrString.subarray(offset, offset + length);
+      }
+
+      const { status, data } = await asyncRequest(OP.FWRITE, '', 0, null, undefined, { fd, data: writeData, position: pos });
       if (status !== 0) throw statusToError(status, 'write', String(fd));
       const bytesWritten = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      return { bytesWritten, buffer };
+      return { bytesWritten, buffer: resultBuffer };
     },
 
     async readFile(options?: ReadOptions | Encoding | null) {
