@@ -12,7 +12,7 @@
 
 import type {
   Encoding, ReadOptions, WriteOptions, MkdirOptions, RmdirOptions, RmOptions,
-  ReaddirOptions, Stats, Dirent, VFSConfig, FSMode,
+  ReaddirOptions, Stats, Dirent, VFSConfig, FSMode, FileHandle,
   WatchOptions, WatchFileOptions, WatchEventType, FSWatcher, WatchListener, WatchFileListener,
   ReadStreamOptions, WriteStreamOptions,
 } from './types.js';
@@ -938,23 +938,29 @@ export class VFSFileSystem {
   createWriteStream(filePath: string, options?: WriteStreamOptions | string): WritableStream<Uint8Array> {
     const opts = typeof options === 'string' ? { encoding: options as Encoding } : options;
     let position = opts?.start ?? 0;
-    let initialized = false;
+    let handle: FileHandle | null = null;
 
     return new WritableStream<Uint8Array>({
       write: async (chunk) => {
-        if (!initialized) {
-          // Truncate file on first write (unless appending)
-          if (opts?.flags !== 'a' && opts?.flags !== 'a+') {
-            await this.promises.writeFile(filePath, new Uint8Array(0));
-          }
-          initialized = true;
+        if (!handle) {
+          handle = await this.promises.open(filePath, opts?.flags ?? 'w');
         }
-        await this.promises.appendFile(filePath, chunk);
-        position += chunk.byteLength;
+        const { bytesWritten } = await handle.write(chunk, 0, chunk.byteLength, position);
+        position += bytesWritten;
       },
       close: async () => {
-        if (opts?.flush) {
-          await this.promises.flush();
+        if (handle) {
+          if (opts?.flush) {
+            await handle.sync();
+          }
+          await handle.close();
+          handle = null;
+        }
+      },
+      abort: async () => {
+        if (handle) {
+          await handle.close();
+          handle = null;
         }
       },
     });
