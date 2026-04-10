@@ -14,7 +14,7 @@ function readdirBaseSync(
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'readdir', filePath);
   if (!data) return [];
-  return withFileTypes ? decodeDirents(data) : decodeNames(data);
+  return withFileTypes ? decodeDirents(data, filePath) : decodeNames(data);
 }
 
 async function readdirBaseAsync(
@@ -26,7 +26,7 @@ async function readdirBaseAsync(
   const { status, data } = await asyncRequest(OP.READDIR, filePath, flags);
   if (status !== 0) throw statusToError(status, 'readdir', filePath);
   if (!data) return [];
-  return withFileTypes ? decodeDirents(data) : decodeNames(data);
+  return withFileTypes ? decodeDirents(data, filePath) : decodeNames(data);
 }
 
 function readdirRecursiveSync(

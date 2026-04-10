@@ -71,6 +71,10 @@ export interface Stats {
 
 export interface Dirent {
   name: string;
+  /** The directory path that was read (Node 20+). */
+  parentPath: string;
+  /** @deprecated Alias for `parentPath`. */
+  path: string;
   isFile(): boolean;
   isDirectory(): boolean;
   isBlockDevice(): boolean;

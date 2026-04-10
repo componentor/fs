@@ -75,7 +75,7 @@ export function decodeStats(data: Uint8Array): Stats {
  *     bytes 2+: name (UTF-8)
  *     byte after name: type (uint8)
  */
-export function decodeDirents(data: Uint8Array): Dirent[] {
+export function decodeDirents(data: Uint8Array, parentPath: string = ''): Dirent[] {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const count = view.getUint32(0, true);
   const decoder = new TextDecoder();
@@ -95,6 +95,8 @@ export function decodeDirents(data: Uint8Array): Dirent[] {
 
     entries.push({
       name,
+      parentPath,
+      path: parentPath,
       isFile: () => isFile,
       isDirectory: () => isDirectory,
       isBlockDevice: () => false,
