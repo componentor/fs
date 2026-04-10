@@ -19,7 +19,7 @@ export function toPathString(p: PathLike): string {
     }
     return decodeURIComponent(p.pathname);
   }
-  return String(p);
+  throw new TypeError('The "path" argument must be of type string, Uint8Array, or URL. Received ' + typeof p);
 }
 
 export const sep = '/';

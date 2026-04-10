@@ -185,7 +185,7 @@ export async function open(
   return createFileHandle(fd, asyncRequest);
 }
 
-function createFileHandle(fd: number, asyncRequest: AsyncRequestFn): FileHandle {
+export function createFileHandle(fd: number, asyncRequest: AsyncRequestFn): FileHandle {
   return {
     fd,
 
