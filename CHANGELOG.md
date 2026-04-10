@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.0.30
+
+- Add missing callback versions: `lchmod`, `lchown`, `lutimes`
+- Fix `readv`, `writev`, `fsync`, `fdatasync` callbacks to fire as macrotasks (setTimeout)
+
 ## 3.0.29
 
 Complete Node.js fs API coverage.

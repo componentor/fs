@@ -3082,9 +3082,9 @@ var VFSFileSystem = class {
     }
     try {
       const bytesRead = this.readvSync(fd, buffers, pos);
-      cb(null, bytesRead, buffers);
+      setTimeout(() => cb(null, bytesRead, buffers), 0);
     } catch (err) {
-      cb(err);
+      setTimeout(() => cb(err), 0);
     }
   }
   writev(fd, buffers, positionOrCallback, callback) {
@@ -3099,9 +3099,9 @@ var VFSFileSystem = class {
     }
     try {
       const bytesWritten = this.writevSync(fd, buffers, pos);
-      cb(null, bytesWritten, buffers);
+      setTimeout(() => cb(null, bytesWritten, buffers), 0);
     } catch (err) {
-      cb(err);
+      setTimeout(() => cb(err), 0);
     }
   }
   // ---- statfs methods ----
@@ -3502,17 +3502,17 @@ var VFSFileSystem = class {
   fdatasync(fd, callback) {
     try {
       this.fdatasyncSync(fd);
-      callback(null);
+      setTimeout(() => callback(null), 0);
     } catch (err) {
-      callback(err);
+      setTimeout(() => callback(err), 0);
     }
   }
   fsync(fd, callback) {
     try {
       this.fsyncSync(fd);
-      callback(null);
+      setTimeout(() => callback(null), 0);
     } catch (err) {
-      callback(err);
+      setTimeout(() => callback(err), 0);
     }
   }
   fstat(fd, optionsOrCallback, callback) {
@@ -3598,6 +3598,24 @@ var VFSFileSystem = class {
   }
   fchown(fd, uid, gid, callback) {
     setTimeout(() => callback(null), 0);
+  }
+  lchmod(filePath, mode, callback) {
+    this.promises.lchmod(filePath, mode).then(
+      () => setTimeout(() => callback(null), 0),
+      (err) => setTimeout(() => callback(err), 0)
+    );
+  }
+  lchown(filePath, uid, gid, callback) {
+    this.promises.lchown(filePath, uid, gid).then(
+      () => setTimeout(() => callback(null), 0),
+      (err) => setTimeout(() => callback(err), 0)
+    );
+  }
+  lutimes(filePath, atime, mtime, callback) {
+    this.promises.lutimes(filePath, atime, mtime).then(
+      () => setTimeout(() => callback(null), 0),
+      (err) => setTimeout(() => callback(err), 0)
+    );
   }
 };
 var VFSPromises = class {

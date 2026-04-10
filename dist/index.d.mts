@@ -545,6 +545,9 @@ declare class VFSFileSystem {
     futimes(fd: number, atime: Date | number, mtime: Date | number, callback: (err: Error | null) => void): void;
     fchmod(fd: number, mode: number, callback: (err: Error | null) => void): void;
     fchown(fd: number, uid: number, gid: number, callback: (err: Error | null) => void): void;
+    lchmod(filePath: string, mode: number, callback: (err: Error | null) => void): void;
+    lchown(filePath: string, uid: number, gid: number, callback: (err: Error | null) => void): void;
+    lutimes(filePath: string, atime: Date | number, mtime: Date | number, callback: (err: Error | null) => void): void;
 }
 declare class VFSPromises {
     private _async;

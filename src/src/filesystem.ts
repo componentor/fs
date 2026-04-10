@@ -1089,9 +1089,9 @@ export class VFSFileSystem {
     }
     try {
       const bytesRead = this.readvSync(fd, buffers, pos);
-      cb(null, bytesRead, buffers);
+      setTimeout(() => cb(null, bytesRead, buffers), 0);
     } catch (err: any) {
-      cb(err);
+      setTimeout(() => cb(err), 0);
     }
   }
 
@@ -1109,9 +1109,9 @@ export class VFSFileSystem {
     }
     try {
       const bytesWritten = this.writevSync(fd, buffers, pos);
-      cb(null, bytesWritten, buffers);
+      setTimeout(() => cb(null, bytesWritten, buffers), 0);
     } catch (err: any) {
-      cb(err);
+      setTimeout(() => cb(err), 0);
     }
   }
 
@@ -1619,18 +1619,18 @@ export class VFSFileSystem {
   fdatasync(fd: number, callback: (err: Error | null) => void): void {
     try {
       this.fdatasyncSync(fd);
-      callback(null);
+      setTimeout(() => callback(null), 0);
     } catch (err: any) {
-      callback(err);
+      setTimeout(() => callback(err), 0);
     }
   }
 
   fsync(fd: number, callback: (err: Error | null) => void): void {
     try {
       this.fsyncSync(fd);
-      callback(null);
+      setTimeout(() => callback(null), 0);
     } catch (err: any) {
-      callback(err);
+      setTimeout(() => callback(err), 0);
     }
   }
 
@@ -1741,6 +1741,27 @@ export class VFSFileSystem {
   fchown(fd: number, uid: number, gid: number, callback: (err: Error | null) => void): void {
     // No-op: fd-based permission changes are not supported in this OPFS VFS.
     setTimeout(() => callback(null), 0);
+  }
+
+  lchmod(filePath: string, mode: number, callback: (err: Error | null) => void): void {
+    this.promises.lchmod(filePath, mode).then(
+      () => setTimeout(() => callback(null), 0),
+      (err: any) => setTimeout(() => callback(err), 0)
+    );
+  }
+
+  lchown(filePath: string, uid: number, gid: number, callback: (err: Error | null) => void): void {
+    this.promises.lchown(filePath, uid, gid).then(
+      () => setTimeout(() => callback(null), 0),
+      (err: any) => setTimeout(() => callback(err), 0)
+    );
+  }
+
+  lutimes(filePath: string, atime: Date | number, mtime: Date | number, callback: (err: Error | null) => void): void {
+    this.promises.lutimes(filePath, atime, mtime).then(
+      () => setTimeout(() => callback(null), 0),
+      (err: any) => setTimeout(() => callback(err), 0)
+    );
   }
 }
 
