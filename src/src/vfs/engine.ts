@@ -1080,8 +1080,16 @@ export class VFSEngine {
     // symlinks but returns the symlink inode itself for the last component.
     // Direct pathIndex.get(path) fails for paths through symlinked directories
     // because children are stored under the symlink target path in pathIndex.
-    const idx = this.resolvePathComponents(path, false);
-    if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    let idx = this.resolvePathComponents(path, false);
+    if (idx === undefined) {
+      // Fallback: followLast=false can fail for paths through symlink chains
+      // when pathIndex stores files under their resolved (real) path.
+      // Try with followLast=true — if it resolves, use the result regardless
+      // of whether the final component is a symlink or not. lstat on an
+      // existing symlink should return the symlink's own stats, not ENOENT.
+      idx = this.resolvePathComponents(path, true);
+      if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    }
 
     return this.encodeStatResponse(idx);
   }

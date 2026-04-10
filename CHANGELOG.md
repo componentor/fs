@@ -1,5 +1,9 @@
 # Changelog
 
+## 3.0.34
+
+- Fix lstat for deeply nested symlink chains: fallback to full resolution when intermediate path lookup fails
+
 ## 3.0.33
 
 - Callback methods now return the promise when no callback is given (hybrid API)
