@@ -1775,7 +1775,7 @@ function toPathString(p) {
     }
     return decodeURIComponent(p.pathname);
   }
-  return String(p);
+  throw new TypeError('The "path" argument must be of type string, Uint8Array, or URL. Received ' + typeof p);
 }
 var sep = "/";
 var delimiter = ":";
@@ -3124,7 +3124,7 @@ var VFSFileSystem = class {
   statfs(path, callback) {
     const result = this.statfsSync(path);
     if (callback) {
-      callback(null, result);
+      setTimeout(() => callback(null, result), 0);
       return;
     }
     return Promise.resolve(result);
@@ -3155,18 +3155,24 @@ var VFSFileSystem = class {
     let handle = null;
     let finished = false;
     const cleanup = async () => {
-      if (handle) {
+      if (handle && ownsHandle) {
         try {
           await handle.close();
         } catch {
         }
-        handle = null;
       }
+      handle = null;
     };
+    const providedFd = opts?.fd;
+    let ownsHandle = providedFd == null;
     const readFn = async () => {
       if (finished) return { done: true };
       if (!handle) {
-        handle = await this.promises.open(toPathString(filePath), opts?.flags ?? "r");
+        if (providedFd != null) {
+          handle = createFileHandle(providedFd, this._async);
+        } else {
+          handle = await this.promises.open(toPathString(filePath), opts?.flags ?? "r");
+        }
       }
       const readLen = end !== void 0 ? Math.min(highWaterMark, end - position + 1) : highWaterMark;
       if (readLen <= 0) {
@@ -3197,9 +3203,15 @@ var VFSFileSystem = class {
     const opts = typeof options === "string" ? { } : options;
     let position = opts?.start ?? 0;
     let handle = null;
+    const providedWFd = opts?.fd;
+    const ownsWHandle = providedWFd == null;
     const writeFn = async (chunk) => {
       if (!handle) {
-        handle = await this.promises.open(toPathString(filePath), opts?.flags ?? "w");
+        if (providedWFd != null) {
+          handle = createFileHandle(providedWFd, this._async);
+        } else {
+          handle = await this.promises.open(toPathString(filePath), opts?.flags ?? "w");
+        }
       }
       const { bytesWritten } = await handle.write(chunk, 0, chunk.byteLength, position);
       position += bytesWritten;
@@ -3209,7 +3221,9 @@ var VFSFileSystem = class {
         if (opts?.flush) {
           await handle.sync();
         }
-        await handle.close();
+        if (ownsWHandle) {
+          await handle.close();
+        }
         handle = null;
       }
     };
@@ -3319,8 +3333,17 @@ var VFSFileSystem = class {
     }
     return this.readyPromise;
   }
+  // ========== Callback API ==========
+  // Node.js-style callback overloads for all async operations.
+  // These delegate to this.promises.* and adapt the result to (err, result) callbacks.
+  _validateCb(cb) {
+    if (typeof cb !== "function") {
+      throw new TypeError('The "cb" argument must be of type function. Received ' + typeof cb);
+    }
+  }
   readFile(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
     this.promises.readFile(filePath, opts).then(
       (result) => setTimeout(() => cb(null, result), 0),
@@ -3329,6 +3352,7 @@ var VFSFileSystem = class {
   }
   writeFile(filePath, data, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
     this.promises.writeFile(filePath, data, opts).then(
       () => setTimeout(() => cb(null), 0),
@@ -3337,6 +3361,7 @@ var VFSFileSystem = class {
   }
   appendFile(filePath, data, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
     this.promises.appendFile(filePath, data, opts).then(
       () => setTimeout(() => cb(null), 0),
@@ -3345,6 +3370,7 @@ var VFSFileSystem = class {
   }
   mkdir(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
     this.promises.mkdir(filePath, opts).then(
       (result) => setTimeout(() => cb(null, result), 0),
@@ -3353,6 +3379,7 @@ var VFSFileSystem = class {
   }
   rmdir(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
     this.promises.rmdir(filePath, opts).then(
       () => setTimeout(() => cb(null), 0),
@@ -3361,6 +3388,7 @@ var VFSFileSystem = class {
   }
   rm(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
     this.promises.rm(filePath, opts).then(
       () => setTimeout(() => cb(null), 0),
@@ -3368,6 +3396,7 @@ var VFSFileSystem = class {
     );
   }
   unlink(filePath, callback) {
+    this._validateCb(callback);
     this.promises.unlink(filePath).then(
       () => setTimeout(() => callback(null), 0),
       (err) => setTimeout(() => callback(err), 0)
@@ -3375,6 +3404,7 @@ var VFSFileSystem = class {
   }
   readdir(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
     this.promises.readdir(filePath, opts).then(
       (result) => setTimeout(() => cb(null, result), 0),
@@ -3383,6 +3413,7 @@ var VFSFileSystem = class {
   }
   stat(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
     this.promises.stat(filePath, opts).then(
       (result) => setTimeout(() => cb(null, result), 0),
@@ -3391,6 +3422,7 @@ var VFSFileSystem = class {
   }
   lstat(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
     this.promises.lstat(filePath, opts).then(
       (result) => setTimeout(() => cb(null, result), 0),
@@ -3399,6 +3431,7 @@ var VFSFileSystem = class {
   }
   access(filePath, modeOrCallback, callback) {
     const cb = typeof modeOrCallback === "function" ? modeOrCallback : callback;
+    this._validateCb(cb);
     const mode = typeof modeOrCallback === "function" ? void 0 : modeOrCallback;
     this.promises.access(filePath, mode).then(
       () => setTimeout(() => cb(null), 0),
@@ -3406,6 +3439,7 @@ var VFSFileSystem = class {
     );
   }
   rename(oldPath, newPath, callback) {
+    this._validateCb(callback);
     this.promises.rename(oldPath, newPath).then(
       () => setTimeout(() => callback(null), 0),
       (err) => setTimeout(() => callback(err), 0)
@@ -3413,6 +3447,7 @@ var VFSFileSystem = class {
   }
   copyFile(src, dest, modeOrCallback, callback) {
     const cb = typeof modeOrCallback === "function" ? modeOrCallback : callback;
+    this._validateCb(cb);
     const mode = typeof modeOrCallback === "function" ? void 0 : modeOrCallback;
     this.promises.copyFile(src, dest, mode).then(
       () => setTimeout(() => cb(null), 0),
@@ -3421,6 +3456,7 @@ var VFSFileSystem = class {
   }
   truncate(filePath, lenOrCallback, callback) {
     const cb = typeof lenOrCallback === "function" ? lenOrCallback : callback;
+    this._validateCb(cb);
     const len = typeof lenOrCallback === "function" ? void 0 : lenOrCallback;
     this.promises.truncate(filePath, len).then(
       () => setTimeout(() => cb(null), 0),
@@ -3428,24 +3464,28 @@ var VFSFileSystem = class {
     );
   }
   realpath(filePath, callback) {
+    this._validateCb(callback);
     this.promises.realpath(filePath).then(
       (result) => setTimeout(() => callback(null, result), 0),
       (err) => setTimeout(() => callback(err), 0)
     );
   }
   chmod(filePath, mode, callback) {
+    this._validateCb(callback);
     this.promises.chmod(filePath, mode).then(
       () => setTimeout(() => callback(null), 0),
       (err) => setTimeout(() => callback(err), 0)
     );
   }
   chown(filePath, uid, gid, callback) {
+    this._validateCb(callback);
     this.promises.chown(filePath, uid, gid).then(
       () => setTimeout(() => callback(null), 0),
       (err) => setTimeout(() => callback(err), 0)
     );
   }
   utimes(filePath, atime, mtime, callback) {
+    this._validateCb(callback);
     this.promises.utimes(filePath, atime, mtime).then(
       () => setTimeout(() => callback(null), 0),
       (err) => setTimeout(() => callback(err), 0)
@@ -3453,6 +3493,7 @@ var VFSFileSystem = class {
   }
   symlink(target, linkPath, typeOrCallback, callback) {
     const cb = typeof typeOrCallback === "function" ? typeOrCallback : callback;
+    this._validateCb(cb);
     const type = typeof typeOrCallback === "function" ? void 0 : typeOrCallback;
     this.promises.symlink(target, linkPath, type).then(
       () => setTimeout(() => cb(null), 0),
@@ -3461,6 +3502,7 @@ var VFSFileSystem = class {
   }
   readlink(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
     this.promises.readlink(filePath, opts).then(
       (result) => setTimeout(() => cb(null, result), 0),
@@ -3468,6 +3510,7 @@ var VFSFileSystem = class {
     );
   }
   link(existingPath, newPath, callback) {
+    this._validateCb(callback);
     this.promises.link(existingPath, newPath).then(
       () => setTimeout(() => callback(null), 0),
       (err) => setTimeout(() => callback(err), 0)
@@ -3475,6 +3518,7 @@ var VFSFileSystem = class {
   }
   open(filePath, flags, modeOrCallback, callback) {
     const cb = typeof modeOrCallback === "function" ? modeOrCallback : callback;
+    this._validateCb(cb);
     const mode = typeof modeOrCallback === "function" ? void 0 : modeOrCallback;
     this.promises.open(filePath, flags, mode).then(
       (handle) => setTimeout(() => cb(null, handle.fd), 0),
@@ -3482,6 +3526,7 @@ var VFSFileSystem = class {
     );
   }
   mkdtemp(prefix, callback) {
+    this._validateCb(callback);
     this.promises.mkdtemp(prefix).then(
       (result) => setTimeout(() => callback(null, result), 0),
       (err) => setTimeout(() => callback(err), 0)
@@ -3500,6 +3545,7 @@ var VFSFileSystem = class {
     return this._cpAsync(src, dest, opts);
   }
   fdatasync(fd, callback) {
+    this._validateCb(callback);
     try {
       this.fdatasyncSync(fd);
       setTimeout(() => callback(null), 0);
@@ -3508,6 +3554,7 @@ var VFSFileSystem = class {
     }
   }
   fsync(fd, callback) {
+    this._validateCb(callback);
     try {
       this.fsyncSync(fd);
       setTimeout(() => callback(null), 0);
@@ -3517,6 +3564,7 @@ var VFSFileSystem = class {
   }
   fstat(fd, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    this._validateCb(cb);
     try {
       const result = this.fstatSync(fd);
       setTimeout(() => cb(null, result), 0);
@@ -3526,6 +3574,7 @@ var VFSFileSystem = class {
   }
   ftruncate(fd, lenOrCallback, callback) {
     const cb = typeof lenOrCallback === "function" ? lenOrCallback : callback;
+    this._validateCb(cb);
     const len = typeof lenOrCallback === "function" ? 0 : lenOrCallback;
     try {
       this.ftruncateSync(fd, len);
@@ -3535,6 +3584,7 @@ var VFSFileSystem = class {
     }
   }
   read(fd, buffer, offset, length, position, callback) {
+    this._validateCb(callback);
     try {
       const bytesRead = this.readSync(fd, buffer, offset, length, position);
       setTimeout(() => callback(null, bytesRead, buffer), 0);
@@ -3544,6 +3594,7 @@ var VFSFileSystem = class {
   }
   write(fd, bufferOrString, offsetOrPosition, lengthOrEncoding, position, callback) {
     const cb = [offsetOrPosition, lengthOrEncoding, position, callback].find((a) => typeof a === "function");
+    this._validateCb(cb);
     try {
       let bytesWritten;
       if (typeof bufferOrString === "string") {
@@ -3577,6 +3628,7 @@ var VFSFileSystem = class {
     );
   }
   opendir(filePath, callback) {
+    this._validateCb(callback);
     this.promises.opendir(filePath).then(
       (dir) => setTimeout(() => callback(null, dir), 0),
       (err) => setTimeout(() => callback(err), 0)
@@ -3584,6 +3636,7 @@ var VFSFileSystem = class {
   }
   glob(pattern, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
     this.promises.glob(pattern, opts).then(
       (result) => setTimeout(() => cb(null, result), 0),
@@ -3591,27 +3644,33 @@ var VFSFileSystem = class {
     );
   }
   futimes(fd, atime, mtime, callback) {
+    this._validateCb(callback);
     setTimeout(() => callback(null), 0);
   }
   fchmod(fd, mode, callback) {
+    this._validateCb(callback);
     setTimeout(() => callback(null), 0);
   }
   fchown(fd, uid, gid, callback) {
+    this._validateCb(callback);
     setTimeout(() => callback(null), 0);
   }
   lchmod(filePath, mode, callback) {
+    this._validateCb(callback);
     this.promises.lchmod(filePath, mode).then(
       () => setTimeout(() => callback(null), 0),
       (err) => setTimeout(() => callback(err), 0)
     );
   }
   lchown(filePath, uid, gid, callback) {
+    this._validateCb(callback);
     this.promises.lchown(filePath, uid, gid).then(
       () => setTimeout(() => callback(null), 0),
       (err) => setTimeout(() => callback(err), 0)
     );
   }
   lutimes(filePath, atime, mtime, callback) {
+    this._validateCb(callback);
     this.promises.lutimes(filePath, atime, mtime).then(
       () => setTimeout(() => callback(null), 0),
       (err) => setTimeout(() => callback(err), 0)

@@ -2,7 +2,7 @@
  * Type definitions for the VFS-based filesystem.
  * Mirrors Node.js fs module interfaces.
  */
-type Encoding = 'utf8' | 'utf-8' | 'ascii' | 'base64' | 'hex' | 'binary' | 'latin1' | 'ucs2' | 'ucs-2' | 'utf16le' | 'utf-16le';
+type Encoding = 'utf8' | 'utf-8' | 'ascii' | 'base64' | 'hex' | 'binary' | 'latin1' | 'ucs2' | 'ucs-2' | 'utf16le' | 'utf-16le' | 'buffer';
 interface ReadOptions {
     encoding?: Encoding | null;
     flag?: string;
@@ -486,6 +486,7 @@ declare class VFSFileSystem {
      *
      *  Returns a Promise that resolves when the new mode is ready. */
     setMode(newMode: FSMode): Promise<void>;
+    private _validateCb;
     readFile(filePath: string, callback: (err: Error | null, data?: Uint8Array | string) => void): void;
     readFile(filePath: string, options: ReadOptions | Encoding | null, callback: (err: Error | null, data?: Uint8Array | string) => void): void;
     writeFile(filePath: string, data: string | Uint8Array, callback: (err: Error | null) => void): void;

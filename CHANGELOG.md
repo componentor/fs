@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.0.31
+
+- Fix `statfs` callback to fire asynchronously (macrotask)
+- `createReadStream`/`createWriteStream` now support `fd` option for pre-opened file descriptors
+- Add `'buffer'` to Encoding type (fixes TypeScript error with `readdir({encoding: 'buffer'})`)
+- Throw `TypeError` when callback argument is missing (matches Node.js behavior)
+- Throw `TypeError` on null/undefined paths (matches Node.js behavior)
+
 ## 3.0.30
 
 - Add missing callback versions: `lchmod`, `lchown`, `lutimes`
