@@ -1,5 +1,27 @@
 # Changelog
 
+## 3.0.27
+
+Node.js fs compatibility — 15 more fixes closing the remaining gaps.
+
+- Add callback API for all async methods (`fs.readFile(path, cb)` style)
+- `createReadStream` now returns Node.js-compatible `Readable` with `.on('data')`, `.pipe()`, etc.
+- `createWriteStream` now returns Node.js-compatible `Writable` with `.write()`, `.end()`, events
+- Fix `Dirent.parentPath`/`path` missing on recursive readdir results
+- Add nanosecond timestamp fields (`atimeNs`, `mtimeNs`, `ctimeNs`, `birthtimeNs`) to `Stats`
+- Set `Stats.dev` to non-zero synthetic device number
+- Add `lutimes`/`lchmod`/`lchown` (symlink permission methods)
+- Add `fchmod`/`fchown` (file descriptor permission methods)
+- Add `readv`/`writev` (vector I/O)
+- Add `signal: AbortSignal` support on `readFile`/`writeFile` options
+- Add `maxRetries`/`retryDelay` to `RmOptions`
+- Add `openAsBlob(path, options?)` method
+- Accept `Uint8Array` and `file:` URL as paths (`PathLike`)
+- Add `readSync(fd, {buffer, ...})` and `writeSync(fd, buffer, {offset, ...})` object forms
+- Add `FileHandle.appendFile`, `chmod`, `chown`, `[Symbol.asyncDispose]`
+- `mkdir` recursive now correctly returns first created directory path
+- Add missing platform constants (`O_NONBLOCK`, `O_DSYNC`, `O_DIRECTORY`, `O_NOFOLLOW`, etc.)
+
 ## 3.0.26
 
 Node.js fs compatibility improvements — 17 fixes bringing the API closer to native behavior.
