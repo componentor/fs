@@ -56,11 +56,11 @@ export function readSync(
   length: number = buffer.byteLength,
   position: number | null = null
 ): number {
-  const fdBuf = new Uint8Array(12);
+  const fdBuf = new Uint8Array(16);
   const dv = new DataView(fdBuf.buffer);
   dv.setUint32(0, fd, true);
   dv.setUint32(4, length, true);
-  dv.setInt32(8, position ?? -1, true);
+  dv.setFloat64(8, position ?? -1, true);
   const buf = encodeRequest(OP.FREAD, '', 0, fdBuf);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'read', String(fd));
@@ -80,11 +80,11 @@ export function writeSyncFd(
   position: number | null = null
 ): number {
   const writeData = buffer.subarray(offset, offset + length);
-  const fdBuf = new Uint8Array(8 + writeData.byteLength);
+  const fdBuf = new Uint8Array(12 + writeData.byteLength);
   const dv = new DataView(fdBuf.buffer);
   dv.setUint32(0, fd, true);
-  dv.setInt32(4, position ?? -1, true);
-  fdBuf.set(writeData, 8);
+  dv.setFloat64(4, position ?? -1, true);
+  fdBuf.set(writeData, 12);
   const buf = encodeRequest(OP.FWRITE, '', 0, fdBuf);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'write', String(fd));
