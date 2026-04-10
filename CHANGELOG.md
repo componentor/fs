@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.0.28
+
+Final Node.js fs compatibility fixes.
+
+- Fix `emptyStats()` in watchFile missing nanosecond timestamp fields
+- Callback-style methods now fire via macrotask (`setTimeout`) matching Node.js timing guarantee
+- Add `fsync(fd)`/`fsyncSync(fd)` and `fdatasync(fd)` to main fs object
+- Add `setEncoding(encoding)` on readable streams (emits strings instead of Uint8Array)
+- Add `cork()`/`uncork()` on writable streams
+
 ## 3.0.27
 
 Node.js fs compatibility — 15 more fixes closing the remaining gaps.
