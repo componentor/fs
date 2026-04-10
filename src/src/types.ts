@@ -34,6 +34,7 @@ export interface RmOptions {
 export interface ReaddirOptions {
   encoding?: Encoding | null;
   withFileTypes?: boolean;
+  recursive?: boolean;
 }
 
 export interface StatOptions {
