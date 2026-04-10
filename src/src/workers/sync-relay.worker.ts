@@ -331,27 +331,27 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
     }
 
     case OP.FREAD: {
-      if (!data || data.byteLength < 12) {
+      if (!data || data.byteLength < 16) {
         result = { status: 7 };
         break;
       }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       const fd = dv.getUint32(0, true);
       const length = dv.getUint32(4, true);
-      const pos = dv.getInt32(8, true);
+      const pos = dv.getFloat64(8, true);
       result = engine.fread(fd, length, pos === -1 ? null : pos);
       break;
     }
 
     case OP.FWRITE: {
-      if (!data || data.byteLength < 8) {
+      if (!data || data.byteLength < 12) {
         result = { status: 7 };
         break;
       }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       const fd = dv.getUint32(0, true);
-      const pos = dv.getInt32(4, true);
-      const writeData = data.subarray(8);
+      const pos = dv.getFloat64(4, true);
+      const writeData = data.subarray(12);
       result = engine.fwrite(fd, writeData, pos === -1 ? null : pos);
       if (result.status === 0) { syncOp = op; syncPath = engine.getPathForFd(fd) ?? undefined; }
       break;
@@ -532,17 +532,18 @@ async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise
       break;
     }
     case OP.FREAD: {
-      if (!data || data.byteLength < 12) { result = { status: 7 }; break; }
+      if (!data || data.byteLength < 16) { result = { status: 7 }; break; }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      result = await oe.fread(dv.getUint32(0, true), dv.getUint32(4, true), dv.getInt32(8, true) === -1 ? null : dv.getInt32(8, true));
+      const pos = dv.getFloat64(8, true);
+      result = await oe.fread(dv.getUint32(0, true), dv.getUint32(4, true), pos === -1 ? null : pos);
       break;
     }
     case OP.FWRITE: {
-      if (!data || data.byteLength < 8) { result = { status: 7 }; break; }
+      if (!data || data.byteLength < 12) { result = { status: 7 }; break; }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       const fd = dv.getUint32(0, true);
-      const pos = dv.getInt32(4, true);
-      result = await oe.fwrite(fd, data.subarray(8), pos === -1 ? null : pos);
+      const pos = dv.getFloat64(4, true);
+      result = await oe.fwrite(fd, data.subarray(12), pos === -1 ? null : pos);
       syncPath = oe.getPathForFd(fd) ?? undefined;
       break;
     }

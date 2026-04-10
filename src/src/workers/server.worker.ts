@@ -181,27 +181,27 @@ function handleRequest(tabId: string, buffer: ArrayBuffer): ArrayBuffer {
     }
 
     case OP.FREAD: {
-      if (!data || data.byteLength < 12) {
+      if (!data || data.byteLength < 16) {
         result = { status: 7 }; // EINVAL
         break;
       }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       const fd = dv.getUint32(0, true);
       const length = dv.getUint32(4, true);
-      const pos = dv.getInt32(8, true);
+      const pos = dv.getFloat64(8, true);
       result = engine.fread(fd, length, pos === -1 ? null : pos);
       break;
     }
 
     case OP.FWRITE: {
-      if (!data || data.byteLength < 8) {
+      if (!data || data.byteLength < 12) {
         result = { status: 7 }; // EINVAL
         break;
       }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       const fd = dv.getUint32(0, true);
-      const pos = dv.getInt32(4, true);
-      const writeData = data.subarray(8);
+      const pos = dv.getFloat64(4, true);
+      const writeData = data.subarray(12);
       result = engine.fwrite(fd, writeData, pos === -1 ? null : pos);
       break;
     }
