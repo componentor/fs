@@ -816,8 +816,8 @@ export class VFSFileSystem {
     _symlinkSync(this._sync, target, linkPath);
   }
 
-  readlinkSync(filePath: string): string {
-    return _readlinkSync(this._sync, filePath);
+  readlinkSync(filePath: string, options?: { encoding?: string | null } | string | null): string | Uint8Array {
+    return _readlinkSync(this._sync, filePath, options);
   }
 
   linkSync(existingPath: string, newPath: string): void {
@@ -1182,8 +1182,8 @@ class VFSPromises {
     return _symlink(this._async, target, linkPath);
   }
 
-  readlink(filePath: string) {
-    return _readlink(this._async, filePath);
+  readlink(filePath: string, options?: { encoding?: string | null } | string | null) {
+    return _readlink(this._async, filePath, options);
   }
 
   link(existingPath: string, newPath: string) {
