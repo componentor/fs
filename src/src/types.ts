@@ -178,6 +178,7 @@ export interface FSReadStream {
   pause(): this;
   resume(): this;
   read(size?: number): Uint8Array | null;
+  setEncoding(encoding: string): this;
   destroy(err?: Error): this;
 }
 
@@ -209,6 +210,8 @@ export interface FSWriteStream {
   writable: boolean;
   bytesWritten: number;
   path: string;
+  cork(): void;
+  uncork(): void;
   write(chunk: string | Uint8Array, encodingOrCb?: string | Function, cb?: Function): boolean;
   end(chunk?: string | Uint8Array | Function, encodingOrCb?: string | Function, cb?: Function): this;
   on(event: string, fn: Function): this;

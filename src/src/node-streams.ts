@@ -94,6 +94,7 @@ export class NodeReadable extends SimpleEventEmitter {
   private _ended = false;
   private _reading = false;
   private _readBuffer: Uint8Array | null = null;
+  private _encoding: string | null = null;
 
   /** Whether the stream is still readable (not ended or destroyed). */
   readable = true;
@@ -135,6 +136,15 @@ export class NodeReadable extends SimpleEventEmitter {
     if (this._destroyed || this._ended) return this;
     this._paused = false;
     this._drain();
+    return this;
+  }
+
+  /**
+   * Set the character encoding for data read from this stream.
+   * When set, 'data' events emit strings instead of Uint8Array.
+   */
+  setEncoding(encoding: string): this {
+    this._encoding = encoding;
     return this;
   }
 
@@ -228,7 +238,11 @@ export class NodeReadable extends SimpleEventEmitter {
 
         this.bytesRead += result.value.byteLength;
         this._readBuffer = result.value;
-        this.emit('data', result.value);
+        if (this._encoding) {
+          this.emit('data', new TextDecoder(this._encoding).decode(result.value));
+        } else {
+          this.emit('data', result.value);
+        }
       }
     } catch (err) {
       if (!this._destroyed) {
@@ -257,6 +271,7 @@ export class NodeWritable extends SimpleEventEmitter {
   private _destroyed = false;
   private _finished = false;
   private _writing = false;
+  private _corked = false;
 
   constructor(
     path: string,
@@ -268,6 +283,22 @@ export class NodeWritable extends SimpleEventEmitter {
   }
 
   // -- public API -----------------------------------------------------------
+
+  /**
+   * Buffer all writes until `uncork()` is called.
+   * In this minimal implementation we only track the flag for compatibility.
+   */
+  cork(): void {
+    this._corked = true;
+  }
+
+  /**
+   * Flush buffered writes (clears the cork flag).
+   * In this minimal implementation we only track the flag for compatibility.
+   */
+  uncork(): void {
+    this._corked = false;
+  }
 
   write(
     chunk: string | Uint8Array,

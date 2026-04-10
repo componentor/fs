@@ -245,7 +245,7 @@ function triggerWatchFile(entry: WatchFileEntry): void {
   }
 }
 
-function emptyStats(): Stats {
+export function emptyStats(): Stats {
   const zero = new Date(0);
   return {
     isFile: () => false,
@@ -259,6 +259,7 @@ function emptyStats(): Stats {
     size: 0, blksize: 4096, blocks: 0,
     atimeMs: 0, mtimeMs: 0, ctimeMs: 0, birthtimeMs: 0,
     atime: zero, mtime: zero, ctime: zero, birthtime: zero,
+    atimeNs: 0, mtimeNs: 0, ctimeNs: 0, birthtimeNs: 0,
   };
 }
 

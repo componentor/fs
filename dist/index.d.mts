@@ -159,6 +159,7 @@ interface FSReadStream {
     pause(): this;
     resume(): this;
     read(size?: number): Uint8Array | null;
+    setEncoding(encoding: string): this;
     destroy(err?: Error): this;
 }
 interface ReadStreamOptions {
@@ -187,6 +188,8 @@ interface FSWriteStream {
     writable: boolean;
     bytesWritten: number;
     path: string;
+    cork(): void;
+    uncork(): void;
     write(chunk: string | Uint8Array, encodingOrCb?: string | Function, cb?: Function): boolean;
     end(chunk?: string | Uint8Array | Function, encodingOrCb?: string | Function, cb?: Function): this;
     on(event: string, fn: Function): this;
@@ -435,6 +438,7 @@ declare class VFSFileSystem {
     fstatSync(fd: number): Stats;
     ftruncateSync(fd: number, len?: number): void;
     fdatasyncSync(fd: number): void;
+    fsyncSync(fd: number): void;
     readvSync(fd: number, buffers: Uint8Array[], position?: number | null): number;
     writevSync(fd: number, buffers: Uint8Array[], position?: number | null): number;
     readv(fd: number, buffers: Uint8Array[], position: number | null | undefined, callback: (err: Error | null, bytesRead?: number, buffers?: Uint8Array[]) => void): void;
@@ -509,6 +513,8 @@ declare class VFSFileSystem {
     mkdtemp(prefix: string, callback: (err: Error | null, folder?: string) => void): void;
     cp(src: string, dest: string, callback: (err: Error | null) => void): void;
     cp(src: string, dest: string, options: CpOptions, callback: (err: Error | null) => void): void;
+    fdatasync(fd: number, callback: (err: Error | null) => void): void;
+    fsync(fd: number, callback: (err: Error | null) => void): void;
     exists(filePath: string, callback: (exists: boolean) => void): void;
 }
 declare class VFSPromises {
@@ -557,6 +563,8 @@ declare class VFSPromises {
     openAsBlob(filePath: string, options?: OpenAsBlobOptions): Promise<Blob>;
     statfs(path: string): Promise<StatFs>;
     watch(filePath: string, options?: WatchOptions): AsyncIterable<WatchEventType>;
+    fsync(_fd: number): Promise<void>;
+    fdatasync(_fd: number): Promise<void>;
     flush(): Promise<void>;
     purge(): Promise<void>;
 }
@@ -587,6 +595,7 @@ declare class NodeReadable extends SimpleEventEmitter {
     private _ended;
     private _reading;
     private _readBuffer;
+    private _encoding;
     /** Whether the stream is still readable (not ended or destroyed). */
     readable: boolean;
     /** The file path this stream reads from (set externally). */
@@ -602,6 +611,11 @@ declare class NodeReadable extends SimpleEventEmitter {
     on(event: string, fn: Listener): this;
     pause(): this;
     resume(): this;
+    /**
+     * Set the character encoding for data read from this stream.
+     * When set, 'data' events emit strings instead of Uint8Array.
+     */
+    setEncoding(encoding: string): this;
     /**
      * Non-flowing read — returns the last buffered chunk or null.
      * Node.js has a complex buffer system; we keep it simple here.
@@ -624,7 +638,18 @@ declare class NodeWritable extends SimpleEventEmitter {
     private _destroyed;
     private _finished;
     private _writing;
+    private _corked;
     constructor(path: string, _writeFn: (chunk: Uint8Array) => Promise<void>, _closeFn: () => Promise<void>);
+    /**
+     * Buffer all writes until `uncork()` is called.
+     * In this minimal implementation we only track the flag for compatibility.
+     */
+    cork(): void;
+    /**
+     * Flush buffered writes (clears the cork flag).
+     * In this minimal implementation we only track the flag for compatibility.
+     */
+    uncork(): void;
     write(chunk: string | Uint8Array, encodingOrCb?: string | ((...args: unknown[]) => void), cb?: (...args: unknown[]) => void): boolean;
     end(chunk?: string | Uint8Array | ((...args: unknown[]) => void), encodingOrCb?: string | ((...args: unknown[]) => void), cb?: (...args: unknown[]) => void): this;
     destroy(err?: Error): this;
