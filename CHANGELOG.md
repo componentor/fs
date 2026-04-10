@@ -1,6 +1,6 @@
 # Changelog
 
-## 3.0.34
+## 3.0.34 - 3.0.35
 
 - Fix lstat for deeply nested symlink chains: fallback to full resolution when intermediate path lookup fails
 
