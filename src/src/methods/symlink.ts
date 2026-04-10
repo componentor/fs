@@ -18,11 +18,14 @@ export function symlinkSync(
 
 export function readlinkSync(
   syncRequest: SyncRequestFn,
-  filePath: string
-): string {
+  filePath: string,
+  options?: { encoding?: string | null } | string | null
+): string | Uint8Array {
   const buf = encodeRequest(OP.READLINK, filePath);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'readlink', filePath);
+  const encoding = typeof options === 'string' ? options : options?.encoding;
+  if (encoding === 'buffer') return new Uint8Array(data!);
   return decoder.decode(data!);
 }
 
@@ -38,9 +41,12 @@ export async function symlink(
 
 export async function readlink(
   asyncRequest: AsyncRequestFn,
-  filePath: string
-): Promise<string> {
+  filePath: string,
+  options?: { encoding?: string | null } | string | null
+): Promise<string | Uint8Array> {
   const { status, data } = await asyncRequest(OP.READLINK, filePath);
   if (status !== 0) throw statusToError(status, 'readlink', filePath);
+  const encoding = typeof options === 'string' ? options : options?.encoding;
+  if (encoding === 'buffer') return new Uint8Array(data!);
   return decoder.decode(data!);
 }
