@@ -31,6 +31,19 @@ export interface RmOptions {
   force?: boolean;
 }
 
+export interface CpOptions {
+  /** Dereference symlinks (default: false) */
+  dereference?: boolean;
+  /** Throw if destination exists (default: false) */
+  errorOnExist?: boolean;
+  /** Overwrite existing files/directories (default: true) */
+  force?: boolean;
+  /** Preserve timestamps from source (default: false) */
+  preserveTimestamps?: boolean;
+  /** Copy directories recursively (required for directories) */
+  recursive?: boolean;
+}
+
 export interface ReaddirOptions {
   encoding?: Encoding | null;
   withFileTypes?: boolean;
@@ -39,6 +52,38 @@ export interface ReaddirOptions {
 
 export interface StatOptions {
   bigint?: boolean;
+}
+
+export interface BigIntStats {
+  isFile(): boolean;
+  isDirectory(): boolean;
+  isBlockDevice(): boolean;
+  isCharacterDevice(): boolean;
+  isSymbolicLink(): boolean;
+  isFIFO(): boolean;
+  isSocket(): boolean;
+  dev: bigint;
+  ino: bigint;
+  mode: bigint;
+  nlink: bigint;
+  uid: bigint;
+  gid: bigint;
+  rdev: bigint;
+  size: bigint;
+  blksize: bigint;
+  blocks: bigint;
+  atimeMs: bigint;
+  mtimeMs: bigint;
+  ctimeMs: bigint;
+  birthtimeMs: bigint;
+  atime: Date;
+  mtime: Date;
+  ctime: Date;
+  birthtime: Date;
+  atimeNs: bigint;
+  mtimeNs: bigint;
+  ctimeNs: bigint;
+  birthtimeNs: bigint;
 }
 
 export interface Stats {
@@ -82,6 +127,21 @@ export interface Dirent {
   isSymbolicLink(): boolean;
   isFIFO(): boolean;
   isSocket(): boolean;
+}
+
+export interface StatFs {
+  type: number;      // filesystem type (0x56465321 = "VFS!")
+  bsize: number;     // block size
+  blocks: number;    // total blocks
+  bfree: number;     // free blocks
+  bavail: number;    // available blocks (same as bfree)
+  files: number;     // total inodes
+  ffree: number;     // free inodes
+}
+
+export interface GlobOptions {
+  cwd?: string;
+  exclude?: (path: string) => boolean;
 }
 
 export type PathLike = string;

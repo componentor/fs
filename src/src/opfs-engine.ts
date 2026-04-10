@@ -156,7 +156,7 @@ export class OPFSEngine {
     mtime: number,
     ino: number,
   ): Uint8Array {
-    const buf = new Uint8Array(49);
+    const buf = new Uint8Array(53);
     const view = new DataView(buf.buffer);
     view.setUint8(0, kind === 'file' ? TYPE_FILE : TYPE_DIRECTORY);
     view.setUint32(1, kind === 'file' ? 0o100644 : 0o040755, true);
@@ -167,6 +167,7 @@ export class OPFSEngine {
     view.setUint32(37, this.processUid, true);
     view.setUint32(41, this.processGid, true);
     view.setUint32(45, ino, true);
+    view.setUint32(49, kind === 'directory' ? 2 : 1, true); // nlink
     return buf;
   }
 

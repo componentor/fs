@@ -28,7 +28,26 @@ describe('Stats', () => {
       expect(stats.size).toBe(1024);
       expect(stats.mode).toBe(0o100644);
       expect(stats.ino).toBe(42);
+      expect(stats.nlink).toBe(1); // backwards compat: 49-byte buffer defaults to 1
       expect(stats.mtime).toBeInstanceOf(Date);
+    });
+
+    it('should decode nlink from 53-byte buffer', () => {
+      const buf = new Uint8Array(53);
+      const view = new DataView(buf.buffer);
+      view.setUint8(0, INODE_TYPE.FILE);
+      view.setUint32(1, 0o100644, true);
+      view.setFloat64(5, 512, true);
+      view.setFloat64(13, 1700000000000, true);
+      view.setFloat64(21, 1700000000000, true);
+      view.setFloat64(29, 1700000000000, true);
+      view.setUint32(37, 0, true);
+      view.setUint32(41, 0, true);
+      view.setUint32(45, 10, true);
+      view.setUint32(49, 3, true); // nlink = 3
+
+      const stats = decodeStats(buf);
+      expect(stats.nlink).toBe(3);
     });
 
     it('should decode a directory stat', () => {

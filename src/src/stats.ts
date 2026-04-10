@@ -3,11 +3,11 @@
  * Decodes binary stat responses from the server into Node.js-compatible objects.
  */
 
-import type { Stats, Dirent } from './types.js';
+import type { Stats, BigIntStats, Dirent } from './types.js';
 import { INODE_TYPE } from './vfs/layout.js';
 
 /**
- * Decode a binary stat response (49 bytes) into a Stats object.
+ * Decode a binary stat response (53 bytes) into a Stats object.
  *
  * Format:
  *   byte 0:    type (uint8)
@@ -19,6 +19,7 @@ import { INODE_TYPE } from './vfs/layout.js';
  *   bytes 37-40: uid (uint32)
  *   bytes 41-44: gid (uint32)
  *   bytes 45-48: ino (uint32)
+ *   bytes 49-52: nlink (uint32)
  */
 export function decodeStats(data: Uint8Array): Stats {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
@@ -31,6 +32,8 @@ export function decodeStats(data: Uint8Array): Stats {
   const uid = view.getUint32(37, true);
   const gid = view.getUint32(41, true);
   const ino = view.getUint32(45, true);
+  // Backwards compatible: older 49-byte buffers default nlink to 1
+  const nlink = data.byteLength >= 53 ? view.getUint32(49, true) : 1;
 
   const isFile = type === INODE_TYPE.FILE;
   const isDirectory = type === INODE_TYPE.DIRECTORY;
@@ -47,7 +50,7 @@ export function decodeStats(data: Uint8Array): Stats {
     dev: 0,
     ino,
     mode,
-    nlink: 1,
+    nlink,
     uid,
     gid,
     rdev: 0,
@@ -62,6 +65,64 @@ export function decodeStats(data: Uint8Array): Stats {
     mtime: new Date(mtimeMs),
     ctime: new Date(ctimeMs),
     birthtime: new Date(ctimeMs),
+  };
+}
+
+/**
+ * Decode a binary stat response (49 bytes) into a BigIntStats object.
+ * Same binary format as decodeStats but returns BigInt values.
+ */
+export function decodeStatsBigInt(data: Uint8Array): BigIntStats {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const type = view.getUint8(0);
+  const mode = view.getUint32(1, true);
+  const size = view.getFloat64(5, true);
+  const mtimeMs = view.getFloat64(13, true);
+  const ctimeMs = view.getFloat64(21, true);
+  const atimeMs = view.getFloat64(29, true);
+  const uid = view.getUint32(37, true);
+  const gid = view.getUint32(41, true);
+  const ino = view.getUint32(45, true);
+  const nlink = data.byteLength >= 53 ? view.getUint32(49, true) : 1;
+
+  const isFile = type === INODE_TYPE.FILE;
+  const isDirectory = type === INODE_TYPE.DIRECTORY;
+  const isSymlink = type === INODE_TYPE.SYMLINK;
+
+  const atimeMsBigInt = BigInt(Math.trunc(atimeMs));
+  const mtimeMsBigInt = BigInt(Math.trunc(mtimeMs));
+  const ctimeMsBigInt = BigInt(Math.trunc(ctimeMs));
+
+  return {
+    isFile: () => isFile,
+    isDirectory: () => isDirectory,
+    isBlockDevice: () => false,
+    isCharacterDevice: () => false,
+    isSymbolicLink: () => isSymlink,
+    isFIFO: () => false,
+    isSocket: () => false,
+    dev: 0n,
+    ino: BigInt(ino),
+    mode: BigInt(mode),
+    nlink: BigInt(nlink),
+    uid: BigInt(uid),
+    gid: BigInt(gid),
+    rdev: 0n,
+    size: BigInt(Math.trunc(size)),
+    blksize: 4096n,
+    blocks: BigInt(Math.ceil(size / 512)),
+    atimeMs: atimeMsBigInt,
+    mtimeMs: mtimeMsBigInt,
+    ctimeMs: ctimeMsBigInt,
+    birthtimeMs: ctimeMsBigInt,
+    atime: new Date(atimeMs),
+    mtime: new Date(mtimeMs),
+    ctime: new Date(ctimeMs),
+    birthtime: new Date(ctimeMs),
+    atimeNs: atimeMsBigInt * 1_000_000n,
+    mtimeNs: mtimeMsBigInt * 1_000_000n,
+    ctimeNs: ctimeMsBigInt * 1_000_000n,
+    birthtimeNs: ctimeMsBigInt * 1_000_000n,
   };
 }
 

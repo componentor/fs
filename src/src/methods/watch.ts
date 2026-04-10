@@ -176,7 +176,7 @@ export function watchFile(
   const interval = opts.interval ?? 5007; // Node.js default
 
   let prevStats: Stats | null = null;
-  try { prevStats = statSync(syncRequest, absPath); } catch { /* file may not exist */ }
+  try { prevStats = statSync(syncRequest, absPath) as Stats; } catch { /* file may not exist */ }
 
   const entry: WatchFileEntry = {
     ns,
@@ -234,7 +234,7 @@ export function unwatchFile(
 
 function triggerWatchFile(entry: WatchFileEntry): void {
   let currStats: Stats | null = null;
-  try { currStats = statSync(entry.syncRequest, entry.absPath); } catch { /* file gone */ }
+  try { currStats = statSync(entry.syncRequest, entry.absPath) as Stats; } catch { /* file gone */ }
 
   const prev = entry.prevStats ?? emptyStats();
   const curr = currStats ?? emptyStats();

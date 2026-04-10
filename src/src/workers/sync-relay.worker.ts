@@ -584,7 +584,7 @@ async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise
   // But EXISTS is special: it returns OK (status=0) with data=[0] for non-existent paths.
   // So we also trigger fallback for EXISTS when the result indicates "not found".
   const ENOENT_STATUS = 1; // CODE_TO_STATUS.ENOENT
-  const READ_OPS = [OP.READ, OP.STAT, OP.LSTAT, OP.READDIR, OP.EXISTS, OP.ACCESS, OP.REALPATH, OP.READLINK];
+  const READ_OPS: number[] = [OP.READ, OP.STAT, OP.LSTAT, OP.READDIR, OP.EXISTS, OP.ACCESS, OP.REALPATH, OP.READLINK];
   const isExistsNotFound = op === OP.EXISTS && result.status === 0 && result.data instanceof Uint8Array && result.data[0] === 0;
   if ((result.status === ENOENT_STATUS || isExistsNotFound) && READ_OPS.includes(op)) {
     const vfsResult = (() => {

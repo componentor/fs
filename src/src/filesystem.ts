@@ -11,8 +11,8 @@
  */
 
 import type {
-  Encoding, ReadOptions, WriteOptions, MkdirOptions, RmdirOptions, RmOptions,
-  ReaddirOptions, Stats, Dirent, VFSConfig, FSMode, FileHandle,
+  Encoding, ReadOptions, WriteOptions, MkdirOptions, RmdirOptions, RmOptions, CpOptions,
+  ReaddirOptions, StatOptions, Stats, BigIntStats, StatFs, Dirent, VFSConfig, FSMode, FileHandle, GlobOptions,
   WatchOptions, WatchFileOptions, WatchEventType, FSWatcher, WatchListener, WatchFileListener,
   ReadStreamOptions, WriteStreamOptions,
 } from './types.js';
@@ -49,6 +49,10 @@ import {
 } from './methods/open.js';
 import { opendir as _opendir } from './methods/opendir.js';
 import { watch as _watch, watchFile as _watchFile, unwatchFile as _unwatchFile, watchAsync as _watchAsync } from './methods/watch.js';
+import { globSync as _globSync, glob as _glob } from './methods/glob.js';
+import { join as pathJoin } from './path.js';
+import { createError } from './errors.js';
+import { constants } from './constants.js';
 
 const encoder = new TextEncoder();
 
@@ -772,12 +776,16 @@ export class VFSFileSystem {
     return _readdirSync(this._sync, filePath, options);
   }
 
-  statSync(filePath: string): Stats {
-    return _statSync(this._sync, filePath);
+  globSync(pattern: string, options?: GlobOptions): string[] {
+    return _globSync(this._sync, pattern, options);
   }
 
-  lstatSync(filePath: string): Stats {
-    return _lstatSync(this._sync, filePath);
+  statSync(filePath: string, options?: StatOptions): Stats | BigIntStats {
+    return _statSync(this._sync, filePath, options);
+  }
+
+  lstatSync(filePath: string, options?: StatOptions): Stats | BigIntStats {
+    return _lstatSync(this._sync, filePath, options);
   }
 
   renameSync(oldPath: string, newPath: string): void {
@@ -786,6 +794,111 @@ export class VFSFileSystem {
 
   copyFileSync(src: string, dest: string, mode?: number): void {
     _copyFileSync(this._sync, src, dest, mode);
+  }
+
+  cpSync(src: string, dest: string, options?: CpOptions): void {
+    const force = options?.force !== false;          // default true
+    const errorOnExist = options?.errorOnExist ?? false;
+    const dereference = options?.dereference ?? false;
+    const preserveTimestamps = options?.preserveTimestamps ?? false;
+
+    const srcStat = dereference ? this.statSync(src) : this.lstatSync(src);
+
+    if (srcStat.isDirectory()) {
+      if (!options?.recursive) {
+        throw createError('EISDIR', 'cp', src);
+      }
+      // Create destination directory
+      try {
+        this.mkdirSync(dest, { recursive: true });
+      } catch (e: any) {
+        if (e.code !== 'EEXIST') throw e;
+      }
+      // Copy each entry
+      const entries = this.readdirSync(src, { withFileTypes: true }) as Dirent[];
+      for (const entry of entries) {
+        const srcChild = pathJoin(src, entry.name);
+        const destChild = pathJoin(dest, entry.name);
+        this.cpSync(srcChild, destChild, options);
+      }
+    } else if (srcStat.isSymbolicLink() && !dereference) {
+      // Copy symlink itself
+      const target = this.readlinkSync(src) as string;
+      // Check if dest exists
+      let destExists = false;
+      try { this.lstatSync(dest); destExists = true; } catch {}
+      if (destExists) {
+        if (errorOnExist) throw createError('EEXIST', 'cp', dest);
+        if (!force) return;
+        this.unlinkSync(dest);
+      }
+      this.symlinkSync(target, dest);
+    } else {
+      // File (or dereferenced symlink)
+      let destExists = false;
+      try { this.lstatSync(dest); destExists = true; } catch {}
+      if (destExists) {
+        if (errorOnExist) throw createError('EEXIST', 'cp', dest);
+        if (!force) return;
+      }
+      this.copyFileSync(src, dest, errorOnExist ? constants.COPYFILE_EXCL : 0);
+    }
+
+    if (preserveTimestamps) {
+      const st = this.statSync(src);
+      this.utimesSync(dest, st.atime, st.mtime);
+    }
+  }
+
+  async cp(src: string, dest: string, options?: CpOptions): Promise<void> {
+    const force = options?.force !== false;
+    const errorOnExist = options?.errorOnExist ?? false;
+    const dereference = options?.dereference ?? false;
+    const preserveTimestamps = options?.preserveTimestamps ?? false;
+
+    const srcStat = dereference
+      ? await this.promises.stat(src)
+      : await this.promises.lstat(src);
+
+    if (srcStat.isDirectory()) {
+      if (!options?.recursive) {
+        throw createError('EISDIR', 'cp', src);
+      }
+      try {
+        await this.promises.mkdir(dest, { recursive: true });
+      } catch (e: any) {
+        if (e.code !== 'EEXIST') throw e;
+      }
+      const entries = await this.promises.readdir(src, { withFileTypes: true }) as Dirent[];
+      for (const entry of entries) {
+        const srcChild = pathJoin(src, entry.name);
+        const destChild = pathJoin(dest, entry.name);
+        await this.cp(srcChild, destChild, options);
+      }
+    } else if (srcStat.isSymbolicLink() && !dereference) {
+      const target = await this.promises.readlink(src) as string;
+      let destExists = false;
+      try { await this.promises.lstat(dest); destExists = true; } catch {}
+      if (destExists) {
+        if (errorOnExist) throw createError('EEXIST', 'cp', dest);
+        if (!force) return;
+        await this.promises.unlink(dest);
+      }
+      await this.promises.symlink(target, dest);
+    } else {
+      let destExists = false;
+      try { await this.promises.lstat(dest); destExists = true; } catch {}
+      if (destExists) {
+        if (errorOnExist) throw createError('EEXIST', 'cp', dest);
+        if (!force) return;
+      }
+      await this.promises.copyFile(src, dest, errorOnExist ? constants.COPYFILE_EXCL : 0);
+    }
+
+    if (preserveTimestamps) {
+      const st = await this.promises.stat(src);
+      await this.promises.utimes(dest, st.atime, st.mtime);
+    }
   }
 
   truncateSync(filePath: string, len?: number): void {
@@ -856,6 +969,31 @@ export class VFSFileSystem {
 
   fdatasyncSync(fd: number): void {
     _fdatasyncSync(this._sync, fd);
+  }
+
+  // ---- statfs methods ----
+
+  statfsSync(_path?: string): StatFs {
+    return {
+      type: 0x56465321,       // "VFS!"
+      bsize: 4096,
+      blocks: 1024 * 1024,    // ~4GB virtual capacity
+      bfree: 512 * 1024,      // ~2GB free (estimate)
+      bavail: 512 * 1024,
+      files: 10000,            // default max inodes
+      ffree: 5000,             // estimate half free
+    };
+  }
+
+  statfs(path: string, callback: (err: Error | null, stats?: StatFs) => void): void;
+  statfs(path: string): Promise<StatFs>;
+  statfs(path: string, callback?: (err: Error | null, stats?: StatFs) => void): Promise<StatFs> | void {
+    const result = this.statfsSync(path);
+    if (callback) {
+      callback(null, result);
+      return;
+    }
+    return Promise.resolve(result);
   }
 
   // ---- Watch methods ----
@@ -1134,12 +1272,16 @@ class VFSPromises {
     return _readdir(this._async, filePath, options);
   }
 
-  stat(filePath: string) {
-    return _stat(this._async, filePath);
+  glob(pattern: string, options?: GlobOptions): Promise<string[]> {
+    return _glob(this._async, pattern, options);
   }
 
-  lstat(filePath: string) {
-    return _lstat(this._async, filePath);
+  stat(filePath: string, options?: StatOptions) {
+    return _stat(this._async, filePath, options);
+  }
+
+  lstat(filePath: string, options?: StatOptions) {
+    return _lstat(this._async, filePath, options);
   }
 
   access(filePath: string, mode?: number) {
@@ -1152,6 +1294,57 @@ class VFSPromises {
 
   copyFile(src: string, dest: string, mode?: number) {
     return _copyFile(this._async, src, dest, mode);
+  }
+
+  async cp(src: string, dest: string, options?: CpOptions): Promise<void> {
+    const force = options?.force !== false;
+    const errorOnExist = options?.errorOnExist ?? false;
+    const dereference = options?.dereference ?? false;
+    const preserveTimestamps = options?.preserveTimestamps ?? false;
+
+    const srcStat = dereference
+      ? await this.stat(src)
+      : await this.lstat(src);
+
+    if (srcStat.isDirectory()) {
+      if (!options?.recursive) {
+        throw createError('EISDIR', 'cp', src);
+      }
+      try {
+        await this.mkdir(dest, { recursive: true });
+      } catch (e: any) {
+        if (e.code !== 'EEXIST') throw e;
+      }
+      const entries = await this.readdir(src, { withFileTypes: true }) as Dirent[];
+      for (const entry of entries) {
+        const srcChild = pathJoin(src, entry.name);
+        const destChild = pathJoin(dest, entry.name);
+        await this.cp(srcChild, destChild, options);
+      }
+    } else if (srcStat.isSymbolicLink() && !dereference) {
+      const target = await this.readlink(src) as string;
+      let destExists = false;
+      try { await this.lstat(dest); destExists = true; } catch {}
+      if (destExists) {
+        if (errorOnExist) throw createError('EEXIST', 'cp', dest);
+        if (!force) return;
+        await this.unlink(dest);
+      }
+      await this.symlink(target, dest);
+    } else {
+      let destExists = false;
+      try { await this.lstat(dest); destExists = true; } catch {}
+      if (destExists) {
+        if (errorOnExist) throw createError('EEXIST', 'cp', dest);
+        if (!force) return;
+      }
+      await this.copyFile(src, dest, errorOnExist ? constants.COPYFILE_EXCL : 0);
+    }
+
+    if (preserveTimestamps) {
+      const st = await this.stat(src);
+      await this.utimes(dest, st.atime, st.mtime);
+    }
   }
 
   truncate(filePath: string, len?: number) {
@@ -1200,6 +1393,18 @@ class VFSPromises {
 
   mkdtemp(prefix: string) {
     return _mkdtemp(this._async, prefix);
+  }
+
+  async statfs(path: string): Promise<StatFs> {
+    return {
+      type: 0x56465321,       // "VFS!"
+      bsize: 4096,
+      blocks: 1024 * 1024,    // ~4GB virtual capacity
+      bfree: 512 * 1024,      // ~2GB free (estimate)
+      bavail: 512 * 1024,
+      files: 10000,            // default max inodes
+      ffree: 5000,             // estimate half free
+    };
   }
 
   async *watch(filePath: string, options?: WatchOptions): AsyncIterable<WatchEventType> {

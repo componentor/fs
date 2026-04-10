@@ -25,12 +25,16 @@ export type { UnpackResult, LoadResult, RepairResult } from './helpers.js';
 export * as path from './path.js';
 export type {
   Stats,
+  StatFs,
+  BigIntStats,
+  StatOptions,
   Dirent,
   ReadOptions,
   WriteOptions,
   MkdirOptions,
   RmdirOptions,
   RmOptions,
+  CpOptions,
   ReaddirOptions,
   Encoding,
   PathLike,

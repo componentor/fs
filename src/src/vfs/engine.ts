@@ -31,6 +31,7 @@ interface Inode {
   atime: number;
   uid: number;
   gid: number;
+  nlink: number;
 }
 
 interface FdEntry {
@@ -429,6 +430,7 @@ export class VFSEngine {
         type,
         pathOffset,
         pathLength,
+        nlink: inodeView.getUint16(off + INODE.NLINK, true) || 1,
         mode: inodeView.getUint32(off + INODE.MODE, true),
         size,
         firstBlock,
@@ -471,6 +473,7 @@ export class VFSEngine {
       type: v.getUint8(INODE.TYPE),
       pathOffset: v.getUint32(INODE.PATH_OFFSET, true),
       pathLength: v.getUint16(INODE.PATH_LENGTH, true),
+      nlink: v.getUint16(INODE.NLINK, true) || 1,
       mode: v.getUint32(INODE.MODE, true),
       size: v.getFloat64(INODE.SIZE, true),
       firstBlock: v.getUint32(INODE.FIRST_BLOCK, true),
@@ -500,7 +503,7 @@ export class VFSEngine {
     v.setUint8(INODE.FLAGS + 2, 0);
     v.setUint32(INODE.PATH_OFFSET, inode.pathOffset, true);
     v.setUint16(INODE.PATH_LENGTH, inode.pathLength, true);
-    v.setUint16(INODE.RESERVED_10, 0, true);
+    v.setUint16(INODE.NLINK, inode.nlink, true);
     v.setUint32(INODE.MODE, inode.mode, true);
     v.setFloat64(INODE.SIZE, inode.size, true);
     v.setUint32(INODE.FIRST_BLOCK, inode.firstBlock, true);
@@ -835,6 +838,7 @@ export class VFSEngine {
       type,
       pathOffset: pathOff,
       pathLength: pathLen,
+      nlink: type === INODE_TYPE.DIRECTORY ? 2 : 1,
       mode,
       size,
       firstBlock,
@@ -1041,6 +1045,9 @@ export class VFSEngine {
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
 
+    // Decrement nlink; only free data when it reaches 0
+    inode.nlink = Math.max(0, inode.nlink - 1);
+
     // Free data blocks
     this.freeBlockRange(inode.firstBlock, inode.blockCount);
 
@@ -1081,8 +1088,25 @@ export class VFSEngine {
 
   private encodeStatResponse(idx: number): { status: number; data: Uint8Array } {
     const inode = this.readInode(idx);
-    // Encode stat into binary: type(1) + mode(4) + size(8) + mtime(8) + ctime(8) + atime(8) + uid(4) + gid(4) + ino(4) = 49 bytes
-    const buf = new Uint8Array(49);
+
+    // Compute nlink for directories: 2 + number of child subdirectories
+    let nlink = inode.nlink;
+    if (inode.type === INODE_TYPE.DIRECTORY) {
+      const path = this.readPath(inode.pathOffset, inode.pathLength);
+      const children = this.getDirectChildren(path);
+      let subdirCount = 0;
+      for (const child of children) {
+        const childIdx = this.pathIndex.get(child);
+        if (childIdx !== undefined) {
+          const childInode = this.readInode(childIdx);
+          if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
+        }
+      }
+      nlink = 2 + subdirCount;
+    }
+
+    // Encode stat into binary: type(1) + mode(4) + size(8) + mtime(8) + ctime(8) + atime(8) + uid(4) + gid(4) + ino(4) + nlink(4) = 53 bytes
+    const buf = new Uint8Array(53);
     const view = new DataView(buf.buffer);
     view.setUint8(0, inode.type);
     view.setUint32(1, inode.mode, true);
@@ -1093,6 +1117,7 @@ export class VFSEngine {
     view.setUint32(37, inode.uid, true);
     view.setUint32(41, inode.gid, true);
     view.setUint32(45, idx, true); // ino = inode index
+    view.setUint32(49, nlink, true);
 
     return { status: 0, data: buf };
   }
@@ -1512,9 +1537,36 @@ export class VFSEngine {
     return { status: 0, data: target };
   }
 
-  // ---- LINK (hard link — copies the file) ----
+  // ---- LINK (hard link — copies the file data, tracks nlink) ----
   link(existingPath: string, newPath: string): { status: number } {
-    return this.copy(existingPath, newPath);
+    existingPath = this.normalizePath(existingPath);
+    newPath = this.normalizePath(newPath);
+
+    const srcIdx = this.resolvePathComponents(existingPath, true);
+    if (srcIdx === undefined) return { status: CODE_TO_STATUS.ENOENT };
+
+    const srcInode = this.readInode(srcIdx);
+    if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EPERM };
+
+    if (this.pathIndex.has(newPath)) return { status: CODE_TO_STATUS.EEXIST };
+
+    // Copy file data to new inode
+    const result = this.copy(existingPath, newPath);
+    if (result.status !== 0) return result;
+
+    // Increment nlink on source
+    srcInode.nlink++;
+    this.writeInode(srcIdx, srcInode);
+
+    // Set nlink on destination to match source
+    const destIdx = this.pathIndex.get(newPath);
+    if (destIdx !== undefined) {
+      const destInode = this.readInode(destIdx);
+      destInode.nlink = srcInode.nlink;
+      this.writeInode(destIdx, destInode);
+    }
+
+    return { status: 0 };
   }
 
   // ---- OPEN (file descriptor) ----

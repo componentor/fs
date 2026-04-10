@@ -79,14 +79,6 @@ export function writeSyncFd(
   lengthOrEncoding?: number | string,
   position?: number | null
 ): number {
-<<<<<<< HEAD
-  const writeData = buffer.subarray(offset, offset + length);
-  const fdBuf = new Uint8Array(12 + writeData.byteLength);
-  const dv = new DataView(fdBuf.buffer);
-  dv.setUint32(0, fd, true);
-  dv.setFloat64(4, position ?? -1, true);
-  fdBuf.set(writeData, 12);
-=======
   let writeData: Uint8Array;
   let pos: number | null;
 
@@ -102,12 +94,11 @@ export function writeSyncFd(
     pos = position ?? null;
     writeData = bufferOrString.subarray(offset, offset + length);
   }
-  const fdBuf = new Uint8Array(8 + writeData.byteLength);
+  const fdBuf = new Uint8Array(12 + writeData.byteLength);
   const dv = new DataView(fdBuf.buffer);
   dv.setUint32(0, fd, true);
-  dv.setInt32(4, pos ?? -1, true);
-  fdBuf.set(writeData, 8);
->>>>>>> worktree-agent-ac76d596
+  dv.setFloat64(4, pos ?? -1, true);
+  fdBuf.set(writeData, 12);
   const buf = encodeRequest(OP.FWRITE, '', 0, fdBuf);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'write', String(fd));

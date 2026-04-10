@@ -37,7 +37,7 @@ export const INODE = {
   FLAGS: 1,           // uint8[3] - reserved
   PATH_OFFSET: 4,     // uint32 - byte offset into path table
   PATH_LENGTH: 8,     // uint16 - length of path string
-  RESERVED_10: 10,    // uint16
+  NLINK: 10,          // uint16 - hard link count
   MODE: 12,           // uint32 - permissions (e.g. 0o100644)
   SIZE: 16,           // float64 - file content size in bytes (using f64 for >4GB)
   FIRST_BLOCK: 24,    // uint32 - index of first data block

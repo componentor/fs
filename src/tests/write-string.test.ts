@@ -23,11 +23,11 @@ function createMockSync() {
   const syncRequest: SyncRequestFn = (buf: ArrayBuffer) => {
     const { op, data } = decodeRequest(buf);
     expect(op).toBe(OP.FWRITE);
-    if (data && data.byteLength >= 8) {
+    if (data && data.byteLength >= 12) {
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       const fd = dv.getUint32(0, true);
-      const position = dv.getInt32(4, true);
-      const writeData = data.subarray(8);
+      const position = dv.getFloat64(4, true);
+      const writeData = data.subarray(12);
       captured = { fd, position, writeData: new Uint8Array(writeData) };
 
       // Return bytesWritten as a Uint8Array-wrapped uint32
