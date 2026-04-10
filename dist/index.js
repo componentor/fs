@@ -1176,6 +1176,21 @@ async function readFile(asyncRequest, filePath, options) {
   }
 }
 
+// src/methods/chmod.ts
+function chmodSync(syncRequest, filePath, mode) {
+  const modeBuf = new Uint8Array(4);
+  new DataView(modeBuf.buffer).setUint32(0, mode, true);
+  const buf = encodeRequest(OP.CHMOD, filePath, 0, modeBuf);
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "chmod", filePath);
+}
+async function chmod(asyncRequest, filePath, mode) {
+  const modeBuf = new Uint8Array(4);
+  new DataView(modeBuf.buffer).setUint32(0, mode, true);
+  const { status } = await asyncRequest(OP.CHMOD, filePath, 0, modeBuf);
+  if (status !== 0) throw statusToError(status, "chmod", filePath);
+}
+
 // src/methods/writeFile.ts
 var encoder3 = new TextEncoder();
 function writeFileSync(syncRequest, filePath, data, options) {
@@ -1191,9 +1206,12 @@ function writeFileSync(syncRequest, filePath, data, options) {
     const buf = encodeRequest(OP.WRITE, filePath, flags, encoded);
     const { status } = syncRequest(buf);
     if (status !== 0) throw statusToError(status, "write", filePath);
+    if (opts?.mode !== void 0) {
+      chmodSync(syncRequest, filePath, opts.mode);
+    }
     return;
   }
-  const fd = openSync(syncRequest, filePath, flag);
+  const fd = openSync(syncRequest, filePath, flag, opts?.mode);
   try {
     writeSyncFd(syncRequest, fd, encoded, 0, encoded.byteLength, 0);
   } finally {
@@ -1213,9 +1231,12 @@ async function writeFile(asyncRequest, filePath, data, options) {
     const { status } = await asyncRequest(OP.WRITE, filePath, flags, encoded);
     if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
     if (status !== 0) throw statusToError(status, "write", filePath);
+    if (opts?.mode !== void 0) {
+      await chmod(asyncRequest, filePath, opts.mode);
+    }
     return;
   }
-  const handle = await open(asyncRequest, filePath, flag);
+  const handle = await open(asyncRequest, filePath, flag, opts?.mode);
   try {
     await handle.writeFile(encoded);
     if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
@@ -1371,6 +1392,10 @@ async function unlink(asyncRequest, filePath) {
 }
 
 // src/methods/readdir.ts
+var textEncoder = new TextEncoder();
+function namesToBuffers(names) {
+  return names.map((n) => textEncoder.encode(n));
+}
 function readdirBaseSync(syncRequest, filePath, withFileTypes) {
   const flags = withFileTypes ? 1 : 0;
   const buf = encodeRequest(OP.READDIR, filePath, flags);
@@ -1456,28 +1481,46 @@ async function readdirRecursiveAsync(asyncRequest, basePath, prefix, withFileTyp
   return results;
 }
 function readdirSync(syncRequest, filePath, options) {
-  const opts = typeof options === "string" ? { } : options;
+  const opts = typeof options === "string" ? { encoding: options } : options;
+  const asBuffer = opts?.encoding === "buffer";
   if (opts?.recursive) {
-    return readdirRecursiveSync(
+    const result2 = readdirRecursiveSync(
       syncRequest,
       filePath,
       "",
       !!opts?.withFileTypes
     );
+    if (asBuffer && !opts?.withFileTypes) {
+      return namesToBuffers(result2);
+    }
+    return result2;
   }
-  return readdirBaseSync(syncRequest, filePath, !!opts?.withFileTypes);
+  const result = readdirBaseSync(syncRequest, filePath, !!opts?.withFileTypes);
+  if (asBuffer && !opts?.withFileTypes) {
+    return namesToBuffers(result);
+  }
+  return result;
 }
 async function readdir(asyncRequest, filePath, options) {
-  const opts = typeof options === "string" ? { } : options;
+  const opts = typeof options === "string" ? { encoding: options } : options;
+  const asBuffer = opts?.encoding === "buffer";
   if (opts?.recursive) {
-    return readdirRecursiveAsync(
+    const result2 = await readdirRecursiveAsync(
       asyncRequest,
       filePath,
       "",
       !!opts?.withFileTypes
     );
+    if (asBuffer && !opts?.withFileTypes) {
+      return namesToBuffers(result2);
+    }
+    return result2;
   }
-  return readdirBaseAsync(asyncRequest, filePath, !!opts?.withFileTypes);
+  const result = await readdirBaseAsync(asyncRequest, filePath, !!opts?.withFileTypes);
+  if (asBuffer && !opts?.withFileTypes) {
+    return namesToBuffers(result);
+  }
+  return result;
 }
 
 // src/methods/stat.ts
@@ -1574,21 +1617,6 @@ async function realpath(asyncRequest, filePath) {
   const { status, data } = await asyncRequest(OP.REALPATH, filePath);
   if (status !== 0) throw statusToError(status, "realpath", filePath);
   return decoder5.decode(data);
-}
-
-// src/methods/chmod.ts
-function chmodSync(syncRequest, filePath, mode) {
-  const modeBuf = new Uint8Array(4);
-  new DataView(modeBuf.buffer).setUint32(0, mode, true);
-  const buf = encodeRequest(OP.CHMOD, filePath, 0, modeBuf);
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "chmod", filePath);
-}
-async function chmod(asyncRequest, filePath, mode) {
-  const modeBuf = new Uint8Array(4);
-  new DataView(modeBuf.buffer).setUint32(0, mode, true);
-  const { status } = await asyncRequest(OP.CHMOD, filePath, 0, modeBuf);
-  if (status !== 0) throw statusToError(status, "chmod", filePath);
 }
 
 // src/methods/chown.ts
@@ -2326,6 +2354,12 @@ var VFSFileSystem = class {
       this.rejectReady = reject;
     });
     this.promises = new VFSPromises(this._async, ns);
+    const boundRealpath = this.realpath.bind(this);
+    boundRealpath.native = boundRealpath;
+    this.realpath = boundRealpath;
+    const boundRealpathSync = this.realpathSync.bind(this);
+    boundRealpathSync.native = boundRealpathSync;
+    this.realpathSync = boundRealpathSync;
     instanceRegistry.set(ns, this);
     this.bootstrap();
   }
@@ -2799,6 +2833,25 @@ var VFSFileSystem = class {
   globSync(pattern, options) {
     return globSync(this._sync, pattern, options);
   }
+  opendirSync(filePath) {
+    const dirPath = toPathString(filePath);
+    const entries = this.readdirSync(dirPath, { withFileTypes: true });
+    let index = 0;
+    return {
+      path: dirPath,
+      async read() {
+        if (index >= entries.length) return null;
+        return entries[index++];
+      },
+      async close() {
+      },
+      async *[Symbol.asyncIterator]() {
+        for (const entry of entries) {
+          yield entry;
+        }
+      }
+    };
+  }
   statSync(filePath, options) {
     return statSync(this._sync, toPathString(filePath), options);
   }
@@ -2950,6 +3003,9 @@ var VFSFileSystem = class {
   }
   utimesSync(filePath, atime, mtime) {
     utimesSync(this._sync, toPathString(filePath), atime, mtime);
+  }
+  /** utimes on an open file descriptor. No-op in this VFS (cannot resolve fd to path). */
+  futimesSync(_fd, _atime, _mtime) {
   }
   /** Like utimesSync but operates on the symlink itself. In this VFS, delegates to utimesSync. */
   lutimesSync(filePath, atime, mtime) {
@@ -3459,11 +3515,89 @@ var VFSFileSystem = class {
       callback(err);
     }
   }
+  fstat(fd, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    try {
+      const result = this.fstatSync(fd);
+      setTimeout(() => cb(null, result), 0);
+    } catch (err) {
+      setTimeout(() => cb(err), 0);
+    }
+  }
+  ftruncate(fd, lenOrCallback, callback) {
+    const cb = typeof lenOrCallback === "function" ? lenOrCallback : callback;
+    const len = typeof lenOrCallback === "function" ? 0 : lenOrCallback;
+    try {
+      this.ftruncateSync(fd, len);
+      setTimeout(() => cb(null), 0);
+    } catch (err) {
+      setTimeout(() => cb(err), 0);
+    }
+  }
+  read(fd, buffer, offset, length, position, callback) {
+    try {
+      const bytesRead = this.readSync(fd, buffer, offset, length, position);
+      setTimeout(() => callback(null, bytesRead, buffer), 0);
+    } catch (err) {
+      setTimeout(() => callback(err), 0);
+    }
+  }
+  write(fd, bufferOrString, offsetOrPosition, lengthOrEncoding, position, callback) {
+    const cb = [offsetOrPosition, lengthOrEncoding, position, callback].find((a) => typeof a === "function");
+    try {
+      let bytesWritten;
+      if (typeof bufferOrString === "string") {
+        const pos = typeof offsetOrPosition === "function" ? void 0 : offsetOrPosition;
+        const enc = typeof lengthOrEncoding === "function" ? void 0 : lengthOrEncoding;
+        bytesWritten = this.writeSync(fd, bufferOrString, pos, enc);
+      } else {
+        const off = typeof offsetOrPosition === "function" ? void 0 : offsetOrPosition;
+        const len = typeof lengthOrEncoding === "function" ? void 0 : lengthOrEncoding;
+        const pos = typeof position === "function" ? void 0 : position;
+        bytesWritten = this.writeSync(fd, bufferOrString, off, len, pos);
+      }
+      setTimeout(() => cb(null, bytesWritten, bufferOrString), 0);
+    } catch (err) {
+      setTimeout(() => cb(err), 0);
+    }
+  }
+  close(fd, callback) {
+    try {
+      this.closeSync(fd);
+      if (callback) setTimeout(() => callback(null), 0);
+    } catch (err) {
+      if (callback) setTimeout(() => callback(err), 0);
+      else throw err;
+    }
+  }
   exists(filePath, callback) {
     this.promises.exists(filePath).then(
       (result) => setTimeout(() => callback(result), 0),
       () => setTimeout(() => callback(false), 0)
     );
+  }
+  opendir(filePath, callback) {
+    this.promises.opendir(filePath).then(
+      (dir) => setTimeout(() => callback(null, dir), 0),
+      (err) => setTimeout(() => callback(err), 0)
+    );
+  }
+  glob(pattern, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    this.promises.glob(pattern, opts).then(
+      (result) => setTimeout(() => cb(null, result), 0),
+      (err) => setTimeout(() => cb(err), 0)
+    );
+  }
+  futimes(fd, atime, mtime, callback) {
+    setTimeout(() => callback(null), 0);
+  }
+  fchmod(fd, mode, callback) {
+    setTimeout(() => callback(null), 0);
+  }
+  fchown(fd, uid, gid, callback) {
+    setTimeout(() => callback(null), 0);
   }
 };
 var VFSPromises = class {
@@ -3472,6 +3606,10 @@ var VFSPromises = class {
   constructor(asyncRequest, ns) {
     this._async = asyncRequest;
     this._ns = ns;
+  }
+  /** Node.js compat: fs.promises.constants (same as fs.constants) */
+  get constants() {
+    return constants;
   }
   readFile(filePath, options) {
     return readFile(this._async, toPathString(filePath), options);
@@ -3601,6 +3739,9 @@ var VFSPromises = class {
   }
   utimes(filePath, atime, mtime) {
     return utimes(this._async, toPathString(filePath), atime, mtime);
+  }
+  /** utimes on an open file descriptor. No-op in this VFS (cannot resolve fd to path). */
+  async futimes(_fd, _atime, _mtime) {
   }
   /** Like utimes but operates on the symlink itself. In this VFS, delegates to utimes. */
   lutimes(filePath, atime, mtime) {
@@ -5332,6 +5473,6 @@ function init() {
   return getDefaultFS().init();
 }
 
-export { FSError, NodeReadable, NodeWritable, SimpleEventEmitter, VFSFileSystem, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path_exports as path, repairVFS, statusToError, unpackToOPFS };
+export { FSError, NodeReadable, NodeWritable, NodeReadable as ReadStream, SimpleEventEmitter, VFSFileSystem, NodeWritable as WriteStream, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path_exports as path, repairVFS, statusToError, unpackToOPFS };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map

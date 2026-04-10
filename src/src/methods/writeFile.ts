@@ -4,6 +4,7 @@ import { OP, encodeRequest } from '../protocol/opcodes.js';
 import { statusToError } from '../errors.js';
 import { parseFlags, openSync, closeSync, writeSyncFd, open } from './open.js';
 import { encodeString } from '../encoding.js';
+import { chmodSync, chmod as chmodAsync } from './chmod.js';
 
 const encoder = new TextEncoder();
 
@@ -27,11 +28,14 @@ export function writeFileSync(
     const buf = encodeRequest(OP.WRITE, filePath, flags, encoded);
     const { status } = syncRequest(buf);
     if (status !== 0) throw statusToError(status, 'write', filePath);
+    if (opts?.mode !== undefined) {
+      chmodSync(syncRequest, filePath, opts.mode);
+    }
     return;
   }
 
   // Non-default flag: use fd-based open → write → close
-  const fd = openSync(syncRequest, filePath, flag);
+  const fd = openSync(syncRequest, filePath, flag, opts?.mode);
   try {
     writeSyncFd(syncRequest, fd, encoded, 0, encoded.byteLength, 0);
   } finally {
@@ -59,11 +63,14 @@ export async function writeFile(
     const { status } = await asyncRequest(OP.WRITE, filePath, flags, encoded);
     if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
     if (status !== 0) throw statusToError(status, 'write', filePath);
+    if (opts?.mode !== undefined) {
+      await chmodAsync(asyncRequest, filePath, opts.mode);
+    }
     return;
   }
 
   // Non-default flag: use FileHandle-based open → writeFile → close
-  const handle = await open(asyncRequest, filePath, flag);
+  const handle = await open(asyncRequest, filePath, flag, opts?.mode);
   try {
     await handle.writeFile(encoded);
     if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');

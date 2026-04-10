@@ -311,6 +311,18 @@ type AsyncRequestFn = (op: number, path: string, flags?: number, data?: Uint8Arr
     data: Uint8Array | null;
 }>;
 
+/**
+ * VFSFileSystem — main thread API.
+ *
+ * Provides Node.js-compatible sync and async filesystem methods.
+ * Sync methods use SAB + Atomics to block until the server responds.
+ * Async methods use postMessage to the async relay worker.
+ *
+ * On import, workers are spawned immediately. Every method blocks
+ * (or waits) until the worker is ready. This is by design — the library
+ * primarily runs inside workers where blocking is fine.
+ */
+
 declare class VFSFileSystem {
     private sab;
     private ctrl;
@@ -388,8 +400,9 @@ declare class VFSFileSystem {
     rmdirSync(filePath: PathLike, options?: RmdirOptions): void;
     rmSync(filePath: PathLike, options?: RmOptions): void;
     unlinkSync(filePath: PathLike): void;
-    readdirSync(filePath: PathLike, options?: ReaddirOptions | Encoding | null): string[] | Dirent[];
+    readdirSync(filePath: PathLike, options?: ReaddirOptions | Encoding | null): string[] | Uint8Array[] | Dirent[];
     globSync(pattern: string, options?: GlobOptions): string[];
+    opendirSync(filePath: PathLike): Dir;
     statSync(filePath: PathLike, options?: StatOptions): Stats | BigIntStats;
     lstatSync(filePath: PathLike, options?: StatOptions): Stats | BigIntStats;
     renameSync(oldPath: PathLike, newPath: PathLike): void;
@@ -410,6 +423,8 @@ declare class VFSFileSystem {
     /** chown on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
     fchownSync(_fd: number, _uid: number, _gid: number): void;
     utimesSync(filePath: PathLike, atime: Date | number, mtime: Date | number): void;
+    /** utimes on an open file descriptor. No-op in this VFS (cannot resolve fd to path). */
+    futimesSync(_fd: number, _atime: Date | number, _mtime: Date | number): void;
     /** Like utimesSync but operates on the symlink itself. In this VFS, delegates to utimesSync. */
     lutimesSync(filePath: string, atime: Date | number, mtime: Date | number): void;
     symlinkSync(target: PathLike, linkPath: PathLike, type?: string | null): void;
@@ -515,12 +530,70 @@ declare class VFSFileSystem {
     cp(src: string, dest: string, options: CpOptions, callback: (err: Error | null) => void): void;
     fdatasync(fd: number, callback: (err: Error | null) => void): void;
     fsync(fd: number, callback: (err: Error | null) => void): void;
+    fstat(fd: number, callback: (err: Error | null, stats?: Stats) => void): void;
+    fstat(fd: number, options: any, callback: (err: Error | null, stats?: Stats) => void): void;
+    ftruncate(fd: number, callback: (err: Error | null) => void): void;
+    ftruncate(fd: number, len: number, callback: (err: Error | null) => void): void;
+    read(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null, callback: (err: Error | null, bytesRead?: number, buffer?: Uint8Array) => void): void;
+    write(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null, callback: (err: Error | null, bytesWritten?: number, buffer?: Uint8Array) => void): void;
+    write(fd: number, data: string, position: number | null | undefined, encoding: string | undefined, callback: (err: Error | null, bytesWritten?: number, data?: string) => void): void;
+    close(fd: number, callback?: (err: Error | null) => void): void;
     exists(filePath: string, callback: (exists: boolean) => void): void;
+    opendir(filePath: string, callback: (err: Error | null, dir?: Dir) => void): void;
+    glob(pattern: string, callback: (err: Error | null, matches?: string[]) => void): void;
+    glob(pattern: string, options: GlobOptions, callback: (err: Error | null, matches?: string[]) => void): void;
+    futimes(fd: number, atime: Date | number, mtime: Date | number, callback: (err: Error | null) => void): void;
+    fchmod(fd: number, mode: number, callback: (err: Error | null) => void): void;
+    fchown(fd: number, uid: number, gid: number, callback: (err: Error | null) => void): void;
 }
 declare class VFSPromises {
     private _async;
     private _ns;
     constructor(asyncRequest: AsyncRequestFn, ns: string);
+    /** Node.js compat: fs.promises.constants (same as fs.constants) */
+    get constants(): {
+        readonly F_OK: 0;
+        readonly R_OK: 4;
+        readonly W_OK: 2;
+        readonly X_OK: 1;
+        readonly COPYFILE_EXCL: 1;
+        readonly COPYFILE_FICLONE: 2;
+        readonly COPYFILE_FICLONE_FORCE: 4;
+        readonly O_RDONLY: 0;
+        readonly O_WRONLY: 1;
+        readonly O_RDWR: 2;
+        readonly O_CREAT: 64;
+        readonly O_EXCL: 128;
+        readonly O_TRUNC: 512;
+        readonly O_APPEND: 1024;
+        readonly O_NOCTTY: 256;
+        readonly O_NONBLOCK: 2048;
+        readonly O_SYNC: 4096;
+        readonly O_DSYNC: 4096;
+        readonly O_DIRECTORY: 65536;
+        readonly O_NOFOLLOW: 131072;
+        readonly O_NOATIME: 262144;
+        readonly S_IFMT: 61440;
+        readonly S_IFREG: 32768;
+        readonly S_IFDIR: 16384;
+        readonly S_IFCHR: 8192;
+        readonly S_IFBLK: 24576;
+        readonly S_IFIFO: 4096;
+        readonly S_IFLNK: 40960;
+        readonly S_IFSOCK: 49152;
+        readonly S_IRWXU: 448;
+        readonly S_IRUSR: 256;
+        readonly S_IWUSR: 128;
+        readonly S_IXUSR: 64;
+        readonly S_IRWXG: 56;
+        readonly S_IRGRP: 32;
+        readonly S_IWGRP: 16;
+        readonly S_IXGRP: 8;
+        readonly S_IRWXO: 7;
+        readonly S_IROTH: 4;
+        readonly S_IWOTH: 2;
+        readonly S_IXOTH: 1;
+    };
     readFile(filePath: PathLike, options?: ReadOptions | Encoding | null): Promise<string | Uint8Array<ArrayBufferLike>>;
     writeFile(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): Promise<void>;
     appendFile(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): Promise<void>;
@@ -528,7 +601,7 @@ declare class VFSPromises {
     rmdir(filePath: PathLike, options?: RmdirOptions): Promise<void>;
     rm(filePath: PathLike, options?: RmOptions): Promise<void>;
     unlink(filePath: PathLike): Promise<void>;
-    readdir(filePath: PathLike, options?: ReaddirOptions | Encoding | null): Promise<string[] | Dirent[]>;
+    readdir(filePath: PathLike, options?: ReaddirOptions | Encoding | null): Promise<Uint8Array<ArrayBufferLike>[] | string[] | Dirent[]>;
     glob(pattern: string, options?: GlobOptions): Promise<string[]>;
     stat(filePath: PathLike, options?: StatOptions): Promise<BigIntStats | Stats>;
     lstat(filePath: PathLike, options?: StatOptions): Promise<BigIntStats | Stats>;
@@ -550,6 +623,8 @@ declare class VFSPromises {
     /** chown on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
     fchown(_fd: number, _uid: number, _gid: number): Promise<void>;
     utimes(filePath: PathLike, atime: Date | number, mtime: Date | number): Promise<void>;
+    /** utimes on an open file descriptor. No-op in this VFS (cannot resolve fd to path). */
+    futimes(_fd: number, _atime: Date | number, _mtime: Date | number): Promise<void>;
     /** Like utimes but operates on the symlink itself. In this VFS, delegates to utimes. */
     lutimes(filePath: string, atime: Date | number, mtime: Date | number): Promise<void>;
     symlink(target: PathLike, linkPath: PathLike, type?: string | null): Promise<void>;
@@ -856,4 +931,4 @@ declare function getDefaultFS(): VFSFileSystem;
 /** Async init helper — avoids blocking main thread */
 declare function init(): Promise<void>;
 
-export { type BigIntStats, type CpOptions, type Dir, type Dirent, type Encoding, FSError, type FSMode, type FSReadStream, type FSWatcher, type FSWriteStream, type FileHandle, type LoadResult, type MkdirOptions, NodeReadable, NodeWritable, type OpenAsBlobOptions, type PathLike, type ReadOptions, type ReadStreamOptions, type ReaddirOptions, type RepairResult, type RmOptions, type RmdirOptions, SimpleEventEmitter, type StatFs, type StatOptions, type Stats, type UnpackResult, type VFSConfig, VFSFileSystem, type VFSLimits, type WatchEventType, type WatchFileListener, type WatchListener, type WatchOptions, type WriteOptions, type WriteStreamOptions, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path, repairVFS, statusToError, unpackToOPFS };
+export { type BigIntStats, type CpOptions, type Dir, type Dirent, type Encoding, FSError, type FSMode, type FSReadStream, type FSWatcher, type FSWriteStream, type FileHandle, type LoadResult, type MkdirOptions, NodeReadable, NodeWritable, type OpenAsBlobOptions, type PathLike, type ReadOptions, NodeReadable as ReadStream, type ReadStreamOptions, type ReaddirOptions, type RepairResult, type RmOptions, type RmdirOptions, SimpleEventEmitter, type StatFs, type StatOptions, type Stats, type UnpackResult, type VFSConfig, VFSFileSystem, type VFSLimits, type WatchEventType, type WatchFileListener, type WatchListener, type WatchOptions, type WriteOptions, NodeWritable as WriteStream, type WriteStreamOptions, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path, repairVFS, statusToError, unpackToOPFS };

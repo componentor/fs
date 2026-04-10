@@ -4,6 +4,12 @@ import { OP, encodeRequest } from '../protocol/opcodes.js';
 import { statusToError } from '../errors.js';
 import { decodeDirents, decodeNames } from '../stats.js';
 
+const textEncoder = new TextEncoder();
+
+function namesToBuffers(names: string[]): Uint8Array[] {
+  return names.map(n => textEncoder.encode(n));
+}
+
 function readdirBaseSync(
   syncRequest: SyncRequestFn,
   filePath: string,
@@ -122,30 +128,48 @@ export function readdirSync(
   syncRequest: SyncRequestFn,
   filePath: string,
   options?: ReaddirOptions | Encoding | null
-): string[] | Dirent[] {
+): string[] | Uint8Array[] | Dirent[] {
   const opts = typeof options === 'string' ? { encoding: options } : options;
+  const asBuffer = opts?.encoding === 'buffer';
 
   if (opts?.recursive) {
-    return readdirRecursiveSync(
+    const result = readdirRecursiveSync(
       syncRequest, filePath, '', !!opts?.withFileTypes
-    ) as string[] | Dirent[];
+    );
+    if (asBuffer && !opts?.withFileTypes) {
+      return namesToBuffers(result as string[]);
+    }
+    return result as string[] | Dirent[];
   }
 
-  return readdirBaseSync(syncRequest, filePath, !!opts?.withFileTypes);
+  const result = readdirBaseSync(syncRequest, filePath, !!opts?.withFileTypes);
+  if (asBuffer && !opts?.withFileTypes) {
+    return namesToBuffers(result as string[]);
+  }
+  return result;
 }
 
 export async function readdir(
   asyncRequest: AsyncRequestFn,
   filePath: string,
   options?: ReaddirOptions | Encoding | null
-): Promise<string[] | Dirent[]> {
+): Promise<string[] | Uint8Array[] | Dirent[]> {
   const opts = typeof options === 'string' ? { encoding: options } : options;
+  const asBuffer = opts?.encoding === 'buffer';
 
   if (opts?.recursive) {
-    return readdirRecursiveAsync(
+    const result = await readdirRecursiveAsync(
       asyncRequest, filePath, '', !!opts?.withFileTypes
-    ) as Promise<string[] | Dirent[]>;
+    );
+    if (asBuffer && !opts?.withFileTypes) {
+      return namesToBuffers(result as string[]);
+    }
+    return result as string[] | Dirent[];
   }
 
-  return readdirBaseAsync(asyncRequest, filePath, !!opts?.withFileTypes);
+  const result = await readdirBaseAsync(asyncRequest, filePath, !!opts?.withFileTypes);
+  if (asBuffer && !opts?.withFileTypes) {
+    return namesToBuffers(result as string[]);
+  }
+  return result;
 }

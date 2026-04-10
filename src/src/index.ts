@@ -19,6 +19,7 @@
 
 export { VFSFileSystem } from './filesystem.js';
 export { NodeReadable, NodeWritable, SimpleEventEmitter } from './node-streams.js';
+export { NodeReadable as ReadStream, NodeWritable as WriteStream } from './node-streams.js';
 export { constants } from './constants.js';
 export { FSError, createError, statusToError } from './errors.js';
 export { unpackToOPFS, loadFromOPFS, repairVFS } from './helpers.js';

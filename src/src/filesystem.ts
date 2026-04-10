@@ -12,7 +12,7 @@
 
 import type {
   Encoding, ReadOptions, WriteOptions, MkdirOptions, RmdirOptions, RmOptions, CpOptions,
-  ReaddirOptions, StatOptions, Stats, BigIntStats, StatFs, Dirent, VFSConfig, FSMode, FileHandle, GlobOptions,
+  ReaddirOptions, StatOptions, Stats, BigIntStats, StatFs, Dirent, Dir, VFSConfig, FSMode, FileHandle, GlobOptions,
   WatchOptions, WatchFileOptions, WatchEventType, FSWatcher, WatchListener, WatchFileListener,
   ReadStreamOptions, WriteStreamOptions, FSReadStream, FSWriteStream, OpenAsBlobOptions, PathLike,
 } from './types.js';
@@ -179,6 +179,16 @@ export class VFSFileSystem {
       this.rejectReady = reject;
     });
     this.promises = new VFSPromises(this._async, ns);
+
+    // Attach .native aliases (Node.js compat: fs.realpath.native, fs.realpathSync.native)
+    // We create bound own-property functions so .native can be set on them.
+    const boundRealpath = this.realpath.bind(this);
+    (boundRealpath as any).native = boundRealpath;
+    (this as any).realpath = boundRealpath;
+
+    const boundRealpathSync = this.realpathSync.bind(this);
+    (boundRealpathSync as any).native = boundRealpathSync;
+    (this as any).realpathSync = boundRealpathSync;
 
     instanceRegistry.set(ns, this);
     this.bootstrap();
@@ -773,12 +783,37 @@ export class VFSFileSystem {
     _unlinkSync(this._sync, toPathString(filePath));
   }
 
-  readdirSync(filePath: PathLike, options?: ReaddirOptions | Encoding | null): string[] | Dirent[] {
+  readdirSync(filePath: PathLike, options?: ReaddirOptions | Encoding | null): string[] | Uint8Array[] | Dirent[] {
     return _readdirSync(this._sync, toPathString(filePath), options);
   }
 
   globSync(pattern: string, options?: GlobOptions): string[] {
     return _globSync(this._sync, pattern, options);
+  }
+
+  opendirSync(filePath: PathLike): Dir {
+    const dirPath = toPathString(filePath);
+    const entries = this.readdirSync(dirPath, { withFileTypes: true }) as Dirent[];
+    let index = 0;
+
+    return {
+      path: dirPath,
+
+      async read(): Promise<Dirent | null> {
+        if (index >= entries.length) return null;
+        return entries[index++];
+      },
+
+      async close(): Promise<void> {
+        // Nothing to release — entries were read eagerly.
+      },
+
+      async *[Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
+        for (const entry of entries) {
+          yield entry;
+        }
+      },
+    };
   }
 
   statSync(filePath: PathLike, options?: StatOptions): Stats | BigIntStats {
@@ -941,6 +976,11 @@ export class VFSFileSystem {
 
   utimesSync(filePath: PathLike, atime: Date | number, mtime: Date | number): void {
     _utimesSync(this._sync, toPathString(filePath), atime, mtime);
+  }
+
+  /** utimes on an open file descriptor. No-op in this VFS (cannot resolve fd to path). */
+  futimesSync(_fd: number, _atime: Date | number, _mtime: Date | number): void {
+    // No-op: fd-based timestamp changes are not supported in this OPFS VFS.
   }
 
   /** Like utimesSync but operates on the symlink itself. In this VFS, delegates to utimesSync. */
@@ -1594,11 +1634,113 @@ export class VFSFileSystem {
     }
   }
 
+  fstat(fd: number, callback: (err: Error | null, stats?: Stats) => void): void;
+  fstat(fd: number, options: any, callback: (err: Error | null, stats?: Stats) => void): void;
+  fstat(fd: number, optionsOrCallback: any, callback?: any): void {
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    try {
+      const result = this.fstatSync(fd);
+      setTimeout(() => cb(null, result), 0);
+    } catch (err) {
+      setTimeout(() => cb(err), 0);
+    }
+  }
+
+  ftruncate(fd: number, callback: (err: Error | null) => void): void;
+  ftruncate(fd: number, len: number, callback: (err: Error | null) => void): void;
+  ftruncate(fd: number, lenOrCallback?: any, callback?: any): void {
+    const cb = typeof lenOrCallback === 'function' ? lenOrCallback : callback;
+    const len = typeof lenOrCallback === 'function' ? 0 : lenOrCallback;
+    try {
+      this.ftruncateSync(fd, len);
+      setTimeout(() => cb(null), 0);
+    } catch (err) {
+      setTimeout(() => cb(err), 0);
+    }
+  }
+
+  read(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null, callback: (err: Error | null, bytesRead?: number, buffer?: Uint8Array) => void): void {
+    try {
+      const bytesRead = this.readSync(fd, buffer, offset, length, position);
+      setTimeout(() => callback(null, bytesRead, buffer), 0);
+    } catch (err) {
+      setTimeout(() => callback(err as Error), 0);
+    }
+  }
+
+  write(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null, callback: (err: Error | null, bytesWritten?: number, buffer?: Uint8Array) => void): void;
+  write(fd: number, data: string, position: number | null | undefined, encoding: string | undefined, callback: (err: Error | null, bytesWritten?: number, data?: string) => void): void;
+  write(fd: number, bufferOrString: Uint8Array | string, offsetOrPosition?: any, lengthOrEncoding?: any, position?: any, callback?: any): void {
+    const cb = [offsetOrPosition, lengthOrEncoding, position, callback].find(a => typeof a === 'function');
+    try {
+      let bytesWritten: number;
+      if (typeof bufferOrString === 'string') {
+        // String form: write(fd, string, position?, encoding?)
+        const pos = typeof offsetOrPosition === 'function' ? undefined : offsetOrPosition;
+        const enc = typeof lengthOrEncoding === 'function' ? undefined : lengthOrEncoding;
+        bytesWritten = this.writeSync(fd, bufferOrString, pos, enc);
+      } else {
+        // Buffer form: write(fd, buffer, offset, length, position)
+        const off = typeof offsetOrPosition === 'function' ? undefined : offsetOrPosition;
+        const len = typeof lengthOrEncoding === 'function' ? undefined : lengthOrEncoding;
+        const pos = typeof position === 'function' ? undefined : position;
+        bytesWritten = this.writeSync(fd, bufferOrString, off, len, pos);
+      }
+      setTimeout(() => cb(null, bytesWritten, bufferOrString), 0);
+    } catch (err) {
+      setTimeout(() => cb(err), 0);
+    }
+  }
+
+  close(fd: number, callback?: (err: Error | null) => void): void {
+    try {
+      this.closeSync(fd);
+      if (callback) setTimeout(() => callback(null), 0);
+    } catch (err) {
+      if (callback) setTimeout(() => callback(err as Error), 0);
+      else throw err;
+    }
+  }
+
   exists(filePath: string, callback: (exists: boolean) => void): void {
     this.promises.exists(filePath).then(
       (result) => setTimeout(() => callback(result), 0),
       () => setTimeout(() => callback(false), 0),
     );
+  }
+
+  opendir(filePath: string, callback: (err: Error | null, dir?: Dir) => void): void {
+    this.promises.opendir(filePath).then(
+      (dir) => setTimeout(() => callback(null, dir), 0),
+      (err) => setTimeout(() => callback(err), 0),
+    );
+  }
+
+  glob(pattern: string, callback: (err: Error | null, matches?: string[]) => void): void;
+  glob(pattern: string, options: GlobOptions, callback: (err: Error | null, matches?: string[]) => void): void;
+  glob(pattern: string, optionsOrCallback?: any, callback?: any): void {
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    this.promises.glob(pattern, opts).then(
+      (result) => setTimeout(() => cb(null, result), 0),
+      (err) => setTimeout(() => cb(err), 0),
+    );
+  }
+
+  futimes(fd: number, atime: Date | number, mtime: Date | number, callback: (err: Error | null) => void): void {
+    // No-op: fd-based timestamp changes are not supported in this OPFS VFS.
+    setTimeout(() => callback(null), 0);
+  }
+
+  fchmod(fd: number, mode: number, callback: (err: Error | null) => void): void {
+    // No-op: fd-based permission changes are not supported in this OPFS VFS.
+    setTimeout(() => callback(null), 0);
+  }
+
+  fchown(fd: number, uid: number, gid: number, callback: (err: Error | null) => void): void {
+    // No-op: fd-based permission changes are not supported in this OPFS VFS.
+    setTimeout(() => callback(null), 0);
   }
 }
 
@@ -1612,6 +1754,9 @@ class VFSPromises {
     this._async = asyncRequest;
     this._ns = ns;
   }
+
+  /** Node.js compat: fs.promises.constants (same as fs.constants) */
+  get constants() { return constants; }
 
   readFile(filePath: PathLike, options?: ReadOptions | Encoding | null) {
     return _readFile(this._async, toPathString(filePath), options);
@@ -1764,6 +1909,11 @@ class VFSPromises {
 
   utimes(filePath: PathLike, atime: Date | number, mtime: Date | number) {
     return _utimes(this._async, toPathString(filePath), atime, mtime);
+  }
+
+  /** utimes on an open file descriptor. No-op in this VFS (cannot resolve fd to path). */
+  async futimes(_fd: number, _atime: Date | number, _mtime: Date | number): Promise<void> {
+    // No-op: fd-based timestamp changes are not supported in this OPFS VFS.
   }
 
   /** Like utimes but operates on the symlink itself. In this VFS, delegates to utimes. */
