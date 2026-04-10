@@ -1,5 +1,18 @@
 # Changelog
 
+## 3.0.29
+
+Complete Node.js fs API coverage.
+
+- Add callback versions: `fstat`, `ftruncate`, `read`, `write`, `close`, `opendir`, `glob`, `fchmod`, `fchown`, `futimes`
+- Add `futimes`/`futimesSync` (fd timestamp methods)
+- Add `opendirSync` returning `Dir` with sync readdir-based iteration
+- Add `realpath.native`/`realpathSync.native` aliases
+- Add `fs.promises.constants`
+- Export `ReadStream`/`WriteStream` classes from index
+- `writeFile` now respects `mode` option (applies chmod after write)
+- `readdir` with `encoding: 'buffer'` now returns `Uint8Array[]` names
+
 ## 3.0.28
 
 Final Node.js fs compatibility fixes.
