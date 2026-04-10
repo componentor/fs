@@ -52,7 +52,8 @@ import { opendir as _opendir } from './methods/opendir.js';
 import { watch as _watch, watchFile as _watchFile, unwatchFile as _unwatchFile, watchAsync as _watchAsync } from './methods/watch.js';
 import { globSync as _globSync, glob as _glob } from './methods/glob.js';
 import { join as pathJoin, toPathString } from './path.js';
-import { createError } from './errors.js';
+import { createError, statusToError as _statusToError } from './errors.js';
+import { decodeStats as _decodeStats, decodeStatsBigInt as _decodeStatsBigInt } from './stats.js';
 import { constants } from './constants.js';
 
 const encoder = new TextEncoder();
@@ -1034,8 +1035,8 @@ export class VFSFileSystem {
     return _writeSyncFd(this._sync, fd, bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position);
   }
 
-  fstatSync(fd: number): Stats {
-    return _fstatSync(this._sync, fd);
+  fstatSync(fd: number, options?: StatOptions): Stats | BigIntStats {
+    return _fstatSync(this._sync, fd, options);
   }
 
   ftruncateSync(fd: number, len?: number): void {
@@ -1087,6 +1088,7 @@ export class VFSFileSystem {
       pos = positionOrCallback;
       cb = callback!;
     }
+    this._validateCb(cb);
     try {
       const bytesRead = this.readvSync(fd, buffers, pos);
       setTimeout(() => cb(null, bytesRead, buffers), 0);
@@ -1107,6 +1109,7 @@ export class VFSFileSystem {
       pos = positionOrCallback;
       cb = callback!;
     }
+    this._validateCb(cb);
     try {
       const bytesWritten = this.writevSync(fd, buffers, pos);
       setTimeout(() => cb(null, bytesWritten, buffers), 0);
@@ -1134,6 +1137,7 @@ export class VFSFileSystem {
   statfs(path: string, callback?: (err: Error | null, stats?: StatFs) => void): Promise<StatFs> | void {
     const result = this.statfsSync(path);
     if (callback) {
+      this._validateCb(callback);
       setTimeout(() => callback(null, result), 0);
       return;
     }
@@ -1651,6 +1655,7 @@ export class VFSFileSystem {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
     if (cb) {
+      this._validateCb(cb);
       this._cpAsync(src, dest, opts).then(
         () => setTimeout(() => cb(null), 0),
         (err) => setTimeout(() => cb(err), 0),
@@ -1681,14 +1686,14 @@ export class VFSFileSystem {
     }
   }
 
-  fstat(fd: number, callback: (err: Error | null, stats?: Stats) => void): void;
-  fstat(fd: number, options: any, callback: (err: Error | null, stats?: Stats) => void): void;
+  fstat(fd: number, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
+  fstat(fd: number, options: any, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
   fstat(fd: number, optionsOrCallback: any, callback?: any): void {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
     try {
-      const result = this.fstatSync(fd);
+      const result = this.fstatSync(fd, opts);
       setTimeout(() => cb(null, result), 0);
     } catch (err) {
       setTimeout(() => cb(err), 0);
@@ -1709,13 +1714,34 @@ export class VFSFileSystem {
     }
   }
 
-  read(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null, callback: (err: Error | null, bytesRead?: number, buffer?: Uint8Array) => void): void {
-    this._validateCb(callback);
+  read(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null, callback: (err: Error | null, bytesRead?: number, buffer?: Uint8Array) => void): void;
+  read(fd: number, options: { buffer: Uint8Array; offset?: number; length?: number; position?: number | null }, callback: (err: Error | null, bytesRead?: number, buffer?: Uint8Array) => void): void;
+  read(fd: number, buffer: any, offset?: any, length?: any, position?: any, callback?: any): void {
+    let cb: Function;
+    let buf: Uint8Array;
+    let off: number;
+    let len: number;
+    let pos: number | null;
+    if (typeof buffer === 'object' && !(buffer instanceof Uint8Array) && buffer !== null && 'buffer' in buffer) {
+      // Object form: read(fd, { buffer, offset?, length?, position? }, callback)
+      cb = offset;
+      buf = buffer.buffer;
+      off = buffer.offset ?? 0;
+      len = buffer.length ?? buf.byteLength;
+      pos = buffer.position ?? null;
+    } else {
+      cb = callback;
+      buf = buffer;
+      off = offset;
+      len = length;
+      pos = position;
+    }
+    this._validateCb(cb);
     try {
-      const bytesRead = this.readSync(fd, buffer, offset, length, position);
-      setTimeout(() => callback(null, bytesRead, buffer), 0);
+      const bytesRead = this.readSync(fd, buf, off, len, pos);
+      setTimeout(() => cb(null, bytesRead, buf), 0);
     } catch (err) {
-      setTimeout(() => callback(err as Error), 0);
+      setTimeout(() => cb(err as Error), 0);
     }
   }
 
@@ -2045,6 +2071,17 @@ class VFSPromises {
 
   async *watch(filePath: string, options?: WatchOptions): AsyncIterable<WatchEventType> {
     yield* _watchAsync(this._ns, this._async, filePath, options);
+  }
+
+  async fstat(fd: number, options?: StatOptions): Promise<Stats | BigIntStats> {
+    const { status, data } = await this._async(OP.FSTAT, '', 0, null, undefined, { fd });
+    if (status !== 0) throw _statusToError(status, 'fstat', String(fd));
+    return options?.bigint ? _decodeStatsBigInt(data!) : _decodeStats(data!);
+  }
+
+  async ftruncate(fd: number, len: number = 0): Promise<void> {
+    const { status } = await this._async(OP.FTRUNCATE, '', 0, null, undefined, { fd, length: len });
+    if (status !== 0) throw _statusToError(status, 'ftruncate', String(fd));
   }
 
   async fsync(_fd: number): Promise<void> {

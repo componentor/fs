@@ -1,8 +1,8 @@
-import type { Stats, FileHandle, ReadOptions, WriteOptions, Encoding } from '../types.js';
+import type { Stats, BigIntStats, StatOptions, FileHandle, ReadOptions, WriteOptions, Encoding } from '../types.js';
 import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { OP, encodeRequest } from '../protocol/opcodes.js';
 import { statusToError } from '../errors.js';
-import { decodeStats } from '../stats.js';
+import { decodeStats, decodeStatsBigInt } from '../stats.js';
 import { constants } from '../constants.js';
 
 const encoder = new TextEncoder();
@@ -137,14 +137,15 @@ export function writeSyncFd(
 
 export function fstatSync(
   syncRequest: SyncRequestFn,
-  fd: number
-): Stats {
+  fd: number,
+  options?: StatOptions
+): Stats | BigIntStats {
   const fdBuf = new Uint8Array(4);
   new DataView(fdBuf.buffer).setUint32(0, fd, true);
   const buf = encodeRequest(OP.FSTAT, '', 0, fdBuf);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'fstat', String(fd));
-  return decodeStats(data!);
+  return options?.bigint ? decodeStatsBigInt(data!) : decodeStats(data!);
 }
 
 export function ftruncateSync(

@@ -74,6 +74,29 @@ export class SimpleEventEmitter {
   listenerCount(event: string): number {
     return this._listeners.get(event)?.length ?? 0;
   }
+
+  rawListeners(event: string): Function[] {
+    return [...(this._listeners.get(event) ?? [])];
+  }
+
+  prependListener(event: string, fn: Listener): this {
+    const arr = this._listeners.get(event) ?? [];
+    arr.unshift(fn);
+    this._listeners.set(event, arr);
+    return this;
+  }
+
+  prependOnceListener(event: string, fn: Listener): this {
+    const wrapper: Listener = (...args: unknown[]) => {
+      this.off(event, wrapper);
+      fn(...args);
+    };
+    return this.prependListener(event, wrapper);
+  }
+
+  eventNames(): string[] {
+    return [...this._listeners.keys()].filter(k => (this._listeners.get(k)?.length ?? 0) > 0);
+  }
 }
 
 // ---------------------------------------------------------------------------
