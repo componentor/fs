@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.0.24
+
+- Fix EXISTS fallback: OPFS returns OK with data[0]=0 instead of ENOENT for missing paths, so VFS fallback now triggers correctly
+
+## 3.0.23
+
+- Fix lstat to follow intermediate symlinks via resolvePathComponents
+- Fix VFS readdir for symlinked directories, async OPFS fallback
+
 ## 3.0.22
 
 - Fix multi-chunk signal protocol: async-relay now waits for last chunk ack before reading response, preventing signal confusion
