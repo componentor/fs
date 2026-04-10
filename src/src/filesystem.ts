@@ -881,37 +881,56 @@ export class VFSFileSystem {
     const highWaterMark = opts?.highWaterMark ?? 64 * 1024;
 
     let position = start;
+    let handle: import('./types.js').FileHandle | null = null;
+
+    const cleanup = async () => {
+      if (handle) {
+        try { await handle.close(); } catch { /* ignore close errors */ }
+        handle = null;
+      }
+    };
 
     return new ReadableStream<Uint8Array>({
       pull: async (controller) => {
         try {
+          // Lazily open the file on first pull
+          if (!handle) {
+            handle = await this.promises.open(filePath, opts?.flags ?? 'r');
+          }
+
           const readLen = end !== undefined
             ? Math.min(highWaterMark, end - position + 1)
             : highWaterMark;
 
           if (readLen <= 0) {
+            await cleanup();
             controller.close();
             return;
           }
 
-          const result = await this.promises.readFile(filePath);
-          const data = result instanceof Uint8Array ? result : encoder.encode(result);
-          const chunk = data.subarray(position, position + readLen);
+          const buffer = new Uint8Array(readLen);
+          const { bytesRead } = await handle.read(buffer, 0, readLen, position);
 
-          if (chunk.byteLength === 0) {
+          if (bytesRead === 0) {
+            await cleanup();
             controller.close();
             return;
           }
 
-          controller.enqueue(chunk);
-          position += chunk.byteLength;
+          controller.enqueue(buffer.subarray(0, bytesRead));
+          position += bytesRead;
 
           if (end !== undefined && position > end) {
+            await cleanup();
             controller.close();
           }
         } catch (err) {
+          await cleanup();
           controller.error(err);
         }
+      },
+      cancel: async () => {
+        await cleanup();
       },
     });
   }
