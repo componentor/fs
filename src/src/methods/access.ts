@@ -16,8 +16,8 @@ export function accessSync(
 export async function access(
   asyncRequest: AsyncRequestFn,
   filePath: string,
-  mode?: number
+  mode: number = constants.F_OK
 ): Promise<void> {
-  const { status } = await asyncRequest(OP.ACCESS, filePath, mode ?? 0);
+  const { status } = await asyncRequest(OP.ACCESS, filePath, mode);
   if (status !== 0) throw statusToError(status, 'access', filePath);
 }
