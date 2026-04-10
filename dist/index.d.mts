@@ -2,7 +2,7 @@
  * Type definitions for the VFS-based filesystem.
  * Mirrors Node.js fs module interfaces.
  */
-type Encoding = 'utf8' | 'utf-8' | 'ascii' | 'base64' | 'hex' | 'binary';
+type Encoding = 'utf8' | 'utf-8' | 'ascii' | 'base64' | 'hex' | 'binary' | 'latin1' | 'ucs2' | 'ucs-2' | 'utf16le' | 'utf-16le';
 interface ReadOptions {
     encoding?: Encoding | null;
     flag?: string;
@@ -24,9 +24,56 @@ interface RmOptions {
     recursive?: boolean;
     force?: boolean;
 }
+interface CpOptions {
+    /** Dereference symlinks (default: false) */
+    dereference?: boolean;
+    /** Throw if destination exists (default: false) */
+    errorOnExist?: boolean;
+    /** Overwrite existing files/directories (default: true) */
+    force?: boolean;
+    /** Preserve timestamps from source (default: false) */
+    preserveTimestamps?: boolean;
+    /** Copy directories recursively (required for directories) */
+    recursive?: boolean;
+}
 interface ReaddirOptions {
     encoding?: Encoding | null;
     withFileTypes?: boolean;
+    recursive?: boolean;
+}
+interface StatOptions {
+    bigint?: boolean;
+}
+interface BigIntStats {
+    isFile(): boolean;
+    isDirectory(): boolean;
+    isBlockDevice(): boolean;
+    isCharacterDevice(): boolean;
+    isSymbolicLink(): boolean;
+    isFIFO(): boolean;
+    isSocket(): boolean;
+    dev: bigint;
+    ino: bigint;
+    mode: bigint;
+    nlink: bigint;
+    uid: bigint;
+    gid: bigint;
+    rdev: bigint;
+    size: bigint;
+    blksize: bigint;
+    blocks: bigint;
+    atimeMs: bigint;
+    mtimeMs: bigint;
+    ctimeMs: bigint;
+    birthtimeMs: bigint;
+    atime: Date;
+    mtime: Date;
+    ctime: Date;
+    birthtime: Date;
+    atimeNs: bigint;
+    mtimeNs: bigint;
+    ctimeNs: bigint;
+    birthtimeNs: bigint;
 }
 interface Stats {
     isFile(): boolean;
@@ -57,6 +104,10 @@ interface Stats {
 }
 interface Dirent {
     name: string;
+    /** The directory path that was read (Node 20+). */
+    parentPath: string;
+    /** @deprecated Alias for `parentPath`. */
+    path: string;
     isFile(): boolean;
     isDirectory(): boolean;
     isBlockDevice(): boolean;
@@ -64,6 +115,19 @@ interface Dirent {
     isSymbolicLink(): boolean;
     isFIFO(): boolean;
     isSocket(): boolean;
+}
+interface StatFs {
+    type: number;
+    bsize: number;
+    blocks: number;
+    bfree: number;
+    bavail: number;
+    files: number;
+    ffree: number;
+}
+interface GlobOptions {
+    cwd?: string;
+    exclude?: (path: string) => boolean;
 }
 type PathLike = string;
 interface ReadStreamOptions {
@@ -109,6 +173,10 @@ interface FileHandle {
         buffer: Uint8Array;
     }>;
     write(buffer: Uint8Array, offset?: number, length?: number, position?: number | null): Promise<{
+        bytesWritten: number;
+        buffer: Uint8Array;
+    }>;
+    write(string: string, position?: number, encoding?: string): Promise<{
         bytesWritten: number;
         buffer: Uint8Array;
     }>;
@@ -262,27 +330,35 @@ declare class VFSFileSystem {
     rmSync(filePath: string, options?: RmOptions): void;
     unlinkSync(filePath: string): void;
     readdirSync(filePath: string, options?: ReaddirOptions | Encoding | null): string[] | Dirent[];
-    statSync(filePath: string): Stats;
-    lstatSync(filePath: string): Stats;
+    globSync(pattern: string, options?: GlobOptions): string[];
+    statSync(filePath: string, options?: StatOptions): Stats | BigIntStats;
+    lstatSync(filePath: string, options?: StatOptions): Stats | BigIntStats;
     renameSync(oldPath: string, newPath: string): void;
     copyFileSync(src: string, dest: string, mode?: number): void;
+    cpSync(src: string, dest: string, options?: CpOptions): void;
+    cp(src: string, dest: string, options?: CpOptions): Promise<void>;
     truncateSync(filePath: string, len?: number): void;
     accessSync(filePath: string, mode?: number): void;
     realpathSync(filePath: string): string;
     chmodSync(filePath: string, mode: number): void;
     chownSync(filePath: string, uid: number, gid: number): void;
     utimesSync(filePath: string, atime: Date | number, mtime: Date | number): void;
-    symlinkSync(target: string, linkPath: string): void;
-    readlinkSync(filePath: string): string;
+    symlinkSync(target: string, linkPath: string, type?: string | null): void;
+    readlinkSync(filePath: string, options?: {
+        encoding?: string | null;
+    } | string | null): string | Uint8Array;
     linkSync(existingPath: string, newPath: string): void;
     mkdtempSync(prefix: string): string;
     openSync(filePath: string, flags?: string | number, mode?: number): number;
     closeSync(fd: number): void;
     readSync(fd: number, buffer: Uint8Array, offset?: number, length?: number, position?: number | null): number;
-    writeSync(fd: number, buffer: Uint8Array, offset?: number, length?: number, position?: number | null): number;
+    writeSync(fd: number, bufferOrString: Uint8Array | string, offsetOrPosition?: number, lengthOrEncoding?: number | string, position?: number | null): number;
     fstatSync(fd: number): Stats;
     ftruncateSync(fd: number, len?: number): void;
     fdatasyncSync(fd: number): void;
+    statfsSync(_path?: string): StatFs;
+    statfs(path: string, callback: (err: Error | null, stats?: StatFs) => void): void;
+    statfs(path: string): Promise<StatFs>;
     watch(filePath: string, options?: WatchOptions | Encoding, listener?: WatchListener): FSWatcher;
     watchFile(filePath: string, optionsOrListener?: WatchFileOptions | WatchFileListener, listener?: WatchFileListener): void;
     unwatchFile(filePath: string, listener?: WatchFileListener): void;
@@ -318,23 +394,28 @@ declare class VFSPromises {
     rm(filePath: string, options?: RmOptions): Promise<void>;
     unlink(filePath: string): Promise<void>;
     readdir(filePath: string, options?: ReaddirOptions | Encoding | null): Promise<string[] | Dirent[]>;
-    stat(filePath: string): Promise<Stats>;
-    lstat(filePath: string): Promise<Stats>;
+    glob(pattern: string, options?: GlobOptions): Promise<string[]>;
+    stat(filePath: string, options?: StatOptions): Promise<BigIntStats | Stats>;
+    lstat(filePath: string, options?: StatOptions): Promise<BigIntStats | Stats>;
     access(filePath: string, mode?: number): Promise<void>;
     rename(oldPath: string, newPath: string): Promise<void>;
     copyFile(src: string, dest: string, mode?: number): Promise<void>;
+    cp(src: string, dest: string, options?: CpOptions): Promise<void>;
     truncate(filePath: string, len?: number): Promise<void>;
     realpath(filePath: string): Promise<string>;
     exists(filePath: string): Promise<boolean>;
     chmod(filePath: string, mode: number): Promise<void>;
     chown(filePath: string, uid: number, gid: number): Promise<void>;
     utimes(filePath: string, atime: Date | number, mtime: Date | number): Promise<void>;
-    symlink(target: string, linkPath: string): Promise<void>;
-    readlink(filePath: string): Promise<string>;
+    symlink(target: string, linkPath: string, type?: string | null): Promise<void>;
+    readlink(filePath: string, options?: {
+        encoding?: string | null;
+    } | string | null): Promise<string | Uint8Array<ArrayBufferLike>>;
     link(existingPath: string, newPath: string): Promise<void>;
     open(filePath: string, flags?: string | number, mode?: number): Promise<FileHandle>;
     opendir(filePath: string): Promise<Dir>;
     mkdtemp(prefix: string): Promise<string>;
+    statfs(path: string): Promise<StatFs>;
     watch(filePath: string, options?: WatchOptions): AsyncIterable<WatchEventType>;
     flush(): Promise<void>;
     purge(): Promise<void>;
@@ -527,4 +608,4 @@ declare function getDefaultFS(): VFSFileSystem;
 /** Async init helper — avoids blocking main thread */
 declare function init(): Promise<void>;
 
-export { type Dir, type Dirent, type Encoding, FSError, type FSMode, type FSWatcher, type FileHandle, type LoadResult, type MkdirOptions, type PathLike, type ReadOptions, type ReadStreamOptions, type ReaddirOptions, type RepairResult, type RmOptions, type RmdirOptions, type Stats, type UnpackResult, type VFSConfig, VFSFileSystem, type VFSLimits, type WatchEventType, type WatchFileListener, type WatchListener, type WatchOptions, type WriteOptions, type WriteStreamOptions, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path, repairVFS, statusToError, unpackToOPFS };
+export { type BigIntStats, type CpOptions, type Dir, type Dirent, type Encoding, FSError, type FSMode, type FSWatcher, type FileHandle, type LoadResult, type MkdirOptions, type PathLike, type ReadOptions, type ReadStreamOptions, type ReaddirOptions, type RepairResult, type RmOptions, type RmdirOptions, type StatFs, type StatOptions, type Stats, type UnpackResult, type VFSConfig, VFSFileSystem, type VFSLimits, type WatchEventType, type WatchFileListener, type WatchListener, type WatchOptions, type WriteOptions, type WriteStreamOptions, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path, repairVFS, statusToError, unpackToOPFS };

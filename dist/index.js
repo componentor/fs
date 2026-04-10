@@ -160,147 +160,6 @@ function statusToError(status, syscall, path) {
   return createError(code, syscall, path);
 }
 
-// src/methods/readFile.ts
-var decoder2 = new TextDecoder();
-function readFileSync(syncRequest, filePath, options) {
-  const encoding = typeof options === "string" ? options : options?.encoding;
-  const buf = encodeRequest(OP.READ, filePath);
-  const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "read", filePath);
-  const result = data ?? new Uint8Array(0);
-  if (encoding) return decoder2.decode(result);
-  return result;
-}
-async function readFile(asyncRequest, filePath, options) {
-  const encoding = typeof options === "string" ? options : options?.encoding;
-  const { status, data } = await asyncRequest(OP.READ, filePath);
-  if (status !== 0) throw statusToError(status, "read", filePath);
-  const result = data ?? new Uint8Array(0);
-  if (encoding) return decoder2.decode(result);
-  return result;
-}
-
-// src/methods/writeFile.ts
-var encoder2 = new TextEncoder();
-function writeFileSync(syncRequest, filePath, data, options) {
-  const opts = typeof options === "string" ? { } : options;
-  const encoded = typeof data === "string" ? encoder2.encode(data) : data;
-  const flags = opts?.flush === true ? 1 : 0;
-  const buf = encodeRequest(OP.WRITE, filePath, flags, encoded);
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "write", filePath);
-}
-async function writeFile(asyncRequest, filePath, data, options) {
-  const opts = typeof options === "string" ? { } : options;
-  const flags = opts?.flush === true ? 1 : 0;
-  const encoded = typeof data === "string" ? encoder2.encode(data) : data;
-  const { status } = await asyncRequest(OP.WRITE, filePath, flags, encoded);
-  if (status !== 0) throw statusToError(status, "write", filePath);
-}
-
-// src/methods/appendFile.ts
-var encoder3 = new TextEncoder();
-function appendFileSync(syncRequest, filePath, data, options) {
-  const encoded = typeof data === "string" ? encoder3.encode(data) : data;
-  const buf = encodeRequest(OP.APPEND, filePath, 0, encoded);
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "appendFile", filePath);
-}
-async function appendFile(asyncRequest, filePath, data, options) {
-  const encoded = typeof data === "string" ? encoder3.encode(data) : data;
-  const { status } = await asyncRequest(OP.APPEND, filePath, 0, encoded);
-  if (status !== 0) throw statusToError(status, "appendFile", filePath);
-}
-
-// src/methods/exists.ts
-function existsSync(syncRequest, filePath) {
-  const buf = encodeRequest(OP.EXISTS, filePath);
-  const { data } = syncRequest(buf);
-  return data ? data[0] === 1 : false;
-}
-async function exists(asyncRequest, filePath) {
-  const { data } = await asyncRequest(OP.EXISTS, filePath);
-  return data ? data[0] === 1 : false;
-}
-
-// src/methods/mkdir.ts
-var decoder3 = new TextDecoder();
-function mkdirSync(syncRequest, filePath, options) {
-  const opts = typeof options === "number" ? { } : options;
-  const flags = opts?.recursive ? 1 : 0;
-  const buf = encodeRequest(OP.MKDIR, filePath, flags);
-  const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "mkdir", filePath);
-  return data ? decoder3.decode(data) : void 0;
-}
-async function mkdir(asyncRequest, filePath, options) {
-  const opts = typeof options === "number" ? { } : options;
-  const flags = opts?.recursive ? 1 : 0;
-  const { status, data } = await asyncRequest(OP.MKDIR, filePath, flags);
-  if (status !== 0) throw statusToError(status, "mkdir", filePath);
-  return data ? decoder3.decode(data) : void 0;
-}
-
-// src/methods/rmdir.ts
-function rmdirSync(syncRequest, filePath, options) {
-  const flags = options?.recursive ? 1 : 0;
-  const buf = encodeRequest(OP.RMDIR, filePath, flags);
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "rmdir", filePath);
-}
-async function rmdir(asyncRequest, filePath, options) {
-  const flags = options?.recursive ? 1 : 0;
-  const { status } = await asyncRequest(OP.RMDIR, filePath, flags);
-  if (status !== 0) throw statusToError(status, "rmdir", filePath);
-}
-
-// src/methods/rm.ts
-function rmSync(syncRequest, filePath, options) {
-  const flags = (options?.recursive ? 1 : 0) | (options?.force ? 2 : 0);
-  const buf = encodeRequest(OP.UNLINK, filePath, flags);
-  const { status } = syncRequest(buf);
-  if (status === 3) {
-    const rmdirBuf = encodeRequest(OP.RMDIR, filePath, flags);
-    const rmdirResult = syncRequest(rmdirBuf);
-    if (rmdirResult.status !== 0) {
-      if (options?.force && rmdirResult.status === 1) return;
-      throw statusToError(rmdirResult.status, "rm", filePath);
-    }
-    return;
-  }
-  if (status !== 0) {
-    if (options?.force && status === 1) return;
-    throw statusToError(status, "rm", filePath);
-  }
-}
-async function rm(asyncRequest, filePath, options) {
-  const flags = (options?.recursive ? 1 : 0) | (options?.force ? 2 : 0);
-  const { status } = await asyncRequest(OP.UNLINK, filePath, flags);
-  if (status === 3) {
-    const { status: s2 } = await asyncRequest(OP.RMDIR, filePath, flags);
-    if (s2 !== 0) {
-      if (options?.force && s2 === 1) return;
-      throw statusToError(s2, "rm", filePath);
-    }
-    return;
-  }
-  if (status !== 0) {
-    if (options?.force && status === 1) return;
-    throw statusToError(status, "rm", filePath);
-  }
-}
-
-// src/methods/unlink.ts
-function unlinkSync(syncRequest, filePath) {
-  const buf = encodeRequest(OP.UNLINK, filePath);
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "unlink", filePath);
-}
-async function unlink(asyncRequest, filePath) {
-  const { status } = await asyncRequest(OP.UNLINK, filePath);
-  if (status !== 0) throw statusToError(status, "unlink", filePath);
-}
-
 // src/vfs/layout.ts
 var VFS_MAGIC = 1447449377;
 var VFS_VERSION = 1;
@@ -339,8 +198,8 @@ var INODE = {
   // uint32 - byte offset into path table
   PATH_LENGTH: 8,
   // uint16 - length of path string
-  RESERVED_10: 10,
-  // uint16
+  NLINK: 10,
+  // uint16 - hard link count
   MODE: 12,
   // uint32 - permissions (e.g. 0o100644)
   SIZE: 16,
@@ -408,6 +267,7 @@ function decodeStats(data) {
   const uid = view.getUint32(37, true);
   const gid = view.getUint32(41, true);
   const ino = view.getUint32(45, true);
+  const nlink = data.byteLength >= 53 ? view.getUint32(49, true) : 1;
   const isFile = type === INODE_TYPE.FILE;
   const isDirectory = type === INODE_TYPE.DIRECTORY;
   const isSymlink = type === INODE_TYPE.SYMLINK;
@@ -422,7 +282,7 @@ function decodeStats(data) {
     dev: 0,
     ino,
     mode,
-    nlink: 1,
+    nlink,
     uid,
     gid,
     rdev: 0,
@@ -439,7 +299,57 @@ function decodeStats(data) {
     birthtime: new Date(ctimeMs)
   };
 }
-function decodeDirents(data) {
+function decodeStatsBigInt(data) {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const type = view.getUint8(0);
+  const mode = view.getUint32(1, true);
+  const size = view.getFloat64(5, true);
+  const mtimeMs = view.getFloat64(13, true);
+  const ctimeMs = view.getFloat64(21, true);
+  const atimeMs = view.getFloat64(29, true);
+  const uid = view.getUint32(37, true);
+  const gid = view.getUint32(41, true);
+  const ino = view.getUint32(45, true);
+  const nlink = data.byteLength >= 53 ? view.getUint32(49, true) : 1;
+  const isFile = type === INODE_TYPE.FILE;
+  const isDirectory = type === INODE_TYPE.DIRECTORY;
+  const isSymlink = type === INODE_TYPE.SYMLINK;
+  const atimeMsBigInt = BigInt(Math.trunc(atimeMs));
+  const mtimeMsBigInt = BigInt(Math.trunc(mtimeMs));
+  const ctimeMsBigInt = BigInt(Math.trunc(ctimeMs));
+  return {
+    isFile: () => isFile,
+    isDirectory: () => isDirectory,
+    isBlockDevice: () => false,
+    isCharacterDevice: () => false,
+    isSymbolicLink: () => isSymlink,
+    isFIFO: () => false,
+    isSocket: () => false,
+    dev: 0n,
+    ino: BigInt(ino),
+    mode: BigInt(mode),
+    nlink: BigInt(nlink),
+    uid: BigInt(uid),
+    gid: BigInt(gid),
+    rdev: 0n,
+    size: BigInt(Math.trunc(size)),
+    blksize: 4096n,
+    blocks: BigInt(Math.ceil(size / 512)),
+    atimeMs: atimeMsBigInt,
+    mtimeMs: mtimeMsBigInt,
+    ctimeMs: ctimeMsBigInt,
+    birthtimeMs: ctimeMsBigInt,
+    atime: new Date(atimeMs),
+    mtime: new Date(mtimeMs),
+    ctime: new Date(ctimeMs),
+    birthtime: new Date(ctimeMs),
+    atimeNs: atimeMsBigInt * 1000000n,
+    mtimeNs: mtimeMsBigInt * 1000000n,
+    ctimeNs: ctimeMsBigInt * 1000000n,
+    birthtimeNs: ctimeMsBigInt * 1000000n
+  };
+}
+function decodeDirents(data, parentPath = "") {
   const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const count = view.getUint32(0, true);
   const decoder9 = new TextDecoder();
@@ -456,6 +366,8 @@ function decodeDirents(data) {
     const isSymlink = type === INODE_TYPE.SYMLINK;
     entries.push({
       name,
+      parentPath,
+      path: parentPath,
       isFile: () => isFile,
       isDirectory: () => isDirectory,
       isBlockDevice: () => false,
@@ -480,96 +392,6 @@ function decodeNames(data) {
     offset += nameLen;
   }
   return names;
-}
-
-// src/methods/readdir.ts
-function readdirSync(syncRequest, filePath, options) {
-  const opts = typeof options === "string" ? { } : options;
-  const flags = opts?.withFileTypes ? 1 : 0;
-  const buf = encodeRequest(OP.READDIR, filePath, flags);
-  const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "readdir", filePath);
-  if (!data) return [];
-  return opts?.withFileTypes ? decodeDirents(data) : decodeNames(data);
-}
-async function readdir(asyncRequest, filePath, options) {
-  const opts = typeof options === "string" ? { } : options;
-  const flags = opts?.withFileTypes ? 1 : 0;
-  const { status, data } = await asyncRequest(OP.READDIR, filePath, flags);
-  if (status !== 0) throw statusToError(status, "readdir", filePath);
-  if (!data) return [];
-  return opts?.withFileTypes ? decodeDirents(data) : decodeNames(data);
-}
-
-// src/methods/stat.ts
-function statSync(syncRequest, filePath) {
-  const buf = encodeRequest(OP.STAT, filePath);
-  const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "stat", filePath);
-  return decodeStats(data);
-}
-function lstatSync(syncRequest, filePath) {
-  const buf = encodeRequest(OP.LSTAT, filePath);
-  const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "lstat", filePath);
-  return decodeStats(data);
-}
-async function stat(asyncRequest, filePath) {
-  const { status, data } = await asyncRequest(OP.STAT, filePath);
-  if (status !== 0) throw statusToError(status, "stat", filePath);
-  return decodeStats(data);
-}
-async function lstat(asyncRequest, filePath) {
-  const { status, data } = await asyncRequest(OP.LSTAT, filePath);
-  if (status !== 0) throw statusToError(status, "lstat", filePath);
-  return decodeStats(data);
-}
-
-// src/methods/rename.ts
-var encoder4 = new TextEncoder();
-function renameSync(syncRequest, oldPath, newPath) {
-  const buf = encodeTwoPathRequest(OP.RENAME, oldPath, newPath);
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "rename", oldPath);
-}
-async function rename(asyncRequest, oldPath, newPath) {
-  const path2Bytes = encoder4.encode(newPath);
-  const payload = new Uint8Array(4 + path2Bytes.byteLength);
-  new DataView(payload.buffer).setUint32(0, path2Bytes.byteLength, true);
-  payload.set(path2Bytes, 4);
-  const { status } = await asyncRequest(OP.RENAME, oldPath, 0, payload);
-  if (status !== 0) throw statusToError(status, "rename", oldPath);
-}
-
-// src/methods/copyFile.ts
-var encoder5 = new TextEncoder();
-function copyFileSync(syncRequest, src, dest, mode) {
-  const buf = encodeTwoPathRequest(OP.COPY, src, dest, mode ?? 0);
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "copyFile", src);
-}
-async function copyFile(asyncRequest, src, dest, mode) {
-  const path2Bytes = encoder5.encode(dest);
-  const payload = new Uint8Array(4 + path2Bytes.byteLength);
-  new DataView(payload.buffer).setUint32(0, path2Bytes.byteLength, true);
-  payload.set(path2Bytes, 4);
-  const { status } = await asyncRequest(OP.COPY, src, mode ?? 0, payload);
-  if (status !== 0) throw statusToError(status, "copyFile", src);
-}
-
-// src/methods/truncate.ts
-function truncateSync(syncRequest, filePath, len = 0) {
-  const lenBuf = new Uint8Array(4);
-  new DataView(lenBuf.buffer).setUint32(0, len, true);
-  const buf = encodeRequest(OP.TRUNCATE, filePath, 0, lenBuf);
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "truncate", filePath);
-}
-async function truncate(asyncRequest, filePath, len) {
-  const lenBuf = new Uint8Array(4);
-  new DataView(lenBuf.buffer).setUint32(0, len ?? 0, true);
-  const { status } = await asyncRequest(OP.TRUNCATE, filePath, 0, lenBuf);
-  if (status !== 0) throw statusToError(status, "truncate", filePath);
 }
 
 // src/constants.ts
@@ -616,29 +438,677 @@ var constants = {
   S_IXOTH: 1
 };
 
+// src/methods/open.ts
+var encoder2 = new TextEncoder();
+var decoder2 = new TextDecoder();
+function parseFlags(flags) {
+  switch (flags) {
+    case "r":
+      return constants.O_RDONLY;
+    case "r+":
+      return constants.O_RDWR;
+    case "w":
+      return constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC;
+    case "w+":
+      return constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC;
+    case "a":
+      return constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND;
+    case "a+":
+      return constants.O_RDWR | constants.O_CREAT | constants.O_APPEND;
+    case "wx":
+      return constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_EXCL;
+    case "wx+":
+      return constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC | constants.O_EXCL;
+    case "ax":
+      return constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_EXCL;
+    case "ax+":
+      return constants.O_RDWR | constants.O_CREAT | constants.O_APPEND | constants.O_EXCL;
+    default:
+      return constants.O_RDONLY;
+  }
+}
+function openSync(syncRequest, filePath, flags = "r", _mode) {
+  const numFlags = typeof flags === "string" ? parseFlags(flags) : flags;
+  const buf = encodeRequest(OP.OPEN, filePath, numFlags);
+  const { status, data } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "open", filePath);
+  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
+}
+function closeSync(syncRequest, fd) {
+  const fdBuf = new Uint8Array(4);
+  new DataView(fdBuf.buffer).setUint32(0, fd, true);
+  const buf = encodeRequest(OP.CLOSE, "", 0, fdBuf);
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "close", String(fd));
+}
+function readSync(syncRequest, fd, buffer, offset = 0, length = buffer.byteLength, position = null) {
+  const fdBuf = new Uint8Array(16);
+  const dv = new DataView(fdBuf.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setUint32(4, length, true);
+  dv.setFloat64(8, position ?? -1, true);
+  const buf = encodeRequest(OP.FREAD, "", 0, fdBuf);
+  const { status, data } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "read", String(fd));
+  if (data) {
+    buffer.set(data.subarray(0, Math.min(data.byteLength, length)), offset);
+    return data.byteLength;
+  }
+  return 0;
+}
+function writeSyncFd(syncRequest, fd, bufferOrString, offsetOrPosition, lengthOrEncoding, position) {
+  let writeData;
+  let pos;
+  if (typeof bufferOrString === "string") {
+    writeData = encoder2.encode(bufferOrString);
+    pos = offsetOrPosition != null ? offsetOrPosition : null;
+  } else {
+    const offset = offsetOrPosition ?? 0;
+    const length = lengthOrEncoding != null ? lengthOrEncoding : bufferOrString.byteLength;
+    pos = position ?? null;
+    writeData = bufferOrString.subarray(offset, offset + length);
+  }
+  const fdBuf = new Uint8Array(12 + writeData.byteLength);
+  const dv = new DataView(fdBuf.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setFloat64(4, pos ?? -1, true);
+  fdBuf.set(writeData, 12);
+  const buf = encodeRequest(OP.FWRITE, "", 0, fdBuf);
+  const { status, data } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "write", String(fd));
+  return data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
+}
+function fstatSync(syncRequest, fd) {
+  const fdBuf = new Uint8Array(4);
+  new DataView(fdBuf.buffer).setUint32(0, fd, true);
+  const buf = encodeRequest(OP.FSTAT, "", 0, fdBuf);
+  const { status, data } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "fstat", String(fd));
+  return decodeStats(data);
+}
+function ftruncateSync(syncRequest, fd, len = 0) {
+  const fdBuf = new Uint8Array(12);
+  const dv = new DataView(fdBuf.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setFloat64(4, len, true);
+  const buf = encodeRequest(OP.FTRUNCATE, "", 0, fdBuf);
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "ftruncate", String(fd));
+}
+function fdatasyncSync(syncRequest, fd) {
+  const buf = encodeRequest(OP.FSYNC, "");
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "fdatasync", String(fd));
+}
+async function open(asyncRequest, filePath, flags, _mode) {
+  const numFlags = typeof flags === "string" ? parseFlags(flags ?? "r") : flags ?? 0;
+  const { status, data } = await asyncRequest(OP.OPEN, filePath, numFlags);
+  if (status !== 0) throw statusToError(status, "open", filePath);
+  const fd = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
+  return createFileHandle(fd, asyncRequest);
+}
+function createFileHandle(fd, asyncRequest) {
+  return {
+    fd,
+    async read(buffer, offset = 0, length = buffer.byteLength, position = null) {
+      const { status, data } = await asyncRequest(OP.FREAD, "", 0, null, void 0, { fd, length, position: position ?? -1 });
+      if (status !== 0) throw statusToError(status, "read", String(fd));
+      const bytesRead = data ? data.byteLength : 0;
+      if (data) buffer.set(data.subarray(0, Math.min(bytesRead, length)), offset);
+      return { bytesRead, buffer };
+    },
+    async write(bufferOrString, offsetOrPosition, lengthOrEncoding, position) {
+      let writeData;
+      let pos;
+      let resultBuffer;
+      if (typeof bufferOrString === "string") {
+        resultBuffer = encoder2.encode(bufferOrString);
+        writeData = resultBuffer;
+        pos = offsetOrPosition != null ? offsetOrPosition : -1;
+      } else {
+        resultBuffer = bufferOrString;
+        const offset = offsetOrPosition ?? 0;
+        const length = lengthOrEncoding != null ? lengthOrEncoding : bufferOrString.byteLength;
+        pos = position != null ? position : -1;
+        writeData = bufferOrString.subarray(offset, offset + length);
+      }
+      const { status, data } = await asyncRequest(OP.FWRITE, "", 0, null, void 0, { fd, data: writeData, position: pos });
+      if (status !== 0) throw statusToError(status, "write", String(fd));
+      const bytesWritten = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
+      return { bytesWritten, buffer: resultBuffer };
+    },
+    async readFile(options) {
+      const encoding = typeof options === "string" ? options : options?.encoding;
+      const { status, data } = await asyncRequest(OP.FREAD, "", 0, null, void 0, { fd, length: Number.MAX_SAFE_INTEGER, position: 0 });
+      if (status !== 0) throw statusToError(status, "read", String(fd));
+      const result = data ?? new Uint8Array(0);
+      if (encoding) return decoder2.decode(result);
+      return result;
+    },
+    async writeFile(data, _options) {
+      const encoded = typeof data === "string" ? encoder2.encode(data) : data;
+      const { status } = await asyncRequest(OP.FWRITE, "", 0, null, void 0, { fd, data: encoded, position: 0 });
+      if (status !== 0) throw statusToError(status, "write", String(fd));
+    },
+    async truncate(len = 0) {
+      const { status } = await asyncRequest(OP.FTRUNCATE, "", 0, null, void 0, { fd, length: len });
+      if (status !== 0) throw statusToError(status, "ftruncate", String(fd));
+    },
+    async stat() {
+      const { status, data } = await asyncRequest(OP.FSTAT, "", 0, null, void 0, { fd });
+      if (status !== 0) throw statusToError(status, "fstat", String(fd));
+      return decodeStats(data);
+    },
+    async sync() {
+      await asyncRequest(OP.FSYNC, "");
+    },
+    async datasync() {
+      await asyncRequest(OP.FSYNC, "");
+    },
+    async close() {
+      const { status } = await asyncRequest(OP.CLOSE, "", 0, null, void 0, { fd });
+      if (status !== 0) throw statusToError(status, "close", String(fd));
+    }
+  };
+}
+
+// src/encoding.ts
+function decodeBuffer(data, encoding) {
+  switch (encoding) {
+    case "utf8":
+    case "utf-8":
+      return new TextDecoder("utf-8").decode(data);
+    case "latin1":
+    case "binary": {
+      let result = "";
+      for (let i = 0; i < data.length; i++) {
+        result += String.fromCharCode(data[i]);
+      }
+      return result;
+    }
+    case "ascii": {
+      let result = "";
+      for (let i = 0; i < data.length; i++) {
+        result += String.fromCharCode(data[i] & 127);
+      }
+      return result;
+    }
+    case "base64": {
+      let binary = "";
+      for (let i = 0; i < data.length; i++) {
+        binary += String.fromCharCode(data[i]);
+      }
+      return btoa(binary);
+    }
+    case "hex": {
+      let hex = "";
+      for (let i = 0; i < data.length; i++) {
+        hex += data[i].toString(16).padStart(2, "0");
+      }
+      return hex;
+    }
+    case "ucs2":
+    case "ucs-2":
+    case "utf16le":
+    case "utf-16le":
+      return new TextDecoder("utf-16le").decode(data);
+    default:
+      return new TextDecoder("utf-8").decode(data);
+  }
+}
+function encodeString(str, encoding) {
+  switch (encoding) {
+    case "utf8":
+    case "utf-8":
+      return new TextEncoder().encode(str);
+    case "latin1":
+    case "binary": {
+      const buf = new Uint8Array(str.length);
+      for (let i = 0; i < str.length; i++) {
+        buf[i] = str.charCodeAt(i) & 255;
+      }
+      return buf;
+    }
+    case "ascii": {
+      const buf = new Uint8Array(str.length);
+      for (let i = 0; i < str.length; i++) {
+        buf[i] = str.charCodeAt(i) & 127;
+      }
+      return buf;
+    }
+    case "base64": {
+      const binary = atob(str);
+      const buf = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        buf[i] = binary.charCodeAt(i);
+      }
+      return buf;
+    }
+    case "hex": {
+      const len = str.length >>> 1;
+      const buf = new Uint8Array(len);
+      for (let i = 0; i < len; i++) {
+        buf[i] = parseInt(str.slice(i * 2, i * 2 + 2), 16);
+      }
+      return buf;
+    }
+    case "ucs2":
+    case "ucs-2":
+    case "utf16le":
+    case "utf-16le": {
+      const buf = new Uint8Array(str.length * 2);
+      for (let i = 0; i < str.length; i++) {
+        const code = str.charCodeAt(i);
+        buf[i * 2] = code & 255;
+        buf[i * 2 + 1] = code >>> 8 & 255;
+      }
+      return buf;
+    }
+    default:
+      return new TextEncoder().encode(str);
+  }
+}
+
+// src/methods/readFile.ts
+new TextDecoder();
+function readFileSync(syncRequest, filePath, options) {
+  const encoding = typeof options === "string" ? options : options?.encoding;
+  const flag = typeof options === "string" ? void 0 : options?.flag;
+  if (!flag || flag === "r") {
+    const buf = encodeRequest(OP.READ, filePath);
+    const { status, data } = syncRequest(buf);
+    if (status !== 0) throw statusToError(status, "read", filePath);
+    const result = data ?? new Uint8Array(0);
+    if (encoding) return decodeBuffer(result, encoding);
+    return result;
+  }
+  const fd = openSync(syncRequest, filePath, flag);
+  try {
+    const chunks = [];
+    let totalRead = 0;
+    const chunkSize = 64 * 1024;
+    while (true) {
+      const chunk = new Uint8Array(chunkSize);
+      const bytesRead = readSync(syncRequest, fd, chunk, 0, chunkSize, totalRead);
+      if (bytesRead === 0) break;
+      chunks.push(chunk.subarray(0, bytesRead));
+      totalRead += bytesRead;
+      if (bytesRead < chunkSize) break;
+    }
+    let result;
+    if (chunks.length === 0) {
+      result = new Uint8Array(0);
+    } else if (chunks.length === 1) {
+      result = chunks[0];
+    } else {
+      result = new Uint8Array(totalRead);
+      let offset = 0;
+      for (const chunk of chunks) {
+        result.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+    }
+    if (encoding) return decodeBuffer(result, encoding);
+    return result;
+  } finally {
+    closeSync(syncRequest, fd);
+  }
+}
+async function readFile(asyncRequest, filePath, options) {
+  const encoding = typeof options === "string" ? options : options?.encoding;
+  const flag = typeof options === "string" ? void 0 : options?.flag;
+  if (!flag || flag === "r") {
+    const { status, data } = await asyncRequest(OP.READ, filePath);
+    if (status !== 0) throw statusToError(status, "read", filePath);
+    const result = data ?? new Uint8Array(0);
+    if (encoding) return decodeBuffer(result, encoding);
+    return result;
+  }
+  const handle = await open(asyncRequest, filePath, flag);
+  try {
+    const result = await handle.readFile(encoding ? encoding : void 0);
+    return result;
+  } finally {
+    await handle.close();
+  }
+}
+
+// src/methods/writeFile.ts
+var encoder3 = new TextEncoder();
+function writeFileSync(syncRequest, filePath, data, options) {
+  const opts = typeof options === "string" ? { encoding: options } : options;
+  const encoded = typeof data === "string" ? opts?.encoding ? encodeString(data, opts.encoding) : encoder3.encode(data) : data;
+  const flag = opts?.flag;
+  if (!flag || flag === "w") {
+    const flags = opts?.flush === true ? 1 : 0;
+    const buf = encodeRequest(OP.WRITE, filePath, flags, encoded);
+    const { status } = syncRequest(buf);
+    if (status !== 0) throw statusToError(status, "write", filePath);
+    return;
+  }
+  const fd = openSync(syncRequest, filePath, flag);
+  try {
+    writeSyncFd(syncRequest, fd, encoded, 0, encoded.byteLength, 0);
+  } finally {
+    closeSync(syncRequest, fd);
+  }
+}
+async function writeFile(asyncRequest, filePath, data, options) {
+  const opts = typeof options === "string" ? { encoding: options } : options;
+  const encoded = typeof data === "string" ? opts?.encoding ? encodeString(data, opts.encoding) : encoder3.encode(data) : data;
+  const flag = opts?.flag;
+  if (!flag || flag === "w") {
+    const flags = opts?.flush === true ? 1 : 0;
+    const { status } = await asyncRequest(OP.WRITE, filePath, flags, encoded);
+    if (status !== 0) throw statusToError(status, "write", filePath);
+    return;
+  }
+  const handle = await open(asyncRequest, filePath, flag);
+  try {
+    await handle.writeFile(encoded);
+  } finally {
+    await handle.close();
+  }
+}
+
+// src/methods/appendFile.ts
+var encoder4 = new TextEncoder();
+function appendFileSync(syncRequest, filePath, data, options) {
+  const encoded = typeof data === "string" ? encoder4.encode(data) : data;
+  const buf = encodeRequest(OP.APPEND, filePath, 0, encoded);
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "appendFile", filePath);
+}
+async function appendFile(asyncRequest, filePath, data, options) {
+  const encoded = typeof data === "string" ? encoder4.encode(data) : data;
+  const { status } = await asyncRequest(OP.APPEND, filePath, 0, encoded);
+  if (status !== 0) throw statusToError(status, "appendFile", filePath);
+}
+
+// src/methods/exists.ts
+function existsSync(syncRequest, filePath) {
+  const buf = encodeRequest(OP.EXISTS, filePath);
+  const { data } = syncRequest(buf);
+  return data ? data[0] === 1 : false;
+}
+async function exists(asyncRequest, filePath) {
+  const { data } = await asyncRequest(OP.EXISTS, filePath);
+  return data ? data[0] === 1 : false;
+}
+
+// src/methods/mkdir.ts
+var decoder4 = new TextDecoder();
+function mkdirSync(syncRequest, filePath, options) {
+  const opts = typeof options === "number" ? { } : options;
+  const flags = opts?.recursive ? 1 : 0;
+  const buf = encodeRequest(OP.MKDIR, filePath, flags);
+  const { status, data } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "mkdir", filePath);
+  return data ? decoder4.decode(data) : void 0;
+}
+async function mkdir(asyncRequest, filePath, options) {
+  const opts = typeof options === "number" ? { } : options;
+  const flags = opts?.recursive ? 1 : 0;
+  const { status, data } = await asyncRequest(OP.MKDIR, filePath, flags);
+  if (status !== 0) throw statusToError(status, "mkdir", filePath);
+  return data ? decoder4.decode(data) : void 0;
+}
+
+// src/methods/rmdir.ts
+function rmdirSync(syncRequest, filePath, options) {
+  const flags = options?.recursive ? 1 : 0;
+  const buf = encodeRequest(OP.RMDIR, filePath, flags);
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "rmdir", filePath);
+}
+async function rmdir(asyncRequest, filePath, options) {
+  const flags = options?.recursive ? 1 : 0;
+  const { status } = await asyncRequest(OP.RMDIR, filePath, flags);
+  if (status !== 0) throw statusToError(status, "rmdir", filePath);
+}
+
+// src/methods/rm.ts
+function rmSync(syncRequest, filePath, options) {
+  const flags = (options?.recursive ? 1 : 0) | (options?.force ? 2 : 0);
+  const buf = encodeRequest(OP.UNLINK, filePath, flags);
+  const { status } = syncRequest(buf);
+  if (status === 3) {
+    const rmdirBuf = encodeRequest(OP.RMDIR, filePath, flags);
+    const rmdirResult = syncRequest(rmdirBuf);
+    if (rmdirResult.status !== 0) {
+      if (options?.force && rmdirResult.status === 1) return;
+      throw statusToError(rmdirResult.status, "rm", filePath);
+    }
+    return;
+  }
+  if (status !== 0) {
+    if (options?.force && status === 1) return;
+    throw statusToError(status, "rm", filePath);
+  }
+}
+async function rm(asyncRequest, filePath, options) {
+  const flags = (options?.recursive ? 1 : 0) | (options?.force ? 2 : 0);
+  const { status } = await asyncRequest(OP.UNLINK, filePath, flags);
+  if (status === 3) {
+    const { status: s2 } = await asyncRequest(OP.RMDIR, filePath, flags);
+    if (s2 !== 0) {
+      if (options?.force && s2 === 1) return;
+      throw statusToError(s2, "rm", filePath);
+    }
+    return;
+  }
+  if (status !== 0) {
+    if (options?.force && status === 1) return;
+    throw statusToError(status, "rm", filePath);
+  }
+}
+
+// src/methods/unlink.ts
+function unlinkSync(syncRequest, filePath) {
+  const buf = encodeRequest(OP.UNLINK, filePath);
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "unlink", filePath);
+}
+async function unlink(asyncRequest, filePath) {
+  const { status } = await asyncRequest(OP.UNLINK, filePath);
+  if (status !== 0) throw statusToError(status, "unlink", filePath);
+}
+
+// src/methods/readdir.ts
+function readdirBaseSync(syncRequest, filePath, withFileTypes) {
+  const flags = withFileTypes ? 1 : 0;
+  const buf = encodeRequest(OP.READDIR, filePath, flags);
+  const { status, data } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "readdir", filePath);
+  if (!data) return [];
+  return withFileTypes ? decodeDirents(data, filePath) : decodeNames(data);
+}
+async function readdirBaseAsync(asyncRequest, filePath, withFileTypes) {
+  const flags = withFileTypes ? 1 : 0;
+  const { status, data } = await asyncRequest(OP.READDIR, filePath, flags);
+  if (status !== 0) throw statusToError(status, "readdir", filePath);
+  if (!data) return [];
+  return withFileTypes ? decodeDirents(data, filePath) : decodeNames(data);
+}
+function readdirRecursiveSync(syncRequest, basePath, prefix, withFileTypes) {
+  const entries = readdirBaseSync(syncRequest, basePath, true);
+  const results = [];
+  for (const entry of entries) {
+    const relativePath = prefix ? prefix + "/" + entry.name : entry.name;
+    if (withFileTypes) {
+      results.push({
+        name: relativePath,
+        isFile: entry.isFile,
+        isDirectory: entry.isDirectory,
+        isBlockDevice: entry.isBlockDevice,
+        isCharacterDevice: entry.isCharacterDevice,
+        isSymbolicLink: entry.isSymbolicLink,
+        isFIFO: entry.isFIFO,
+        isSocket: entry.isSocket
+      });
+    } else {
+      results.push(relativePath);
+    }
+    if (entry.isDirectory()) {
+      const childPath = basePath + "/" + entry.name;
+      results.push(
+        ...readdirRecursiveSync(syncRequest, childPath, relativePath, withFileTypes)
+      );
+    }
+  }
+  return results;
+}
+async function readdirRecursiveAsync(asyncRequest, basePath, prefix, withFileTypes) {
+  const entries = await readdirBaseAsync(asyncRequest, basePath, true);
+  const results = [];
+  for (const entry of entries) {
+    const relativePath = prefix ? prefix + "/" + entry.name : entry.name;
+    if (withFileTypes) {
+      results.push({
+        name: relativePath,
+        isFile: entry.isFile,
+        isDirectory: entry.isDirectory,
+        isBlockDevice: entry.isBlockDevice,
+        isCharacterDevice: entry.isCharacterDevice,
+        isSymbolicLink: entry.isSymbolicLink,
+        isFIFO: entry.isFIFO,
+        isSocket: entry.isSocket
+      });
+    } else {
+      results.push(relativePath);
+    }
+    if (entry.isDirectory()) {
+      const childPath = basePath + "/" + entry.name;
+      const children = await readdirRecursiveAsync(
+        asyncRequest,
+        childPath,
+        relativePath,
+        withFileTypes
+      );
+      results.push(...children);
+    }
+  }
+  return results;
+}
+function readdirSync(syncRequest, filePath, options) {
+  const opts = typeof options === "string" ? { } : options;
+  if (opts?.recursive) {
+    return readdirRecursiveSync(
+      syncRequest,
+      filePath,
+      "",
+      !!opts?.withFileTypes
+    );
+  }
+  return readdirBaseSync(syncRequest, filePath, !!opts?.withFileTypes);
+}
+async function readdir(asyncRequest, filePath, options) {
+  const opts = typeof options === "string" ? { } : options;
+  if (opts?.recursive) {
+    return readdirRecursiveAsync(
+      asyncRequest,
+      filePath,
+      "",
+      !!opts?.withFileTypes
+    );
+  }
+  return readdirBaseAsync(asyncRequest, filePath, !!opts?.withFileTypes);
+}
+
+// src/methods/stat.ts
+function statSync(syncRequest, filePath, options) {
+  const buf = encodeRequest(OP.STAT, filePath);
+  const { status, data } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "stat", filePath);
+  return options?.bigint ? decodeStatsBigInt(data) : decodeStats(data);
+}
+function lstatSync(syncRequest, filePath, options) {
+  const buf = encodeRequest(OP.LSTAT, filePath);
+  const { status, data } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "lstat", filePath);
+  return options?.bigint ? decodeStatsBigInt(data) : decodeStats(data);
+}
+async function stat(asyncRequest, filePath, options) {
+  const { status, data } = await asyncRequest(OP.STAT, filePath);
+  if (status !== 0) throw statusToError(status, "stat", filePath);
+  return options?.bigint ? decodeStatsBigInt(data) : decodeStats(data);
+}
+async function lstat(asyncRequest, filePath, options) {
+  const { status, data } = await asyncRequest(OP.LSTAT, filePath);
+  if (status !== 0) throw statusToError(status, "lstat", filePath);
+  return options?.bigint ? decodeStatsBigInt(data) : decodeStats(data);
+}
+
+// src/methods/rename.ts
+var encoder5 = new TextEncoder();
+function renameSync(syncRequest, oldPath, newPath) {
+  const buf = encodeTwoPathRequest(OP.RENAME, oldPath, newPath);
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "rename", oldPath);
+}
+async function rename(asyncRequest, oldPath, newPath) {
+  const path2Bytes = encoder5.encode(newPath);
+  const payload = new Uint8Array(4 + path2Bytes.byteLength);
+  new DataView(payload.buffer).setUint32(0, path2Bytes.byteLength, true);
+  payload.set(path2Bytes, 4);
+  const { status } = await asyncRequest(OP.RENAME, oldPath, 0, payload);
+  if (status !== 0) throw statusToError(status, "rename", oldPath);
+}
+
+// src/methods/copyFile.ts
+var encoder6 = new TextEncoder();
+function copyFileSync(syncRequest, src, dest, mode) {
+  const buf = encodeTwoPathRequest(OP.COPY, src, dest, mode ?? 0);
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "copyFile", src);
+}
+async function copyFile(asyncRequest, src, dest, mode) {
+  const path2Bytes = encoder6.encode(dest);
+  const payload = new Uint8Array(4 + path2Bytes.byteLength);
+  new DataView(payload.buffer).setUint32(0, path2Bytes.byteLength, true);
+  payload.set(path2Bytes, 4);
+  const { status } = await asyncRequest(OP.COPY, src, mode ?? 0, payload);
+  if (status !== 0) throw statusToError(status, "copyFile", src);
+}
+
+// src/methods/truncate.ts
+function truncateSync(syncRequest, filePath, len = 0) {
+  const lenBuf = new Uint8Array(8);
+  new DataView(lenBuf.buffer).setFloat64(0, len, true);
+  const buf = encodeRequest(OP.TRUNCATE, filePath, 0, lenBuf);
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "truncate", filePath);
+}
+async function truncate(asyncRequest, filePath, len) {
+  const lenBuf = new Uint8Array(8);
+  new DataView(lenBuf.buffer).setFloat64(0, len ?? 0, true);
+  const { status } = await asyncRequest(OP.TRUNCATE, filePath, 0, lenBuf);
+  if (status !== 0) throw statusToError(status, "truncate", filePath);
+}
+
 // src/methods/access.ts
 function accessSync(syncRequest, filePath, mode = constants.F_OK) {
   const buf = encodeRequest(OP.ACCESS, filePath, mode);
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "access", filePath);
 }
-async function access(asyncRequest, filePath, mode) {
-  const { status } = await asyncRequest(OP.ACCESS, filePath, mode ?? 0);
+async function access(asyncRequest, filePath, mode = constants.F_OK) {
+  const { status } = await asyncRequest(OP.ACCESS, filePath, mode);
   if (status !== 0) throw statusToError(status, "access", filePath);
 }
 
 // src/methods/realpath.ts
-var decoder4 = new TextDecoder();
+var decoder5 = new TextDecoder();
 function realpathSync(syncRequest, filePath) {
   const buf = encodeRequest(OP.REALPATH, filePath);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "realpath", filePath);
-  return decoder4.decode(data);
+  return decoder5.decode(data);
 }
 async function realpath(asyncRequest, filePath) {
   const { status, data } = await asyncRequest(OP.REALPATH, filePath);
   if (status !== 0) throw statusToError(status, "realpath", filePath);
-  return decoder4.decode(data);
+  return decoder5.decode(data);
 }
 
 // src/methods/chmod.ts
@@ -695,40 +1165,44 @@ async function utimes(asyncRequest, filePath, atime, mtime) {
 }
 
 // src/methods/symlink.ts
-var encoder6 = new TextEncoder();
-var decoder5 = new TextDecoder();
-function symlinkSync(syncRequest, target, linkPath) {
-  const targetBytes = encoder6.encode(target);
+var encoder7 = new TextEncoder();
+var decoder6 = new TextDecoder();
+function symlinkSync(syncRequest, target, linkPath, type) {
+  const targetBytes = encoder7.encode(target);
   const buf = encodeRequest(OP.SYMLINK, linkPath, 0, targetBytes);
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "symlink", linkPath);
 }
-function readlinkSync(syncRequest, filePath) {
+function readlinkSync(syncRequest, filePath, options) {
   const buf = encodeRequest(OP.READLINK, filePath);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "readlink", filePath);
-  return decoder5.decode(data);
+  const encoding = typeof options === "string" ? options : options?.encoding;
+  if (encoding === "buffer") return new Uint8Array(data);
+  return decoder6.decode(data);
 }
-async function symlink(asyncRequest, target, linkPath) {
-  const targetBytes = encoder6.encode(target);
+async function symlink(asyncRequest, target, linkPath, type) {
+  const targetBytes = encoder7.encode(target);
   const { status } = await asyncRequest(OP.SYMLINK, linkPath, 0, targetBytes);
   if (status !== 0) throw statusToError(status, "symlink", linkPath);
 }
-async function readlink(asyncRequest, filePath) {
+async function readlink(asyncRequest, filePath, options) {
   const { status, data } = await asyncRequest(OP.READLINK, filePath);
   if (status !== 0) throw statusToError(status, "readlink", filePath);
-  return decoder5.decode(data);
+  const encoding = typeof options === "string" ? options : options?.encoding;
+  if (encoding === "buffer") return new Uint8Array(data);
+  return decoder6.decode(data);
 }
 
 // src/methods/link.ts
-var encoder7 = new TextEncoder();
+var encoder8 = new TextEncoder();
 function linkSync(syncRequest, existingPath, newPath) {
   const buf = encodeTwoPathRequest(OP.LINK, existingPath, newPath);
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "link", existingPath);
 }
 async function link(asyncRequest, existingPath, newPath) {
-  const path2Bytes = encoder7.encode(newPath);
+  const path2Bytes = encoder8.encode(newPath);
   const payload = new Uint8Array(4 + path2Bytes.byteLength);
   new DataView(payload.buffer).setUint32(0, path2Bytes.byteLength, true);
   payload.set(path2Bytes, 4);
@@ -737,168 +1211,17 @@ async function link(asyncRequest, existingPath, newPath) {
 }
 
 // src/methods/mkdtemp.ts
-var decoder6 = new TextDecoder();
+var decoder7 = new TextDecoder();
 function mkdtempSync(syncRequest, prefix) {
   const buf = encodeRequest(OP.MKDTEMP, prefix);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "mkdtemp", prefix);
-  return decoder6.decode(data);
+  return decoder7.decode(data);
 }
 async function mkdtemp(asyncRequest, prefix) {
   const { status, data } = await asyncRequest(OP.MKDTEMP, prefix);
   if (status !== 0) throw statusToError(status, "mkdtemp", prefix);
-  return decoder6.decode(data);
-}
-
-// src/methods/open.ts
-var encoder8 = new TextEncoder();
-var decoder7 = new TextDecoder();
-function parseFlags(flags) {
-  switch (flags) {
-    case "r":
-      return constants.O_RDONLY;
-    case "r+":
-      return constants.O_RDWR;
-    case "w":
-      return constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC;
-    case "w+":
-      return constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC;
-    case "a":
-      return constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND;
-    case "a+":
-      return constants.O_RDWR | constants.O_CREAT | constants.O_APPEND;
-    case "wx":
-      return constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_EXCL;
-    case "wx+":
-      return constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC | constants.O_EXCL;
-    case "ax":
-      return constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_EXCL;
-    case "ax+":
-      return constants.O_RDWR | constants.O_CREAT | constants.O_APPEND | constants.O_EXCL;
-    default:
-      return constants.O_RDONLY;
-  }
-}
-function openSync(syncRequest, filePath, flags = "r", _mode) {
-  const numFlags = typeof flags === "string" ? parseFlags(flags) : flags;
-  const buf = encodeRequest(OP.OPEN, filePath, numFlags);
-  const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "open", filePath);
-  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
-}
-function closeSync(syncRequest, fd) {
-  const fdBuf = new Uint8Array(4);
-  new DataView(fdBuf.buffer).setUint32(0, fd, true);
-  const buf = encodeRequest(OP.CLOSE, "", 0, fdBuf);
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "close", String(fd));
-}
-function readSync(syncRequest, fd, buffer, offset = 0, length = buffer.byteLength, position = null) {
-  const fdBuf = new Uint8Array(12);
-  const dv = new DataView(fdBuf.buffer);
-  dv.setUint32(0, fd, true);
-  dv.setUint32(4, length, true);
-  dv.setInt32(8, position ?? -1, true);
-  const buf = encodeRequest(OP.FREAD, "", 0, fdBuf);
-  const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "read", String(fd));
-  if (data) {
-    buffer.set(data.subarray(0, Math.min(data.byteLength, length)), offset);
-    return data.byteLength;
-  }
-  return 0;
-}
-function writeSyncFd(syncRequest, fd, buffer, offset = 0, length = buffer.byteLength, position = null) {
-  const writeData = buffer.subarray(offset, offset + length);
-  const fdBuf = new Uint8Array(8 + writeData.byteLength);
-  const dv = new DataView(fdBuf.buffer);
-  dv.setUint32(0, fd, true);
-  dv.setInt32(4, position ?? -1, true);
-  fdBuf.set(writeData, 8);
-  const buf = encodeRequest(OP.FWRITE, "", 0, fdBuf);
-  const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "write", String(fd));
-  return data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-}
-function fstatSync(syncRequest, fd) {
-  const fdBuf = new Uint8Array(4);
-  new DataView(fdBuf.buffer).setUint32(0, fd, true);
-  const buf = encodeRequest(OP.FSTAT, "", 0, fdBuf);
-  const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "fstat", String(fd));
-  return decodeStats(data);
-}
-function ftruncateSync(syncRequest, fd, len = 0) {
-  const fdBuf = new Uint8Array(8);
-  const dv = new DataView(fdBuf.buffer);
-  dv.setUint32(0, fd, true);
-  dv.setUint32(4, len, true);
-  const buf = encodeRequest(OP.FTRUNCATE, "", 0, fdBuf);
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "ftruncate", String(fd));
-}
-function fdatasyncSync(syncRequest, fd) {
-  const buf = encodeRequest(OP.FSYNC, "");
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "fdatasync", String(fd));
-}
-async function open(asyncRequest, filePath, flags, _mode) {
-  const numFlags = typeof flags === "string" ? parseFlags(flags ?? "r") : flags ?? 0;
-  const { status, data } = await asyncRequest(OP.OPEN, filePath, numFlags);
-  if (status !== 0) throw statusToError(status, "open", filePath);
-  const fd = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
-  return createFileHandle(fd, asyncRequest);
-}
-function createFileHandle(fd, asyncRequest) {
-  return {
-    fd,
-    async read(buffer, offset = 0, length = buffer.byteLength, position = null) {
-      const { status, data } = await asyncRequest(OP.FREAD, "", 0, null, void 0, { fd, length, position: position ?? -1 });
-      if (status !== 0) throw statusToError(status, "read", String(fd));
-      const bytesRead = data ? data.byteLength : 0;
-      if (data) buffer.set(data.subarray(0, Math.min(bytesRead, length)), offset);
-      return { bytesRead, buffer };
-    },
-    async write(buffer, offset = 0, length = buffer.byteLength, position = null) {
-      const writeData = buffer.subarray(offset, offset + length);
-      const { status, data } = await asyncRequest(OP.FWRITE, "", 0, null, void 0, { fd, data: writeData, position: position ?? -1 });
-      if (status !== 0) throw statusToError(status, "write", String(fd));
-      const bytesWritten = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      return { bytesWritten, buffer };
-    },
-    async readFile(options) {
-      const encoding = typeof options === "string" ? options : options?.encoding;
-      const { status, data } = await asyncRequest(OP.FREAD, "", 0, null, void 0, { fd, length: Number.MAX_SAFE_INTEGER, position: 0 });
-      if (status !== 0) throw statusToError(status, "read", String(fd));
-      const result = data ?? new Uint8Array(0);
-      if (encoding) return decoder7.decode(result);
-      return result;
-    },
-    async writeFile(data, _options) {
-      const encoded = typeof data === "string" ? encoder8.encode(data) : data;
-      const { status } = await asyncRequest(OP.FWRITE, "", 0, null, void 0, { fd, data: encoded, position: 0 });
-      if (status !== 0) throw statusToError(status, "write", String(fd));
-    },
-    async truncate(len = 0) {
-      const { status } = await asyncRequest(OP.FTRUNCATE, "", 0, null, void 0, { fd, length: len });
-      if (status !== 0) throw statusToError(status, "ftruncate", String(fd));
-    },
-    async stat() {
-      const { status, data } = await asyncRequest(OP.FSTAT, "", 0, null, void 0, { fd });
-      if (status !== 0) throw statusToError(status, "fstat", String(fd));
-      return decodeStats(data);
-    },
-    async sync() {
-      await asyncRequest(OP.FSYNC, "");
-    },
-    async datasync() {
-      await asyncRequest(OP.FSYNC, "");
-    },
-    async close() {
-      const { status } = await asyncRequest(OP.CLOSE, "", 0, null, void 0, { fd });
-      if (status !== 0) throw statusToError(status, "close", String(fd));
-    }
-  };
+  return decoder7.decode(data);
 }
 
 // src/methods/opendir.ts
@@ -1271,8 +1594,168 @@ async function* watchAsync(ns, _asyncRequest, filePath, options) {
   }
 }
 
+// src/methods/glob.ts
+function segmentToRegex(pattern) {
+  let re = "^";
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === "*") {
+      re += "[^/]*";
+    } else if (ch === "?") {
+      re += "[^/]";
+    } else if (".+^${}()|[]\\".includes(ch)) {
+      re += "\\" + ch;
+    } else {
+      re += ch;
+    }
+  }
+  re += "$";
+  return new RegExp(re);
+}
+function matchSegment(name, pattern) {
+  return segmentToRegex(pattern).test(name);
+}
+function joinPath(base, name) {
+  if (base === "/") return "/" + name;
+  return base + "/" + name;
+}
+function globSync(syncRequest, pattern, options) {
+  const cwd = options?.cwd ?? "/";
+  const exclude = options?.exclude;
+  const segments = pattern.split("/").filter((s) => s !== "");
+  const results = [];
+  function walk(dir, segIdx) {
+    if (segIdx >= segments.length) return;
+    const seg = segments[segIdx];
+    const isLast = segIdx === segments.length - 1;
+    if (seg === "**") {
+      if (segIdx + 1 < segments.length) {
+        walk(dir, segIdx + 1);
+      }
+      let entries2;
+      try {
+        entries2 = readdirSync(syncRequest, dir);
+      } catch {
+        return;
+      }
+      for (const entry of entries2) {
+        const full = joinPath(dir, entry);
+        if (exclude && exclude(full)) continue;
+        let isDir;
+        try {
+          const s = statSync(syncRequest, full);
+          isDir = s.isDirectory();
+        } catch {
+          continue;
+        }
+        if (isDir) {
+          walk(full, segIdx);
+        }
+        if (isLast) {
+          results.push(full);
+        }
+      }
+      return;
+    }
+    let entries;
+    try {
+      entries = readdirSync(syncRequest, dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!matchSegment(entry, seg)) continue;
+      const full = joinPath(dir, entry);
+      if (exclude && exclude(full)) continue;
+      if (isLast) {
+        results.push(full);
+      } else {
+        let isDir;
+        try {
+          const s = statSync(syncRequest, full);
+          isDir = s.isDirectory();
+        } catch {
+          continue;
+        }
+        if (isDir) {
+          walk(full, segIdx + 1);
+        }
+      }
+    }
+  }
+  walk(cwd, 0);
+  return results;
+}
+async function glob(asyncRequest, pattern, options) {
+  const cwd = options?.cwd ?? "/";
+  const exclude = options?.exclude;
+  const segments = pattern.split("/").filter((s) => s !== "");
+  const results = [];
+  async function walk(dir, segIdx) {
+    if (segIdx >= segments.length) return;
+    const seg = segments[segIdx];
+    const isLast = segIdx === segments.length - 1;
+    if (seg === "**") {
+      if (segIdx + 1 < segments.length) {
+        await walk(dir, segIdx + 1);
+      }
+      let entries2;
+      try {
+        entries2 = await readdir(asyncRequest, dir);
+      } catch {
+        return;
+      }
+      for (const entry of entries2) {
+        const full = joinPath(dir, entry);
+        if (exclude && exclude(full)) continue;
+        let isDir;
+        try {
+          const s = await stat(asyncRequest, full);
+          isDir = s.isDirectory();
+        } catch {
+          continue;
+        }
+        if (isDir) {
+          await walk(full, segIdx);
+        }
+        if (isLast) {
+          results.push(full);
+        }
+      }
+      return;
+    }
+    let entries;
+    try {
+      entries = await readdir(asyncRequest, dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!matchSegment(entry, seg)) continue;
+      const full = joinPath(dir, entry);
+      if (exclude && exclude(full)) continue;
+      if (isLast) {
+        results.push(full);
+      } else {
+        let isDir;
+        try {
+          const s = await stat(asyncRequest, full);
+          isDir = s.isDirectory();
+        } catch {
+          continue;
+        }
+        if (isDir) {
+          await walk(full, segIdx + 1);
+        }
+      }
+    }
+  }
+  await walk(cwd, 0);
+  return results;
+}
+
 // src/filesystem.ts
-var encoder9 = new TextEncoder();
+new TextEncoder();
 var DEFAULT_SAB_SIZE = 2 * 1024 * 1024;
 var instanceRegistry = /* @__PURE__ */ new Map();
 var HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
@@ -1832,17 +2315,126 @@ var VFSFileSystem = class {
   readdirSync(filePath, options) {
     return readdirSync(this._sync, filePath, options);
   }
-  statSync(filePath) {
-    return statSync(this._sync, filePath);
+  globSync(pattern, options) {
+    return globSync(this._sync, pattern, options);
   }
-  lstatSync(filePath) {
-    return lstatSync(this._sync, filePath);
+  statSync(filePath, options) {
+    return statSync(this._sync, filePath, options);
+  }
+  lstatSync(filePath, options) {
+    return lstatSync(this._sync, filePath, options);
   }
   renameSync(oldPath, newPath) {
     renameSync(this._sync, oldPath, newPath);
   }
   copyFileSync(src, dest, mode) {
     copyFileSync(this._sync, src, dest, mode);
+  }
+  cpSync(src, dest, options) {
+    const force = options?.force !== false;
+    const errorOnExist = options?.errorOnExist ?? false;
+    const dereference = options?.dereference ?? false;
+    const preserveTimestamps = options?.preserveTimestamps ?? false;
+    const srcStat = dereference ? this.statSync(src) : this.lstatSync(src);
+    if (srcStat.isDirectory()) {
+      if (!options?.recursive) {
+        throw createError("EISDIR", "cp", src);
+      }
+      try {
+        this.mkdirSync(dest, { recursive: true });
+      } catch (e) {
+        if (e.code !== "EEXIST") throw e;
+      }
+      const entries = this.readdirSync(src, { withFileTypes: true });
+      for (const entry of entries) {
+        const srcChild = join(src, entry.name);
+        const destChild = join(dest, entry.name);
+        this.cpSync(srcChild, destChild, options);
+      }
+    } else if (srcStat.isSymbolicLink() && !dereference) {
+      const target = this.readlinkSync(src);
+      let destExists = false;
+      try {
+        this.lstatSync(dest);
+        destExists = true;
+      } catch {
+      }
+      if (destExists) {
+        if (errorOnExist) throw createError("EEXIST", "cp", dest);
+        if (!force) return;
+        this.unlinkSync(dest);
+      }
+      this.symlinkSync(target, dest);
+    } else {
+      let destExists = false;
+      try {
+        this.lstatSync(dest);
+        destExists = true;
+      } catch {
+      }
+      if (destExists) {
+        if (errorOnExist) throw createError("EEXIST", "cp", dest);
+        if (!force) return;
+      }
+      this.copyFileSync(src, dest, errorOnExist ? constants.COPYFILE_EXCL : 0);
+    }
+    if (preserveTimestamps) {
+      const st = this.statSync(src);
+      this.utimesSync(dest, st.atime, st.mtime);
+    }
+  }
+  async cp(src, dest, options) {
+    const force = options?.force !== false;
+    const errorOnExist = options?.errorOnExist ?? false;
+    const dereference = options?.dereference ?? false;
+    const preserveTimestamps = options?.preserveTimestamps ?? false;
+    const srcStat = dereference ? await this.promises.stat(src) : await this.promises.lstat(src);
+    if (srcStat.isDirectory()) {
+      if (!options?.recursive) {
+        throw createError("EISDIR", "cp", src);
+      }
+      try {
+        await this.promises.mkdir(dest, { recursive: true });
+      } catch (e) {
+        if (e.code !== "EEXIST") throw e;
+      }
+      const entries = await this.promises.readdir(src, { withFileTypes: true });
+      for (const entry of entries) {
+        const srcChild = join(src, entry.name);
+        const destChild = join(dest, entry.name);
+        await this.cp(srcChild, destChild, options);
+      }
+    } else if (srcStat.isSymbolicLink() && !dereference) {
+      const target = await this.promises.readlink(src);
+      let destExists = false;
+      try {
+        await this.promises.lstat(dest);
+        destExists = true;
+      } catch {
+      }
+      if (destExists) {
+        if (errorOnExist) throw createError("EEXIST", "cp", dest);
+        if (!force) return;
+        await this.promises.unlink(dest);
+      }
+      await this.promises.symlink(target, dest);
+    } else {
+      let destExists = false;
+      try {
+        await this.promises.lstat(dest);
+        destExists = true;
+      } catch {
+      }
+      if (destExists) {
+        if (errorOnExist) throw createError("EEXIST", "cp", dest);
+        if (!force) return;
+      }
+      await this.promises.copyFile(src, dest, errorOnExist ? constants.COPYFILE_EXCL : 0);
+    }
+    if (preserveTimestamps) {
+      const st = await this.promises.stat(src);
+      await this.promises.utimes(dest, st.atime, st.mtime);
+    }
   }
   truncateSync(filePath, len) {
     truncateSync(this._sync, filePath, len);
@@ -1862,11 +2454,11 @@ var VFSFileSystem = class {
   utimesSync(filePath, atime, mtime) {
     utimesSync(this._sync, filePath, atime, mtime);
   }
-  symlinkSync(target, linkPath) {
+  symlinkSync(target, linkPath, type) {
     symlinkSync(this._sync, target, linkPath);
   }
-  readlinkSync(filePath) {
-    return readlinkSync(this._sync, filePath);
+  readlinkSync(filePath, options) {
+    return readlinkSync(this._sync, filePath, options);
   }
   linkSync(existingPath, newPath) {
     linkSync(this._sync, existingPath, newPath);
@@ -1884,8 +2476,8 @@ var VFSFileSystem = class {
   readSync(fd, buffer, offset = 0, length = buffer.byteLength, position = null) {
     return readSync(this._sync, fd, buffer, offset, length, position);
   }
-  writeSync(fd, buffer, offset = 0, length = buffer.byteLength, position = null) {
-    return writeSyncFd(this._sync, fd, buffer, offset, length, position);
+  writeSync(fd, bufferOrString, offsetOrPosition, lengthOrEncoding, position) {
+    return writeSyncFd(this._sync, fd, bufferOrString, offsetOrPosition, lengthOrEncoding, position);
   }
   fstatSync(fd) {
     return fstatSync(this._sync, fd);
@@ -1895,6 +2487,31 @@ var VFSFileSystem = class {
   }
   fdatasyncSync(fd) {
     fdatasyncSync(this._sync, fd);
+  }
+  // ---- statfs methods ----
+  statfsSync(_path) {
+    return {
+      type: 1447449377,
+      // "VFS!"
+      bsize: 4096,
+      blocks: 1024 * 1024,
+      // ~4GB virtual capacity
+      bfree: 512 * 1024,
+      // ~2GB free (estimate)
+      bavail: 512 * 1024,
+      files: 1e4,
+      // default max inodes
+      ffree: 5e3
+      // estimate half free
+    };
+  }
+  statfs(path, callback) {
+    const result = this.statfsSync(path);
+    if (callback) {
+      callback(null, result);
+      return;
+    }
+    return Promise.resolve(result);
   }
   // ---- Watch methods ----
   watch(filePath, options, listener) {
@@ -1908,55 +2525,81 @@ var VFSFileSystem = class {
   }
   // ---- Stream methods ----
   createReadStream(filePath, options) {
-    const opts = typeof options === "string" ? { } : options;
+    const opts = typeof options === "string" ? { encoding: options } : options;
     const start = opts?.start ?? 0;
     const end = opts?.end;
     const highWaterMark = opts?.highWaterMark ?? 64 * 1024;
     let position = start;
+    let handle = null;
+    const cleanup = async () => {
+      if (handle) {
+        try {
+          await handle.close();
+        } catch {
+        }
+        handle = null;
+      }
+    };
     return new ReadableStream({
       pull: async (controller) => {
         try {
+          if (!handle) {
+            handle = await this.promises.open(filePath, opts?.flags ?? "r");
+          }
           const readLen = end !== void 0 ? Math.min(highWaterMark, end - position + 1) : highWaterMark;
           if (readLen <= 0) {
+            await cleanup();
             controller.close();
             return;
           }
-          const result = await this.promises.readFile(filePath);
-          const data = result instanceof Uint8Array ? result : encoder9.encode(result);
-          const chunk = data.subarray(position, position + readLen);
-          if (chunk.byteLength === 0) {
+          const buffer = new Uint8Array(readLen);
+          const { bytesRead } = await handle.read(buffer, 0, readLen, position);
+          if (bytesRead === 0) {
+            await cleanup();
             controller.close();
             return;
           }
-          controller.enqueue(chunk);
-          position += chunk.byteLength;
+          controller.enqueue(buffer.subarray(0, bytesRead));
+          position += bytesRead;
           if (end !== void 0 && position > end) {
+            await cleanup();
             controller.close();
           }
         } catch (err) {
+          await cleanup();
           controller.error(err);
         }
+      },
+      cancel: async () => {
+        await cleanup();
       }
     });
   }
   createWriteStream(filePath, options) {
     const opts = typeof options === "string" ? { } : options;
     let position = opts?.start ?? 0;
-    let initialized = false;
+    let handle = null;
     return new WritableStream({
       write: async (chunk) => {
-        if (!initialized) {
-          if (opts?.flags !== "a" && opts?.flags !== "a+") {
-            await this.promises.writeFile(filePath, new Uint8Array(0));
-          }
-          initialized = true;
+        if (!handle) {
+          handle = await this.promises.open(filePath, opts?.flags ?? "w");
         }
-        await this.promises.appendFile(filePath, chunk);
-        position += chunk.byteLength;
+        const { bytesWritten } = await handle.write(chunk, 0, chunk.byteLength, position);
+        position += bytesWritten;
       },
       close: async () => {
-        if (opts?.flush) {
-          await this.promises.flush();
+        if (handle) {
+          if (opts?.flush) {
+            await handle.sync();
+          }
+          await handle.close();
+          handle = null;
+        }
+      },
+      abort: async () => {
+        if (handle) {
+          await handle.close();
+          handle = null;
         }
       }
     });
@@ -2097,11 +2740,14 @@ var VFSPromises = class {
   readdir(filePath, options) {
     return readdir(this._async, filePath, options);
   }
-  stat(filePath) {
-    return stat(this._async, filePath);
+  glob(pattern, options) {
+    return glob(this._async, pattern, options);
   }
-  lstat(filePath) {
-    return lstat(this._async, filePath);
+  stat(filePath, options) {
+    return stat(this._async, filePath, options);
+  }
+  lstat(filePath, options) {
+    return lstat(this._async, filePath, options);
   }
   access(filePath, mode) {
     return access(this._async, filePath, mode);
@@ -2111,6 +2757,59 @@ var VFSPromises = class {
   }
   copyFile(src, dest, mode) {
     return copyFile(this._async, src, dest, mode);
+  }
+  async cp(src, dest, options) {
+    const force = options?.force !== false;
+    const errorOnExist = options?.errorOnExist ?? false;
+    const dereference = options?.dereference ?? false;
+    const preserveTimestamps = options?.preserveTimestamps ?? false;
+    const srcStat = dereference ? await this.stat(src) : await this.lstat(src);
+    if (srcStat.isDirectory()) {
+      if (!options?.recursive) {
+        throw createError("EISDIR", "cp", src);
+      }
+      try {
+        await this.mkdir(dest, { recursive: true });
+      } catch (e) {
+        if (e.code !== "EEXIST") throw e;
+      }
+      const entries = await this.readdir(src, { withFileTypes: true });
+      for (const entry of entries) {
+        const srcChild = join(src, entry.name);
+        const destChild = join(dest, entry.name);
+        await this.cp(srcChild, destChild, options);
+      }
+    } else if (srcStat.isSymbolicLink() && !dereference) {
+      const target = await this.readlink(src);
+      let destExists = false;
+      try {
+        await this.lstat(dest);
+        destExists = true;
+      } catch {
+      }
+      if (destExists) {
+        if (errorOnExist) throw createError("EEXIST", "cp", dest);
+        if (!force) return;
+        await this.unlink(dest);
+      }
+      await this.symlink(target, dest);
+    } else {
+      let destExists = false;
+      try {
+        await this.lstat(dest);
+        destExists = true;
+      } catch {
+      }
+      if (destExists) {
+        if (errorOnExist) throw createError("EEXIST", "cp", dest);
+        if (!force) return;
+      }
+      await this.copyFile(src, dest, errorOnExist ? constants.COPYFILE_EXCL : 0);
+    }
+    if (preserveTimestamps) {
+      const st = await this.stat(src);
+      await this.utimes(dest, st.atime, st.mtime);
+    }
   }
   truncate(filePath, len) {
     return truncate(this._async, filePath, len);
@@ -2130,11 +2829,11 @@ var VFSPromises = class {
   utimes(filePath, atime, mtime) {
     return utimes(this._async, filePath, atime, mtime);
   }
-  symlink(target, linkPath) {
+  symlink(target, linkPath, type) {
     return symlink(this._async, target, linkPath);
   }
-  readlink(filePath) {
-    return readlink(this._async, filePath);
+  readlink(filePath, options) {
+    return readlink(this._async, filePath, options);
   }
   link(existingPath, newPath) {
     return link(this._async, existingPath, newPath);
@@ -2147,6 +2846,22 @@ var VFSPromises = class {
   }
   mkdtemp(prefix) {
     return mkdtemp(this._async, prefix);
+  }
+  async statfs(path) {
+    return {
+      type: 1447449377,
+      // "VFS!"
+      bsize: 4096,
+      blocks: 1024 * 1024,
+      // ~4GB virtual capacity
+      bfree: 512 * 1024,
+      // ~2GB free (estimate)
+      bavail: 512 * 1024,
+      files: 1e4,
+      // default max inodes
+      ffree: 5e3
+      // estimate half free
+    };
   }
   async *watch(filePath, options) {
     yield* watchAsync(this._ns, this._async, filePath, options);
@@ -2461,6 +3176,7 @@ var VFSEngine = class {
         type,
         pathOffset,
         pathLength,
+        nlink: inodeView.getUint16(off + INODE.NLINK, true) || 1,
         mode: inodeView.getUint32(off + INODE.MODE, true),
         size,
         firstBlock,
@@ -2495,6 +3211,7 @@ var VFSEngine = class {
       type: v.getUint8(INODE.TYPE),
       pathOffset: v.getUint32(INODE.PATH_OFFSET, true),
       pathLength: v.getUint16(INODE.PATH_LENGTH, true),
+      nlink: v.getUint16(INODE.NLINK, true) || 1,
       mode: v.getUint32(INODE.MODE, true),
       size: v.getFloat64(INODE.SIZE, true),
       firstBlock: v.getUint32(INODE.FIRST_BLOCK, true),
@@ -2521,7 +3238,7 @@ var VFSEngine = class {
     v.setUint8(INODE.FLAGS + 2, 0);
     v.setUint32(INODE.PATH_OFFSET, inode.pathOffset, true);
     v.setUint16(INODE.PATH_LENGTH, inode.pathLength, true);
-    v.setUint16(INODE.RESERVED_10, 0, true);
+    v.setUint16(INODE.NLINK, inode.nlink, true);
     v.setUint32(INODE.MODE, inode.mode, true);
     v.setFloat64(INODE.SIZE, inode.size, true);
     v.setUint32(INODE.FIRST_BLOCK, inode.firstBlock, true);
@@ -2763,6 +3480,7 @@ var VFSEngine = class {
       type,
       pathOffset: pathOff,
       pathLength: pathLen,
+      nlink: type === INODE_TYPE.DIRECTORY ? 2 : 1,
       mode,
       size,
       firstBlock,
@@ -2915,6 +3633,7 @@ var VFSEngine = class {
     if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
+    inode.nlink = Math.max(0, inode.nlink - 1);
     this.freeBlockRange(inode.firstBlock, inode.blockCount);
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
@@ -2939,7 +3658,21 @@ var VFSEngine = class {
   }
   encodeStatResponse(idx) {
     const inode = this.readInode(idx);
-    const buf = new Uint8Array(49);
+    let nlink = inode.nlink;
+    if (inode.type === INODE_TYPE.DIRECTORY) {
+      const path = this.readPath(inode.pathOffset, inode.pathLength);
+      const children = this.getDirectChildren(path);
+      let subdirCount = 0;
+      for (const child of children) {
+        const childIdx = this.pathIndex.get(child);
+        if (childIdx !== void 0) {
+          const childInode = this.readInode(childIdx);
+          if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
+        }
+      }
+      nlink = 2 + subdirCount;
+    }
+    const buf = new Uint8Array(53);
     const view = new DataView(buf.buffer);
     view.setUint8(0, inode.type);
     view.setUint32(1, inode.mode, true);
@@ -2950,6 +3683,7 @@ var VFSEngine = class {
     view.setUint32(37, inode.uid, true);
     view.setUint32(41, inode.gid, true);
     view.setUint32(45, idx, true);
+    view.setUint32(49, nlink, true);
     return { status: 0, data: buf };
   }
   // ---- MKDIR ----
@@ -3262,9 +3996,26 @@ var VFSEngine = class {
     const target = this.readData(inode.firstBlock, inode.blockCount, inode.size);
     return { status: 0, data: target };
   }
-  // ---- LINK (hard link — copies the file) ----
+  // ---- LINK (hard link — copies the file data, tracks nlink) ----
   link(existingPath, newPath) {
-    return this.copy(existingPath, newPath);
+    existingPath = this.normalizePath(existingPath);
+    newPath = this.normalizePath(newPath);
+    const srcIdx = this.resolvePathComponents(existingPath, true);
+    if (srcIdx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    const srcInode = this.readInode(srcIdx);
+    if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EPERM };
+    if (this.pathIndex.has(newPath)) return { status: CODE_TO_STATUS.EEXIST };
+    const result = this.copy(existingPath, newPath);
+    if (result.status !== 0) return result;
+    srcInode.nlink++;
+    this.writeInode(srcIdx, srcInode);
+    const destIdx = this.pathIndex.get(newPath);
+    if (destIdx !== void 0) {
+      const destInode = this.readInode(destIdx);
+      destInode.nlink = srcInode.nlink;
+      this.writeInode(destIdx, destInode);
+    }
+    return { status: 0 };
   }
   // ---- OPEN (file descriptor) ----
   open(path, flags, tabId) {

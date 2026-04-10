@@ -40,8 +40,8 @@ var INODE = {
   // uint32 - byte offset into path table
   PATH_LENGTH: 8,
   // uint16 - length of path string
-  RESERVED_10: 10,
-  // uint16
+  NLINK: 10,
+  // uint16 - hard link count
   MODE: 12,
   // uint32 - permissions (e.g. 0o100644)
   SIZE: 16,
@@ -415,6 +415,7 @@ var VFSEngine = class {
         type,
         pathOffset,
         pathLength,
+        nlink: inodeView.getUint16(off + INODE.NLINK, true) || 1,
         mode: inodeView.getUint32(off + INODE.MODE, true),
         size,
         firstBlock,
@@ -449,6 +450,7 @@ var VFSEngine = class {
       type: v.getUint8(INODE.TYPE),
       pathOffset: v.getUint32(INODE.PATH_OFFSET, true),
       pathLength: v.getUint16(INODE.PATH_LENGTH, true),
+      nlink: v.getUint16(INODE.NLINK, true) || 1,
       mode: v.getUint32(INODE.MODE, true),
       size: v.getFloat64(INODE.SIZE, true),
       firstBlock: v.getUint32(INODE.FIRST_BLOCK, true),
@@ -475,7 +477,7 @@ var VFSEngine = class {
     v.setUint8(INODE.FLAGS + 2, 0);
     v.setUint32(INODE.PATH_OFFSET, inode.pathOffset, true);
     v.setUint16(INODE.PATH_LENGTH, inode.pathLength, true);
-    v.setUint16(INODE.RESERVED_10, 0, true);
+    v.setUint16(INODE.NLINK, inode.nlink, true);
     v.setUint32(INODE.MODE, inode.mode, true);
     v.setFloat64(INODE.SIZE, inode.size, true);
     v.setUint32(INODE.FIRST_BLOCK, inode.firstBlock, true);
@@ -717,6 +719,7 @@ var VFSEngine = class {
       type,
       pathOffset: pathOff,
       pathLength: pathLen,
+      nlink: type === INODE_TYPE.DIRECTORY ? 2 : 1,
       mode,
       size,
       firstBlock,
@@ -869,6 +872,7 @@ var VFSEngine = class {
     if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
+    inode.nlink = Math.max(0, inode.nlink - 1);
     this.freeBlockRange(inode.firstBlock, inode.blockCount);
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
@@ -893,7 +897,21 @@ var VFSEngine = class {
   }
   encodeStatResponse(idx) {
     const inode = this.readInode(idx);
-    const buf = new Uint8Array(49);
+    let nlink = inode.nlink;
+    if (inode.type === INODE_TYPE.DIRECTORY) {
+      const path = this.readPath(inode.pathOffset, inode.pathLength);
+      const children = this.getDirectChildren(path);
+      let subdirCount = 0;
+      for (const child of children) {
+        const childIdx = this.pathIndex.get(child);
+        if (childIdx !== void 0) {
+          const childInode = this.readInode(childIdx);
+          if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
+        }
+      }
+      nlink = 2 + subdirCount;
+    }
+    const buf = new Uint8Array(53);
     const view = new DataView(buf.buffer);
     view.setUint8(0, inode.type);
     view.setUint32(1, inode.mode, true);
@@ -904,6 +922,7 @@ var VFSEngine = class {
     view.setUint32(37, inode.uid, true);
     view.setUint32(41, inode.gid, true);
     view.setUint32(45, idx, true);
+    view.setUint32(49, nlink, true);
     return { status: 0, data: buf };
   }
   // ---- MKDIR ----
@@ -1216,9 +1235,26 @@ var VFSEngine = class {
     const target = this.readData(inode.firstBlock, inode.blockCount, inode.size);
     return { status: 0, data: target };
   }
-  // ---- LINK (hard link — copies the file) ----
+  // ---- LINK (hard link — copies the file data, tracks nlink) ----
   link(existingPath, newPath) {
-    return this.copy(existingPath, newPath);
+    existingPath = this.normalizePath(existingPath);
+    newPath = this.normalizePath(newPath);
+    const srcIdx = this.resolvePathComponents(existingPath, true);
+    if (srcIdx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    const srcInode = this.readInode(srcIdx);
+    if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EPERM };
+    if (this.pathIndex.has(newPath)) return { status: CODE_TO_STATUS.EEXIST };
+    const result = this.copy(existingPath, newPath);
+    if (result.status !== 0) return result;
+    srcInode.nlink++;
+    this.writeInode(srcIdx, srcInode);
+    const destIdx = this.pathIndex.get(newPath);
+    if (destIdx !== void 0) {
+      const destInode = this.readInode(destIdx);
+      destInode.nlink = srcInode.nlink;
+      this.writeInode(destIdx, destInode);
+    }
+    return { status: 0 };
   }
   // ---- OPEN (file descriptor) ----
   open(path, flags, tabId2) {
@@ -1550,7 +1586,7 @@ var OPFSEngine = class {
     return dir;
   }
   encodeStat(kind, size, mtime, ino) {
-    const buf = new Uint8Array(49);
+    const buf = new Uint8Array(53);
     const view = new DataView(buf.buffer);
     view.setUint8(0, kind === "file" ? TYPE_FILE : TYPE_DIRECTORY);
     view.setUint32(1, kind === "file" ? 33188 : 16877, true);
@@ -1561,6 +1597,7 @@ var OPFSEngine = class {
     view.setUint32(37, this.processUid, true);
     view.setUint32(41, this.processGid, true);
     view.setUint32(45, ino, true);
+    view.setUint32(49, kind === "directory" ? 2 : 1, true);
     return buf;
   }
   // ========== FS Operations ==========
@@ -2245,7 +2282,7 @@ function handleRequest(reqTabId, buffer) {
       result = engine.exists(path);
       break;
     case OP.TRUNCATE: {
-      const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
+      const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getFloat64(0, true) : 0;
       result = engine.truncate(path, len);
       if (result.status === 0) {
         syncOp = op;
@@ -2337,26 +2374,26 @@ function handleRequest(reqTabId, buffer) {
       break;
     }
     case OP.FREAD: {
-      if (!data || data.byteLength < 12) {
+      if (!data || data.byteLength < 16) {
         result = { status: 7 };
         break;
       }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       const fd = dv.getUint32(0, true);
       const length = dv.getUint32(4, true);
-      const pos = dv.getInt32(8, true);
+      const pos = dv.getFloat64(8, true);
       result = engine.fread(fd, length, pos === -1 ? null : pos);
       break;
     }
     case OP.FWRITE: {
-      if (!data || data.byteLength < 8) {
+      if (!data || data.byteLength < 12) {
         result = { status: 7 };
         break;
       }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       const fd = dv.getUint32(0, true);
-      const pos = dv.getInt32(4, true);
-      const writeData = data.subarray(8);
+      const pos = dv.getFloat64(4, true);
+      const writeData = data.subarray(12);
       result = engine.fwrite(fd, writeData, pos === -1 ? null : pos);
       if (result.status === 0) {
         syncOp = op;
@@ -2370,13 +2407,13 @@ function handleRequest(reqTabId, buffer) {
       break;
     }
     case OP.FTRUNCATE: {
-      if (!data || data.byteLength < 8) {
+      if (!data || data.byteLength < 12) {
         result = { status: 7 };
         break;
       }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       const fd = dv.getUint32(0, true);
-      const len = dv.getUint32(4, true);
+      const len = dv.getFloat64(4, true);
       result = engine.ftruncate(fd, len);
       if (result.status === 0) {
         syncOp = op;
@@ -2472,7 +2509,7 @@ async function handleRequestOPFS(reqTabId, buffer) {
       result = await oe.exists(path);
       break;
     case OP.TRUNCATE: {
-      const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
+      const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getFloat64(0, true) : 0;
       result = await oe.truncate(path, len);
       syncPath = path;
       break;
@@ -2535,23 +2572,24 @@ async function handleRequestOPFS(reqTabId, buffer) {
       break;
     }
     case OP.FREAD: {
+      if (!data || data.byteLength < 16) {
+        result = { status: 7 };
+        break;
+      }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const pos = dv.getFloat64(8, true);
+      result = await oe.fread(dv.getUint32(0, true), dv.getUint32(4, true), pos === -1 ? null : pos);
+      break;
+    }
+    case OP.FWRITE: {
       if (!data || data.byteLength < 12) {
         result = { status: 7 };
         break;
       }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      result = await oe.fread(dv.getUint32(0, true), dv.getUint32(4, true), dv.getInt32(8, true) === -1 ? null : dv.getInt32(8, true));
-      break;
-    }
-    case OP.FWRITE: {
-      if (!data || data.byteLength < 8) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       const fd = dv.getUint32(0, true);
-      const pos = dv.getInt32(4, true);
-      result = await oe.fwrite(fd, data.subarray(8), pos === -1 ? null : pos);
+      const pos = dv.getFloat64(4, true);
+      result = await oe.fwrite(fd, data.subarray(12), pos === -1 ? null : pos);
       syncPath = oe.getPathForFd(fd) ?? void 0;
       break;
     }
@@ -2561,12 +2599,12 @@ async function handleRequestOPFS(reqTabId, buffer) {
       break;
     }
     case OP.FTRUNCATE: {
-      if (!data || data.byteLength < 8) {
+      if (!data || data.byteLength < 12) {
         result = { status: 7 };
         break;
       }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      result = await oe.ftruncate(dv.getUint32(0, true), dv.getUint32(4, true));
+      result = await oe.ftruncate(dv.getUint32(0, true), dv.getFloat64(4, true));
       syncPath = oe.getPathForFd(dv.getUint32(0, true)) ?? void 0;
       break;
     }
