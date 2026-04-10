@@ -248,7 +248,7 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
       break;
 
     case OP.TRUNCATE: {
-      const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
+      const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getFloat64(0, true) : 0;
       result = engine.truncate(path, len);
       if (result.status === 0) { syncOp = op; syncPath = path; }
       break;
@@ -364,13 +364,13 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
     }
 
     case OP.FTRUNCATE: {
-      if (!data || data.byteLength < 8) {
+      if (!data || data.byteLength < 12) {
         result = { status: 7 };
         break;
       }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
       const fd = dv.getUint32(0, true);
-      const len = dv.getUint32(4, true);
+      const len = dv.getFloat64(4, true);
       result = engine.ftruncate(fd, len);
       if (result.status === 0) { syncOp = op; syncPath = engine.getPathForFd(fd) ?? undefined; }
       break;
@@ -475,7 +475,7 @@ async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise
       result = await oe.exists(path);
       break;
     case OP.TRUNCATE: {
-      const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
+      const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getFloat64(0, true) : 0;
       result = await oe.truncate(path, len);
       syncPath = path;
       break;
@@ -553,9 +553,9 @@ async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise
       break;
     }
     case OP.FTRUNCATE: {
-      if (!data || data.byteLength < 8) { result = { status: 7 }; break; }
+      if (!data || data.byteLength < 12) { result = { status: 7 }; break; }
       const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      result = await oe.ftruncate(dv.getUint32(0, true), dv.getUint32(4, true));
+      result = await oe.ftruncate(dv.getUint32(0, true), dv.getFloat64(4, true));
       syncPath = oe.getPathForFd(dv.getUint32(0, true)) ?? undefined;
       break;
     }

@@ -108,10 +108,10 @@ export function ftruncateSync(
   fd: number,
   len: number = 0
 ): void {
-  const fdBuf = new Uint8Array(8);
+  const fdBuf = new Uint8Array(12);
   const dv = new DataView(fdBuf.buffer);
   dv.setUint32(0, fd, true);
-  dv.setUint32(4, len, true);
+  dv.setFloat64(4, len, true);
   const buf = encodeRequest(OP.FTRUNCATE, '', 0, fdBuf);
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'ftruncate', String(fd));
