@@ -450,7 +450,7 @@ declare class VFSFileSystem {
         length?: number;
         position?: number | null;
     }, lengthOrEncoding?: number | string, position?: number | null): number;
-    fstatSync(fd: number): Stats;
+    fstatSync(fd: number, options?: StatOptions): Stats | BigIntStats;
     ftruncateSync(fd: number, len?: number): void;
     fdatasyncSync(fd: number): void;
     fsyncSync(fd: number): void;
@@ -531,11 +531,17 @@ declare class VFSFileSystem {
     cp(src: string, dest: string, options: CpOptions, callback: (err: Error | null) => void): void;
     fdatasync(fd: number, callback: (err: Error | null) => void): void;
     fsync(fd: number, callback: (err: Error | null) => void): void;
-    fstat(fd: number, callback: (err: Error | null, stats?: Stats) => void): void;
-    fstat(fd: number, options: any, callback: (err: Error | null, stats?: Stats) => void): void;
+    fstat(fd: number, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
+    fstat(fd: number, options: any, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
     ftruncate(fd: number, callback: (err: Error | null) => void): void;
     ftruncate(fd: number, len: number, callback: (err: Error | null) => void): void;
     read(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null, callback: (err: Error | null, bytesRead?: number, buffer?: Uint8Array) => void): void;
+    read(fd: number, options: {
+        buffer: Uint8Array;
+        offset?: number;
+        length?: number;
+        position?: number | null;
+    }, callback: (err: Error | null, bytesRead?: number, buffer?: Uint8Array) => void): void;
     write(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null, callback: (err: Error | null, bytesWritten?: number, buffer?: Uint8Array) => void): void;
     write(fd: number, data: string, position: number | null | undefined, encoding: string | undefined, callback: (err: Error | null, bytesWritten?: number, data?: string) => void): void;
     close(fd: number, callback?: (err: Error | null) => void): void;
@@ -642,6 +648,8 @@ declare class VFSPromises {
     openAsBlob(filePath: string, options?: OpenAsBlobOptions): Promise<Blob>;
     statfs(path: string): Promise<StatFs>;
     watch(filePath: string, options?: WatchOptions): AsyncIterable<WatchEventType>;
+    fstat(fd: number, options?: StatOptions): Promise<Stats | BigIntStats>;
+    ftruncate(fd: number, len?: number): Promise<void>;
     fsync(_fd: number): Promise<void>;
     fdatasync(_fd: number): Promise<void>;
     flush(): Promise<void>;
@@ -666,6 +674,10 @@ declare class SimpleEventEmitter {
     removeAllListeners(event?: string): this;
     emit(event: string, ...args: unknown[]): boolean;
     listenerCount(event: string): number;
+    rawListeners(event: string): Function[];
+    prependListener(event: string, fn: Listener): this;
+    prependOnceListener(event: string, fn: Listener): this;
+    eventNames(): string[];
 }
 declare class NodeReadable extends SimpleEventEmitter {
     private _readFn;

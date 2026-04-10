@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.0.32
+
+- Add `promises.fstat()` and `promises.ftruncate()`
+- Export `fstat`, `ftruncate`, `lchmod`, `lchown`, `lutimes`, `fsync`, `fdatasync` from promises module
+- Add `rawListeners()`, `prependListener()`, `prependOnceListener()`, `eventNames()` to stream EventEmitter
+- `fstat`/`fstatSync` now accept `{bigint: true}` option returning `BigIntStats`
+- Add callback validation to `cp`, `readv`, `writev`, `statfs`
+- Add `read(fd, {buffer, ...}, callback)` object-form overload
+
 ## 3.0.31
 
 - Fix `statfs` callback to fire asynchronously (macrotask)

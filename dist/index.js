@@ -59,6 +59,25 @@ var SimpleEventEmitter = class {
   listenerCount(event) {
     return this._listeners.get(event)?.length ?? 0;
   }
+  rawListeners(event) {
+    return [...this._listeners.get(event) ?? []];
+  }
+  prependListener(event, fn) {
+    const arr = this._listeners.get(event) ?? [];
+    arr.unshift(fn);
+    this._listeners.set(event, arr);
+    return this;
+  }
+  prependOnceListener(event, fn) {
+    const wrapper = (...args) => {
+      this.off(event, wrapper);
+      fn(...args);
+    };
+    return this.prependListener(event, wrapper);
+  }
+  eventNames() {
+    return [...this._listeners.keys()].filter((k) => (this._listeners.get(k)?.length ?? 0) > 0);
+  }
 };
 var NodeReadable = class extends SimpleEventEmitter {
   constructor(_readFn, destroyFn) {
@@ -852,13 +871,13 @@ function writeSyncFd(syncRequest, fd, bufferOrString, offsetOrPositionOrOptions,
   if (status !== 0) throw statusToError(status, "write", String(fd));
   return data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
 }
-function fstatSync(syncRequest, fd) {
+function fstatSync(syncRequest, fd, options) {
   const fdBuf = new Uint8Array(4);
   new DataView(fdBuf.buffer).setUint32(0, fd, true);
   const buf = encodeRequest(OP.FSTAT, "", 0, fdBuf);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "fstat", String(fd));
-  return decodeStats(data);
+  return options?.bigint ? decodeStatsBigInt(data) : decodeStats(data);
 }
 function ftruncateSync(syncRequest, fd, len = 0) {
   const fdBuf = new Uint8Array(12);
@@ -3036,8 +3055,8 @@ var VFSFileSystem = class {
   writeSync(fd, bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position) {
     return writeSyncFd(this._sync, fd, bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position);
   }
-  fstatSync(fd) {
-    return fstatSync(this._sync, fd);
+  fstatSync(fd, options) {
+    return fstatSync(this._sync, fd, options);
   }
   ftruncateSync(fd, len) {
     ftruncateSync(this._sync, fd, len);
@@ -3080,6 +3099,7 @@ var VFSFileSystem = class {
       pos = positionOrCallback;
       cb = callback;
     }
+    this._validateCb(cb);
     try {
       const bytesRead = this.readvSync(fd, buffers, pos);
       setTimeout(() => cb(null, bytesRead, buffers), 0);
@@ -3097,6 +3117,7 @@ var VFSFileSystem = class {
       pos = positionOrCallback;
       cb = callback;
     }
+    this._validateCb(cb);
     try {
       const bytesWritten = this.writevSync(fd, buffers, pos);
       setTimeout(() => cb(null, bytesWritten, buffers), 0);
@@ -3124,6 +3145,7 @@ var VFSFileSystem = class {
   statfs(path, callback) {
     const result = this.statfsSync(path);
     if (callback) {
+      this._validateCb(callback);
       setTimeout(() => callback(null, result), 0);
       return;
     }
@@ -3536,6 +3558,7 @@ var VFSFileSystem = class {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
     if (cb) {
+      this._validateCb(cb);
       this._cpAsync(src, dest, opts).then(
         () => setTimeout(() => cb(null), 0),
         (err) => setTimeout(() => cb(err), 0)
@@ -3565,8 +3588,9 @@ var VFSFileSystem = class {
   fstat(fd, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     this._validateCb(cb);
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
     try {
-      const result = this.fstatSync(fd);
+      const result = this.fstatSync(fd, opts);
       setTimeout(() => cb(null, result), 0);
     } catch (err) {
       setTimeout(() => cb(err), 0);
@@ -3584,12 +3608,30 @@ var VFSFileSystem = class {
     }
   }
   read(fd, buffer, offset, length, position, callback) {
-    this._validateCb(callback);
+    let cb;
+    let buf;
+    let off;
+    let len;
+    let pos;
+    if (typeof buffer === "object" && !(buffer instanceof Uint8Array) && buffer !== null && "buffer" in buffer) {
+      cb = offset;
+      buf = buffer.buffer;
+      off = buffer.offset ?? 0;
+      len = buffer.length ?? buf.byteLength;
+      pos = buffer.position ?? null;
+    } else {
+      cb = callback;
+      buf = buffer;
+      off = offset;
+      len = length;
+      pos = position;
+    }
+    this._validateCb(cb);
     try {
-      const bytesRead = this.readSync(fd, buffer, offset, length, position);
-      setTimeout(() => callback(null, bytesRead, buffer), 0);
+      const bytesRead = this.readSync(fd, buf, off, len, pos);
+      setTimeout(() => cb(null, bytesRead, buf), 0);
     } catch (err) {
-      setTimeout(() => callback(err), 0);
+      setTimeout(() => cb(err), 0);
     }
   }
   write(fd, bufferOrString, offsetOrPosition, lengthOrEncoding, position, callback) {
@@ -3865,6 +3907,15 @@ var VFSPromises = class {
   }
   async *watch(filePath, options) {
     yield* watchAsync(this._ns, this._async, filePath, options);
+  }
+  async fstat(fd, options) {
+    const { status, data } = await this._async(OP.FSTAT, "", 0, null, void 0, { fd });
+    if (status !== 0) throw statusToError(status, "fstat", String(fd));
+    return options?.bigint ? decodeStatsBigInt(data) : decodeStats(data);
+  }
+  async ftruncate(fd, len = 0) {
+    const { status } = await this._async(OP.FTRUNCATE, "", 0, null, void 0, { fd, length: len });
+    if (status !== 0) throw statusToError(status, "ftruncate", String(fd));
   }
   async fsync(_fd) {
     await this._async(OP.FSYNC, "");
