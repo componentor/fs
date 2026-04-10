@@ -1,12 +1,9 @@
 # Changelog
 
-## 3.0.35 - ## 3.0.38
-
-- Add lstat through symlink chain tests including VFS remount persistence scenario
-
-## 3.0.34 - 3.0.36
+## 3.0.34 - 3.0.39
 
 - Fix lstat for deeply nested symlink chains: fallback to full resolution when intermediate path lookup fails
+- Add lstat through symlink chain tests including VFS remount persistence scenario
 
 ## 3.0.33
 
