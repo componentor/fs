@@ -8,7 +8,8 @@ const decoder = new TextDecoder();
 export function symlinkSync(
   syncRequest: SyncRequestFn,
   target: string,
-  linkPath: string
+  linkPath: string,
+  type?: string | null
 ): void {
   const targetBytes = encoder.encode(target);
   const buf = encodeRequest(OP.SYMLINK, linkPath, 0, targetBytes);
@@ -32,7 +33,8 @@ export function readlinkSync(
 export async function symlink(
   asyncRequest: AsyncRequestFn,
   target: string,
-  linkPath: string
+  linkPath: string,
+  type?: string | null
 ): Promise<void> {
   const targetBytes = encoder.encode(target);
   const { status } = await asyncRequest(OP.SYMLINK, linkPath, 0, targetBytes);
