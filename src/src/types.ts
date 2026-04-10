@@ -126,6 +126,7 @@ export interface FileHandle {
   fd: number;
   read(buffer: Uint8Array, offset?: number, length?: number, position?: number | null): Promise<{ bytesRead: number; buffer: Uint8Array }>;
   write(buffer: Uint8Array, offset?: number, length?: number, position?: number | null): Promise<{ bytesWritten: number; buffer: Uint8Array }>;
+  write(string: string, position?: number, encoding?: string): Promise<{ bytesWritten: number; buffer: Uint8Array }>;
   readFile(options?: ReadOptions | Encoding | null): Promise<Uint8Array | string>;
   writeFile(data: Uint8Array | string, options?: WriteOptions | Encoding): Promise<void>;
   truncate(len?: number): Promise<void>;

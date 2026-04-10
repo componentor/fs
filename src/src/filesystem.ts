@@ -842,8 +842,8 @@ export class VFSFileSystem {
     return _readSync(this._sync, fd, buffer, offset, length, position);
   }
 
-  writeSync(fd: number, buffer: Uint8Array, offset = 0, length = buffer.byteLength, position: number | null = null): number {
-    return _writeSyncFd(this._sync, fd, buffer, offset, length, position);
+  writeSync(fd: number, bufferOrString: Uint8Array | string, offsetOrPosition?: number, lengthOrEncoding?: number | string, position?: number | null): number {
+    return _writeSyncFd(this._sync, fd, bufferOrString, offsetOrPosition, lengthOrEncoding, position);
   }
 
   fstatSync(fd: number): Stats {
