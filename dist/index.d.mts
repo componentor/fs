@@ -487,6 +487,12 @@ declare class VFSFileSystem {
      *  Returns a Promise that resolves when the new mode is ready. */
     setMode(newMode: FSMode): Promise<void>;
     private _validateCb;
+    /** Adapt a promise to optional Node.js callback style.
+     *  If cb is a function: calls cb(err, result) via setTimeout. Returns void.
+     *  If cb is missing: returns the promise (allows .then() or await). */
+    private _cb;
+    /** Like _cb but for void-returning promises (no result value). */
+    private _cbVoid;
     readFile(filePath: string, callback: (err: Error | null, data?: Uint8Array | string) => void): void;
     readFile(filePath: string, options: ReadOptions | Encoding | null, callback: (err: Error | null, data?: Uint8Array | string) => void): void;
     writeFile(filePath: string, data: string | Uint8Array, callback: (err: Error | null) => void): void;
@@ -499,7 +505,7 @@ declare class VFSFileSystem {
     rmdir(filePath: string, options: RmdirOptions, callback: (err: Error | null) => void): void;
     rm(filePath: string, callback: (err: Error | null) => void): void;
     rm(filePath: string, options: RmOptions, callback: (err: Error | null) => void): void;
-    unlink(filePath: string, callback: (err: Error | null) => void): void;
+    unlink(filePath: string, callback?: (err: Error | null) => void): any;
     readdir(filePath: string, callback: (err: Error | null, files?: string[] | Dirent[]) => void): void;
     readdir(filePath: string, options: ReaddirOptions | Encoding | null, callback: (err: Error | null, files?: string[] | Dirent[]) => void): void;
     stat(filePath: string, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
@@ -508,29 +514,29 @@ declare class VFSFileSystem {
     lstat(filePath: string, options: StatOptions, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
     access(filePath: string, callback: (err: Error | null) => void): void;
     access(filePath: string, mode: number, callback: (err: Error | null) => void): void;
-    rename(oldPath: string, newPath: string, callback: (err: Error | null) => void): void;
+    rename(oldPath: string, newPath: string, callback?: (err: Error | null) => void): any;
     copyFile(src: string, dest: string, callback: (err: Error | null) => void): void;
     copyFile(src: string, dest: string, mode: number, callback: (err: Error | null) => void): void;
     truncate(filePath: string, callback: (err: Error | null) => void): void;
     truncate(filePath: string, len: number, callback: (err: Error | null) => void): void;
-    realpath(filePath: string, callback: (err: Error | null, resolvedPath?: string) => void): void;
-    chmod(filePath: string, mode: number, callback: (err: Error | null) => void): void;
-    chown(filePath: string, uid: number, gid: number, callback: (err: Error | null) => void): void;
-    utimes(filePath: string, atime: Date | number, mtime: Date | number, callback: (err: Error | null) => void): void;
+    realpath(filePath: string, callback?: (err: Error | null, resolvedPath?: string) => void): any;
+    chmod(filePath: string, mode: number, callback?: (err: Error | null) => void): any;
+    chown(filePath: string, uid: number, gid: number, callback?: (err: Error | null) => void): any;
+    utimes(filePath: string, atime: Date | number, mtime: Date | number, callback?: (err: Error | null) => void): any;
     symlink(target: string, linkPath: string, callback: (err: Error | null) => void): void;
     symlink(target: string, linkPath: string, type: string | null, callback: (err: Error | null) => void): void;
     readlink(filePath: string, callback: (err: Error | null, linkString?: string | Uint8Array) => void): void;
     readlink(filePath: string, options: {
         encoding?: string | null;
     } | string | null, callback: (err: Error | null, linkString?: string | Uint8Array) => void): void;
-    link(existingPath: string, newPath: string, callback: (err: Error | null) => void): void;
+    link(existingPath: string, newPath: string, callback?: (err: Error | null) => void): any;
     open(filePath: string, flags: string | number, callback: (err: Error | null, fd?: number) => void): void;
     open(filePath: string, flags: string | number, mode: number, callback: (err: Error | null, fd?: number) => void): void;
-    mkdtemp(prefix: string, callback: (err: Error | null, folder?: string) => void): void;
+    mkdtemp(prefix: string, callback?: (err: Error | null, folder?: string) => void): any;
     cp(src: string, dest: string, callback: (err: Error | null) => void): void;
     cp(src: string, dest: string, options: CpOptions, callback: (err: Error | null) => void): void;
-    fdatasync(fd: number, callback: (err: Error | null) => void): void;
-    fsync(fd: number, callback: (err: Error | null) => void): void;
+    fdatasync(fd: number, callback?: (err: Error | null) => void): void;
+    fsync(fd: number, callback?: (err: Error | null) => void): void;
     fstat(fd: number, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
     fstat(fd: number, options: any, callback: (err: Error | null, stats?: Stats | BigIntStats) => void): void;
     ftruncate(fd: number, callback: (err: Error | null) => void): void;
@@ -545,16 +551,16 @@ declare class VFSFileSystem {
     write(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null, callback: (err: Error | null, bytesWritten?: number, buffer?: Uint8Array) => void): void;
     write(fd: number, data: string, position: number | null | undefined, encoding: string | undefined, callback: (err: Error | null, bytesWritten?: number, data?: string) => void): void;
     close(fd: number, callback?: (err: Error | null) => void): void;
-    exists(filePath: string, callback: (exists: boolean) => void): void;
-    opendir(filePath: string, callback: (err: Error | null, dir?: Dir) => void): void;
+    exists(filePath: string, callback?: (exists: boolean) => void): any;
+    opendir(filePath: string, callback?: (err: Error | null, dir?: Dir) => void): any;
     glob(pattern: string, callback: (err: Error | null, matches?: string[]) => void): void;
     glob(pattern: string, options: GlobOptions, callback: (err: Error | null, matches?: string[]) => void): void;
-    futimes(fd: number, atime: Date | number, mtime: Date | number, callback: (err: Error | null) => void): void;
-    fchmod(fd: number, mode: number, callback: (err: Error | null) => void): void;
-    fchown(fd: number, uid: number, gid: number, callback: (err: Error | null) => void): void;
-    lchmod(filePath: string, mode: number, callback: (err: Error | null) => void): void;
-    lchown(filePath: string, uid: number, gid: number, callback: (err: Error | null) => void): void;
-    lutimes(filePath: string, atime: Date | number, mtime: Date | number, callback: (err: Error | null) => void): void;
+    futimes(fd: number, atime: Date | number, mtime: Date | number, callback?: (err: Error | null) => void): void;
+    fchmod(fd: number, mode: number, callback?: (err: Error | null) => void): void;
+    fchown(fd: number, uid: number, gid: number, callback?: (err: Error | null) => void): void;
+    lchmod(filePath: string, mode: number, callback?: (err: Error | null) => void): any;
+    lchown(filePath: string, uid: number, gid: number, callback?: (err: Error | null) => void): any;
+    lutimes(filePath: string, atime: Date | number, mtime: Date | number, callback?: (err: Error | null) => void): any;
 }
 declare class VFSPromises {
     private _async;

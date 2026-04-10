@@ -1,5 +1,12 @@
 # Changelog
 
+## 3.0.33
+
+- Callback methods now return the promise when no callback is given (hybrid API)
+- Relax callback validation to allow undefined/null (matches real-world polyfill usage)
+- Refactor callback API with `_cb`/`_cbVoid` helpers, eliminating repetitive setTimeout wrappers
+- Guard all sync-based callback methods with `if (cb)` checks
+
 ## 3.0.32
 
 - Add `promises.fstat()` and `promises.ftruncate()`
