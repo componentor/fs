@@ -3,7 +3,7 @@
  * Mirrors Node.js fs module interfaces.
  */
 
-export type Encoding = 'utf8' | 'utf-8' | 'ascii' | 'base64' | 'hex' | 'binary';
+export type Encoding = 'utf8' | 'utf-8' | 'ascii' | 'base64' | 'hex' | 'binary' | 'latin1' | 'ucs2' | 'ucs-2' | 'utf16le' | 'utf-16le';
 
 export interface ReadOptions {
   encoding?: Encoding | null;

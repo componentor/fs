@@ -3,6 +3,7 @@ import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { OP, encodeRequest } from '../protocol/opcodes.js';
 import { statusToError } from '../errors.js';
 import { parseFlags, openSync, closeSync, writeSyncFd, open } from './open.js';
+import { encodeString } from '../encoding.js';
 
 const encoder = new TextEncoder();
 
@@ -13,7 +14,7 @@ export function writeFileSync(
   options?: WriteOptions | Encoding
 ): void {
   const opts = typeof options === 'string' ? { encoding: options } : options;
-  const encoded = typeof data === 'string' ? encoder.encode(data) : data;
+  const encoded = typeof data === 'string' ? (opts?.encoding ? encodeString(data, opts.encoding) : encoder.encode(data)) : data;
   const flag = opts?.flag;
 
   // Fast path: default flag or no flag specified
@@ -41,7 +42,7 @@ export async function writeFile(
   options?: WriteOptions | Encoding
 ): Promise<void> {
   const opts = typeof options === 'string' ? { encoding: options } : options;
-  const encoded = typeof data === 'string' ? encoder.encode(data) : data;
+  const encoded = typeof data === 'string' ? (opts?.encoding ? encodeString(data, opts.encoding) : encoder.encode(data)) : data;
   const flag = opts?.flag;
 
   // Fast path: default flag or no flag specified

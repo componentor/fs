@@ -3,6 +3,7 @@ import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { OP, encodeRequest } from '../protocol/opcodes.js';
 import { statusToError } from '../errors.js';
 import { parseFlags, openSync, closeSync, readSync, open } from './open.js';
+import { decodeBuffer } from '../encoding.js';
 
 const decoder = new TextDecoder();
 
@@ -20,7 +21,7 @@ export function readFileSync(
     const { status, data } = syncRequest(buf);
     if (status !== 0) throw statusToError(status, 'read', filePath);
     const result = data ?? new Uint8Array(0);
-    if (encoding) return decoder.decode(result);
+    if (encoding) return decodeBuffer(result, encoding);
     return result;
   }
 
@@ -52,7 +53,7 @@ export function readFileSync(
         offset += chunk.byteLength;
       }
     }
-    if (encoding) return decoder.decode(result);
+    if (encoding) return decodeBuffer(result, encoding);
     return result;
   } finally {
     closeSync(syncRequest, fd);
@@ -72,7 +73,7 @@ export async function readFile(
     const { status, data } = await asyncRequest(OP.READ, filePath);
     if (status !== 0) throw statusToError(status, 'read', filePath);
     const result = data ?? new Uint8Array(0);
-    if (encoding) return decoder.decode(result);
+    if (encoding) return decodeBuffer(result, encoding);
     return result;
   }
 
