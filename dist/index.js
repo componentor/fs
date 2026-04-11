@@ -483,7 +483,7 @@ function statusToError(status, syscall, path) {
 var VFS_MAGIC = 1447449377;
 var VFS_VERSION = 1;
 var DEFAULT_BLOCK_SIZE = 4096;
-var DEFAULT_INODE_COUNT = 1e4;
+var DEFAULT_INODE_COUNT = 1e5;
 var INODE_SIZE = 64;
 var SUPERBLOCK = {
   SIZE: 64,

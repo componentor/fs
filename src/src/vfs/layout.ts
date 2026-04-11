@@ -11,7 +11,7 @@ export const VFS_VERSION = 1;
 
 // Default sizes
 export const DEFAULT_BLOCK_SIZE = 4096;
-export const DEFAULT_INODE_COUNT = 10000;
+export const DEFAULT_INODE_COUNT = 100000;
 export const INODE_SIZE = 64; // bytes per inode entry
 
 // Superblock layout (64 bytes)

@@ -136,6 +136,22 @@ describe('lstat through symlink chains', () => {
   it('readdir should list contents through symlink', () => {
     const result = engine.readdir('/node_modules/.pnpm/pkg@1.0.0/node_modules/pkg/templates', 0);
     expect(result.status).toBe(0);
+    // Should contain 'vanilla' directory
+    expect(result.data).toBeTruthy();
+    if (result.data) {
+      const names = new TextDecoder().decode(result.data).split('\0').filter(Boolean);
+      expect(names).toContain('vanilla');
+    }
+  });
+
+  it('readdir should list contents of subdirectory through symlink', () => {
+    const result = engine.readdir('/node_modules/.pnpm/pkg@1.0.0/node_modules/pkg/templates/vanilla', 0);
+    expect(result.status).toBe(0);
+    expect(result.data).toBeTruthy();
+    if (result.data) {
+      const names = new TextDecoder().decode(result.data).split('\0').filter(Boolean);
+      expect(names).toContain('index.ts');
+    }
   });
 
   // Test with VFS reload (simulates browser page reload)

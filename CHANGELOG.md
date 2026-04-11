@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.0.41
+
+- Increase default inode count from 10,000 to 100,000 to support large projects (e.g. Strapi)
+- Strengthen readdir-through-symlink test assertions
+
 ## 3.0.34 - 3.0.39
 
 - Fix lstat for deeply nested symlink chains: fallback to full resolution when intermediate path lookup fails
