@@ -1,5 +1,9 @@
 # Changelog
 
+## 3.0.43
+
+- Update README changelog section and link to `CHANGELOG.md`
+
 ## 3.0.42
 
 - Implement real `fchmod`/`fchown`/`futimes` (sync, promises, and `FileHandle.utimes`) — previously no-ops

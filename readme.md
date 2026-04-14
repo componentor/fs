@@ -602,6 +602,28 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 ## Changelog
 
+See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
+
+### v3.0.43 (2026)
+
+**Docs:**
+- Update README changelog section and link to `CHANGELOG.md`
+
+### v3.0.42 (2026)
+
+**Features:**
+- Implement real `fchmod`/`fchown`/`futimes` (sync, promises, and `FileHandle.utimes`) — previously no-ops
+- Add wire opcodes `FCHMOD`/`FCHOWN`/`FUTIMES` (31/32/33) wired through VFS and OPFS engines, server worker, and sync-relay
+- Sync-relay broadcasts fd-based ops as path-based equivalents via `getPathForFd` so watchers still fire
+- Rewrite `glob`/`globSync`: brace expansion, character classes with `[!...]` negation, escapes, `withFileTypes`, `string[]` patterns, `URL` cwd, dedupe, trailing-`**` self-match
+- `watch`: per-microtask `(event, filename)` coalescing, `encoding: 'buffer'` support, reclassify `COPY` as `change` to match libuv
+
+### v3.0.41 (2026)
+
+**Features:**
+- Increase default inode count from 10,000 to 100,000 to support large projects (e.g. Strapi)
+- Strengthen readdir-through-symlink test assertions
+
 ### v3.0.19-v3.0.20 (2026)
 
 **Features:**
