@@ -148,8 +148,16 @@ export interface StatFs {
 }
 
 export interface GlobOptions {
-  cwd?: string;
-  exclude?: (path: string) => boolean;
+  /** Base directory to resolve relative patterns against. Default: '/' */
+  cwd?: string | URL;
+  /**
+   * Exclude callback. Called with every candidate path (for `withFileTypes`,
+   * called with a Dirent). Returning truthy drops the entry. Matches Node's
+   * `fs.glob` behavior.
+   */
+  exclude?: ((path: string) => boolean) | ((dirent: Dirent) => boolean);
+  /** Return Dirent objects instead of path strings. Default: false */
+  withFileTypes?: boolean;
 }
 
 export type PathLike = string | Uint8Array | URL;
@@ -253,6 +261,7 @@ export interface FileHandle {
   appendFile(data: string | Uint8Array, options?: WriteOptions | Encoding): Promise<void>;
   chmod(mode: number): Promise<void>;
   chown(uid: number, gid: number): Promise<void>;
+  utimes(atime: Date | number, mtime: Date | number): Promise<void>;
   sync(): Promise<void>;
   datasync(): Promise<void>;
   close(): Promise<void>;

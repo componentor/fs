@@ -36,9 +36,9 @@ import { copyFileSync as _copyFileSync, copyFile as _copyFile } from './methods/
 import { truncateSync as _truncateSync, truncate as _truncate } from './methods/truncate.js';
 import { accessSync as _accessSync, access as _access } from './methods/access.js';
 import { realpathSync as _realpathSync, realpath as _realpath } from './methods/realpath.js';
-import { chmodSync as _chmodSync, chmod as _chmod } from './methods/chmod.js';
-import { chownSync as _chownSync, chown as _chown } from './methods/chown.js';
-import { utimesSync as _utimesSync, utimes as _utimes } from './methods/utimes.js';
+import { chmodSync as _chmodSync, chmod as _chmod, fchmodSync as _fchmodSync, fchmod as _fchmod } from './methods/chmod.js';
+import { chownSync as _chownSync, chown as _chown, fchownSync as _fchownSync, fchown as _fchown } from './methods/chown.js';
+import { utimesSync as _utimesSync, utimes as _utimes, futimesSync as _futimesSync, futimes as _futimes } from './methods/utimes.js';
 import { symlinkSync as _symlinkSync, readlinkSync as _readlinkSync, symlink as _symlink, readlink as _readlink } from './methods/symlink.js';
 import { linkSync as _linkSync, link as _link } from './methods/link.js';
 import { mkdtempSync as _mkdtempSync, mkdtemp as _mkdtemp } from './methods/mkdtemp.js';
@@ -788,7 +788,7 @@ export class VFSFileSystem {
     return _readdirSync(this._sync, toPathString(filePath), options);
   }
 
-  globSync(pattern: string, options?: GlobOptions): string[] {
+  globSync(pattern: string | string[], options?: GlobOptions): string[] | Dirent[] {
     return _globSync(this._sync, pattern, options);
   }
 
@@ -956,9 +956,11 @@ export class VFSFileSystem {
     _chmodSync(this._sync, filePath, mode);
   }
 
-  /** chmod on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
-  fchmodSync(_fd: number, _mode: number): void {
-    // No-op: fd-based permission changes are not supported in this OPFS VFS.
+  /** chmod on an open file descriptor. Resolves the fd to its inode on the
+   *  server side and mutates the inode's mode bits directly, matching what
+   *  native Node's libuv does. */
+  fchmodSync(fd: number, mode: number): void {
+    _fchmodSync(this._sync, fd, mode);
   }
 
   chownSync(filePath: PathLike, uid: number, gid: number): void {
@@ -970,18 +972,18 @@ export class VFSFileSystem {
     _chownSync(this._sync, filePath, uid, gid);
   }
 
-  /** chown on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
-  fchownSync(_fd: number, _uid: number, _gid: number): void {
-    // No-op: fd-based permission changes are not supported in this OPFS VFS.
+  /** chown on an open file descriptor. Mutates the underlying inode's uid/gid. */
+  fchownSync(fd: number, uid: number, gid: number): void {
+    _fchownSync(this._sync, fd, uid, gid);
   }
 
   utimesSync(filePath: PathLike, atime: Date | number, mtime: Date | number): void {
     _utimesSync(this._sync, toPathString(filePath), atime, mtime);
   }
 
-  /** utimes on an open file descriptor. No-op in this VFS (cannot resolve fd to path). */
-  futimesSync(_fd: number, _atime: Date | number, _mtime: Date | number): void {
-    // No-op: fd-based timestamp changes are not supported in this OPFS VFS.
+  /** utimes on an open file descriptor. Mutates the underlying inode's atime/mtime. */
+  futimesSync(fd: number, atime: Date | number, mtime: Date | number): void {
+    _futimesSync(this._sync, fd, atime, mtime);
   }
 
   /** Like utimesSync but operates on the symlink itself. In this VFS, delegates to utimesSync. */
@@ -1774,20 +1776,17 @@ export class VFSFileSystem {
 
   futimes(fd: number, atime: Date | number, mtime: Date | number, callback?: (err: Error | null) => void): void {
     this._validateCb(callback);
-    // No-op: fd-based timestamp changes are not supported in this OPFS VFS.
-    if (callback) setTimeout(() => callback(null), 0);
+    return this._cbVoid(this.promises.futimes(fd, atime, mtime), callback);
   }
 
   fchmod(fd: number, mode: number, callback?: (err: Error | null) => void): void {
     this._validateCb(callback);
-    // No-op: fd-based permission changes are not supported in this OPFS VFS.
-    if (callback) setTimeout(() => callback(null), 0);
+    return this._cbVoid(this.promises.fchmod(fd, mode), callback);
   }
 
   fchown(fd: number, uid: number, gid: number, callback?: (err: Error | null) => void): void {
     this._validateCb(callback);
-    // No-op: fd-based permission changes are not supported in this OPFS VFS.
-    if (callback) setTimeout(() => callback(null), 0);
+    return this._cbVoid(this.promises.fchown(fd, uid, gid), callback);
   }
 
   lchmod(filePath: string, mode: number, callback?: (err: Error | null) => void): any {
@@ -1852,7 +1851,7 @@ class VFSPromises {
     return _readdir(this._async, toPathString(filePath), options);
   }
 
-  glob(pattern: string, options?: GlobOptions): Promise<string[]> {
+  glob(pattern: string | string[], options?: GlobOptions): Promise<string[] | Dirent[]> {
     return _glob(this._async, pattern, options);
   }
 
@@ -1950,9 +1949,10 @@ class VFSPromises {
     return _chmod(this._async, filePath, mode);
   }
 
-  /** chmod on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
-  async fchmod(_fd: number, _mode: number): Promise<void> {
-    // No-op: fd-based permission changes are not supported in this OPFS VFS.
+  /** chmod on an open file descriptor. Engine resolves fd → inode and
+   *  mutates the mode bits directly. */
+  fchmod(fd: number, mode: number): Promise<void> {
+    return _fchmod(this._async, fd, mode);
   }
 
   chown(filePath: PathLike, uid: number, gid: number) {
@@ -1964,18 +1964,20 @@ class VFSPromises {
     return _chown(this._async, filePath, uid, gid);
   }
 
-  /** chown on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
-  async fchown(_fd: number, _uid: number, _gid: number): Promise<void> {
-    // No-op: fd-based permission changes are not supported in this OPFS VFS.
+  /** chown on an open file descriptor. Engine resolves fd → inode and
+   *  mutates uid/gid directly. */
+  fchown(fd: number, uid: number, gid: number): Promise<void> {
+    return _fchown(this._async, fd, uid, gid);
   }
 
   utimes(filePath: PathLike, atime: Date | number, mtime: Date | number) {
     return _utimes(this._async, toPathString(filePath), atime, mtime);
   }
 
-  /** utimes on an open file descriptor. No-op in this VFS (cannot resolve fd to path). */
-  async futimes(_fd: number, _atime: Date | number, _mtime: Date | number): Promise<void> {
-    // No-op: fd-based timestamp changes are not supported in this OPFS VFS.
+  /** utimes on an open file descriptor. Engine resolves fd → inode and
+   *  mutates atime/mtime directly. */
+  futimes(fd: number, atime: Date | number, mtime: Date | number): Promise<void> {
+    return _futimes(this._async, fd, atime, mtime);
   }
 
   /** Like utimes but operates on the symlink itself. In this VFS, delegates to utimes. */

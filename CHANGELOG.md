@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.0.42
+
+- Implement real `fchmod`/`fchown`/`futimes` (sync, promises, and `FileHandle.utimes`) — previously no-ops
+- Add new wire opcodes `FCHMOD`/`FCHOWN`/`FUTIMES` (31/32/33) wired through VFS and OPFS engines, server worker, and sync-relay
+- Sync-relay broadcasts fd-based ops as path-based equivalents via `getPathForFd` so watchers still fire
+- Rewrite `glob`/`globSync`: brace expansion, character classes with `[!...]` negation, escapes, `withFileTypes`, `string[]` patterns, `URL` cwd, dedupe, trailing-`**` self-match
+- `watch`: per-microtask `(event, filename)` coalescing, `encoding: 'buffer'` support, reclassify `COPY` as `change` to match libuv
+
 ## 3.0.41
 
 - Increase default inode count from 10,000 to 100,000 to support large projects (e.g. Strapi)

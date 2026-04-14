@@ -309,12 +309,38 @@ export function createFileHandle(fd: number, asyncRequest: AsyncRequestFn): File
       if (status !== 0) throw statusToError(status, 'write', String(fd));
     },
 
-    async chmod(_mode: number) {
-      // Permissions are cosmetic in a browser VFS — silently succeed
+    async chmod(mode: number) {
+      // Payload: [fd: u32][mode: u32] — engine resolves fd → inode and
+      // updates its mode bits directly, matching native libuv.
+      const payload = new Uint8Array(8);
+      const dv = new DataView(payload.buffer);
+      dv.setUint32(0, fd, true);
+      dv.setUint32(4, mode, true);
+      const { status } = await asyncRequest(OP.FCHMOD, '', 0, payload);
+      if (status !== 0) throw statusToError(status, 'fchmod', String(fd));
     },
 
-    async chown(_uid: number, _gid: number) {
-      // Ownership is cosmetic in a browser VFS — silently succeed
+    async chown(uid: number, gid: number) {
+      // Payload: [fd: u32][uid: u32][gid: u32]
+      const payload = new Uint8Array(12);
+      const dv = new DataView(payload.buffer);
+      dv.setUint32(0, fd, true);
+      dv.setUint32(4, uid, true);
+      dv.setUint32(8, gid, true);
+      const { status } = await asyncRequest(OP.FCHOWN, '', 0, payload);
+      if (status !== 0) throw statusToError(status, 'fchown', String(fd));
+    },
+
+    async utimes(atime: Date | number, mtime: Date | number) {
+      // Payload: [fd: u32][pad: u32][atime: f64][mtime: f64] — 4-byte pad
+      // keeps f64 fields 8-byte aligned for DataView access on both sides.
+      const payload = new Uint8Array(24);
+      const dv = new DataView(payload.buffer);
+      dv.setUint32(0, fd, true);
+      dv.setFloat64(8, typeof atime === 'number' ? atime : atime.getTime(), true);
+      dv.setFloat64(16, typeof mtime === 'number' ? mtime : mtime.getTime(), true);
+      const { status } = await asyncRequest(OP.FUTIMES, '', 0, payload);
+      if (status !== 0) throw statusToError(status, 'futimes', String(fd));
     },
 
     async sync() {

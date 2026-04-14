@@ -1362,6 +1362,40 @@ var VFSEngine = class {
     this.handle.flush();
     return { status: 0 };
   }
+  // ---- FCHMOD ----
+  // fd-based chmod: look up the inode directly from the fd table and mutate
+  // its mode bits. Native Node does the same thing at the libuv layer.
+  fchmod(fd, mode) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    const inode = this.readInode(entry.inodeIdx);
+    inode.mode = inode.mode & S_IFMT | mode & 4095;
+    inode.ctime = Date.now();
+    this.writeInode(entry.inodeIdx, inode);
+    return { status: 0 };
+  }
+  // ---- FCHOWN ----
+  fchown(fd, uid, gid) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    const inode = this.readInode(entry.inodeIdx);
+    inode.uid = uid;
+    inode.gid = gid;
+    inode.ctime = Date.now();
+    this.writeInode(entry.inodeIdx, inode);
+    return { status: 0 };
+  }
+  // ---- FUTIMES ----
+  futimes(fd, atime, mtime) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    const inode = this.readInode(entry.inodeIdx);
+    inode.atime = atime;
+    inode.mtime = mtime;
+    inode.ctime = Date.now();
+    this.writeInode(entry.inodeIdx, inode);
+    return { status: 0 };
+  }
   // ---- OPENDIR ----
   opendir(path, tabId2) {
     path = this.normalizePath(path);
@@ -1856,7 +1890,9 @@ var OPFSEngine = class {
     if (!entry) return { status: ENOENT, data: null };
     return { status: OK, data: encoder2.encode(path) };
   }
-  // OPFS doesn't support permissions — these are no-ops
+  // OPFS doesn't support permissions/ownership/timestamps — these succeed as
+  // no-ops when the target exists, mirroring the VFS engine's behavior so
+  // callers can write code that works in both modes.
   async chmod(path, _mode) {
     path = this.normalizePath(path);
     const entry = await this.getEntry(path);
@@ -1874,6 +1910,17 @@ var OPFSEngine = class {
     const entry = await this.getEntry(path);
     if (!entry) return { status: ENOENT, data: null };
     return { status: OK, data: null };
+  }
+  // fd-based variants: validate the fd and succeed. There's nowhere to store
+  // mode/uid/gid/timestamps in OPFS, so they're accepted and discarded.
+  async fchmod(fd, _mode) {
+    return this.fdTable.has(fd) ? { status: OK, data: null } : { status: EBADF, data: null };
+  }
+  async fchown(fd, _uid, _gid) {
+    return this.fdTable.has(fd) ? { status: OK, data: null } : { status: EBADF, data: null };
+  }
+  async futimes(fd, _atime, _mtime) {
+    return this.fdTable.has(fd) ? { status: OK, data: null } : { status: EBADF, data: null };
   }
   // OPFS has no symlinks or hard links
   async symlink(_target, _linkPath) {
@@ -2018,7 +2065,10 @@ var OP = {
   FTRUNCATE: 27,
   FSYNC: 28,
   OPENDIR: 29,
-  MKDTEMP: 30
+  MKDTEMP: 30,
+  FCHMOD: 31,
+  FCHOWN: 32,
+  FUTIMES: 33
 };
 var SAB_OFFSETS = {
   CONTROL: 0,
@@ -2446,6 +2496,53 @@ function handleRequest(reqTabId, buffer) {
         syncPath = new TextDecoder().decode(result.data instanceof Uint8Array ? result.data : new Uint8Array(0));
       }
       break;
+    case OP.FCHMOD: {
+      if (!data || data.byteLength < 8) {
+        result = { status: 7 };
+        break;
+      }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const fd = dv.getUint32(0, true);
+      const mode = dv.getUint32(4, true);
+      result = engine.fchmod(fd, mode);
+      if (result.status === 0) {
+        syncOp = OP.CHMOD;
+        syncPath = engine.getPathForFd(fd) ?? void 0;
+      }
+      break;
+    }
+    case OP.FCHOWN: {
+      if (!data || data.byteLength < 12) {
+        result = { status: 7 };
+        break;
+      }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const fd = dv.getUint32(0, true);
+      const uid = dv.getUint32(4, true);
+      const gid = dv.getUint32(8, true);
+      result = engine.fchown(fd, uid, gid);
+      if (result.status === 0) {
+        syncOp = OP.CHOWN;
+        syncPath = engine.getPathForFd(fd) ?? void 0;
+      }
+      break;
+    }
+    case OP.FUTIMES: {
+      if (!data || data.byteLength < 24) {
+        result = { status: 7 };
+        break;
+      }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const fd = dv.getUint32(0, true);
+      const atime = dv.getFloat64(8, true);
+      const mtime = dv.getFloat64(16, true);
+      result = engine.futimes(fd, atime, mtime);
+      if (result.status === 0) {
+        syncOp = OP.UTIMES;
+        syncPath = engine.getPathForFd(fd) ?? void 0;
+      }
+      break;
+    }
     default:
       result = { status: 7 };
   }
@@ -2632,6 +2729,33 @@ async function handleRequestOPFS(reqTabId, buffer) {
         syncPath = new TextDecoder().decode(result.data instanceof Uint8Array ? result.data : new Uint8Array(0));
       }
       break;
+    case OP.FCHMOD: {
+      if (!data || data.byteLength < 8) {
+        result = { status: 7 };
+        break;
+      }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      result = await oe.fchmod(dv.getUint32(0, true), dv.getUint32(4, true));
+      break;
+    }
+    case OP.FCHOWN: {
+      if (!data || data.byteLength < 12) {
+        result = { status: 7 };
+        break;
+      }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      result = await oe.fchown(dv.getUint32(0, true), dv.getUint32(4, true), dv.getUint32(8, true));
+      break;
+    }
+    case OP.FUTIMES: {
+      if (!data || data.byteLength < 24) {
+        result = { status: 7 };
+        break;
+      }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      result = await oe.futimes(dv.getUint32(0, true), dv.getFloat64(8, true), dv.getFloat64(16, true));
+      break;
+    }
     default:
       result = { status: 7 };
   }
@@ -3053,6 +3177,7 @@ function broadcastWatch(op, path, newPath) {
     case OP.CHMOD:
     case OP.CHOWN:
     case OP.UTIMES:
+    case OP.COPY:
       eventType = "change";
       break;
     case OP.UNLINK:
@@ -3062,7 +3187,6 @@ function broadcastWatch(op, path, newPath) {
     case OP.MKDTEMP:
     case OP.SYMLINK:
     case OP.LINK:
-    case OP.COPY:
       eventType = "rename";
       break;
     default:

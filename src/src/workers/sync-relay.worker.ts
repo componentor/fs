@@ -392,6 +392,50 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
       }
       break;
 
+    case OP.FCHMOD: {
+      // Payload: [fd: u32][mode: u32]
+      if (!data || data.byteLength < 8) { result = { status: 7 }; break; }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const fd = dv.getUint32(0, true);
+      const mode = dv.getUint32(4, true);
+      result = engine.fchmod(fd, mode);
+      if (result.status === 0) {
+        syncOp = OP.CHMOD;
+        syncPath = engine.getPathForFd(fd) ?? undefined;
+      }
+      break;
+    }
+
+    case OP.FCHOWN: {
+      // Payload: [fd: u32][uid: u32][gid: u32]
+      if (!data || data.byteLength < 12) { result = { status: 7 }; break; }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const fd = dv.getUint32(0, true);
+      const uid = dv.getUint32(4, true);
+      const gid = dv.getUint32(8, true);
+      result = engine.fchown(fd, uid, gid);
+      if (result.status === 0) {
+        syncOp = OP.CHOWN;
+        syncPath = engine.getPathForFd(fd) ?? undefined;
+      }
+      break;
+    }
+
+    case OP.FUTIMES: {
+      // Payload: [fd: u32][pad: u32][atime: f64][mtime: f64]
+      if (!data || data.byteLength < 24) { result = { status: 7 }; break; }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const fd = dv.getUint32(0, true);
+      const atime = dv.getFloat64(8, true);
+      const mtime = dv.getFloat64(16, true);
+      result = engine.futimes(fd, atime, mtime);
+      if (result.status === 0) {
+        syncOp = OP.UTIMES;
+        syncPath = engine.getPathForFd(fd) ?? undefined;
+      }
+      break;
+    }
+
     default:
       result = { status: 7 }; // EINVAL — unknown op
   }
@@ -571,6 +615,24 @@ async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise
         syncPath = new TextDecoder().decode(result.data instanceof Uint8Array ? result.data : new Uint8Array(0));
       }
       break;
+    case OP.FCHMOD: {
+      if (!data || data.byteLength < 8) { result = { status: 7 }; break; }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      result = await oe.fchmod(dv.getUint32(0, true), dv.getUint32(4, true));
+      break;
+    }
+    case OP.FCHOWN: {
+      if (!data || data.byteLength < 12) { result = { status: 7 }; break; }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      result = await oe.fchown(dv.getUint32(0, true), dv.getUint32(4, true), dv.getUint32(8, true));
+      break;
+    }
+    case OP.FUTIMES: {
+      if (!data || data.byteLength < 24) { result = { status: 7 }; break; }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      result = await oe.futimes(dv.getUint32(0, true), dv.getFloat64(8, true), dv.getFloat64(16, true));
+      break;
+    }
     default:
       result = { status: 7 };
   }
@@ -1173,6 +1235,9 @@ async function initOPFSEngine(config: {
 function broadcastWatch(op: number, path: string, newPath?: string): void {
   if (!watchBc) return;
 
+  // Mirror Node/libuv semantics:
+  //   'change' — contents or metadata of an existing entry changed
+  //   'rename' — an entry was created, removed, or moved in its parent
   let eventType: 'change' | 'rename';
   switch (op) {
     case OP.WRITE:
@@ -1183,6 +1248,7 @@ function broadcastWatch(op: number, path: string, newPath?: string): void {
     case OP.CHMOD:
     case OP.CHOWN:
     case OP.UTIMES:
+    case OP.COPY: // target file's contents were overwritten → 'change'
       eventType = 'change';
       break;
     case OP.UNLINK:
@@ -1192,7 +1258,6 @@ function broadcastWatch(op: number, path: string, newPath?: string): void {
     case OP.MKDTEMP:
     case OP.SYMLINK:
     case OP.LINK:
-    case OP.COPY:
       eventType = 'rename';
       break;
     default:

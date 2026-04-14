@@ -463,7 +463,9 @@ export class OPFSEngine {
     return { status: OK, data: encoder.encode(path) };
   }
 
-  // OPFS doesn't support permissions — these are no-ops
+  // OPFS doesn't support permissions/ownership/timestamps — these succeed as
+  // no-ops when the target exists, mirroring the VFS engine's behavior so
+  // callers can write code that works in both modes.
 
   async chmod(path: string, _mode: number): Promise<OPFSResult> {
     path = this.normalizePath(path);
@@ -484,6 +486,20 @@ export class OPFSEngine {
     const entry = await this.getEntry(path);
     if (!entry) return { status: ENOENT, data: null };
     return { status: OK, data: null };
+  }
+
+  // fd-based variants: validate the fd and succeed. There's nowhere to store
+  // mode/uid/gid/timestamps in OPFS, so they're accepted and discarded.
+  async fchmod(fd: number, _mode: number): Promise<OPFSResult> {
+    return this.fdTable.has(fd) ? { status: OK, data: null } : { status: EBADF, data: null };
+  }
+
+  async fchown(fd: number, _uid: number, _gid: number): Promise<OPFSResult> {
+    return this.fdTable.has(fd) ? { status: OK, data: null } : { status: EBADF, data: null };
+  }
+
+  async futimes(fd: number, _atime: number, _mtime: number): Promise<OPFSResult> {
+    return this.fdTable.has(fd) ? { status: OK, data: null } : { status: EBADF, data: null };
   }
 
   // OPFS has no symlinks or hard links

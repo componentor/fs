@@ -236,6 +236,47 @@ function handleRequest(tabId: string, buffer: ArrayBuffer): ArrayBuffer {
       result = engine.mkdtemp(path);
       break;
 
+    case OP.FCHMOD: {
+      // Payload: [fd: u32][mode: u32]
+      if (!data || data.byteLength < 8) {
+        result = { status: 7 };
+        break;
+      }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const fd = dv.getUint32(0, true);
+      const mode = dv.getUint32(4, true);
+      result = engine.fchmod(fd, mode);
+      break;
+    }
+
+    case OP.FCHOWN: {
+      // Payload: [fd: u32][uid: u32][gid: u32]
+      if (!data || data.byteLength < 12) {
+        result = { status: 7 };
+        break;
+      }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const fd = dv.getUint32(0, true);
+      const uid = dv.getUint32(4, true);
+      const gid = dv.getUint32(8, true);
+      result = engine.fchown(fd, uid, gid);
+      break;
+    }
+
+    case OP.FUTIMES: {
+      // Payload: [fd: u32][pad: u32][atime: f64][mtime: f64]
+      if (!data || data.byteLength < 24) {
+        result = { status: 7 };
+        break;
+      }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const fd = dv.getUint32(0, true);
+      const atime = dv.getFloat64(8, true);
+      const mtime = dv.getFloat64(16, true);
+      result = engine.futimes(fd, atime, mtime);
+      break;
+    }
+
     default:
       result = { status: 7 }; // EINVAL — unknown op
   }

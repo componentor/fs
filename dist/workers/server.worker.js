@@ -1362,6 +1362,40 @@ var VFSEngine = class {
     this.handle.flush();
     return { status: 0 };
   }
+  // ---- FCHMOD ----
+  // fd-based chmod: look up the inode directly from the fd table and mutate
+  // its mode bits. Native Node does the same thing at the libuv layer.
+  fchmod(fd, mode) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    const inode = this.readInode(entry.inodeIdx);
+    inode.mode = inode.mode & S_IFMT | mode & 4095;
+    inode.ctime = Date.now();
+    this.writeInode(entry.inodeIdx, inode);
+    return { status: 0 };
+  }
+  // ---- FCHOWN ----
+  fchown(fd, uid, gid) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    const inode = this.readInode(entry.inodeIdx);
+    inode.uid = uid;
+    inode.gid = gid;
+    inode.ctime = Date.now();
+    this.writeInode(entry.inodeIdx, inode);
+    return { status: 0 };
+  }
+  // ---- FUTIMES ----
+  futimes(fd, atime, mtime) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    const inode = this.readInode(entry.inodeIdx);
+    inode.atime = atime;
+    inode.mtime = mtime;
+    inode.ctime = Date.now();
+    this.writeInode(entry.inodeIdx, inode);
+    return { status: 0 };
+  }
   // ---- OPENDIR ----
   opendir(path, tabId) {
     path = this.normalizePath(path);
@@ -1510,7 +1544,10 @@ var OP = {
   FTRUNCATE: 27,
   FSYNC: 28,
   OPENDIR: 29,
-  MKDTEMP: 30
+  MKDTEMP: 30,
+  FCHMOD: 31,
+  FCHOWN: 32,
+  FUTIMES: 33
 };
 var encoder2 = new TextEncoder();
 var decoder2 = new TextDecoder();
@@ -1720,6 +1757,41 @@ function handleRequest(tabId, buffer) {
     case OP.MKDTEMP:
       result = engine.mkdtemp(path);
       break;
+    case OP.FCHMOD: {
+      if (!data || data.byteLength < 8) {
+        result = { status: 7 };
+        break;
+      }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const fd = dv.getUint32(0, true);
+      const mode = dv.getUint32(4, true);
+      result = engine.fchmod(fd, mode);
+      break;
+    }
+    case OP.FCHOWN: {
+      if (!data || data.byteLength < 12) {
+        result = { status: 7 };
+        break;
+      }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const fd = dv.getUint32(0, true);
+      const uid = dv.getUint32(4, true);
+      const gid = dv.getUint32(8, true);
+      result = engine.fchown(fd, uid, gid);
+      break;
+    }
+    case OP.FUTIMES: {
+      if (!data || data.byteLength < 24) {
+        result = { status: 7 };
+        break;
+      }
+      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+      const fd = dv.getUint32(0, true);
+      const atime = dv.getFloat64(8, true);
+      const mtime = dv.getFloat64(16, true);
+      result = engine.futimes(fd, atime, mtime);
+      break;
+    }
     default:
       result = { status: 7 };
   }

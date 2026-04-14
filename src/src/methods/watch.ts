@@ -11,6 +11,15 @@ interface WatchEntry {
   recursive: boolean;
   listener: WatchListener;
   signal?: AbortSignal;
+  /** When true, the listener wants Buffer filenames instead of strings. */
+  asBuffer: boolean;
+  /**
+   * Per-tick coalescing: dedupe `(eventType, filename)` pairs emitted during
+   * the same microtask, matching libuv's behavior where the kernel queues
+   * multiple inotify events per syscall and libuv delivers the deduplicated
+   * set in one batch.
+   */
+  pendingEvents: Set<string> | null;
 }
 
 interface WatchFileEntry {
@@ -54,12 +63,11 @@ function releaseBc(ns: string): void {
 function onBroadcast(event: MessageEvent<{ eventType: 'change' | 'rename'; path: string }>): void {
   const { eventType, path: mutatedPath } = event.data;
 
-  // Notify fs.watch() watchers
+  // Notify fs.watch() watchers — dedupe per (event, filename) per microtask
   for (const entry of watchers) {
     const filename = matchWatcher(entry, mutatedPath);
-    if (filename !== null) {
-      try { entry.listener(eventType, filename); } catch { /* swallow */ }
-    }
+    if (filename === null) continue;
+    queueWatchEvent(entry, eventType, filename);
   }
 
   // Notify fs.watchFile() watchers
@@ -69,6 +77,39 @@ function onBroadcast(event: MessageEvent<{ eventType: 'change' | 'rename'; path:
       triggerWatchFile(entry);
     }
   }
+}
+
+/**
+ * Coalesce events for a single watcher during one microtask. Node/libuv
+ * collapses runs of rapid inotify events so the listener observes at most one
+ * `(event, filename)` per tick — we match that to avoid firing e.g. two
+ * `change` events when a single write touches both the file and its inode.
+ */
+function queueWatchEvent(entry: WatchEntry, eventType: 'change' | 'rename', filename: string): void {
+  const key = eventType + ':' + filename;
+  if (!entry.pendingEvents) {
+    entry.pendingEvents = new Set();
+    queueMicrotask(() => {
+      const pending = entry.pendingEvents!;
+      entry.pendingEvents = null;
+      for (const k of pending) {
+        const colon = k.indexOf(':');
+        const et = k.slice(0, colon) as 'change' | 'rename';
+        const name = k.slice(colon + 1);
+        try {
+          entry.listener(et, entry.asBuffer ? encodeFilename(name) : name);
+        } catch { /* swallow */ }
+      }
+    });
+  }
+  entry.pendingEvents.add(key);
+}
+
+function encodeFilename(name: string): Uint8Array {
+  // Node returns a Buffer when encoding='buffer'; Buffer is a Uint8Array
+  // subclass, and our wrapper layer (fs.polyfill.ts in the webcontainer)
+  // wraps this with Buffer.from() if the host environment has Buffer.
+  return new TextEncoder().encode(name);
 }
 
 // ========== Path matching ==========
@@ -112,6 +153,7 @@ export function watch(
   const cb: WatchListener = listener ?? (() => {});
   const absPath = path.resolve(filePath);
   const signal = opts.signal;
+  const asBuffer = (opts as { encoding?: string }).encoding === 'buffer';
 
   const entry: WatchEntry = {
     ns,
@@ -119,6 +161,8 @@ export function watch(
     recursive: opts.recursive ?? false,
     listener: cb,
     signal,
+    asBuffer,
+    pendingEvents: null,
   };
 
   ensureBc(ns);
@@ -278,6 +322,7 @@ export async function* watchAsync(
   const queue: WatchEventType[] = [];
   let resolve: (() => void) | null = null;
 
+  const asBuffer = (options as { encoding?: string } | undefined)?.encoding === 'buffer';
   const entry: WatchEntry = {
     ns,
     absPath,
@@ -287,6 +332,8 @@ export async function* watchAsync(
       if (resolve) { resolve(); resolve = null; }
     },
     signal,
+    asBuffer,
+    pendingEvents: null,
   };
 
   ensureBc(ns);

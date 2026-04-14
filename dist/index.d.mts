@@ -134,8 +134,16 @@ interface StatFs {
     ffree: number;
 }
 interface GlobOptions {
-    cwd?: string;
-    exclude?: (path: string) => boolean;
+    /** Base directory to resolve relative patterns against. Default: '/' */
+    cwd?: string | URL;
+    /**
+     * Exclude callback. Called with every candidate path (for `withFileTypes`,
+     * called with a Dirent). Returning truthy drops the entry. Matches Node's
+     * `fs.glob` behavior.
+     */
+    exclude?: ((path: string) => boolean) | ((dirent: Dirent) => boolean);
+    /** Return Dirent objects instead of path strings. Default: false */
+    withFileTypes?: boolean;
 }
 type PathLike = string | Uint8Array | URL;
 interface OpenAsBlobOptions {
@@ -242,6 +250,7 @@ interface FileHandle {
     appendFile(data: string | Uint8Array, options?: WriteOptions | Encoding): Promise<void>;
     chmod(mode: number): Promise<void>;
     chown(uid: number, gid: number): Promise<void>;
+    utimes(atime: Date | number, mtime: Date | number): Promise<void>;
     sync(): Promise<void>;
     datasync(): Promise<void>;
     close(): Promise<void>;
@@ -401,7 +410,7 @@ declare class VFSFileSystem {
     rmSync(filePath: PathLike, options?: RmOptions): void;
     unlinkSync(filePath: PathLike): void;
     readdirSync(filePath: PathLike, options?: ReaddirOptions | Encoding | null): string[] | Uint8Array[] | Dirent[];
-    globSync(pattern: string, options?: GlobOptions): string[];
+    globSync(pattern: string | string[], options?: GlobOptions): string[] | Dirent[];
     opendirSync(filePath: PathLike): Dir;
     statSync(filePath: PathLike, options?: StatOptions): Stats | BigIntStats;
     lstatSync(filePath: PathLike, options?: StatOptions): Stats | BigIntStats;
@@ -415,16 +424,18 @@ declare class VFSFileSystem {
     chmodSync(filePath: PathLike, mode: number): void;
     /** Like chmodSync but operates on the symlink itself. In this VFS, delegates to chmodSync. */
     lchmodSync(filePath: string, mode: number): void;
-    /** chmod on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
-    fchmodSync(_fd: number, _mode: number): void;
+    /** chmod on an open file descriptor. Resolves the fd to its inode on the
+     *  server side and mutates the inode's mode bits directly, matching what
+     *  native Node's libuv does. */
+    fchmodSync(fd: number, mode: number): void;
     chownSync(filePath: PathLike, uid: number, gid: number): void;
     /** Like chownSync but operates on the symlink itself. In this VFS, delegates to chownSync. */
     lchownSync(filePath: string, uid: number, gid: number): void;
-    /** chown on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
-    fchownSync(_fd: number, _uid: number, _gid: number): void;
+    /** chown on an open file descriptor. Mutates the underlying inode's uid/gid. */
+    fchownSync(fd: number, uid: number, gid: number): void;
     utimesSync(filePath: PathLike, atime: Date | number, mtime: Date | number): void;
-    /** utimes on an open file descriptor. No-op in this VFS (cannot resolve fd to path). */
-    futimesSync(_fd: number, _atime: Date | number, _mtime: Date | number): void;
+    /** utimes on an open file descriptor. Mutates the underlying inode's atime/mtime. */
+    futimesSync(fd: number, atime: Date | number, mtime: Date | number): void;
     /** Like utimesSync but operates on the symlink itself. In this VFS, delegates to utimesSync. */
     lutimesSync(filePath: string, atime: Date | number, mtime: Date | number): void;
     symlinkSync(target: PathLike, linkPath: PathLike, type?: string | null): void;
@@ -618,7 +629,7 @@ declare class VFSPromises {
     rm(filePath: PathLike, options?: RmOptions): Promise<void>;
     unlink(filePath: PathLike): Promise<void>;
     readdir(filePath: PathLike, options?: ReaddirOptions | Encoding | null): Promise<Uint8Array<ArrayBufferLike>[] | string[] | Dirent[]>;
-    glob(pattern: string, options?: GlobOptions): Promise<string[]>;
+    glob(pattern: string | string[], options?: GlobOptions): Promise<string[] | Dirent[]>;
     stat(filePath: PathLike, options?: StatOptions): Promise<BigIntStats | Stats>;
     lstat(filePath: PathLike, options?: StatOptions): Promise<BigIntStats | Stats>;
     access(filePath: PathLike, mode?: number): Promise<void>;
@@ -631,16 +642,19 @@ declare class VFSPromises {
     chmod(filePath: PathLike, mode: number): Promise<void>;
     /** Like chmod but operates on the symlink itself. In this VFS, delegates to chmod. */
     lchmod(filePath: string, mode: number): Promise<void>;
-    /** chmod on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
-    fchmod(_fd: number, _mode: number): Promise<void>;
+    /** chmod on an open file descriptor. Engine resolves fd → inode and
+     *  mutates the mode bits directly. */
+    fchmod(fd: number, mode: number): Promise<void>;
     chown(filePath: PathLike, uid: number, gid: number): Promise<void>;
     /** Like chown but operates on the symlink itself. In this VFS, delegates to chown. */
     lchown(filePath: string, uid: number, gid: number): Promise<void>;
-    /** chown on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
-    fchown(_fd: number, _uid: number, _gid: number): Promise<void>;
+    /** chown on an open file descriptor. Engine resolves fd → inode and
+     *  mutates uid/gid directly. */
+    fchown(fd: number, uid: number, gid: number): Promise<void>;
     utimes(filePath: PathLike, atime: Date | number, mtime: Date | number): Promise<void>;
-    /** utimes on an open file descriptor. No-op in this VFS (cannot resolve fd to path). */
-    futimes(_fd: number, _atime: Date | number, _mtime: Date | number): Promise<void>;
+    /** utimes on an open file descriptor. Engine resolves fd → inode and
+     *  mutates atime/mtime directly. */
+    futimes(fd: number, atime: Date | number, mtime: Date | number): Promise<void>;
     /** Like utimes but operates on the symlink itself. In this VFS, delegates to utimes. */
     lutimes(filePath: string, atime: Date | number, mtime: Date | number): Promise<void>;
     symlink(target: PathLike, linkPath: PathLike, type?: string | null): Promise<void>;

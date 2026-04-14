@@ -354,7 +354,10 @@ var OP = {
   FTRUNCATE: 27,
   FSYNC: 28,
   OPENDIR: 29,
-  MKDTEMP: 30
+  MKDTEMP: 30,
+  FCHMOD: 31,
+  FCHOWN: 32,
+  FUTIMES: 33
 };
 var SAB_OFFSETS = {
   // Int32 - bytes in this chunk
@@ -1004,9 +1007,31 @@ function createFileHandle(fd, asyncRequest) {
       const { status } = await asyncRequest(OP.FWRITE, "", 0, null, void 0, { fd, data: encoded, position: st.size });
       if (status !== 0) throw statusToError(status, "write", String(fd));
     },
-    async chmod(_mode) {
+    async chmod(mode) {
+      const payload = new Uint8Array(8);
+      const dv = new DataView(payload.buffer);
+      dv.setUint32(0, fd, true);
+      dv.setUint32(4, mode, true);
+      const { status } = await asyncRequest(OP.FCHMOD, "", 0, payload);
+      if (status !== 0) throw statusToError(status, "fchmod", String(fd));
     },
-    async chown(_uid, _gid) {
+    async chown(uid, gid) {
+      const payload = new Uint8Array(12);
+      const dv = new DataView(payload.buffer);
+      dv.setUint32(0, fd, true);
+      dv.setUint32(4, uid, true);
+      dv.setUint32(8, gid, true);
+      const { status } = await asyncRequest(OP.FCHOWN, "", 0, payload);
+      if (status !== 0) throw statusToError(status, "fchown", String(fd));
+    },
+    async utimes(atime, mtime) {
+      const payload = new Uint8Array(24);
+      const dv = new DataView(payload.buffer);
+      dv.setUint32(0, fd, true);
+      dv.setFloat64(8, typeof atime === "number" ? atime : atime.getTime(), true);
+      dv.setFloat64(16, typeof mtime === "number" ? mtime : mtime.getTime(), true);
+      const { status } = await asyncRequest(OP.FUTIMES, "", 0, payload);
+      if (status !== 0) throw statusToError(status, "futimes", String(fd));
     },
     async sync() {
       await asyncRequest(OP.FSYNC, "");
@@ -1208,6 +1233,23 @@ async function chmod(asyncRequest, filePath, mode) {
   new DataView(modeBuf.buffer).setUint32(0, mode, true);
   const { status } = await asyncRequest(OP.CHMOD, filePath, 0, modeBuf);
   if (status !== 0) throw statusToError(status, "chmod", filePath);
+}
+function fchmodSync(syncRequest, fd, mode) {
+  const payload = new Uint8Array(8);
+  const dv = new DataView(payload.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setUint32(4, mode, true);
+  const buf = encodeRequest(OP.FCHMOD, "", 0, payload);
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "fchmod", String(fd));
+}
+async function fchmod(asyncRequest, fd, mode) {
+  const payload = new Uint8Array(8);
+  const dv = new DataView(payload.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setUint32(4, mode, true);
+  const { status } = await asyncRequest(OP.FCHMOD, "", 0, payload);
+  if (status !== 0) throw statusToError(status, "fchmod", String(fd));
 }
 
 // src/methods/writeFile.ts
@@ -1656,6 +1698,25 @@ async function chown(asyncRequest, filePath, uid, gid) {
   const { status } = await asyncRequest(OP.CHOWN, filePath, 0, buf);
   if (status !== 0) throw statusToError(status, "chown", filePath);
 }
+function fchownSync(syncRequest, fd, uid, gid) {
+  const payload = new Uint8Array(12);
+  const dv = new DataView(payload.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setUint32(4, uid, true);
+  dv.setUint32(8, gid, true);
+  const buf = encodeRequest(OP.FCHOWN, "", 0, payload);
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "fchown", String(fd));
+}
+async function fchown(asyncRequest, fd, uid, gid) {
+  const payload = new Uint8Array(12);
+  const dv = new DataView(payload.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setUint32(4, uid, true);
+  dv.setUint32(8, gid, true);
+  const { status } = await asyncRequest(OP.FCHOWN, "", 0, payload);
+  if (status !== 0) throw statusToError(status, "fchown", String(fd));
+}
 
 // src/methods/utimes.ts
 function utimesSync(syncRequest, filePath, atime, mtime) {
@@ -1674,6 +1735,25 @@ async function utimes(asyncRequest, filePath, atime, mtime) {
   dv.setFloat64(8, typeof mtime === "number" ? mtime : mtime.getTime(), true);
   const { status } = await asyncRequest(OP.UTIMES, filePath, 0, buf);
   if (status !== 0) throw statusToError(status, "utimes", filePath);
+}
+function futimesSync(syncRequest, fd, atime, mtime) {
+  const payload = new Uint8Array(24);
+  const dv = new DataView(payload.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setFloat64(8, typeof atime === "number" ? atime : atime.getTime(), true);
+  dv.setFloat64(16, typeof mtime === "number" ? mtime : mtime.getTime(), true);
+  const buf = encodeRequest(OP.FUTIMES, "", 0, payload);
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "futimes", String(fd));
+}
+async function futimes(asyncRequest, fd, atime, mtime) {
+  const payload = new Uint8Array(24);
+  const dv = new DataView(payload.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setFloat64(8, typeof atime === "number" ? atime : atime.getTime(), true);
+  dv.setFloat64(16, typeof mtime === "number" ? mtime : mtime.getTime(), true);
+  const { status } = await asyncRequest(OP.FUTIMES, "", 0, payload);
+  if (status !== 0) throw statusToError(status, "futimes", String(fd));
 }
 
 // src/methods/symlink.ts
@@ -1908,12 +1988,8 @@ function onBroadcast(event) {
   const { eventType, path: mutatedPath } = event.data;
   for (const entry of watchers) {
     const filename = matchWatcher(entry, mutatedPath);
-    if (filename !== null) {
-      try {
-        entry.listener(eventType, filename);
-      } catch {
-      }
-    }
+    if (filename === null) continue;
+    queueWatchEvent(entry, eventType, filename);
   }
   const fileSet = fileWatchers.get(mutatedPath);
   if (fileSet) {
@@ -1921,6 +1997,29 @@ function onBroadcast(event) {
       triggerWatchFile(entry);
     }
   }
+}
+function queueWatchEvent(entry, eventType, filename) {
+  const key = eventType + ":" + filename;
+  if (!entry.pendingEvents) {
+    entry.pendingEvents = /* @__PURE__ */ new Set();
+    queueMicrotask(() => {
+      const pending = entry.pendingEvents;
+      entry.pendingEvents = null;
+      for (const k of pending) {
+        const colon = k.indexOf(":");
+        const et = k.slice(0, colon);
+        const name = k.slice(colon + 1);
+        try {
+          entry.listener(et, entry.asBuffer ? encodeFilename(name) : name);
+        } catch {
+        }
+      }
+    });
+  }
+  entry.pendingEvents.add(key);
+}
+function encodeFilename(name) {
+  return new TextEncoder().encode(name);
 }
 function matchWatcher(entry, mutatedPath) {
   const { absPath, recursive } = entry;
@@ -1936,17 +2035,20 @@ function matchWatcher(entry, mutatedPath) {
   return relativePath.indexOf("/") === -1 ? relativePath : null;
 }
 function watch(ns, filePath, options, listener) {
-  const opts = typeof options === "string" ? { } : options ?? {};
+  const opts = typeof options === "string" ? { encoding: options } : options ?? {};
   const cb = listener ?? (() => {
   });
   const absPath = resolve(filePath);
   const signal = opts.signal;
+  const asBuffer = opts.encoding === "buffer";
   const entry = {
     ns,
     absPath,
     recursive: opts.recursive ?? false,
     listener: cb,
-    signal
+    signal,
+    asBuffer,
+    pendingEvents: null
   };
   ensureBc(ns);
   watchers.add(entry);
@@ -2090,6 +2192,7 @@ async function* watchAsync(ns, _asyncRequest, filePath, options) {
   const signal = options?.signal;
   const queue = [];
   let resolve2 = null;
+  const asBuffer = options?.encoding === "buffer";
   const entry = {
     ns,
     absPath,
@@ -2101,7 +2204,9 @@ async function* watchAsync(ns, _asyncRequest, filePath, options) {
         resolve2 = null;
       }
     },
-    signal
+    signal,
+    asBuffer,
+    pendingEvents: null
   };
   ensureBc(ns);
   watchers.add(entry);
@@ -2123,15 +2228,112 @@ async function* watchAsync(ns, _asyncRequest, filePath, options) {
 }
 
 // src/methods/glob.ts
+function expandBraces(pattern) {
+  const out = [];
+  function recurse(prefix, rest) {
+    const open2 = findBrace(rest);
+    if (open2 === -1) {
+      out.push(prefix + rest);
+      return;
+    }
+    const close = matchCloseBrace(rest, open2);
+    if (close === -1) {
+      out.push(prefix + rest);
+      return;
+    }
+    const head = rest.slice(0, open2);
+    const body = rest.slice(open2 + 1, close);
+    const tail = rest.slice(close + 1);
+    for (const alt of splitAlternations(body)) {
+      recurse(prefix + head + alt, tail);
+    }
+  }
+  recurse("", pattern);
+  return out;
+}
+function findBrace(s) {
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c === "\\") {
+      i++;
+      continue;
+    }
+    if (c === "[") {
+      const end = s.indexOf("]", i + 1);
+      if (end !== -1) {
+        i = end;
+        continue;
+      }
+    }
+    if (c === "{") return i;
+  }
+  return -1;
+}
+function matchCloseBrace(s, open2) {
+  let depth = 1;
+  for (let i = open2 + 1; i < s.length; i++) {
+    const c = s[i];
+    if (c === "\\") {
+      i++;
+      continue;
+    }
+    if (c === "[") {
+      const end = s.indexOf("]", i + 1);
+      if (end !== -1) {
+        i = end;
+        continue;
+      }
+    }
+    if (c === "{") depth++;
+    else if (c === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+function splitAlternations(body) {
+  const parts = [];
+  let depth = 0;
+  let start = 0;
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c === "\\") {
+      i++;
+      continue;
+    }
+    if (c === "{") depth++;
+    else if (c === "}") depth--;
+    else if (c === "," && depth === 0) {
+      parts.push(body.slice(start, i));
+      start = i + 1;
+    }
+  }
+  parts.push(body.slice(start));
+  return parts;
+}
 function segmentToRegex(pattern) {
   let re = "^";
   for (let i = 0; i < pattern.length; i++) {
     const ch = pattern[i];
-    if (ch === "*") {
+    if (ch === "\\" && i + 1 < pattern.length) {
+      const next = pattern[++i];
+      re += /[.+^${}()|[\]\\*?]/.test(next) ? "\\" + next : next;
+    } else if (ch === "*") {
       re += "[^/]*";
     } else if (ch === "?") {
       re += "[^/]";
-    } else if (".+^${}()|[]\\".includes(ch)) {
+    } else if (ch === "[") {
+      const end = pattern.indexOf("]", i + 1);
+      if (end === -1) {
+        re += "\\[";
+      } else {
+        let body = pattern.slice(i + 1, end);
+        if (body.startsWith("!")) body = "^" + body.slice(1);
+        re += "[" + body + "]";
+        i = end;
+      }
+    } else if (".+^${}()|\\".includes(ch)) {
       re += "\\" + ch;
     } else {
       re += ch;
@@ -2140,25 +2342,69 @@ function segmentToRegex(pattern) {
   re += "$";
   return new RegExp(re);
 }
-function matchSegment(name, pattern) {
-  return segmentToRegex(pattern).test(name);
-}
 function joinPath(base, name) {
   if (base === "/") return "/" + name;
   return base + "/" + name;
 }
+function normalizeCwd(cwd) {
+  if (!cwd) return "/";
+  if (typeof cwd === "string") return cwd || "/";
+  return cwd.pathname || "/";
+}
+function makeDirent(parentPath, name, isDir, isSymlink) {
+  return {
+    name,
+    parentPath,
+    isFile: () => !isDir && !isSymlink,
+    isDirectory: () => isDir,
+    isBlockDevice: () => false,
+    isCharacterDevice: () => false,
+    isSymbolicLink: () => isSymlink,
+    isFIFO: () => false,
+    isSocket: () => false
+  };
+}
 function globSync(syncRequest, pattern, options) {
-  const cwd = options?.cwd ?? "/";
+  const patterns = Array.isArray(pattern) ? pattern : [pattern];
+  const cwd = normalizeCwd(options?.cwd);
   const exclude = options?.exclude;
-  const segments = pattern.split("/").filter((s) => s !== "");
-  const results = [];
-  function walk(dir, segIdx) {
+  const withFileTypes = options?.withFileTypes === true;
+  const resultsSet = /* @__PURE__ */ new Set();
+  const resultsDirents = [];
+  const pushResult = (fullPath) => {
+    if (withFileTypes) {
+      if (!resultsSet.has(fullPath)) {
+        resultsSet.add(fullPath);
+        let isDir = false, isSymlink = false;
+        try {
+          const s = statSync(syncRequest, fullPath);
+          isDir = s.isDirectory();
+        } catch {
+        }
+        const slash = fullPath.lastIndexOf("/");
+        const parent = slash <= 0 ? "/" : fullPath.slice(0, slash);
+        const name = fullPath.slice(slash + 1);
+        const dirent = makeDirent(parent, name, isDir, isSymlink);
+        if (exclude && exclude(dirent)) {
+          resultsSet.delete(fullPath);
+          return;
+        }
+        resultsDirents.push(dirent);
+      }
+    } else {
+      if (exclude && exclude(fullPath)) return;
+      resultsSet.add(fullPath);
+    }
+  };
+  function walk(dir, segments, segIdx) {
     if (segIdx >= segments.length) return;
     const seg = segments[segIdx];
     const isLast = segIdx === segments.length - 1;
     if (seg === "**") {
       if (segIdx + 1 < segments.length) {
-        walk(dir, segIdx + 1);
+        walk(dir, segments, segIdx + 1);
+      } else {
+        pushResult(dir);
       }
       let entries2;
       try {
@@ -2168,20 +2414,16 @@ function globSync(syncRequest, pattern, options) {
       }
       for (const entry of entries2) {
         const full = joinPath(dir, entry);
-        if (exclude && exclude(full)) continue;
         let isDir;
         try {
-          const s = statSync(syncRequest, full);
-          isDir = s.isDirectory();
+          isDir = statSync(syncRequest, full).isDirectory();
         } catch {
           continue;
         }
         if (isDir) {
-          walk(full, segIdx);
+          walk(full, segments, segIdx);
         }
-        if (isLast) {
-          results.push(full);
-        }
+        if (isLast) pushResult(full);
       }
       return;
     }
@@ -2191,41 +2433,71 @@ function globSync(syncRequest, pattern, options) {
     } catch {
       return;
     }
+    const re = segmentToRegex(seg);
     for (const entry of entries) {
-      if (!matchSegment(entry, seg)) continue;
+      if (!re.test(entry)) continue;
       const full = joinPath(dir, entry);
-      if (exclude && exclude(full)) continue;
       if (isLast) {
-        results.push(full);
+        pushResult(full);
       } else {
         let isDir;
         try {
-          const s = statSync(syncRequest, full);
-          isDir = s.isDirectory();
+          isDir = statSync(syncRequest, full).isDirectory();
         } catch {
           continue;
         }
-        if (isDir) {
-          walk(full, segIdx + 1);
-        }
+        if (isDir) walk(full, segments, segIdx + 1);
       }
     }
   }
-  walk(cwd, 0);
-  return results;
+  for (const pat of patterns) {
+    for (const expanded of expandBraces(pat)) {
+      const segments = expanded.split("/").filter((s) => s !== "");
+      walk(cwd, segments, 0);
+    }
+  }
+  return withFileTypes ? resultsDirents : Array.from(resultsSet);
 }
 async function glob(asyncRequest, pattern, options) {
-  const cwd = options?.cwd ?? "/";
+  const patterns = Array.isArray(pattern) ? pattern : [pattern];
+  const cwd = normalizeCwd(options?.cwd);
   const exclude = options?.exclude;
-  const segments = pattern.split("/").filter((s) => s !== "");
-  const results = [];
-  async function walk(dir, segIdx) {
+  const withFileTypes = options?.withFileTypes === true;
+  const resultsSet = /* @__PURE__ */ new Set();
+  const resultsDirents = [];
+  const pushResult = async (fullPath) => {
+    if (withFileTypes) {
+      if (resultsSet.has(fullPath)) return;
+      resultsSet.add(fullPath);
+      let isDir = false, isSymlink = false;
+      try {
+        const s = await stat(asyncRequest, fullPath);
+        isDir = s.isDirectory();
+      } catch {
+      }
+      const slash = fullPath.lastIndexOf("/");
+      const parent = slash <= 0 ? "/" : fullPath.slice(0, slash);
+      const name = fullPath.slice(slash + 1);
+      const dirent = makeDirent(parent, name, isDir, isSymlink);
+      if (exclude && exclude(dirent)) {
+        resultsSet.delete(fullPath);
+        return;
+      }
+      resultsDirents.push(dirent);
+    } else {
+      if (exclude && exclude(fullPath)) return;
+      resultsSet.add(fullPath);
+    }
+  };
+  async function walk(dir, segments, segIdx) {
     if (segIdx >= segments.length) return;
     const seg = segments[segIdx];
     const isLast = segIdx === segments.length - 1;
     if (seg === "**") {
       if (segIdx + 1 < segments.length) {
-        await walk(dir, segIdx + 1);
+        await walk(dir, segments, segIdx + 1);
+      } else {
+        await pushResult(dir);
       }
       let entries2;
       try {
@@ -2235,20 +2507,14 @@ async function glob(asyncRequest, pattern, options) {
       }
       for (const entry of entries2) {
         const full = joinPath(dir, entry);
-        if (exclude && exclude(full)) continue;
         let isDir;
         try {
-          const s = await stat(asyncRequest, full);
-          isDir = s.isDirectory();
+          isDir = (await stat(asyncRequest, full)).isDirectory();
         } catch {
           continue;
         }
-        if (isDir) {
-          await walk(full, segIdx);
-        }
-        if (isLast) {
-          results.push(full);
-        }
+        if (isDir) await walk(full, segments, segIdx);
+        if (isLast) await pushResult(full);
       }
       return;
     }
@@ -2258,28 +2524,30 @@ async function glob(asyncRequest, pattern, options) {
     } catch {
       return;
     }
+    const re = segmentToRegex(seg);
     for (const entry of entries) {
-      if (!matchSegment(entry, seg)) continue;
+      if (!re.test(entry)) continue;
       const full = joinPath(dir, entry);
-      if (exclude && exclude(full)) continue;
       if (isLast) {
-        results.push(full);
+        await pushResult(full);
       } else {
         let isDir;
         try {
-          const s = await stat(asyncRequest, full);
-          isDir = s.isDirectory();
+          isDir = (await stat(asyncRequest, full)).isDirectory();
         } catch {
           continue;
         }
-        if (isDir) {
-          await walk(full, segIdx + 1);
-        }
+        if (isDir) await walk(full, segments, segIdx + 1);
       }
     }
   }
-  await walk(cwd, 0);
-  return results;
+  for (const pat of patterns) {
+    for (const expanded of expandBraces(pat)) {
+      const segments = expanded.split("/").filter((s) => s !== "");
+      await walk(cwd, segments, 0);
+    }
+  }
+  return withFileTypes ? resultsDirents : Array.from(resultsSet);
 }
 
 // src/filesystem.ts
@@ -3007,8 +3275,11 @@ var VFSFileSystem = class {
   lchmodSync(filePath, mode) {
     chmodSync(this._sync, filePath, mode);
   }
-  /** chmod on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
-  fchmodSync(_fd, _mode) {
+  /** chmod on an open file descriptor. Resolves the fd to its inode on the
+   *  server side and mutates the inode's mode bits directly, matching what
+   *  native Node's libuv does. */
+  fchmodSync(fd, mode) {
+    fchmodSync(this._sync, fd, mode);
   }
   chownSync(filePath, uid, gid) {
     chownSync(this._sync, toPathString(filePath), uid, gid);
@@ -3017,14 +3288,16 @@ var VFSFileSystem = class {
   lchownSync(filePath, uid, gid) {
     chownSync(this._sync, filePath, uid, gid);
   }
-  /** chown on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
-  fchownSync(_fd, _uid, _gid) {
+  /** chown on an open file descriptor. Mutates the underlying inode's uid/gid. */
+  fchownSync(fd, uid, gid) {
+    fchownSync(this._sync, fd, uid, gid);
   }
   utimesSync(filePath, atime, mtime) {
     utimesSync(this._sync, toPathString(filePath), atime, mtime);
   }
-  /** utimes on an open file descriptor. No-op in this VFS (cannot resolve fd to path). */
-  futimesSync(_fd, _atime, _mtime) {
+  /** utimes on an open file descriptor. Mutates the underlying inode's atime/mtime. */
+  futimesSync(fd, atime, mtime) {
+    futimesSync(this._sync, fd, atime, mtime);
   }
   /** Like utimesSync but operates on the symlink itself. In this VFS, delegates to utimesSync. */
   lutimesSync(filePath, atime, mtime) {
@@ -3649,15 +3922,15 @@ var VFSFileSystem = class {
   }
   futimes(fd, atime, mtime, callback) {
     this._validateCb(callback);
-    if (callback) setTimeout(() => callback(null), 0);
+    return this._cbVoid(this.promises.futimes(fd, atime, mtime), callback);
   }
   fchmod(fd, mode, callback) {
     this._validateCb(callback);
-    if (callback) setTimeout(() => callback(null), 0);
+    return this._cbVoid(this.promises.fchmod(fd, mode), callback);
   }
   fchown(fd, uid, gid, callback) {
     this._validateCb(callback);
-    if (callback) setTimeout(() => callback(null), 0);
+    return this._cbVoid(this.promises.fchown(fd, uid, gid), callback);
   }
   lchmod(filePath, mode, callback) {
     this._validateCb(callback);
@@ -3796,8 +4069,10 @@ var VFSPromises = class {
   lchmod(filePath, mode) {
     return chmod(this._async, filePath, mode);
   }
-  /** chmod on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
-  async fchmod(_fd, _mode) {
+  /** chmod on an open file descriptor. Engine resolves fd → inode and
+   *  mutates the mode bits directly. */
+  fchmod(fd, mode) {
+    return fchmod(this._async, fd, mode);
   }
   chown(filePath, uid, gid) {
     return chown(this._async, toPathString(filePath), uid, gid);
@@ -3806,14 +4081,18 @@ var VFSPromises = class {
   lchown(filePath, uid, gid) {
     return chown(this._async, filePath, uid, gid);
   }
-  /** chown on an open file descriptor. No-op in this VFS (permissions are cosmetic). */
-  async fchown(_fd, _uid, _gid) {
+  /** chown on an open file descriptor. Engine resolves fd → inode and
+   *  mutates uid/gid directly. */
+  fchown(fd, uid, gid) {
+    return fchown(this._async, fd, uid, gid);
   }
   utimes(filePath, atime, mtime) {
     return utimes(this._async, toPathString(filePath), atime, mtime);
   }
-  /** utimes on an open file descriptor. No-op in this VFS (cannot resolve fd to path). */
-  async futimes(_fd, _atime, _mtime) {
+  /** utimes on an open file descriptor. Engine resolves fd → inode and
+   *  mutates atime/mtime directly. */
+  futimes(fd, atime, mtime) {
+    return futimes(this._async, fd, atime, mtime);
   }
   /** Like utimes but operates on the symlink itself. In this VFS, delegates to utimes. */
   lutimes(filePath, atime, mtime) {
@@ -5131,6 +5410,40 @@ var VFSEngine = class {
   fsync() {
     this.commitPending();
     this.handle.flush();
+    return { status: 0 };
+  }
+  // ---- FCHMOD ----
+  // fd-based chmod: look up the inode directly from the fd table and mutate
+  // its mode bits. Native Node does the same thing at the libuv layer.
+  fchmod(fd, mode) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    const inode = this.readInode(entry.inodeIdx);
+    inode.mode = inode.mode & S_IFMT | mode & 4095;
+    inode.ctime = Date.now();
+    this.writeInode(entry.inodeIdx, inode);
+    return { status: 0 };
+  }
+  // ---- FCHOWN ----
+  fchown(fd, uid, gid) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    const inode = this.readInode(entry.inodeIdx);
+    inode.uid = uid;
+    inode.gid = gid;
+    inode.ctime = Date.now();
+    this.writeInode(entry.inodeIdx, inode);
+    return { status: 0 };
+  }
+  // ---- FUTIMES ----
+  futimes(fd, atime, mtime) {
+    const entry = this.fdTable.get(fd);
+    if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    const inode = this.readInode(entry.inodeIdx);
+    inode.atime = atime;
+    inode.mtime = mtime;
+    inode.ctime = Date.now();
+    this.writeInode(entry.inodeIdx, inode);
     return { status: 0 };
   }
   // ---- OPENDIR ----

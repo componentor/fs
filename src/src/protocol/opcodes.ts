@@ -35,6 +35,9 @@ export const OP = {
   FSYNC: 28,
   OPENDIR: 29,
   MKDTEMP: 30,
+  FCHMOD: 31,
+  FCHOWN: 32,
+  FUTIMES: 33,
 } as const;
 
 export type OpCode = (typeof OP)[keyof typeof OP];
