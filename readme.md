@@ -604,6 +604,17 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
 
+### v3.0.45 (2026)
+
+**Fixes:**
+- Eliminate "Array buffer allocation failed" on multi-hundred-MB VFS operations (pnpm install of large monorepos like Directus): every hot path that previously staged a full-file or full-data-region buffer now streams through a bounded 4 MB scratch buffer via the underlying sync access handle — `growPathTable`, `fwrite` grow, `append`, `truncate` extend, and `copy`
+- Fix POSIX "hole" semantics: writes past EOF and extending `truncate` now zero-fill the gap instead of exposing stale bytes from previously-freed blocks
+
+**Tests:**
+- Sparse-write coverage (in-block hole, cross-block hole, pos === size)
+- Chunk-boundary coverage for `append`, `fwrite` grow, `truncate` extend, and `copy` across 5 MB buffers
+- Self-copy and `COPYFILE_EXCL` regression tests
+
 ### v3.0.44 (2026)
 
 **Fixes:**

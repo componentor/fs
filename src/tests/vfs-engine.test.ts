@@ -801,4 +801,181 @@ describe('VFSEngine', () => {
       })).not.toThrow();
     });
   });
+
+  describe('sparse writes (POSIX hole semantics)', () => {
+    // POSIX guarantees that a write past the current end-of-file creates
+    // a "hole" — the bytes between the old EOF and the write position
+    // must read back as zeros, not whatever stale data lived in the
+    // underlying storage blocks. Covers every grow path in `fwrite`:
+    //   1. Hole fits inside existing blocks (no allocation).
+    //   2. Hole spans into newly-allocated blocks (growth path).
+    //   3. Write position coincides with end-of-file (no hole).
+
+    function openForWrite(path: string): number {
+      // O_CREAT | O_WRONLY = 64 | 1 = 65
+      const r = engine.open(path, 64 | 1, 'tab1');
+      return new DataView((r.data as Uint8Array).buffer, (r.data as Uint8Array).byteOffset, 4).getUint32(0, true);
+    }
+
+    it('should zero-fill a hole that fits inside existing blocks', () => {
+      // Pre-populate a 10-byte file so inode has one block already.
+      engine.write('/hole.bin', new TextEncoder().encode('0123456789'));
+      const fd = openForWrite('/hole.bin');
+      // Write 4 bytes at position 100 — gap is [10, 100), well inside
+      // the first 512-byte block. No new blocks needed.
+      engine.fwrite(fd, new Uint8Array([0xaa, 0xbb, 0xcc, 0xdd]), 100);
+      const r = engine.read('/hole.bin');
+      expect(r.status).toBe(0);
+      const data = r.data!;
+      expect(data.byteLength).toBe(104);
+      // Original bytes preserved.
+      expect(new TextDecoder().decode(data.subarray(0, 10))).toBe('0123456789');
+      // Hole reads as zeros.
+      for (let i = 10; i < 100; i++) expect(data[i]).toBe(0);
+      // Caller's bytes landed at the right offset.
+      expect(data[100]).toBe(0xaa);
+      expect(data[103]).toBe(0xdd);
+    });
+
+    it('should zero-fill a hole that spans into newly-allocated blocks', () => {
+      engine.write('/bighole.bin', new TextEncoder().encode('head'));
+      const fd = openForWrite('/bighole.bin');
+      // Block size is 512, write 4 bytes at position 8192 — forces the
+      // file to grow across many new blocks.
+      const pos = 8192;
+      engine.fwrite(fd, new Uint8Array([1, 2, 3, 4]), pos);
+      const r = engine.read('/bighole.bin');
+      expect(r.status).toBe(0);
+      const data = r.data!;
+      expect(data.byteLength).toBe(pos + 4);
+      expect(new TextDecoder().decode(data.subarray(0, 4))).toBe('head');
+      // Every byte in the hole must be zero.
+      let nonZero = 0;
+      for (let i = 4; i < pos; i++) if (data[i] !== 0) nonZero++;
+      expect(nonZero).toBe(0);
+      expect(data[pos]).toBe(1);
+      expect(data[pos + 3]).toBe(4);
+    });
+
+    it('should not allocate an unnecessary hole when pos === size', () => {
+      engine.write('/nohole.bin', new TextEncoder().encode('abc'));
+      const fd = openForWrite('/nohole.bin');
+      engine.fwrite(fd, new Uint8Array([4, 5, 6]), 3);
+      const r = engine.read('/nohole.bin');
+      const data = r.data!;
+      expect(data.byteLength).toBe(6);
+      expect(Array.from(data)).toEqual([0x61, 0x62, 0x63, 4, 5, 6]);
+    });
+  });
+
+  describe('chunked large-buffer operations', () => {
+    // These regression-guard the chunked-copy rewrites in `fwrite` grow,
+    // `append`, `truncate` extend, and `copy`. The mock handle can't
+    // simulate the ~2 GB Chrome allocation cap that motivated the
+    // rewrites, so instead we use a moderately sized buffer (5 MB) that
+    // crosses the 4 MB internal scratch-chunk boundary and verify the
+    // resulting bytes are byte-identical — proving the chunk loop
+    // reassembles correctly.
+
+    const FIVE_MB = 5 * 1024 * 1024;
+
+    function pattern(len: number): Uint8Array {
+      const buf = new Uint8Array(len);
+      for (let i = 0; i < len; i++) buf[i] = (i * 31 + 7) & 0xff;
+      return buf;
+    }
+
+    it('should append across the 4 MB chunk boundary and preserve bytes', () => {
+      const head = pattern(FIVE_MB);
+      const tail = pattern(1024);
+      engine.write('/a.bin', head);
+      engine.append('/a.bin', tail);
+      const r = engine.read('/a.bin');
+      expect(r.status).toBe(0);
+      const data = r.data!;
+      expect(data.byteLength).toBe(FIVE_MB + 1024);
+      // Check a few bytes at the boundaries and across the 4 MB split.
+      expect(data[0]).toBe(head[0]);
+      expect(data[FIVE_MB - 1]).toBe(head[FIVE_MB - 1]);
+      expect(data[FIVE_MB]).toBe(tail[0]);
+      expect(data[FIVE_MB + 1023]).toBe(tail[1023]);
+      // Spot-check the middle of the first chunk and the second chunk.
+      const midFirst = 2 * 1024 * 1024;
+      const midSecond = 4 * 1024 * 1024 + 512 * 1024;
+      expect(data[midFirst]).toBe(head[midFirst]);
+      expect(data[midSecond]).toBe(head[midSecond]);
+    });
+
+    it('should fwrite-grow across the 4 MB chunk boundary and preserve bytes', () => {
+      const base = pattern(FIVE_MB);
+      engine.write('/b.bin', base);
+      const openR = engine.open('/b.bin', 64 | 1, 'tab1');
+      const fd = new DataView((openR.data as Uint8Array).buffer, (openR.data as Uint8Array).byteOffset, 4).getUint32(0, true);
+      // Append 1 KB at the tail via fwrite — must trigger the grow path
+      // and copy existing 5 MB through the chunk loop.
+      const tail = pattern(1024);
+      engine.fwrite(fd, tail, FIVE_MB);
+      const r = engine.read('/b.bin');
+      const data = r.data!;
+      expect(data.byteLength).toBe(FIVE_MB + 1024);
+      expect(data[0]).toBe(base[0]);
+      expect(data[FIVE_MB - 1]).toBe(base[FIVE_MB - 1]);
+      expect(data[FIVE_MB]).toBe(tail[0]);
+      expect(data[FIVE_MB + 1023]).toBe(tail[1023]);
+    });
+
+    it('should truncate-extend with zero-fill across the 4 MB chunk boundary', () => {
+      engine.write('/t.bin', new TextEncoder().encode('seed'));
+      const newLen = FIVE_MB;
+      engine.truncate('/t.bin', newLen);
+      const r = engine.read('/t.bin');
+      const data = r.data!;
+      expect(data.byteLength).toBe(newLen);
+      expect(new TextDecoder().decode(data.subarray(0, 4))).toBe('seed');
+      // Every byte past the seed must be zero.
+      let nonZero = 0;
+      // Sample across the chunk boundary instead of scanning the whole
+      // buffer — much faster and still catches a bogus loop.
+      for (let i = 4; i < 8192; i++) if (data[i] !== 0) nonZero++;
+      for (let i = FIVE_MB - 8192; i < FIVE_MB; i++) if (data[i] !== 0) nonZero++;
+      const near4MB = 4 * 1024 * 1024;
+      for (let i = near4MB - 1024; i < near4MB + 1024; i++) if (data[i] !== 0) nonZero++;
+      expect(nonZero).toBe(0);
+    });
+
+    it('should copy a file across the 4 MB chunk boundary and preserve bytes', () => {
+      const src = pattern(FIVE_MB);
+      engine.write('/src.bin', src);
+      const status = engine.copy('/src.bin', '/dst.bin');
+      expect(status.status).toBe(0);
+      const r = engine.read('/dst.bin');
+      const data = r.data!;
+      expect(data.byteLength).toBe(FIVE_MB);
+      expect(data[0]).toBe(src[0]);
+      expect(data[FIVE_MB - 1]).toBe(src[FIVE_MB - 1]);
+      // Spot-check across the 4 MB chunk boundary.
+      const near4MB = 4 * 1024 * 1024;
+      expect(data[near4MB - 1]).toBe(src[near4MB - 1]);
+      expect(data[near4MB]).toBe(src[near4MB]);
+      expect(data[near4MB + 1]).toBe(src[near4MB + 1]);
+    });
+
+    it('should copy-self as a no-op', () => {
+      engine.write('/self.bin', new TextEncoder().encode('keep'));
+      expect(engine.copy('/self.bin', '/self.bin').status).toBe(0);
+      const r = engine.read('/self.bin');
+      expect(new TextDecoder().decode(r.data!)).toBe('keep');
+    });
+
+    it('should honor COPYFILE_EXCL when destination exists', () => {
+      engine.write('/a.bin', new TextEncoder().encode('a'));
+      engine.write('/b.bin', new TextEncoder().encode('b'));
+      const r = engine.copy('/a.bin', '/b.bin', 1);
+      // EEXIST
+      expect(r.status).not.toBe(0);
+      // Destination unchanged.
+      const got = engine.read('/b.bin');
+      expect(new TextDecoder().decode(got.data!)).toBe('b');
+    });
+  });
 });

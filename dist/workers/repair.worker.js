@@ -510,14 +510,23 @@ var VFSEngine = class {
   growPathTable(needed) {
     const newSize = Math.max(this.pathTableSize * 2, needed + INITIAL_PATH_TABLE_SIZE);
     const growth = newSize - this.pathTableSize;
-    const dataSize = this.totalBlocks * this.blockSize;
-    const dataBuf = new Uint8Array(dataSize);
-    this.handle.read(dataBuf, { at: this.dataOffset });
     const newTotalSize = this.handle.getSize() + growth;
     this.handle.truncate(newTotalSize);
+    const dataSize = this.totalBlocks * this.blockSize;
+    const CHUNK = 4 * 1024 * 1024;
+    const scratch = new Uint8Array(Math.min(CHUNK, Math.max(dataSize, 1)));
+    let remaining = dataSize;
+    while (remaining > 0) {
+      const chunk = Math.min(remaining, CHUNK);
+      const srcAt = this.dataOffset + (remaining - chunk);
+      const dstAt = this.dataOffset + growth + (remaining - chunk);
+      const slice = chunk < scratch.length ? scratch.subarray(0, chunk) : scratch;
+      this.handle.read(slice, { at: srcAt });
+      this.handle.write(slice, { at: dstAt });
+      remaining -= chunk;
+    }
     const newBitmapOffset = this.bitmapOffset + growth;
     const newDataOffset = this.dataOffset + growth;
-    this.handle.write(dataBuf, { at: newDataOffset });
     this.handle.write(this.bitmap, { at: newBitmapOffset });
     this.pathTableSize = newSize;
     this.bitmapOffset = newBitmapOffset;
@@ -525,6 +534,23 @@ var VFSEngine = class {
     this.superblockDirty = true;
   }
   // ========== Bitmap I/O ==========
+  // Write `length` zero bytes at absolute file offset `at` via a small
+  // reusable scratch buffer. Used to materialize POSIX "holes" when a
+  // write starts past the current file size — those bytes must read as
+  // zeros rather than whatever stale data happened to live in the
+  // underlying storage blocks.
+  zeroFileRange(at, length) {
+    if (length <= 0) return;
+    const CHUNK = 4 * 1024 * 1024;
+    const zeros = new Uint8Array(Math.min(length, CHUNK));
+    let written = 0;
+    while (written < length) {
+      const n = Math.min(CHUNK, length - written);
+      const slice = n < zeros.length ? zeros.subarray(0, n) : zeros;
+      this.handle.write(slice, { at: at + written });
+      written += n;
+    }
+  }
   allocateBlocks(count) {
     if (count === 0) return 0;
     const bitmap = this.bitmap;
@@ -849,17 +875,28 @@ var VFSEngine = class {
     }
     const inode = this.readInode(existingIdx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
-    const existing = inode.size > 0 ? this.readData(inode.firstBlock, inode.blockCount, inode.size) : new Uint8Array(0);
-    const combined = new Uint8Array(existing.byteLength + data.byteLength);
-    combined.set(existing);
-    combined.set(data, existing.byteLength);
-    const neededBlocks = Math.ceil(combined.byteLength / this.blockSize);
-    this.freeBlockRange(inode.firstBlock, inode.blockCount);
+    const combinedSize = inode.size + data.byteLength;
+    const neededBlocks = Math.ceil(combinedSize / this.blockSize);
     const newFirst = this.allocateBlocks(neededBlocks);
-    this.writeData(newFirst, combined);
+    const newBase = this.dataOffset + newFirst * this.blockSize;
+    if (inode.size > 0) {
+      const oldBase = this.dataOffset + inode.firstBlock * this.blockSize;
+      const CHUNK = 4 * 1024 * 1024;
+      const scratch = new Uint8Array(Math.min(CHUNK, inode.size));
+      let copied = 0;
+      while (copied < inode.size) {
+        const n = Math.min(CHUNK, inode.size - copied);
+        const slice = n < scratch.length ? scratch.subarray(0, n) : scratch;
+        this.handle.read(slice, { at: oldBase + copied });
+        this.handle.write(slice, { at: newBase + copied });
+        copied += n;
+      }
+    }
+    this.freeBlockRange(inode.firstBlock, inode.blockCount);
+    this.handle.write(data, { at: newBase + inode.size });
     inode.firstBlock = newFirst;
     inode.blockCount = neededBlocks;
-    inode.size = combined.byteLength;
+    inode.size = combinedSize;
     inode.mtime = Date.now();
     this.writeInode(existingIdx, inode);
     this.commitPending();
@@ -1122,13 +1159,29 @@ var VFSEngine = class {
     } else if (len > inode.size) {
       const neededBlocks = Math.ceil(len / this.blockSize);
       if (neededBlocks > inode.blockCount) {
-        const oldData = this.readData(inode.firstBlock, inode.blockCount, inode.size);
-        this.freeBlockRange(inode.firstBlock, inode.blockCount);
         const newFirst = this.allocateBlocks(neededBlocks);
-        const newData = new Uint8Array(len);
-        newData.set(oldData);
-        this.writeData(newFirst, newData);
+        const newBase = this.dataOffset + newFirst * this.blockSize;
+        if (inode.size > 0) {
+          const oldBase = this.dataOffset + inode.firstBlock * this.blockSize;
+          const CHUNK = 4 * 1024 * 1024;
+          const scratch = new Uint8Array(Math.min(CHUNK, inode.size));
+          let copied = 0;
+          while (copied < inode.size) {
+            const n = Math.min(CHUNK, inode.size - copied);
+            const slice = n < scratch.length ? scratch.subarray(0, n) : scratch;
+            this.handle.read(slice, { at: oldBase + copied });
+            this.handle.write(slice, { at: newBase + copied });
+            copied += n;
+          }
+        }
+        this.freeBlockRange(inode.firstBlock, inode.blockCount);
+        this.zeroFileRange(newBase + inode.size, len - inode.size);
         inode.firstBlock = newFirst;
+      } else {
+        this.zeroFileRange(
+          this.dataOffset + inode.firstBlock * this.blockSize + inode.size,
+          len - inode.size
+        );
       }
       inode.blockCount = neededBlocks;
       inode.size = len;
@@ -1149,8 +1202,36 @@ var VFSEngine = class {
     if (flags & 1 && this.pathIndex.has(destPath)) {
       return { status: CODE_TO_STATUS.EEXIST };
     }
-    const data = srcInode.size > 0 ? this.readData(srcInode.firstBlock, srcInode.blockCount, srcInode.size) : new Uint8Array(0);
-    return this.write(destPath, data);
+    if (srcPath === destPath) return { status: 0 };
+    const srcSize = srcInode.size;
+    const srcFirstBlock = srcInode.firstBlock;
+    const emptyStatus = this.write(destPath, new Uint8Array(0));
+    if (emptyStatus.status !== 0) return emptyStatus;
+    if (srcSize === 0) return { status: 0 };
+    const destIdx = this.resolvePathComponents(destPath, true);
+    if (destIdx === void 0) return { status: CODE_TO_STATUS.EIO };
+    const destInode = this.readInode(destIdx);
+    const neededBlocks = Math.ceil(srcSize / this.blockSize);
+    const newFirst = this.allocateBlocks(neededBlocks);
+    const newBase = this.dataOffset + newFirst * this.blockSize;
+    const srcBase = this.dataOffset + srcFirstBlock * this.blockSize;
+    const CHUNK = 4 * 1024 * 1024;
+    const scratch = new Uint8Array(Math.min(CHUNK, srcSize));
+    let copied = 0;
+    while (copied < srcSize) {
+      const n = Math.min(CHUNK, srcSize - copied);
+      const slice = n < scratch.length ? scratch.subarray(0, n) : scratch;
+      this.handle.read(slice, { at: srcBase + copied });
+      this.handle.write(slice, { at: newBase + copied });
+      copied += n;
+    }
+    destInode.firstBlock = newFirst;
+    destInode.blockCount = neededBlocks;
+    destInode.size = srcSize;
+    destInode.mtime = Date.now();
+    this.writeInode(destIdx, destInode);
+    this.commitPending();
+    return { status: 0 };
   }
   // ---- ACCESS ----
   access(path, mode = 0) {
@@ -1314,16 +1395,35 @@ var VFSEngine = class {
     if (endPos > inode.size) {
       const neededBlocks = Math.ceil(endPos / this.blockSize);
       if (neededBlocks > inode.blockCount) {
-        const oldData = inode.size > 0 ? this.readData(inode.firstBlock, inode.blockCount, inode.size) : new Uint8Array(0);
-        this.freeBlockRange(inode.firstBlock, inode.blockCount);
         const newFirst = this.allocateBlocks(neededBlocks);
-        const newBuf = new Uint8Array(endPos);
-        newBuf.set(oldData);
-        newBuf.set(data, pos);
-        this.writeData(newFirst, newBuf);
+        const newBase = this.dataOffset + newFirst * this.blockSize;
+        const oldBase = this.dataOffset + inode.firstBlock * this.blockSize;
+        if (inode.size > 0) {
+          const CHUNK = 4 * 1024 * 1024;
+          const scratch = new Uint8Array(Math.min(CHUNK, inode.size));
+          let copied = 0;
+          while (copied < inode.size) {
+            const n = Math.min(CHUNK, inode.size - copied);
+            const slice = n < scratch.length ? scratch.subarray(0, n) : scratch;
+            this.handle.read(slice, { at: oldBase + copied });
+            this.handle.write(slice, { at: newBase + copied });
+            copied += n;
+          }
+        }
+        this.freeBlockRange(inode.firstBlock, inode.blockCount);
+        if (pos > inode.size) {
+          this.zeroFileRange(newBase + inode.size, pos - inode.size);
+        }
+        this.handle.write(data, { at: newBase + pos });
         inode.firstBlock = newFirst;
         inode.blockCount = neededBlocks;
       } else {
+        if (pos > inode.size) {
+          this.zeroFileRange(
+            this.dataOffset + inode.firstBlock * this.blockSize + inode.size,
+            pos - inode.size
+          );
+        }
         const dataOffset = this.dataOffset + inode.firstBlock * this.blockSize + pos;
         this.handle.write(data, { at: dataOffset });
       }

@@ -1,5 +1,17 @@
 # Changelog
 
+## 3.0.45
+
+- Fix "Array buffer allocation failed" on multi-hundred-MB VFS operations by streaming all large-buffer paths through a bounded 4 MB scratch buffer instead of materializing the whole thing at once:
+  - `growPathTable`: shift the data region back-to-front in chunks rather than reading/writing it as one `Uint8Array(dataSize)`. Root cause of the pnpm/Directus crash (~1300 packages → hundreds of MB data section)
+  - `fwrite` grow path: allocate new blocks, copy old contents chunked, then write caller data at offset — no more `new Uint8Array(endPos)` staging
+  - `append`: same chunked relocate pattern, no more `new Uint8Array(existing + data)`
+  - `truncate` extend: chunked old→new copy plus chunked zero-fill of the extension
+  - `copy`: chunked block-to-block copy via the file handle, no `readData(srcInode.size)` full-file buffer
+- Fix POSIX "hole" semantics for writes past EOF: when a write starts beyond the current file size, the gap bytes now read back as zeros rather than whatever stale data lived in the underlying storage blocks. Covers `fwrite` (grow and in-place branches) and `truncate` extend (both same-blockcount and grow branches). `allocateBlocks` only flips bitmap bits, so zeroing has to happen explicitly
+- Add `zeroFileRange` helper for chunked zero-fill
+- Add tests for sparse writes (3 cases) and for 5 MB buffers crossing the 4 MB chunk boundary in `append`, `fwrite` grow, `truncate` extend, and `copy`, plus self-copy and `COPYFILE_EXCL` coverage
+
 ## 3.0.44
 
 - Fix OOM during large streamed writes: coalesce per-path OPFS sync notifications in `sync-relay.worker.ts` so a single 100 MB chunked upload triggers one full-file read instead of one per chunk (~1500×). Eliminates `RangeError: Array buffer allocation failed` on repeated large uploads (e.g. Strapi multipart)

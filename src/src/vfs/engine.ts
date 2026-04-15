@@ -549,22 +549,38 @@ export class VFSEngine {
     const newSize = Math.max(this.pathTableSize * 2, needed + INITIAL_PATH_TABLE_SIZE);
     const growth = newSize - this.pathTableSize;
 
-    // Need to shift bitmap and data region forward
-    // Use in-memory bitmap (no read needed)
-
-    // Read existing data region
-    const dataSize = this.totalBlocks * this.blockSize;
-    const dataBuf = new Uint8Array(dataSize);
-    this.handle.read(dataBuf, { at: this.dataOffset });
-
-    // Grow file
+    // Grow file first so the shifted data has somewhere to land.
     const newTotalSize = this.handle.getSize() + growth;
     this.handle.truncate(newTotalSize);
 
-    // Write data back at new offset
+    // Shift the data region forward by `growth` bytes. We must NOT allocate
+    // a single buffer the size of the whole data section — when the VFS
+    // holds a large install (pnpm linking ~1300 Directus packages puts the
+    // data section in the hundreds of MB) the one-shot
+    //   new Uint8Array(dataSize)
+    // failed with "Array buffer allocation failed" because Chrome refuses
+    // allocations near the 2 GB cap even with OS memory to spare.
+    //
+    // Copy back-to-front through a small scratch buffer so we never
+    // overwrite bytes we haven't relocated yet, and the peak allocation
+    // stays bounded at CHUNK regardless of how big the VFS has grown.
+    const dataSize = this.totalBlocks * this.blockSize;
+    const CHUNK = 4 * 1024 * 1024; // 4 MB
+    const scratch = new Uint8Array(Math.min(CHUNK, Math.max(dataSize, 1)));
+    let remaining = dataSize;
+    while (remaining > 0) {
+      const chunk = Math.min(remaining, CHUNK);
+      const srcAt = this.dataOffset + (remaining - chunk);
+      const dstAt = this.dataOffset + growth + (remaining - chunk);
+      const slice = chunk < scratch.length ? scratch.subarray(0, chunk) : scratch;
+      this.handle.read(slice, { at: srcAt });
+      this.handle.write(slice, { at: dstAt });
+      remaining -= chunk;
+    }
+
+    // Write the (in-memory) bitmap to its new offset.
     const newBitmapOffset = this.bitmapOffset + growth;
     const newDataOffset = this.dataOffset + growth;
-    this.handle.write(dataBuf, { at: newDataOffset });
     this.handle.write(this.bitmap!, { at: newBitmapOffset });
 
     // Update offsets
@@ -577,6 +593,24 @@ export class VFSEngine {
   }
 
   // ========== Bitmap I/O ==========
+
+  // Write `length` zero bytes at absolute file offset `at` via a small
+  // reusable scratch buffer. Used to materialize POSIX "holes" when a
+  // write starts past the current file size — those bytes must read as
+  // zeros rather than whatever stale data happened to live in the
+  // underlying storage blocks.
+  private zeroFileRange(at: number, length: number): void {
+    if (length <= 0) return;
+    const CHUNK = 4 * 1024 * 1024;
+    const zeros = new Uint8Array(Math.min(length, CHUNK));
+    let written = 0;
+    while (written < length) {
+      const n = Math.min(CHUNK, length - written);
+      const slice = n < zeros.length ? zeros.subarray(0, n) : zeros;
+      this.handle.write(slice, { at: at + written });
+      written += n;
+    }
+  }
 
   private allocateBlocks(count: number): number {
     if (count === 0) return 0;
@@ -1010,25 +1044,37 @@ export class VFSEngine {
     const inode = this.readInode(existingIdx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
 
-    // Read existing data
-    const existing = inode.size > 0
-      ? this.readData(inode.firstBlock, inode.blockCount, inode.size)
-      : new Uint8Array(0);
-
-    // Concat
-    const combined = new Uint8Array(existing.byteLength + data.byteLength);
-    combined.set(existing);
-    combined.set(data, existing.byteLength);
-
-    // Rewrite
-    const neededBlocks = Math.ceil(combined.byteLength / this.blockSize);
-    this.freeBlockRange(inode.firstBlock, inode.blockCount);
+    // Avoid materializing the whole (existing + data) file in a single
+    // Uint8Array — that blew up with "Array buffer allocation failed" on
+    // large appends (e.g. appending a few MB to a multi-hundred-MB file).
+    //
+    // Strategy: allocate a new block run sized to the total, copy the
+    // existing contents over in bounded chunks, then write the caller's
+    // `data` at the end. Peak allocation stays at 4 MB regardless of
+    // file size.
+    const combinedSize = inode.size + data.byteLength;
+    const neededBlocks = Math.ceil(combinedSize / this.blockSize);
     const newFirst = this.allocateBlocks(neededBlocks);
-    this.writeData(newFirst, combined);
+    const newBase = this.dataOffset + newFirst * this.blockSize;
+    if (inode.size > 0) {
+      const oldBase = this.dataOffset + inode.firstBlock * this.blockSize;
+      const CHUNK = 4 * 1024 * 1024; // 4 MB
+      const scratch = new Uint8Array(Math.min(CHUNK, inode.size));
+      let copied = 0;
+      while (copied < inode.size) {
+        const n = Math.min(CHUNK, inode.size - copied);
+        const slice = n < scratch.length ? scratch.subarray(0, n) : scratch;
+        this.handle.read(slice, { at: oldBase + copied });
+        this.handle.write(slice, { at: newBase + copied });
+        copied += n;
+      }
+    }
+    this.freeBlockRange(inode.firstBlock, inode.blockCount);
+    this.handle.write(data, { at: newBase + inode.size });
 
     inode.firstBlock = newFirst;
     inode.blockCount = neededBlocks;
-    inode.size = combined.byteLength;
+    inode.size = combinedSize;
     inode.mtime = Date.now();
     this.writeInode(existingIdx, inode);
 
@@ -1383,18 +1429,41 @@ export class VFSEngine {
       inode.blockCount = neededBlocks;
       inode.size = len;
     } else if (len > inode.size) {
-      // Grow (zero-fill)
+      // Grow with POSIX zero-fill semantics. Old code staged the entire
+      // new file as a single `new Uint8Array(len)` — OOMs for large
+      // truncates and allocates way more than necessary. Instead, copy
+      // old contents in bounded chunks and zero-fill the extension
+      // directly on disk.
       const neededBlocks = Math.ceil(len / this.blockSize);
       if (neededBlocks > inode.blockCount) {
-        // Need more blocks
-        const oldData = this.readData(inode.firstBlock, inode.blockCount, inode.size);
-        this.freeBlockRange(inode.firstBlock, inode.blockCount);
+        // Allocate-then-copy-then-free so the old range is guaranteed
+        // not to overlap the new one. See `fwrite` for the same pattern.
         const newFirst = this.allocateBlocks(neededBlocks);
-        const newData = new Uint8Array(len);
-        newData.set(oldData);
-        // Rest is already zero-filled
-        this.writeData(newFirst, newData);
+        const newBase = this.dataOffset + newFirst * this.blockSize;
+        if (inode.size > 0) {
+          const oldBase = this.dataOffset + inode.firstBlock * this.blockSize;
+          const CHUNK = 4 * 1024 * 1024; // 4 MB
+          const scratch = new Uint8Array(Math.min(CHUNK, inode.size));
+          let copied = 0;
+          while (copied < inode.size) {
+            const n = Math.min(CHUNK, inode.size - copied);
+            const slice = n < scratch.length ? scratch.subarray(0, n) : scratch;
+            this.handle.read(slice, { at: oldBase + copied });
+            this.handle.write(slice, { at: newBase + copied });
+            copied += n;
+          }
+        }
+        this.freeBlockRange(inode.firstBlock, inode.blockCount);
+        this.zeroFileRange(newBase + inode.size, len - inode.size);
         inode.firstBlock = newFirst;
+      } else {
+        // Same block count, just growing `size`. The tail of the last
+        // existing block still contains whatever stale data was there
+        // before — zero it so the extended region reads as zeros.
+        this.zeroFileRange(
+          this.dataOffset + inode.firstBlock * this.blockSize + inode.size,
+          len - inode.size,
+        );
       }
       inode.blockCount = neededBlocks;
       inode.size = len;
@@ -1423,12 +1492,55 @@ export class VFSEngine {
       return { status: CODE_TO_STATUS.EEXIST };
     }
 
-    // Read source data
-    const data = srcInode.size > 0
-      ? this.readData(srcInode.firstBlock, srcInode.blockCount, srcInode.size)
-      : new Uint8Array(0);
+    // Self-copy — no-op.
+    if (srcPath === destPath) return { status: 0 };
 
-    return this.write(destPath, data);
+    const srcSize = srcInode.size;
+    const srcFirstBlock = srcInode.firstBlock;
+
+    // Stage 1: create the destination as an empty file. This goes through
+    // the normal `write` path which handles parent-directory creation,
+    // freeing any pre-existing blocks at `destPath`, and registering the
+    // inode in `pathIndex`. Doing this first also means any side effects
+    // (e.g. a `growPathTable` shift of the data region) happen BEFORE we
+    // start allocating destination blocks, so the relative block indices
+    // we capture below stay valid.
+    const emptyStatus = this.write(destPath, new Uint8Array(0));
+    if (emptyStatus.status !== 0) return emptyStatus;
+
+    if (srcSize === 0) return { status: 0 };
+
+    // Stage 2: allocate a destination block run sized to the source, then
+    // copy the bytes directly between block ranges via the file handle in
+    // bounded chunks. No full-file buffer is ever allocated — peak scratch
+    // stays at 4 MB regardless of how big the source file is.
+    const destIdx = this.resolvePathComponents(destPath, true);
+    if (destIdx === undefined) return { status: CODE_TO_STATUS.EIO };
+    const destInode = this.readInode(destIdx);
+
+    const neededBlocks = Math.ceil(srcSize / this.blockSize);
+    const newFirst = this.allocateBlocks(neededBlocks);
+    const newBase = this.dataOffset + newFirst * this.blockSize;
+    const srcBase = this.dataOffset + srcFirstBlock * this.blockSize;
+
+    const CHUNK = 4 * 1024 * 1024; // 4 MB
+    const scratch = new Uint8Array(Math.min(CHUNK, srcSize));
+    let copied = 0;
+    while (copied < srcSize) {
+      const n = Math.min(CHUNK, srcSize - copied);
+      const slice = n < scratch.length ? scratch.subarray(0, n) : scratch;
+      this.handle.read(slice, { at: srcBase + copied });
+      this.handle.write(slice, { at: newBase + copied });
+      copied += n;
+    }
+
+    destInode.firstBlock = newFirst;
+    destInode.blockCount = neededBlocks;
+    destInode.size = srcSize;
+    destInode.mtime = Date.now();
+    this.writeInode(destIdx, destInode);
+    this.commitPending();
+    return { status: 0 };
   }
 
   // ---- ACCESS ----
@@ -1652,20 +1764,55 @@ export class VFSEngine {
     if (endPos > inode.size) {
       const neededBlocks = Math.ceil(endPos / this.blockSize);
       if (neededBlocks > inode.blockCount) {
-        // Grow — read old data, reallocate, write back
-        const oldData = inode.size > 0
-          ? this.readData(inode.firstBlock, inode.blockCount, inode.size)
-          : new Uint8Array(0);
-        this.freeBlockRange(inode.firstBlock, inode.blockCount);
+        // Grow by relocating to a larger block run. We used to stage the
+        // entire new file contents in a single `new Uint8Array(endPos)`
+        // and then call `writeData` once — that blew up with
+        // "Array buffer allocation failed" on multi-hundred-MB writes
+        // because Chrome refuses contiguous allocations near ~2 GB even
+        // with plenty of OS RAM. Instead, allocate new blocks, copy the
+        // old contents forward in chunks via the underlying file handle
+        // (which is O(N) bytes but with a bounded scratch buffer), then
+        // free the old blocks and write just the caller's `data` at its
+        // offset inside the new region.
         const newFirst = this.allocateBlocks(neededBlocks);
-        const newBuf = new Uint8Array(endPos);
-        newBuf.set(oldData);
-        newBuf.set(data, pos);
-        this.writeData(newFirst, newBuf);
+        const newBase = this.dataOffset + newFirst * this.blockSize;
+        const oldBase = this.dataOffset + inode.firstBlock * this.blockSize;
+        // Copy oldData from old block run to new block run in chunks.
+        if (inode.size > 0) {
+          const CHUNK = 4 * 1024 * 1024; // 4 MB
+          const scratch = new Uint8Array(Math.min(CHUNK, inode.size));
+          let copied = 0;
+          while (copied < inode.size) {
+            const n = Math.min(CHUNK, inode.size - copied);
+            const slice = n < scratch.length ? scratch.subarray(0, n) : scratch;
+            this.handle.read(slice, { at: oldBase + copied });
+            this.handle.write(slice, { at: newBase + copied });
+            copied += n;
+          }
+        }
+        this.freeBlockRange(inode.firstBlock, inode.blockCount);
+        // POSIX "hole" — if the caller is writing past the current EOF
+        // with a gap in between, those bytes must read back as zeros
+        // rather than whatever stale data lives in the freshly allocated
+        // blocks. `allocateBlocks` only flips bitmap bits, it never
+        // zeroes the underlying storage.
+        if (pos > inode.size) {
+          this.zeroFileRange(newBase + inode.size, pos - inode.size);
+        }
+        // Write the caller's new data at its offset inside the new region.
+        this.handle.write(data, { at: newBase + pos });
         inode.firstBlock = newFirst;
         inode.blockCount = neededBlocks;
       } else {
-        // Fits, write at position
+        // Fits within existing blocks. Same hole semantics as above —
+        // stale bytes in the tail of the last allocated block (past the
+        // old file size) must be zeroed before the caller's write lands.
+        if (pos > inode.size) {
+          this.zeroFileRange(
+            this.dataOffset + inode.firstBlock * this.blockSize + inode.size,
+            pos - inode.size,
+          );
+        }
         const dataOffset = this.dataOffset + inode.firstBlock * this.blockSize + pos;
         this.handle.write(data, { at: dataOffset });
       }
