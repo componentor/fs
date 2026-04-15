@@ -67,6 +67,16 @@ function enqueue(event) {
   if (event.op === "rename" && event.newPath) {
     trackPending(event.newPath);
   }
+  if (event.op === "write") {
+    for (let i = queue.length - 1; i >= 0; i--) {
+      const pending = queue[i];
+      if (pending.op === "write" && normalizePath(pending.path) === normalizePath(event.path)) {
+        pending.data = event.data;
+        pending.ts = event.ts;
+        return;
+      }
+    }
+  }
   queue.push(event);
   if (!processing) processNext();
 }
@@ -146,25 +156,57 @@ async function mkdirInOPFS(path) {
     dir = await dir.getDirectoryHandle(part, { create: true });
   }
 }
+var RENAME_CHUNK = 2 * 1024 * 1024;
 async function renameInOPFS(oldPath, newPath) {
+  let srcAccess = null;
+  let dstAccess = null;
   try {
     const oldDir = await navigateToParent(oldPath);
     const oldHandle = await oldDir.getFileHandle(basename(oldPath));
-    const file = await oldHandle.getFile();
-    const data = await file.arrayBuffer();
+    srcAccess = await oldHandle.createSyncAccessHandle();
+    const size = srcAccess.getSize();
     const newDir = await ensureParentDirs(newPath);
     const newHandle = await newDir.getFileHandle(basename(newPath), { create: true });
-    const accessHandle = await newHandle.createSyncAccessHandle();
-    try {
-      accessHandle.truncate(0);
-      accessHandle.write(new Uint8Array(data), { at: 0 });
-      accessHandle.flush();
-    } finally {
-      accessHandle.close();
+    dstAccess = await newHandle.createSyncAccessHandle();
+    dstAccess.truncate(0);
+    if (size > 0) {
+      const chunk = new Uint8Array(Math.min(size, RENAME_CHUNK));
+      let offset = 0;
+      while (offset < size) {
+        const len = Math.min(chunk.length, size - offset);
+        const view = len === chunk.length ? chunk : chunk.subarray(0, len);
+        srcAccess.read(view, { at: offset });
+        dstAccess.write(view, { at: offset });
+        offset += len;
+      }
     }
+    dstAccess.flush();
+    try {
+      dstAccess.close();
+    } catch {
+    }
+    dstAccess = null;
+    try {
+      srcAccess.close();
+    } catch {
+    }
+    srcAccess = null;
     await oldDir.removeEntry(basename(oldPath));
   } catch (err) {
     console.warn("[opfs-sync] rename failed:", oldPath, "\u2192", newPath, err);
+  } finally {
+    if (dstAccess) {
+      try {
+        dstAccess.close();
+      } catch {
+      }
+    }
+    if (srcAccess) {
+      try {
+        srcAccess.close();
+      } catch {
+      }
+    }
   }
 }
 async function navigateToParent(path) {

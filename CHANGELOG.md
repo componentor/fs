@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.0.44
+
+- Fix OOM during large streamed writes: coalesce per-path OPFS sync notifications in `sync-relay.worker.ts` so a single 100 MB chunked upload triggers one full-file read instead of one per chunk (~1500×). Eliminates `RangeError: Array buffer allocation failed` on repeated large uploads (e.g. Strapi multipart)
+- Cancel pending debounced syncs on `UNLINK`/`RMDIR`; reroute pending syncs on `RENAME` to the new path
+- Route `OP.SYMLINK` mirror through the same debounced flusher
+- Replace `scanOPFSEntries` with streaming `populateVFSFromOPFS`: directories created before files at each level, files copied via `SyncAccessHandle` + 2 MB chunked `engine.append`. Init peak memory bounded by chunk size instead of the sum of all OPFS file sizes
+- `renameInOPFS` (in `opfs-sync.worker.ts`) now copies via two `SyncAccessHandle`s in 2 MB chunks instead of materializing the whole file via `file.arrayBuffer()`
+- Coalesce pending `write` events for the same path in the OPFS sync queue — newer payload supersedes older, freeing the stale `ArrayBuffer` for GC while preserving ordering for non-write ops
+- Update `vfs-engine` test for the 100K default inode count
+
 ## 3.0.43
 
 - Update README changelog section and link to `CHANGELOG.md`

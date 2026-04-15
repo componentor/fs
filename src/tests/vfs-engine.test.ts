@@ -762,10 +762,10 @@ describe('VFSEngine', () => {
 
     it('should respect custom limits.maxInodes', () => {
       const h = createFormattedHandle();
-      // Default inode count is 10000, set max to 100
+      // Default inode count is 100000, set max to 100
       const e = new VFSEngine();
       expect(() => e.init(h as unknown as FileSystemSyncAccessHandle, { limits: { maxInodes: 100 } }))
-        .toThrow('Corrupt VFS: inode count 10000 exceeds maximum 100');
+        .toThrow('Corrupt VFS: inode count 100000 exceeds maximum 100');
     });
 
     it('should respect custom limits.maxBlocks', () => {

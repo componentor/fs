@@ -992,32 +992,70 @@ async function followerLoop(): Promise<void> {
 
 // ========== OPFS directory scanning (for auto-populate on fresh VFS) ==========
 
-interface OPFSInitEntry {
-  path: string;
-  type: 'file' | 'directory';
-  data?: Uint8Array;
-}
-
 const OPFS_SKIP = new Set(['.vfs.bin', '.vfs.bin.tmp']);
 
-async function scanOPFSEntries(
+// Chunk size for streamed population of fresh VFS from existing OPFS.
+// Caps peak memory during init at this size per file instead of
+// materializing every OPFS file into the heap simultaneously.
+const OPFS_POPULATE_CHUNK = 2 * 1024 * 1024;
+
+// Populate a fresh VFS from an existing OPFS tree, streaming one file at
+// a time through the engine. Directories are created before their files,
+// files are written via truncate + chunked append so peak memory is
+// bounded by OPFS_POPULATE_CHUNK rather than the sum of all file sizes.
+async function populateVFSFromOPFS(
   dir: FileSystemDirectoryHandle,
   prefix: string,
-): Promise<OPFSInitEntry[]> {
-  const result: OPFSInitEntry[] = [];
+): Promise<void> {
+  const subdirs: Array<{ name: string; handle: FileSystemDirectoryHandle }> = [];
+  const files: Array<{ name: string; handle: FileSystemFileHandle }> = [];
   for await (const [name, handle] of (dir as any).entries()) {
     if (prefix === '' && OPFS_SKIP.has(name)) continue;
-    const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;
     if (handle.kind === 'directory') {
-      result.push({ path: fullPath, type: 'directory' });
-      result.push(...await scanOPFSEntries(handle as FileSystemDirectoryHandle, fullPath));
+      subdirs.push({ name, handle: handle as FileSystemDirectoryHandle });
     } else {
-      const file = await (handle as FileSystemFileHandle).getFile();
-      const buf = await file.arrayBuffer();
-      result.push({ path: fullPath, type: 'file', data: new Uint8Array(buf) });
+      files.push({ name, handle: handle as FileSystemFileHandle });
     }
   }
-  return result;
+
+  // Create directories at this level first so file writes below (and
+  // recursive calls) can rely on their parents existing.
+  for (const { name } of subdirs) {
+    const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;
+    engine.mkdir(fullPath, 0o040755);
+  }
+
+  // Stream each file through a single reusable chunk buffer.
+  for (const { name, handle } of files) {
+    const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;
+    let access: FileSystemSyncAccessHandle | null = null;
+    try {
+      access = await (handle as unknown as { createSyncAccessHandle: () => Promise<FileSystemSyncAccessHandle> }).createSyncAccessHandle();
+      const size = access.getSize();
+      // Create as empty, then append in chunks. engine.write(fullPath, empty)
+      // establishes the inode; engine.append grows it without reallocation.
+      engine.write(fullPath, new Uint8Array(0));
+      if (size > 0) {
+        const chunk = new Uint8Array(Math.min(size, OPFS_POPULATE_CHUNK));
+        let offset = 0;
+        while (offset < size) {
+          const len = Math.min(chunk.length, size - offset);
+          const view = len === chunk.length ? chunk : chunk.subarray(0, len);
+          access.read(view, { at: offset });
+          engine.append(fullPath, view);
+          offset += len;
+        }
+      }
+    } finally {
+      if (access) { try { access.close(); } catch { /* ignore */ } }
+    }
+  }
+
+  // Recurse into subdirectories.
+  for (const { name, handle } of subdirs) {
+    const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;
+    await populateVFSFromOPFS(handle, fullPath);
+  }
 }
 
 /**
@@ -1163,21 +1201,11 @@ async function initEngine(config: {
     throw err;
   }
 
-  // Auto-populate fresh VFS from existing OPFS files
+  // Auto-populate fresh VFS from existing OPFS files (streamed one file
+  // at a time — see populateVFSFromOPFS for why).
   if (wasFresh) {
-    const opfsEntries = await scanOPFSEntries(rootDir, '');
-    if (opfsEntries.length > 0) {
-      const dirs = opfsEntries
-        .filter(e => e.type === 'directory')
-        .sort((a, b) => a.path.localeCompare(b.path));
-      for (const dir of dirs) {
-        engine.mkdir(dir.path, 0o040755);
-      }
-      for (const file of opfsEntries.filter(e => e.type === 'file')) {
-        engine.write(file.path, file.data!);
-      }
-      engine.flush();
-    }
+    await populateVFSFromOPFS(rootDir, '');
+    engine.flush();
   }
 
   // Spawn OPFS sync worker (mirrors VFS mutations to real OPFS files)
@@ -1271,6 +1299,44 @@ function broadcastWatch(op: number, path: string, newPath?: string): void {
 }
 
 // ========== OPFS sync notification (fire-and-forget, after SAB response) ==========
+//
+// Per-path debounce coalescer. Without this, every FWRITE/WRITE/FTRUNCATE
+// triggers a full-file `engine.read(path)` here — which allocates a
+// `new Uint8Array(inode.size)` on every call. For a file grown chunk-by-
+// chunk (e.g. formidable writing a 100 MB upload via a 64 KB stream),
+// that's ~1500 full-file reads totalling many GB of allocations, and the
+// largest allocation (the final full file size) eventually fails with
+// "Array buffer allocation failed" under memory pressure.
+//
+// Instead, coalesce bursts: any write-op schedules a sync 50 ms later,
+// and subsequent write-ops to the same path reset the timer. At most
+// ONE full-file read per burst, reading the file once at its final size.
+const pendingPathSyncs = new Map<string, ReturnType<typeof setTimeout>>();
+const SYNC_DEBOUNCE_MS = 50;
+
+function flushPathSync(path: string): void {
+  pendingPathSyncs.delete(path);
+  if (!opfsSyncPort) return;
+  try {
+    const result = engine.read(path);
+    if (result.status !== 0) return;
+    const ts = Date.now();
+    if (result.data && result.data.byteLength > 0) {
+      const buf = result.data.buffer.byteLength === result.data.byteLength
+        ? result.data.buffer
+        : result.data.slice().buffer;
+      opfsSyncPort.postMessage({ op: 'write', path, data: buf, ts } as const, [buf as ArrayBuffer]);
+    } else {
+      opfsSyncPort.postMessage({ op: 'write', path, data: new ArrayBuffer(0), ts });
+    }
+  } catch { /* best effort — don't crash the relay on sync failures */ }
+}
+
+function schedulePathSync(path: string): void {
+  const prev = pendingPathSyncs.get(path);
+  if (prev) clearTimeout(prev);
+  pendingPathSyncs.set(path, setTimeout(() => flushPathSync(path), SYNC_DEBOUNCE_MS));
+}
 
 function notifyOPFSSync(op: number, path: string, newPath?: string): void {
   if (!opfsSyncPort) return;
@@ -1289,47 +1355,43 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
     case OP.FTRUNCATE:
     case OP.COPY:
     case OP.LINK: {
-      const result = engine.read(path);
-      if (result.status === 0) {
-        if (result.data && result.data.byteLength > 0) {
-          const buf = result.data.buffer.byteLength === result.data.byteLength
-            ? result.data.buffer
-            : result.data.slice().buffer;
-          opfsSyncPort.postMessage({ op: 'write', path, data: buf, ts } as const, [buf as ArrayBuffer]);
-        } else {
-          // Empty file (e.g. .gitkeep) — send with empty ArrayBuffer
-          opfsSyncPort.postMessage({ op: 'write', path, data: new ArrayBuffer(0), ts });
-        }
-      }
+      // Coalesce bursts of writes to the same path — flush once after a
+      // short idle period so large chunked writes don't cause N
+      // full-file reads that exhaust the worker's heap.
+      schedulePathSync(path);
       break;
     }
     case OP.SYMLINK: {
-      // OPFS has no symlinks — mirror as regular file with target's content
-      const result = engine.read(path); // follows symlink to target
-      if (result.status === 0) {
-        if (result.data && result.data.byteLength > 0) {
-          const buf = result.data.buffer.byteLength === result.data.byteLength
-            ? result.data.buffer
-            : result.data.slice().buffer;
-          opfsSyncPort.postMessage({ op: 'write', path, data: buf, ts } as const, [buf as ArrayBuffer]);
-        } else {
-          opfsSyncPort.postMessage({ op: 'write', path, data: new ArrayBuffer(0), ts });
-        }
-      }
-      // If target doesn't exist yet (dangling symlink), skip — will be synced
-      // when the target is written and read through the symlink succeeds
+      // OPFS has no symlinks — mirror as regular file with the target's
+      // content. Route through the same debounced flusher so this also
+      // benefits from coalescing if the symlink target is being actively
+      // written in the same burst.
+      schedulePathSync(path);
       break;
     }
     case OP.UNLINK:
-    case OP.RMDIR:
+    case OP.RMDIR: {
+      // Cancel any pending debounced sync for this path — the file no
+      // longer exists, we'd just fail the read.
+      const pending = pendingPathSyncs.get(path);
+      if (pending) { clearTimeout(pending); pendingPathSyncs.delete(path); }
       opfsSyncPort.postMessage({ op: 'delete', path, ts });
       break;
+    }
     case OP.MKDIR:
     case OP.MKDTEMP:
       opfsSyncPort.postMessage({ op: 'mkdir', path, ts });
       break;
     case OP.RENAME:
       if (newPath) {
+        // Reroute any pending sync on the old path to the new path so
+        // the content ends up at the final location after the burst.
+        const pending = pendingPathSyncs.get(path);
+        if (pending) {
+          clearTimeout(pending);
+          pendingPathSyncs.delete(path);
+          schedulePathSync(newPath);
+        }
         opfsSyncPort.postMessage({ op: 'rename', path, newPath, ts });
       }
       break;

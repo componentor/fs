@@ -119,6 +119,28 @@ function enqueue(event: SyncEvent): void {
   if (event.op === 'rename' && event.newPath) {
     trackPending(event.newPath);
   }
+
+  // Coalesce bursts of 'write' events for the same path that are still
+  // waiting in the queue. Each write event carries a full-file
+  // ArrayBuffer — under backpressure (slow OPFS, big files) the queue
+  // can otherwise hold many superseded buffers at once. Replacing the
+  // pending event's payload with the newest drops the stale buffer for
+  // GC while preserving queue ordering for non-write ops.
+  //
+  // Note: the event at index 0 may already be mid-flight inside
+  // processNext (after its `queue.shift()`), so we only scan what's
+  // still queued.
+  if (event.op === 'write') {
+    for (let i = queue.length - 1; i >= 0; i--) {
+      const pending = queue[i];
+      if (pending.op === 'write' && normalizePath(pending.path) === normalizePath(event.path)) {
+        pending.data = event.data;
+        pending.ts = event.ts;
+        return;
+      }
+    }
+  }
+
   queue.push(event);
   if (!processing) processNext();
 }
@@ -215,28 +237,53 @@ async function mkdirInOPFS(path: string): Promise<void> {
   }
 }
 
+// Chunk size for the chunked rename copy. Caps peak memory during a
+// rename at this size rather than the full file size.
+const RENAME_CHUNK = 2 * 1024 * 1024;
+
 async function renameInOPFS(oldPath: string, newPath: string): Promise<void> {
-  // OPFS doesn't have a native rename — copy + delete
+  // OPFS has no native rename — copy + delete. Copy through two sync
+  // access handles in fixed-size chunks so a rename of a large file
+  // doesn't require materializing the whole file in memory.
+  let srcAccess: FileSystemSyncAccessHandle | null = null;
+  let dstAccess: FileSystemSyncAccessHandle | null = null;
   try {
     const oldDir = await navigateToParent(oldPath);
     const oldHandle = await oldDir.getFileHandle(basename(oldPath));
-    const file = await oldHandle.getFile();
-    const data = await file.arrayBuffer();
+    srcAccess = await oldHandle.createSyncAccessHandle();
+    const size = srcAccess.getSize();
 
     const newDir = await ensureParentDirs(newPath);
     const newHandle = await newDir.getFileHandle(basename(newPath), { create: true });
-    const accessHandle = await newHandle.createSyncAccessHandle();
-    try {
-      accessHandle.truncate(0);
-      accessHandle.write(new Uint8Array(data), { at: 0 });
-      accessHandle.flush();
-    } finally {
-      accessHandle.close();
+    dstAccess = await newHandle.createSyncAccessHandle();
+    dstAccess.truncate(0);
+
+    if (size > 0) {
+      const chunk = new Uint8Array(Math.min(size, RENAME_CHUNK));
+      let offset = 0;
+      while (offset < size) {
+        const len = Math.min(chunk.length, size - offset);
+        const view = len === chunk.length ? chunk : chunk.subarray(0, len);
+        srcAccess.read(view, { at: offset });
+        dstAccess.write(view, { at: offset });
+        offset += len;
+      }
     }
+    dstAccess.flush();
+
+    // Release handles before removeEntry — can't unlink a file that
+    // still has an open sync access handle.
+    try { dstAccess.close(); } catch { /* ignore */ }
+    dstAccess = null;
+    try { srcAccess.close(); } catch { /* ignore */ }
+    srcAccess = null;
 
     await oldDir.removeEntry(basename(oldPath));
   } catch (err) {
     console.warn('[opfs-sync] rename failed:', oldPath, '→', newPath, err);
+  } finally {
+    if (dstAccess) { try { dstAccess.close(); } catch { /* ignore */ } }
+    if (srcAccess) { try { srcAccess.close(); } catch { /* ignore */ } }
   }
 }
 

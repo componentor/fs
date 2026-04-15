@@ -3016,21 +3016,53 @@ async function followerLoop() {
   }
 }
 var OPFS_SKIP = /* @__PURE__ */ new Set([".vfs.bin", ".vfs.bin.tmp"]);
-async function scanOPFSEntries(dir, prefix) {
-  const result = [];
+var OPFS_POPULATE_CHUNK = 2 * 1024 * 1024;
+async function populateVFSFromOPFS(dir, prefix) {
+  const subdirs = [];
+  const files = [];
   for await (const [name, handle] of dir.entries()) {
     if (prefix === "" && OPFS_SKIP.has(name)) continue;
-    const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;
     if (handle.kind === "directory") {
-      result.push({ path: fullPath, type: "directory" });
-      result.push(...await scanOPFSEntries(handle, fullPath));
+      subdirs.push({ name, handle });
     } else {
-      const file = await handle.getFile();
-      const buf = await file.arrayBuffer();
-      result.push({ path: fullPath, type: "file", data: new Uint8Array(buf) });
+      files.push({ name, handle });
     }
   }
-  return result;
+  for (const { name } of subdirs) {
+    const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;
+    engine.mkdir(fullPath, 16877);
+  }
+  for (const { name, handle } of files) {
+    const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;
+    let access = null;
+    try {
+      access = await handle.createSyncAccessHandle();
+      const size = access.getSize();
+      engine.write(fullPath, new Uint8Array(0));
+      if (size > 0) {
+        const chunk = new Uint8Array(Math.min(size, OPFS_POPULATE_CHUNK));
+        let offset = 0;
+        while (offset < size) {
+          const len = Math.min(chunk.length, size - offset);
+          const view = len === chunk.length ? chunk : chunk.subarray(0, len);
+          access.read(view, { at: offset });
+          engine.append(fullPath, view);
+          offset += len;
+        }
+      }
+    } finally {
+      if (access) {
+        try {
+          access.close();
+        } catch {
+        }
+      }
+    }
+  }
+  for (const { name, handle } of subdirs) {
+    const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;
+    await populateVFSFromOPFS(handle, fullPath);
+  }
 }
 var DEFAULT_LIMITS = {
   maxInodes: 4e6,
@@ -3121,17 +3153,8 @@ async function initEngine(config) {
     throw err;
   }
   if (wasFresh) {
-    const opfsEntries = await scanOPFSEntries(rootDir, "");
-    if (opfsEntries.length > 0) {
-      const dirs = opfsEntries.filter((e) => e.type === "directory").sort((a, b) => a.path.localeCompare(b.path));
-      for (const dir of dirs) {
-        engine.mkdir(dir.path, 16877);
-      }
-      for (const file of opfsEntries.filter((e) => e.type === "file")) {
-        engine.write(file.path, file.data);
-      }
-      engine.flush();
-    }
+    await populateVFSFromOPFS(rootDir, "");
+    engine.flush();
   }
   if (config.opfsSync) {
     opfsSyncEnabled = true;
@@ -3197,6 +3220,29 @@ function broadcastWatch(op, path, newPath) {
     watchBc.postMessage({ eventType: "rename", path: newPath });
   }
 }
+var pendingPathSyncs = /* @__PURE__ */ new Map();
+var SYNC_DEBOUNCE_MS = 50;
+function flushPathSync(path) {
+  pendingPathSyncs.delete(path);
+  if (!opfsSyncPort) return;
+  try {
+    const result = engine.read(path);
+    if (result.status !== 0) return;
+    const ts = Date.now();
+    if (result.data && result.data.byteLength > 0) {
+      const buf = result.data.buffer.byteLength === result.data.byteLength ? result.data.buffer : result.data.slice().buffer;
+      opfsSyncPort.postMessage({ op: "write", path, data: buf, ts }, [buf]);
+    } else {
+      opfsSyncPort.postMessage({ op: "write", path, data: new ArrayBuffer(0), ts });
+    }
+  } catch {
+  }
+}
+function schedulePathSync(path) {
+  const prev = pendingPathSyncs.get(path);
+  if (prev) clearTimeout(prev);
+  pendingPathSyncs.set(path, setTimeout(() => flushPathSync(path), SYNC_DEBOUNCE_MS));
+}
 function notifyOPFSSync(op, path, newPath) {
   if (!opfsSyncPort) return;
   if (suppressPaths.has(path)) {
@@ -3212,39 +3258,35 @@ function notifyOPFSSync(op, path, newPath) {
     case OP.FTRUNCATE:
     case OP.COPY:
     case OP.LINK: {
-      const result = engine.read(path);
-      if (result.status === 0) {
-        if (result.data && result.data.byteLength > 0) {
-          const buf = result.data.buffer.byteLength === result.data.byteLength ? result.data.buffer : result.data.slice().buffer;
-          opfsSyncPort.postMessage({ op: "write", path, data: buf, ts }, [buf]);
-        } else {
-          opfsSyncPort.postMessage({ op: "write", path, data: new ArrayBuffer(0), ts });
-        }
-      }
+      schedulePathSync(path);
       break;
     }
     case OP.SYMLINK: {
-      const result = engine.read(path);
-      if (result.status === 0) {
-        if (result.data && result.data.byteLength > 0) {
-          const buf = result.data.buffer.byteLength === result.data.byteLength ? result.data.buffer : result.data.slice().buffer;
-          opfsSyncPort.postMessage({ op: "write", path, data: buf, ts }, [buf]);
-        } else {
-          opfsSyncPort.postMessage({ op: "write", path, data: new ArrayBuffer(0), ts });
-        }
-      }
+      schedulePathSync(path);
       break;
     }
     case OP.UNLINK:
-    case OP.RMDIR:
+    case OP.RMDIR: {
+      const pending = pendingPathSyncs.get(path);
+      if (pending) {
+        clearTimeout(pending);
+        pendingPathSyncs.delete(path);
+      }
       opfsSyncPort.postMessage({ op: "delete", path, ts });
       break;
+    }
     case OP.MKDIR:
     case OP.MKDTEMP:
       opfsSyncPort.postMessage({ op: "mkdir", path, ts });
       break;
     case OP.RENAME:
       if (newPath) {
+        const pending = pendingPathSyncs.get(path);
+        if (pending) {
+          clearTimeout(pending);
+          pendingPathSyncs.delete(path);
+          schedulePathSync(newPath);
+        }
         opfsSyncPort.postMessage({ op: "rename", path, newPath, ts });
       }
       break;
