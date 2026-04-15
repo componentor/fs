@@ -604,6 +604,21 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
 
+### v3.0.44 (2026)
+
+**Fixes:**
+- Coalesce per-path OPFS sync notifications in `sync-relay.worker.ts` — a single chunked 100 MB upload now triggers one full-file read instead of ~1500, eliminating `RangeError: Array buffer allocation failed` on repeated large uploads (e.g. Strapi multipart)
+- Cancel pending debounced syncs on `UNLINK`/`RMDIR`; reroute on `RENAME`
+- Route `OP.SYMLINK` mirror through the same debounced flusher
+
+**Memory:**
+- Replace `scanOPFSEntries` with streaming `populateVFSFromOPFS`: chunked `SyncAccessHandle` + `engine.append`, init peak memory bounded by 2 MB instead of sum of all OPFS file sizes
+- `renameInOPFS` copies via two `SyncAccessHandle`s in 2 MB chunks instead of `file.arrayBuffer()`
+- Coalesce pending `write` events for the same path in the OPFS sync queue — newer payload supersedes older, frees stale `ArrayBuffer` for GC
+
+**Tests:**
+- Update `vfs-engine` test for the 100K default inode count
+
 ### v3.0.43 (2026)
 
 **Docs:**
