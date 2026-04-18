@@ -39,6 +39,7 @@ interface FdEntry {
   inodeIdx: number;
   position: number;
   flags: number;
+  implicitPath?: string; // set when fd was opened via opendir on an implicit directory
 }
 
 export class VFSEngine {
@@ -81,6 +82,15 @@ export class VFSEngine {
 
   // Free inode hint — skip O(n) scan
   private freeInodeHint = 0;
+
+  // Implicit directory support — tracks all directory prefixes implied by file paths.
+  // Rebuilt lazily when pathIndex changes (tracked via generation counter).
+  // Map value is the stable timestamp (ms since epoch) assigned when the implicit
+  // dir was first discovered, so that stat() returns consistent mtime/ctime/atime
+  // across repeated calls.
+  private implicitDirs = new Map<string, number>();
+  private implicitDirsGen = -1;  // generation when implicitDirs was last rebuilt
+  private pathIndexGen = 0;      // bumped on every pathIndex mutation
 
   // Configurable upper bounds
   private maxInodes = 4_000_000;
@@ -458,6 +468,7 @@ export class VFSEngine {
 
       this.pathIndex.set(path, i);
     }
+    this.pathIndexGen++;
   }
 
   // ========== Low-level inode I/O ==========
@@ -886,6 +897,7 @@ export class VFSEngine {
 
     this.writeInode(idx, inode);
     this.pathIndex.set(path, idx);
+    this.pathIndexGen++;
 
     return idx;
   }
@@ -1103,6 +1115,7 @@ export class VFSEngine {
 
     // Remove from index
     this.pathIndex.delete(path);
+    this.pathIndexGen++;
     // Reset free inode hint
     if (idx < this.freeInodeHint) this.freeInodeHint = idx;
 
@@ -1114,7 +1127,13 @@ export class VFSEngine {
   stat(path: string): { status: number; data: Uint8Array | null } {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    if (idx === undefined) {
+      // Check for implicit directory (exists because files exist under it)
+      if (this.isImplicitDirectory(path)) {
+        return this.encodeImplicitDirStatResponse(path);
+      }
+      return { status: CODE_TO_STATUS.ENOENT, data: null };
+    }
 
     return this.encodeStatResponse(idx);
   }
@@ -1134,7 +1153,13 @@ export class VFSEngine {
       // of whether the final component is a symlink or not. lstat on an
       // existing symlink should return the symlink's own stats, not ENOENT.
       idx = this.resolvePathComponents(path, true);
-      if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT, data: null };
+      if (idx === undefined) {
+        // Check for implicit directory
+        if (this.isImplicitDirectory(path)) {
+          return this.encodeImplicitDirStatResponse(path);
+        }
+        return { status: CODE_TO_STATUS.ENOENT, data: null };
+      }
     }
 
     return this.encodeStatResponse(idx);
@@ -1144,16 +1169,22 @@ export class VFSEngine {
     const inode = this.readInode(idx);
 
     // Compute nlink for directories: 2 + number of child subdirectories
+    // (including implicit subdirectories so nlink stays consistent with
+    // what readdir reports).
     let nlink = inode.nlink;
     if (inode.type === INODE_TYPE.DIRECTORY) {
       const path = this.readPath(inode.pathOffset, inode.pathLength);
-      const children = this.getDirectChildren(path);
+      const children = this.getDirectChildrenWithImplicit(path);
       let subdirCount = 0;
       for (const child of children) {
-        const childIdx = this.pathIndex.get(child);
-        if (childIdx !== undefined) {
-          const childInode = this.readInode(childIdx);
-          if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
+        if (child.type === 'implicit') {
+          subdirCount++;
+        } else {
+          const childIdx = this.pathIndex.get(child.path);
+          if (childIdx !== undefined) {
+            const childInode = this.readInode(childIdx);
+            if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
+          }
         }
       }
       nlink = 2 + subdirCount;
@@ -1185,8 +1216,10 @@ export class VFSEngine {
       return this.mkdirRecursive(path);
     }
 
-    // Check if already exists
-    if (this.pathIndex.has(path)) return { status: CODE_TO_STATUS.EEXIST, data: null };
+    // Check if already exists (explicit or implicit)
+    if (this.pathIndex.has(path) || this.isImplicitDirectory(path)) {
+      return { status: CODE_TO_STATUS.EEXIST, data: null };
+    }
 
     // Ensure parent exists
     const parentStatus = this.ensureParent(path);
@@ -1232,7 +1265,31 @@ export class VFSEngine {
     path = this.normalizePath(path);
     const recursive = (flags & 1) !== 0;
     const idx = this.pathIndex.get(path);
-    if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === undefined) {
+      // Check for implicit directory — a dir that exists because files
+      // exist under it but no explicit inode was created.
+      if (this.isImplicitDirectory(path)) {
+        const children = this.getDirectChildrenWithImplicit(path);
+        if (children.length > 0) {
+          if (!recursive) return { status: CODE_TO_STATUS.ENOTEMPTY };
+          // Recursive: delete all real descendants; the implicit dir
+          // disappears automatically when its children are gone.
+          for (const desc of this.getAllDescendants(path)) {
+            const descIdx = this.pathIndex.get(desc)!;
+            const descInode = this.readInode(descIdx);
+            this.freeBlockRange(descInode.firstBlock, descInode.blockCount);
+            descInode.type = INODE_TYPE.FREE;
+            this.writeInode(descIdx, descInode);
+            this.pathIndex.delete(desc);
+          }
+          this.pathIndexGen++;
+          this.commitPending();
+        }
+        // Empty implicit dir or just-emptied: no-op — it vanishes on its own.
+        return { status: 0 };
+      }
+      return { status: CODE_TO_STATUS.ENOENT };
+    }
 
     const inode = this.readInode(idx);
     if (inode.type !== INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTDIR };
@@ -1258,6 +1315,7 @@ export class VFSEngine {
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
     this.pathIndex.delete(path);
+    this.pathIndexGen++;
     if (idx < this.freeInodeHint) this.freeInodeHint = idx;
 
     this.commitPending();
@@ -1268,27 +1326,43 @@ export class VFSEngine {
   readdir(path: string, flags: number = 0): { status: number; data: Uint8Array | null } {
     path = this.normalizePath(path);
     const resolved = this.resolvePathFull(path, true);
-    if (!resolved) return { status: CODE_TO_STATUS.ENOENT, data: null };
 
-    const inode = this.readInode(resolved.idx);
-    if (inode.type !== INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTDIR, data: null };
+    // Determine the effective directory path for child lookup
+    let effectiveDirPath: string;
+
+    if (resolved) {
+      const inode = this.readInode(resolved.idx);
+      if (inode.type !== INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTDIR, data: null };
+      // Use the resolved path for child lookup — when path is a symlink,
+      // the actual children are stored under the target path in pathIndex.
+      effectiveDirPath = resolved.resolvedPath;
+    } else if (this.isImplicitDirectory(path)) {
+      effectiveDirPath = path;
+    } else {
+      return { status: CODE_TO_STATUS.ENOENT, data: null };
+    }
 
     const withFileTypes = (flags & 1) !== 0;
-    // Use the resolved path for child lookup — when path is a symlink,
-    // the actual children are stored under the target path in pathIndex.
-    const children = this.getDirectChildren(resolved.resolvedPath);
+    // Use getDirectChildrenWithImplicit to discover both real and implicit children
+    const children = this.getDirectChildrenWithImplicit(effectiveDirPath);
 
     if (withFileTypes) {
       // Encode as: count(u32) + entries[name_len(u16) + name(bytes) + type(u8)]
       let totalSize = 4;
       const entries: { name: Uint8Array; type: number }[] = [];
 
-      for (const childPath of children) {
-        const name = childPath.substring(childPath.lastIndexOf('/') + 1);
+      for (const child of children) {
+        const name = child.path.substring(child.path.lastIndexOf('/') + 1);
         const nameBytes = encoder.encode(name);
-        const childIdx = this.pathIndex.get(childPath)!;
-        const childInode = this.readInode(childIdx);
-        entries.push({ name: nameBytes, type: childInode.type });
+        let type: number;
+        if (child.type === 'implicit') {
+          type = INODE_TYPE.DIRECTORY;
+        } else {
+          const childIdx = this.pathIndex.get(child.path)!;
+          const childInode = this.readInode(childIdx);
+          type = childInode.type;
+        }
+        entries.push({ name: nameBytes, type });
         totalSize += 2 + nameBytes.byteLength + 1; // nameLen + name + type
       }
 
@@ -1312,8 +1386,8 @@ export class VFSEngine {
     let totalSize = 4;
     const nameEntries: Uint8Array[] = [];
 
-    for (const childPath of children) {
-      const name = childPath.substring(childPath.lastIndexOf('/') + 1);
+    for (const child of children) {
+      const name = child.path.substring(child.path.lastIndexOf('/') + 1);
       const nameBytes = encoder.encode(name);
       nameEntries.push(nameBytes);
       totalSize += 2 + nameBytes.byteLength;
@@ -1367,6 +1441,7 @@ export class VFSEngine {
     // Update index
     this.pathIndex.delete(oldPath);
     this.pathIndex.set(newPath, idx);
+    this.pathIndexGen++;
 
     // If it's a directory, rename all descendants
     if (inode.type === INODE_TYPE.DIRECTORY) {
@@ -1401,7 +1476,7 @@ export class VFSEngine {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
     const buf = new Uint8Array(1);
-    buf[0] = idx !== undefined ? 1 : 0;
+    buf[0] = (idx !== undefined || this.isImplicitDirectory(path)) ? 1 : 0;
     return { status: 0, data: buf };
   }
 
@@ -1547,7 +1622,11 @@ export class VFSEngine {
   access(path: string, mode: number = 0): { status: number } {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === undefined) {
+      // Check for implicit directory
+      if (this.isImplicitDirectory(path)) return { status: 0 };
+      return { status: CODE_TO_STATUS.ENOENT };
+    }
 
     if (mode === 0) return { status: 0 }; // F_OK — just check existence
 
@@ -1575,7 +1654,13 @@ export class VFSEngine {
   realpath(path: string): { status: number; data: Uint8Array | null } {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    if (idx === undefined) {
+      // Check for implicit directory
+      if (this.isImplicitDirectory(path)) {
+        return { status: 0, data: encoder.encode(path) };
+      }
+      return { status: CODE_TO_STATUS.ENOENT, data: null };
+    }
 
     // Find the resolved path for this inode
     const inode = this.readInode(idx);
@@ -1841,6 +1926,7 @@ export class VFSEngine {
   fstat(fd: number): { status: number; data: Uint8Array | null } {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF, data: null };
+    if (entry.implicitPath) return this.encodeImplicitDirStatResponse(entry.implicitPath);
     return this.encodeStatResponse(entry.inodeIdx);
   }
 
@@ -1867,6 +1953,7 @@ export class VFSEngine {
   fchmod(fd: number, mode: number): { status: number } {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    if (entry.implicitPath) return { status: 0 }; // no-op for implicit dirs
     const inode = this.readInode(entry.inodeIdx);
     inode.mode = (inode.mode & S_IFMT) | (mode & 0o7777);
     inode.ctime = Date.now();
@@ -1878,6 +1965,7 @@ export class VFSEngine {
   fchown(fd: number, uid: number, gid: number): { status: number } {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    if (entry.implicitPath) return { status: 0 }; // no-op for implicit dirs
     const inode = this.readInode(entry.inodeIdx);
     inode.uid = uid;
     inode.gid = gid;
@@ -1890,6 +1978,7 @@ export class VFSEngine {
   futimes(fd: number, atime: number, mtime: number): { status: number } {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    if (entry.implicitPath) return { status: 0 }; // no-op for implicit dirs
     const inode = this.readInode(entry.inodeIdx);
     inode.atime = atime;
     inode.mtime = mtime;
@@ -1902,7 +1991,19 @@ export class VFSEngine {
   opendir(path: string, tabId: string): { status: number; data: Uint8Array | null } {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    if (idx === undefined) {
+      // Check for implicit directory
+      if (this.isImplicitDirectory(path)) {
+        // Create fd with synthetic inode index -1 and the path stored so
+        // fd-based operations (fstat, fchmod, etc.) can handle it.
+        const fd = this.nextFd++;
+        this.fdTable.set(fd, { tabId, inodeIdx: -1, position: 0, flags: 0, implicitPath: path });
+        const buf = new Uint8Array(4);
+        new DataView(buf.buffer).setUint32(0, fd, true);
+        return { status: 0, data: buf };
+      }
+      return { status: CODE_TO_STATUS.ENOENT, data: null };
+    }
 
     const inode = this.readInode(idx);
     if (inode.type !== INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTDIR, data: null };
@@ -1957,6 +2058,127 @@ export class VFSEngine {
     return children.sort();
   }
 
+  /**
+   * Rebuild the set of all implicit directory paths.
+   * An implicit directory is any ancestor path of a file/symlink in pathIndex
+   * that doesn't itself have an explicit inode entry.
+   * Only rebuilt when pathIndex has changed (tracked via generation counter).
+   */
+  private rebuildImplicitDirs(): void {
+    if (this.implicitDirsGen === this.pathIndexGen) return;
+
+    const now = Date.now();
+    const prev = this.implicitDirs;
+    this.implicitDirs = new Map<string, number>();
+    for (const filePath of this.pathIndex.keys()) {
+      // Walk up from each path, adding all ancestor dirs that aren't explicit
+      let pos = filePath.length;
+      while (true) {
+        pos = filePath.lastIndexOf('/', pos - 1);
+        if (pos <= 0) break; // reached root
+        const ancestor = filePath.substring(0, pos);
+        if (this.implicitDirs.has(ancestor)) break; // already tracked all ancestors from here up
+        if (!this.pathIndex.has(ancestor)) {
+          // Preserve timestamp if this implicit dir was already known,
+          // otherwise stamp it with "now" so stat() stays stable.
+          this.implicitDirs.set(ancestor, prev.get(ancestor) ?? now);
+        }
+      }
+    }
+
+    this.implicitDirsGen = this.pathIndexGen;
+  }
+
+  /**
+   * Check if a path is an implicit directory (exists because files exist under it,
+   * but no explicit directory inode was created for it).
+   */
+  private isImplicitDirectory(path: string): boolean {
+    if (path === '/') return false; // root always has an explicit inode
+    this.rebuildImplicitDirs();
+    return this.implicitDirs.has(path);
+  }
+
+  /**
+   * Get direct children of a directory path, including implicit subdirectories.
+   * Returns unique child full paths. Each entry is tagged with whether it's a
+   * real inode or an implicit directory.
+   */
+  private getDirectChildrenWithImplicit(dirPath: string): { path: string; type: 'real' | 'implicit' }[] {
+    const prefix = dirPath === '/' ? '/' : dirPath + '/';
+    const childNames = new Map<string, 'real' | 'implicit'>();
+
+    for (const path of this.pathIndex.keys()) {
+      if (path === dirPath) continue;
+      if (!path.startsWith(prefix)) continue;
+      const rest = path.substring(prefix.length);
+      const slashPos = rest.indexOf('/');
+      if (slashPos === -1) {
+        // Direct child file/dir — it's a real inode
+        childNames.set(rest, 'real');
+      } else {
+        // Deeper descendant — the first segment is an implicit subdirectory
+        const childName = rest.substring(0, slashPos);
+        if (!childNames.has(childName)) {
+          // Only mark as implicit if there's no real inode for it
+          const childFullPath = prefix + childName;
+          childNames.set(childName, this.pathIndex.has(childFullPath) ? 'real' : 'implicit');
+        }
+      }
+    }
+
+    const result: { path: string; type: 'real' | 'implicit' }[] = [];
+    for (const [name, type] of childNames) {
+      result.push({ path: prefix + name, type });
+    }
+    result.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+    return result;
+  }
+
+  /**
+   * Encode a synthetic stat response for an implicit directory.
+   * Returns directory stats with default mode, zero size, current timestamps.
+   */
+  private encodeImplicitDirStatResponse(path: string): { status: number; data: Uint8Array } {
+    // Use the stable timestamp assigned when this implicit dir was first
+    // discovered, so repeated stat() calls return the same mtime/ctime/atime.
+    this.rebuildImplicitDirs();
+    const ts = this.implicitDirs.get(path) ?? Date.now();
+    const mode = DEFAULT_DIR_MODE & ~(this.umask & 0o777);
+
+    // Count implicit subdirectories for nlink
+    const children = this.getDirectChildrenWithImplicit(path);
+    let subdirCount = 0;
+    for (const child of children) {
+      if (child.type === 'implicit') {
+        subdirCount++;
+      } else {
+        const childIdx = this.pathIndex.get(child.path);
+        if (childIdx !== undefined) {
+          const childInode = this.readInode(childIdx);
+          if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
+        }
+      }
+    }
+    const nlink = 2 + subdirCount;
+
+    // Encode stat: type(1) + mode(4) + size(8) + mtime(8) + ctime(8) + atime(8) + uid(4) + gid(4) + ino(4) + nlink(4) = 53 bytes
+    const buf = new Uint8Array(53);
+    const view = new DataView(buf.buffer);
+    view.setUint8(0, INODE_TYPE.DIRECTORY);
+    view.setUint32(1, mode, true);
+    view.setFloat64(5, 0, true); // size = 0
+    view.setFloat64(13, ts, true); // mtime
+    view.setFloat64(21, ts, true); // ctime
+    view.setFloat64(29, ts, true); // atime
+    view.setUint32(37, this.processUid, true);
+    view.setUint32(41, this.processGid, true);
+    view.setUint32(45, 0, true); // ino = 0 (synthetic)
+    view.setUint32(49, nlink, true);
+
+    return { status: 0, data: buf };
+  }
+
   private getAllDescendants(dirPath: string): string[] {
     const prefix = dirPath === '/' ? '/' : dirPath + '/';
     const descendants: string[] = [];
@@ -1979,7 +2201,11 @@ export class VFSEngine {
 
     const parentPath = path.substring(0, lastSlash);
     const parentIdx = this.pathIndex.get(parentPath);
-    if (parentIdx === undefined) return CODE_TO_STATUS.ENOENT;
+    if (parentIdx === undefined) {
+      // Check for implicit directory
+      if (this.isImplicitDirectory(parentPath)) return 0;
+      return CODE_TO_STATUS.ENOENT;
+    }
 
     const parentInode = this.readInode(parentIdx);
     if (parentInode.type !== INODE_TYPE.DIRECTORY) return CODE_TO_STATUS.ENOTDIR;

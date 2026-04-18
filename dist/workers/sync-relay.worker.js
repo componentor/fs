@@ -154,6 +154,16 @@ var VFSEngine = class {
   superblockDirty = false;
   // Free inode hint — skip O(n) scan
   freeInodeHint = 0;
+  // Implicit directory support — tracks all directory prefixes implied by file paths.
+  // Rebuilt lazily when pathIndex changes (tracked via generation counter).
+  // Map value is the stable timestamp (ms since epoch) assigned when the implicit
+  // dir was first discovered, so that stat() returns consistent mtime/ctime/atime
+  // across repeated calls.
+  implicitDirs = /* @__PURE__ */ new Map();
+  implicitDirsGen = -1;
+  // generation when implicitDirs was last rebuilt
+  pathIndexGen = 0;
+  // bumped on every pathIndex mutation
   // Configurable upper bounds
   maxInodes = 4e6;
   maxBlocks = 4e6;
@@ -438,6 +448,7 @@ var VFSEngine = class {
       }
       this.pathIndex.set(path, i);
     }
+    this.pathIndexGen++;
   }
   // ========== Low-level inode I/O ==========
   readInode(idx) {
@@ -758,6 +769,7 @@ var VFSEngine = class {
     };
     this.writeInode(idx, inode);
     this.pathIndex.set(path, idx);
+    this.pathIndexGen++;
     return idx;
   }
   // ========== Public API — called by server worker dispatch ==========
@@ -914,6 +926,7 @@ var VFSEngine = class {
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
     this.pathIndex.delete(path);
+    this.pathIndexGen++;
     if (idx < this.freeInodeHint) this.freeInodeHint = idx;
     this.commitPending();
     return { status: 0 };
@@ -922,7 +935,12 @@ var VFSEngine = class {
   stat(path) {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    if (idx === void 0) {
+      if (this.isImplicitDirectory(path)) {
+        return this.encodeImplicitDirStatResponse(path);
+      }
+      return { status: CODE_TO_STATUS.ENOENT, data: null };
+    }
     return this.encodeStatResponse(idx);
   }
   // ---- LSTAT (no symlink follow for the FINAL component) ----
@@ -931,7 +949,12 @@ var VFSEngine = class {
     let idx = this.resolvePathComponents(path, false);
     if (idx === void 0) {
       idx = this.resolvePathComponents(path, true);
-      if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+      if (idx === void 0) {
+        if (this.isImplicitDirectory(path)) {
+          return this.encodeImplicitDirStatResponse(path);
+        }
+        return { status: CODE_TO_STATUS.ENOENT, data: null };
+      }
     }
     return this.encodeStatResponse(idx);
   }
@@ -940,13 +963,17 @@ var VFSEngine = class {
     let nlink = inode.nlink;
     if (inode.type === INODE_TYPE.DIRECTORY) {
       const path = this.readPath(inode.pathOffset, inode.pathLength);
-      const children = this.getDirectChildren(path);
+      const children = this.getDirectChildrenWithImplicit(path);
       let subdirCount = 0;
       for (const child of children) {
-        const childIdx = this.pathIndex.get(child);
-        if (childIdx !== void 0) {
-          const childInode = this.readInode(childIdx);
-          if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
+        if (child.type === "implicit") {
+          subdirCount++;
+        } else {
+          const childIdx = this.pathIndex.get(child.path);
+          if (childIdx !== void 0) {
+            const childInode = this.readInode(childIdx);
+            if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
+          }
         }
       }
       nlink = 2 + subdirCount;
@@ -972,7 +999,9 @@ var VFSEngine = class {
     if (recursive) {
       return this.mkdirRecursive(path);
     }
-    if (this.pathIndex.has(path)) return { status: CODE_TO_STATUS.EEXIST, data: null };
+    if (this.pathIndex.has(path) || this.isImplicitDirectory(path)) {
+      return { status: CODE_TO_STATUS.EEXIST, data: null };
+    }
     const parentStatus = this.ensureParent(path);
     if (parentStatus !== 0) return { status: parentStatus, data: null };
     const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
@@ -1007,7 +1036,26 @@ var VFSEngine = class {
     path = this.normalizePath(path);
     const recursive = (flags & 1) !== 0;
     const idx = this.pathIndex.get(path);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === void 0) {
+      if (this.isImplicitDirectory(path)) {
+        const children2 = this.getDirectChildrenWithImplicit(path);
+        if (children2.length > 0) {
+          if (!recursive) return { status: CODE_TO_STATUS.ENOTEMPTY };
+          for (const desc of this.getAllDescendants(path)) {
+            const descIdx = this.pathIndex.get(desc);
+            const descInode = this.readInode(descIdx);
+            this.freeBlockRange(descInode.firstBlock, descInode.blockCount);
+            descInode.type = INODE_TYPE.FREE;
+            this.writeInode(descIdx, descInode);
+            this.pathIndex.delete(desc);
+          }
+          this.pathIndexGen++;
+          this.commitPending();
+        }
+        return { status: 0 };
+      }
+      return { status: CODE_TO_STATUS.ENOENT };
+    }
     const inode = this.readInode(idx);
     if (inode.type !== INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTDIR };
     const children = this.getDirectChildren(path);
@@ -1025,6 +1073,7 @@ var VFSEngine = class {
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
     this.pathIndex.delete(path);
+    this.pathIndexGen++;
     if (idx < this.freeInodeHint) this.freeInodeHint = idx;
     this.commitPending();
     return { status: 0 };
@@ -1033,20 +1082,33 @@ var VFSEngine = class {
   readdir(path, flags = 0) {
     path = this.normalizePath(path);
     const resolved = this.resolvePathFull(path, true);
-    if (!resolved) return { status: CODE_TO_STATUS.ENOENT, data: null };
-    const inode = this.readInode(resolved.idx);
-    if (inode.type !== INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTDIR, data: null };
+    let effectiveDirPath;
+    if (resolved) {
+      const inode = this.readInode(resolved.idx);
+      if (inode.type !== INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTDIR, data: null };
+      effectiveDirPath = resolved.resolvedPath;
+    } else if (this.isImplicitDirectory(path)) {
+      effectiveDirPath = path;
+    } else {
+      return { status: CODE_TO_STATUS.ENOENT, data: null };
+    }
     const withFileTypes = (flags & 1) !== 0;
-    const children = this.getDirectChildren(resolved.resolvedPath);
+    const children = this.getDirectChildrenWithImplicit(effectiveDirPath);
     if (withFileTypes) {
       let totalSize2 = 4;
       const entries = [];
-      for (const childPath of children) {
-        const name = childPath.substring(childPath.lastIndexOf("/") + 1);
+      for (const child of children) {
+        const name = child.path.substring(child.path.lastIndexOf("/") + 1);
         const nameBytes = encoder.encode(name);
-        const childIdx = this.pathIndex.get(childPath);
-        const childInode = this.readInode(childIdx);
-        entries.push({ name: nameBytes, type: childInode.type });
+        let type;
+        if (child.type === "implicit") {
+          type = INODE_TYPE.DIRECTORY;
+        } else {
+          const childIdx = this.pathIndex.get(child.path);
+          const childInode = this.readInode(childIdx);
+          type = childInode.type;
+        }
+        entries.push({ name: nameBytes, type });
         totalSize2 += 2 + nameBytes.byteLength + 1;
       }
       const buf2 = new Uint8Array(totalSize2);
@@ -1064,8 +1126,8 @@ var VFSEngine = class {
     }
     let totalSize = 4;
     const nameEntries = [];
-    for (const childPath of children) {
-      const name = childPath.substring(childPath.lastIndexOf("/") + 1);
+    for (const child of children) {
+      const name = child.path.substring(child.path.lastIndexOf("/") + 1);
       const nameBytes = encoder.encode(name);
       nameEntries.push(nameBytes);
       totalSize += 2 + nameBytes.byteLength;
@@ -1106,6 +1168,7 @@ var VFSEngine = class {
     this.writeInode(idx, inode);
     this.pathIndex.delete(oldPath);
     this.pathIndex.set(newPath, idx);
+    this.pathIndexGen++;
     if (inode.type === INODE_TYPE.DIRECTORY) {
       const prefix = oldPath === "/" ? "/" : oldPath + "/";
       const toRename = [];
@@ -1134,7 +1197,7 @@ var VFSEngine = class {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
     const buf = new Uint8Array(1);
-    buf[0] = idx !== void 0 ? 1 : 0;
+    buf[0] = idx !== void 0 || this.isImplicitDirectory(path) ? 1 : 0;
     return { status: 0, data: buf };
   }
   // ---- TRUNCATE ----
@@ -1237,7 +1300,10 @@ var VFSEngine = class {
   access(path, mode = 0) {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === void 0) {
+      if (this.isImplicitDirectory(path)) return { status: 0 };
+      return { status: CODE_TO_STATUS.ENOENT };
+    }
     if (mode === 0) return { status: 0 };
     if (!this.strictPermissions) return { status: 0 };
     const inode = this.readInode(idx);
@@ -1257,7 +1323,12 @@ var VFSEngine = class {
   realpath(path) {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    if (idx === void 0) {
+      if (this.isImplicitDirectory(path)) {
+        return { status: 0, data: encoder.encode(path) };
+      }
+      return { status: CODE_TO_STATUS.ENOENT, data: null };
+    }
     const inode = this.readInode(idx);
     const resolvedPath = this.readPath(inode.pathOffset, inode.pathLength);
     return { status: 0, data: encoder.encode(resolvedPath) };
@@ -1446,6 +1517,7 @@ var VFSEngine = class {
   fstat(fd) {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF, data: null };
+    if (entry.implicitPath) return this.encodeImplicitDirStatResponse(entry.implicitPath);
     return this.encodeStatResponse(entry.inodeIdx);
   }
   // ---- FTRUNCATE ----
@@ -1468,6 +1540,7 @@ var VFSEngine = class {
   fchmod(fd, mode) {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    if (entry.implicitPath) return { status: 0 };
     const inode = this.readInode(entry.inodeIdx);
     inode.mode = inode.mode & S_IFMT | mode & 4095;
     inode.ctime = Date.now();
@@ -1478,6 +1551,7 @@ var VFSEngine = class {
   fchown(fd, uid, gid) {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    if (entry.implicitPath) return { status: 0 };
     const inode = this.readInode(entry.inodeIdx);
     inode.uid = uid;
     inode.gid = gid;
@@ -1489,6 +1563,7 @@ var VFSEngine = class {
   futimes(fd, atime, mtime) {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    if (entry.implicitPath) return { status: 0 };
     const inode = this.readInode(entry.inodeIdx);
     inode.atime = atime;
     inode.mtime = mtime;
@@ -1500,7 +1575,16 @@ var VFSEngine = class {
   opendir(path, tabId2) {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    if (idx === void 0) {
+      if (this.isImplicitDirectory(path)) {
+        const fd2 = this.nextFd++;
+        this.fdTable.set(fd2, { tabId: tabId2, inodeIdx: -1, position: 0, flags: 0, implicitPath: path });
+        const buf2 = new Uint8Array(4);
+        new DataView(buf2.buffer).setUint32(0, fd2, true);
+        return { status: 0, data: buf2 };
+      }
+      return { status: CODE_TO_STATUS.ENOENT, data: null };
+    }
     const inode = this.readInode(idx);
     if (inode.type !== INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTDIR, data: null };
     const fd = this.nextFd++;
@@ -1539,6 +1623,106 @@ var VFSEngine = class {
     }
     return children.sort();
   }
+  /**
+   * Rebuild the set of all implicit directory paths.
+   * An implicit directory is any ancestor path of a file/symlink in pathIndex
+   * that doesn't itself have an explicit inode entry.
+   * Only rebuilt when pathIndex has changed (tracked via generation counter).
+   */
+  rebuildImplicitDirs() {
+    if (this.implicitDirsGen === this.pathIndexGen) return;
+    const now = Date.now();
+    const prev = this.implicitDirs;
+    this.implicitDirs = /* @__PURE__ */ new Map();
+    for (const filePath of this.pathIndex.keys()) {
+      let pos = filePath.length;
+      while (true) {
+        pos = filePath.lastIndexOf("/", pos - 1);
+        if (pos <= 0) break;
+        const ancestor = filePath.substring(0, pos);
+        if (this.implicitDirs.has(ancestor)) break;
+        if (!this.pathIndex.has(ancestor)) {
+          this.implicitDirs.set(ancestor, prev.get(ancestor) ?? now);
+        }
+      }
+    }
+    this.implicitDirsGen = this.pathIndexGen;
+  }
+  /**
+   * Check if a path is an implicit directory (exists because files exist under it,
+   * but no explicit directory inode was created for it).
+   */
+  isImplicitDirectory(path) {
+    if (path === "/") return false;
+    this.rebuildImplicitDirs();
+    return this.implicitDirs.has(path);
+  }
+  /**
+   * Get direct children of a directory path, including implicit subdirectories.
+   * Returns unique child full paths. Each entry is tagged with whether it's a
+   * real inode or an implicit directory.
+   */
+  getDirectChildrenWithImplicit(dirPath) {
+    const prefix = dirPath === "/" ? "/" : dirPath + "/";
+    const childNames = /* @__PURE__ */ new Map();
+    for (const path of this.pathIndex.keys()) {
+      if (path === dirPath) continue;
+      if (!path.startsWith(prefix)) continue;
+      const rest = path.substring(prefix.length);
+      const slashPos = rest.indexOf("/");
+      if (slashPos === -1) {
+        childNames.set(rest, "real");
+      } else {
+        const childName = rest.substring(0, slashPos);
+        if (!childNames.has(childName)) {
+          const childFullPath = prefix + childName;
+          childNames.set(childName, this.pathIndex.has(childFullPath) ? "real" : "implicit");
+        }
+      }
+    }
+    const result = [];
+    for (const [name, type] of childNames) {
+      result.push({ path: prefix + name, type });
+    }
+    result.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+    return result;
+  }
+  /**
+   * Encode a synthetic stat response for an implicit directory.
+   * Returns directory stats with default mode, zero size, current timestamps.
+   */
+  encodeImplicitDirStatResponse(path) {
+    this.rebuildImplicitDirs();
+    const ts = this.implicitDirs.get(path) ?? Date.now();
+    const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
+    const children = this.getDirectChildrenWithImplicit(path);
+    let subdirCount = 0;
+    for (const child of children) {
+      if (child.type === "implicit") {
+        subdirCount++;
+      } else {
+        const childIdx = this.pathIndex.get(child.path);
+        if (childIdx !== void 0) {
+          const childInode = this.readInode(childIdx);
+          if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
+        }
+      }
+    }
+    const nlink = 2 + subdirCount;
+    const buf = new Uint8Array(53);
+    const view = new DataView(buf.buffer);
+    view.setUint8(0, INODE_TYPE.DIRECTORY);
+    view.setUint32(1, mode, true);
+    view.setFloat64(5, 0, true);
+    view.setFloat64(13, ts, true);
+    view.setFloat64(21, ts, true);
+    view.setFloat64(29, ts, true);
+    view.setUint32(37, this.processUid, true);
+    view.setUint32(41, this.processGid, true);
+    view.setUint32(45, 0, true);
+    view.setUint32(49, nlink, true);
+    return { status: 0, data: buf };
+  }
   getAllDescendants(dirPath) {
     const prefix = dirPath === "/" ? "/" : dirPath + "/";
     const descendants = [];
@@ -1556,7 +1740,10 @@ var VFSEngine = class {
     if (lastSlash <= 0) return 0;
     const parentPath = path.substring(0, lastSlash);
     const parentIdx = this.pathIndex.get(parentPath);
-    if (parentIdx === void 0) return CODE_TO_STATUS.ENOENT;
+    if (parentIdx === void 0) {
+      if (this.isImplicitDirectory(parentPath)) return 0;
+      return CODE_TO_STATUS.ENOENT;
+    }
     const parentInode = this.readInode(parentIdx);
     if (parentInode.type !== INODE_TYPE.DIRECTORY) return CODE_TO_STATUS.ENOTDIR;
     return 0;

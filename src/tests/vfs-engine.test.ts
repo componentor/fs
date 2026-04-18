@@ -978,4 +978,170 @@ describe('VFSEngine', () => {
       expect(new TextDecoder().decode(got.data!)).toBe('b');
     });
   });
+
+  describe('implicit directories', () => {
+    // An implicit directory exists because files exist beneath it, even
+    // though no explicit mkdir() was ever called for that path.
+
+    function createImplicitSetup() {
+      // Create files via normal write (which requires parent dirs), then
+      // remove the directory inodes to simulate the implicit-dir scenario
+      // that occurs during bulk OPFS import or direct pathIndex population.
+      engine.mkdir('/a', 1);
+      engine.mkdir('/a/b', 1);
+      engine.mkdir('/a/b/c', 1);
+      engine.write('/a/b/c/file1.txt', new TextEncoder().encode('one'));
+      engine.write('/a/b/c/file2.txt', new TextEncoder().encode('two'));
+      engine.write('/a/b/other.txt', new TextEncoder().encode('other'));
+      // Remove the intermediate dir inodes — files stay in pathIndex but
+      // their parent dirs become implicit (no inode, only implied by
+      // child file paths).
+      const pi = (engine as any).pathIndex as Map<string, number>;
+      pi.delete('/a');
+      pi.delete('/a/b');
+      pi.delete('/a/b/c');
+      (engine as any).pathIndexGen++;
+    }
+
+    function decodeFd(data: Uint8Array): number {
+      return new DataView(data.buffer, data.byteOffset, 4).getUint32(0, true);
+    }
+
+    it('should stat an implicit directory', () => {
+      createImplicitSetup();
+      const r = engine.stat('/a/b');
+      expect(r.status).toBe(0);
+      const view = new DataView(r.data!.buffer, r.data!.byteOffset, r.data!.byteLength);
+      // type byte = DIRECTORY (2)
+      expect(view.getUint8(0)).toBe(2);
+    });
+
+    it('should lstat an implicit directory', () => {
+      createImplicitSetup();
+      const r = engine.lstat('/a/b');
+      expect(r.status).toBe(0);
+      expect(new DataView(r.data!.buffer, r.data!.byteOffset).getUint8(0)).toBe(2);
+    });
+
+    it('should return stable timestamps across repeated stat calls', () => {
+      createImplicitSetup();
+      const r1 = engine.stat('/a/b');
+      const r2 = engine.stat('/a/b');
+      const mtime1 = new DataView(r1.data!.buffer, r1.data!.byteOffset).getFloat64(13, true);
+      const mtime2 = new DataView(r2.data!.buffer, r2.data!.byteOffset).getFloat64(13, true);
+      expect(mtime1).toBe(mtime2);
+    });
+
+    it('should readdir an implicit directory', () => {
+      createImplicitSetup();
+      // /a/b has direct children: /a/b/c (implicit subdir) and /a/b/other.txt
+      const r = engine.readdir('/a/b');
+      expect(r.status).toBe(0);
+      // Decode plain readdir response: count(u32) + entries[nameLen(u16) + name]
+      const view = new DataView(r.data!.buffer, r.data!.byteOffset, r.data!.byteLength);
+      const count = view.getUint32(0, true);
+      expect(count).toBe(2); // 'c' and 'other.txt'
+      const names: string[] = [];
+      let off = 4;
+      for (let i = 0; i < count; i++) {
+        const nameLen = view.getUint16(off, true); off += 2;
+        names.push(new TextDecoder().decode(r.data!.subarray(off, off + nameLen)));
+        off += nameLen;
+      }
+      expect(names.sort()).toEqual(['c', 'other.txt']);
+    });
+
+    it('should report exists=true for implicit directory', () => {
+      createImplicitSetup();
+      const r = engine.exists('/a/b');
+      expect(r.data![0]).toBe(1);
+    });
+
+    it('should access an implicit directory', () => {
+      createImplicitSetup();
+      expect(engine.access('/a/b').status).toBe(0);
+    });
+
+    it('should realpath an implicit directory', () => {
+      createImplicitSetup();
+      const r = engine.realpath('/a/b');
+      expect(r.status).toBe(0);
+      expect(new TextDecoder().decode(r.data!)).toBe('/a/b');
+    });
+
+    it('should opendir + fstat an implicit directory without crash', () => {
+      createImplicitSetup();
+      const openR = engine.opendir('/a/b', 'tab1');
+      expect(openR.status).toBe(0);
+      const fd = decodeFd(openR.data!);
+      // fstat must return synthetic dir stats, not crash via readInode(-1)
+      const statR = engine.fstat(fd);
+      expect(statR.status).toBe(0);
+      expect(new DataView(statR.data!.buffer, statR.data!.byteOffset).getUint8(0)).toBe(2);
+    });
+
+    it('should no-op fchmod/fchown/futimes on implicit dir fd', () => {
+      createImplicitSetup();
+      const fd = decodeFd(engine.opendir('/a/b', 'tab1').data!);
+      expect(engine.fchmod(fd, 0o755).status).toBe(0);
+      expect(engine.fchown(fd, 1000, 1000).status).toBe(0);
+      expect(engine.futimes(fd, 100, 200).status).toBe(0);
+    });
+
+    it('should rmdir non-recursive on non-empty implicit dir → ENOTEMPTY', () => {
+      createImplicitSetup();
+      const r = engine.rmdir('/a/b');
+      // ENOTEMPTY
+      expect(r.status).not.toBe(0);
+    });
+
+    it('should rmdir recursive on implicit dir and delete descendants', () => {
+      createImplicitSetup();
+      const r = engine.rmdir('/a/b', 1); // recursive
+      expect(r.status).toBe(0);
+      // Children should be gone.
+      expect(engine.read('/a/b/c/file1.txt').status).not.toBe(0);
+      expect(engine.read('/a/b/other.txt').status).not.toBe(0);
+      // Implicit dir itself should no longer exist.
+      expect(engine.exists('/a/b').data![0]).toBe(0);
+    });
+
+    it('should mkdir(EEXIST) on implicit dir', () => {
+      createImplicitSetup();
+      const r = engine.mkdir('/a/b');
+      expect(r.status).not.toBe(0); // EEXIST
+    });
+
+    it('should mkdirRecursive materialize implicit segments as real dirs', () => {
+      createImplicitSetup();
+      // /a and /a/b are implicit. mkdir -p should materialize them as
+      // real inodes so path resolution works for the new leaf.
+      engine.mkdir('/a/b/newdir', 1); // recursive
+      // /a/b/newdir should exist as a real dir.
+      const r = engine.stat('/a/b/newdir');
+      expect(r.status).toBe(0);
+      expect(new DataView(r.data!.buffer, r.data!.byteOffset).getUint8(0)).toBe(2);
+      // /a and /a/b should now be real dirs too (materialized).
+      expect(engine.stat('/a').status).toBe(0);
+      expect(engine.stat('/a/b').status).toBe(0);
+    });
+
+    it('should include implicit subdirs in nlink of real parent dir', () => {
+      // Create a real parent, a real child dir (so write succeeds), write
+      // a file, then delete the child dir inode to make it implicit.
+      engine.mkdir('/realparent');
+      engine.mkdir('/realparent/implicitchild');
+      engine.write('/realparent/implicitchild/file.txt', new TextEncoder().encode('x'));
+      const pi = (engine as any).pathIndex as Map<string, number>;
+      pi.delete('/realparent/implicitchild');
+      (engine as any).pathIndexGen++;
+
+      const r = engine.stat('/realparent');
+      expect(r.status).toBe(0);
+      const view = new DataView(r.data!.buffer, r.data!.byteOffset, r.data!.byteLength);
+      const nlink = view.getUint32(49, true);
+      // nlink = 2 (self + parent) + 1 implicit subdir = 3
+      expect(nlink).toBe(3);
+    });
+  });
 });

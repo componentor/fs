@@ -1,5 +1,15 @@
 # Changelog
 
+## 3.0.46
+
+- Implicit directory support: directories implied by file paths (e.g. `/a/b` when `/a/b/c/file.txt` exists without an explicit `mkdir`) are now recognized by `stat`, `lstat`, `readdir`, `opendir`, `access`, `realpath`, `exists`, `mkdir` (EEXIST guard), and `ensureParent`
+- Fix crash when calling `fstat`/`fchmod`/`fchown`/`futimes` on an fd opened via `opendir` on an implicit directory (`inodeIdx: -1` previously caused garbage reads from negative file offsets)
+- `rmdir` on implicit directories: non-recursive returns ENOTEMPTY when children exist; recursive deletes all real descendants and the implicit dir vanishes automatically
+- `encodeStatResponse` for real directories now counts implicit subdirectories in `nlink`, consistent with what `readdir` reports
+- Implicit directory timestamps are now stable across repeated `stat()` calls (stored on first discovery, preserved across cache rebuilds)
+- Generation-counter cache (`pathIndexGen`) for lazy implicit-dir rebuild — only recomputed when `pathIndex` actually changes
+- Add 14 tests for implicit directory behavior (stat, lstat, readdir, exists, access, realpath, opendir+fstat, fchmod/fchown/futimes no-op, rmdir non-recursive/recursive, mkdir EEXIST, mkdirRecursive materialization, nlink with implicit subdirs)
+
 ## 3.0.45
 
 - Fix "Array buffer allocation failed" on multi-hundred-MB VFS operations by streaming all large-buffer paths through a bounded 4 MB scratch buffer instead of materializing the whole thing at once:

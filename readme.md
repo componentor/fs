@@ -604,6 +604,21 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
 
+### v3.0.46 (2026)
+
+**Features:**
+- Implicit directory support: directories implied by file paths are now recognized by `stat`, `lstat`, `readdir`, `opendir`, `access`, `realpath`, `exists`, `mkdir`, and `ensureParent`
+- Generation-counter cache for lazy implicit-dir rebuild
+
+**Fixes:**
+- Fix crash on `fstat`/`fchmod`/`fchown`/`futimes` when fd was opened via `opendir` on an implicit directory
+- `rmdir` on implicit directories now returns ENOTEMPTY (non-recursive) or deletes descendants (recursive) instead of ENOENT
+- `nlink` for real directories now counts implicit subdirectories, consistent with `readdir`
+- Implicit directory timestamps are stable across repeated `stat()` calls
+
+**Tests:**
+- 14 new tests for implicit directory behavior
+
 ### v3.0.45 (2026)
 
 **Fixes:**
