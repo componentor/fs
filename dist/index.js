@@ -2924,14 +2924,7 @@ var VFSFileSystem = class {
           }
         };
         mc.port1.start();
-        const oldPort = this.brokerControlPort;
         this.brokerControlPort = mc.port1;
-        if (oldPort) {
-          try {
-            oldPort.close();
-          } catch {
-          }
-        }
       }).catch((err) => {
         console.warn("[VFS] SW broker unavailable, single-tab only:", err.message);
       });

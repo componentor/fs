@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.0.48
+
+- Eliminate residual race in the SW broker heartbeat: stop calling `close()` on the previous control port at all. The 3.0.47 fix posted `register-server` before closing, but `close()` sends its disentangle signal to the SW on a separate IPC pipe with no FIFO guarantee against the SW main-channel queue. If the disentangle landed before the SW processed `register-server`, any follower `transfer-port` already in the SW inbox was dispatched against a now-detached `serverPort` and silently dropped (postMessage to a disentangled peer is a no-op per spec)
+- Leaving the old port open keeps it routable until the SW processes `register-server` and overwrites `serverPort`. Both endpoints of the old channel become unreferenced after that (leader replaced `brokerControlPort`; SW replaced `serverPort`) and the pair is GC-eligible — no leak in steady state, and a port that can't receive messages can't keep itself alive via its onmessage listener
+
 ## 3.0.47
 
 - Fix multi-tab broker death after the service worker is idle-killed (≥30s on Chrome). When the SW restarts, its `serverPort` is null and any follower `transfer-port` queued in `pending` would never reach the leader, so secondary tabs failed with `[Shell] Failed to load cwd` until refresh

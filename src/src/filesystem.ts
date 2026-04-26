@@ -504,14 +504,22 @@ export class VFSFileSystem {
 
     const register = (): void => {
       this.getServiceWorker().then(sw => {
-        // Post the new control port BEFORE closing the old one. If we close
-        // first, any follower `transfer-port` already sitting in the SW's
-        // inbox queue gets forwarded to the now-detached old port and is
-        // silently dropped (postMessage to a port whose peer is detached is
-        // a no-op per spec) — leaving that follower permanently stuck until
-        // refresh. Posting first ensures the SW swaps in the new serverPort
-        // before the next message is processed; the old port can then be
-        // closed without affecting routing.
+        // Deliberately do NOT close the previous control port. Closing it
+        // sends a disentangle signal to the SW on a separate IPC pipe from
+        // the one carrying `register-server`, with no FIFO guarantee between
+        // them. If the disentangle lands first, any follower `transfer-port`
+        // already in the SW's inbox is dispatched against the still-current
+        // `serverPort = old.port2`, which is now detached — postMessage to a
+        // disentangled port is a silent no-op per spec, so the follower's
+        // port disappears and the tab stays stuck.
+        //
+        // Leaving the old port open keeps it routable for any in-flight
+        // `transfer-port` until the SW processes `register-server` and
+        // overwrites `serverPort` with the new port. After that, both
+        // endpoints of the old channel are unreferenced (leader replaced
+        // `brokerControlPort`; SW replaced `serverPort`) and the pair is
+        // GC-eligible. The onmessage listener doesn't keep port1 alive — a
+        // port that can't receive messages can't fire events.
         const mc = new MessageChannel();
         sw.postMessage({ type: 'register-server' }, [mc.port2]);
 
@@ -527,12 +535,7 @@ export class VFSFileSystem {
           }
         };
         mc.port1.start();
-
-        const oldPort = this.brokerControlPort;
         this.brokerControlPort = mc.port1;
-        if (oldPort) {
-          try { oldPort.close(); } catch { /* ignore */ }
-        }
       }).catch(err => {
         console.warn('[VFS] SW broker unavailable, single-tab only:', (err as Error).message);
       });

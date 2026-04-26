@@ -604,6 +604,11 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
 
+### v3.0.48 (2026)
+
+**Fixes:**
+- Close the residual race left in the 3.0.47 broker-heartbeat fix: stop calling `close()` on the prior control port. The disentangle signal travels on a separate IPC pipe from the SW main channel with no ordering guarantee against `register-server`, so a `transfer-port` already queued in the SW inbox could still be dispatched against a detached `serverPort` and silently dropped. Letting the old port live until both endpoints become unreferenced (and GC-collected) keeps it routable through the swap and removes the window entirely
+
 ### v3.0.47 (2026)
 
 **Fixes:**
