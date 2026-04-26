@@ -604,6 +604,13 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
 
+### v3.0.47 (2026)
+
+**Fixes:**
+- Multi-tab broker survives service-worker idle-kill (≥30s on Chrome). Secondary tabs no longer fail with `[Shell] Failed to load cwd` after the SW is restarted — the leader re-registers on a 5 s heartbeat and the SW flushes any queued follower `transfer-port` messages to the new control port
+- Eliminate a race where heartbeat re-registration could silently drop in-flight follower `transfer-port` messages (new control port is now posted to the SW before the old one is closed)
+- `leader-changed` is broadcast exactly once at initial registration instead of on every heartbeat tick — prevents spurious EIO errors on long-running follower operations from leader-port reconnect churn
+
 ### v3.0.46 (2026)
 
 **Features:**

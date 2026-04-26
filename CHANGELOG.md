@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.0.47
+
+- Fix multi-tab broker death after the service worker is idle-killed (≥30s on Chrome). When the SW restarts, its `serverPort` is null and any follower `transfer-port` queued in `pending` would never reach the leader, so secondary tabs failed with `[Shell] Failed to load cwd` until refresh
+- Leader now re-registers with the SW broker on a 5 s heartbeat. Re-posting `register-server` is idempotent in the SW handler — it replaces `serverPort` and flushes `pending` — so any followers stuck against a dead broker get unstuck within one tick
+- Heartbeat re-registration posts the new control port to the SW *before* closing the old one. Closing first opens a race where any follower `transfer-port` already in the SW inbox queue gets forwarded to the now-detached old port and is silently dropped (`postMessage` to a port whose peer is detached is a no-op per spec), leaving that follower stuck
+- `leader-changed` BroadcastChannel notification now fires exactly once at initial registration (not on every heartbeat tick). Broadcasting on every tick would call `connectToLeader()` on every follower, which tears down the existing `leader-port` and resolves any in-flight sync FS request with EIO via the sync-relay reconnect path
+- `promoteToLeader` tears down the prior heartbeat timer and orphaned control port before allowing re-registration as the new leader
+
 ## 3.0.46
 
 - Implicit directory support: directories implied by file paths (e.g. `/a/b` when `/a/b/c/file.txt` exists without an explicit `mkdir`) are now recognized by `stat`, `lstat`, `readdir`, `opendir`, `access`, `realpath`, `exists`, `mkdir` (EEXIST guard), and `ensureParent`

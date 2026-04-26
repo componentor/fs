@@ -133,6 +133,8 @@ export class VFSFileSystem {
   private isFollower = false;
   private holdingLeaderLock = false;
   private brokerInitialized = false;
+  private brokerHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  private brokerControlPort: MessagePort | null = null;
   private leaderChangeBc: BroadcastChannel | null = null;
 
   // Bound request functions for method delegation
@@ -471,35 +473,83 @@ export class VFSFileSystem {
     });
   }
 
-  /** Register as leader with SW broker (receives follower ports via control channel) */
+  /** Register as leader with SW broker (receives follower ports via control channel).
+   *
+   *  Re-registers on a heartbeat so the broker survives SW idle-kill. Without this,
+   *  a follower opening a tab after the SW has been killed (≥30s idle on Chrome)
+   *  sees its `transfer-port` queued in the new SW's `pending` array forever:
+   *  the prior leader's `port2` was held by the dead SW instance, the new SW
+   *  starts with `serverPort=null`, and the leader has no way to know to
+   *  re-register.
+   *
+   *  Re-posting `register-server` is idempotent in the SW handler — it replaces
+   *  `serverPort` and flushes `pending` — so the heartbeat alone unsticks
+   *  followers without needing to disturb anyone else. The follower's queued
+   *  `mc.port2` rides through the pending-flush, and because it's a
+   *  MessageChannel, any messages the follower's sync-relay had already posted
+   *  on `port1` are buffered on `port2` until the leader's syncWorker starts
+   *  the received port. Standard MessageChannel semantics — no follower-side
+   *  notification required.
+   *
+   *  We deliberately do NOT broadcast `leader-changed` from the heartbeat:
+   *  followers receiving it call `connectToLeader()`, which tears down the
+   *  existing `leader-port` and resolves any in-flight sync FS request with
+   *  EIO (sync-relay.worker.ts: `pendingResolve(EIO)`). Broadcasting on every
+   *  tick would inject random EIOs into long-running ops on every connected
+   *  follower. Broadcast only fires once, at initial registration, to wake any
+   *  pre-existing followers (e.g. left over from a previous leader). */
   private initLeaderBroker(): void {
     if (this.brokerInitialized) return;
     this.brokerInitialized = true;
 
-    this.getServiceWorker().then(sw => {
-      const mc = new MessageChannel();
-      sw.postMessage({ type: 'register-server' }, [mc.port2]);
+    const register = (): void => {
+      this.getServiceWorker().then(sw => {
+        // Post the new control port BEFORE closing the old one. If we close
+        // first, any follower `transfer-port` already sitting in the SW's
+        // inbox queue gets forwarded to the now-detached old port and is
+        // silently dropped (postMessage to a port whose peer is detached is
+        // a no-op per spec) — leaving that follower permanently stuck until
+        // refresh. Posting first ensures the SW swaps in the new serverPort
+        // before the next message is processed; the old port can then be
+        // closed without affecting routing.
+        const mc = new MessageChannel();
+        sw.postMessage({ type: 'register-server' }, [mc.port2]);
 
-      mc.port1.onmessage = (event: MessageEvent) => {
-        if (event.data.type === 'client-port') {
-          const clientPort = event.ports[0];
-          if (clientPort) {
-            this.syncWorker.postMessage(
-              { type: 'client-port', tabId: event.data.tabId, port: clientPort },
-              [clientPort],
-            );
+        mc.port1.onmessage = (event: MessageEvent) => {
+          if (event.data.type === 'client-port') {
+            const clientPort = event.ports[0];
+            if (clientPort) {
+              this.syncWorker.postMessage(
+                { type: 'client-port', tabId: event.data.tabId, port: clientPort },
+                [clientPort],
+              );
+            }
           }
-        }
-      };
-      mc.port1.start();
+        };
+        mc.port1.start();
 
-      // Notify followers that a (new) leader is available — they should reconnect
-      const bc = new BroadcastChannel(`${this.ns}-leader-change`);
-      bc.postMessage({ type: 'leader-changed' });
-      bc.close();
-    }).catch(err => {
-      console.warn('[VFS] SW broker unavailable, single-tab only:', (err as Error).message);
-    });
+        const oldPort = this.brokerControlPort;
+        this.brokerControlPort = mc.port1;
+        if (oldPort) {
+          try { oldPort.close(); } catch { /* ignore */ }
+        }
+      }).catch(err => {
+        console.warn('[VFS] SW broker unavailable, single-tab only:', (err as Error).message);
+      });
+    };
+
+    register();
+
+    // Notify pre-existing followers (if any) that a leader is now available.
+    // Fired exactly once — see comment above for why this MUST NOT happen on
+    // every heartbeat.
+    const bc = new BroadcastChannel(`${this.ns}-leader-change`);
+    bc.postMessage({ type: 'leader-changed' });
+    bc.close();
+
+    // 5s tick — worst-case wait for a follower opened against a dead SW broker.
+    if (this.brokerHeartbeatTimer) clearInterval(this.brokerHeartbeatTimer);
+    this.brokerHeartbeatTimer = setInterval(register, 5000);
   }
 
   /** Promote from follower to leader (after leader tab dies and lock is acquired) */
@@ -507,6 +557,18 @@ export class VFSFileSystem {
     this.isFollower = false;
     this.isReady = false;
     this.brokerInitialized = false; // Allow re-registration with SW as new leader
+
+    // Tear down the prior broker plumbing — initLeaderBroker will rebuild it
+    // when sync-relay signals 'ready'. Without this, the old heartbeat keeps
+    // running against a stale control port that no longer routes to anything.
+    if (this.brokerHeartbeatTimer) {
+      clearInterval(this.brokerHeartbeatTimer);
+      this.brokerHeartbeatTimer = null;
+    }
+    if (this.brokerControlPort) {
+      try { this.brokerControlPort.close(); } catch { /* ignore */ }
+      this.brokerControlPort = null;
+    }
 
     // Stop listening for leader changes (we ARE the leader now)
     if (this.leaderChangeBc) {

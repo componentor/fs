@@ -2606,6 +2606,8 @@ var VFSFileSystem = class {
   isFollower = false;
   holdingLeaderLock = false;
   brokerInitialized = false;
+  brokerHeartbeatTimer = null;
+  brokerControlPort = null;
   leaderChangeBc = null;
   // Bound request functions for method delegation
   _sync = (buf) => this.syncRequest(buf);
@@ -2878,37 +2880,85 @@ var VFSFileSystem = class {
       onState();
     });
   }
-  /** Register as leader with SW broker (receives follower ports via control channel) */
+  /** Register as leader with SW broker (receives follower ports via control channel).
+   *
+   *  Re-registers on a heartbeat so the broker survives SW idle-kill. Without this,
+   *  a follower opening a tab after the SW has been killed (≥30s idle on Chrome)
+   *  sees its `transfer-port` queued in the new SW's `pending` array forever:
+   *  the prior leader's `port2` was held by the dead SW instance, the new SW
+   *  starts with `serverPort=null`, and the leader has no way to know to
+   *  re-register.
+   *
+   *  Re-posting `register-server` is idempotent in the SW handler — it replaces
+   *  `serverPort` and flushes `pending` — so the heartbeat alone unsticks
+   *  followers without needing to disturb anyone else. The follower's queued
+   *  `mc.port2` rides through the pending-flush, and because it's a
+   *  MessageChannel, any messages the follower's sync-relay had already posted
+   *  on `port1` are buffered on `port2` until the leader's syncWorker starts
+   *  the received port. Standard MessageChannel semantics — no follower-side
+   *  notification required.
+   *
+   *  We deliberately do NOT broadcast `leader-changed` from the heartbeat:
+   *  followers receiving it call `connectToLeader()`, which tears down the
+   *  existing `leader-port` and resolves any in-flight sync FS request with
+   *  EIO (sync-relay.worker.ts: `pendingResolve(EIO)`). Broadcasting on every
+   *  tick would inject random EIOs into long-running ops on every connected
+   *  follower. Broadcast only fires once, at initial registration, to wake any
+   *  pre-existing followers (e.g. left over from a previous leader). */
   initLeaderBroker() {
     if (this.brokerInitialized) return;
     this.brokerInitialized = true;
-    this.getServiceWorker().then((sw) => {
-      const mc = new MessageChannel();
-      sw.postMessage({ type: "register-server" }, [mc.port2]);
-      mc.port1.onmessage = (event) => {
-        if (event.data.type === "client-port") {
-          const clientPort = event.ports[0];
-          if (clientPort) {
-            this.syncWorker.postMessage(
-              { type: "client-port", tabId: event.data.tabId, port: clientPort },
-              [clientPort]
-            );
+    const register = () => {
+      this.getServiceWorker().then((sw) => {
+        const mc = new MessageChannel();
+        sw.postMessage({ type: "register-server" }, [mc.port2]);
+        mc.port1.onmessage = (event) => {
+          if (event.data.type === "client-port") {
+            const clientPort = event.ports[0];
+            if (clientPort) {
+              this.syncWorker.postMessage(
+                { type: "client-port", tabId: event.data.tabId, port: clientPort },
+                [clientPort]
+              );
+            }
+          }
+        };
+        mc.port1.start();
+        const oldPort = this.brokerControlPort;
+        this.brokerControlPort = mc.port1;
+        if (oldPort) {
+          try {
+            oldPort.close();
+          } catch {
           }
         }
-      };
-      mc.port1.start();
-      const bc = new BroadcastChannel(`${this.ns}-leader-change`);
-      bc.postMessage({ type: "leader-changed" });
-      bc.close();
-    }).catch((err) => {
-      console.warn("[VFS] SW broker unavailable, single-tab only:", err.message);
-    });
+      }).catch((err) => {
+        console.warn("[VFS] SW broker unavailable, single-tab only:", err.message);
+      });
+    };
+    register();
+    const bc = new BroadcastChannel(`${this.ns}-leader-change`);
+    bc.postMessage({ type: "leader-changed" });
+    bc.close();
+    if (this.brokerHeartbeatTimer) clearInterval(this.brokerHeartbeatTimer);
+    this.brokerHeartbeatTimer = setInterval(register, 5e3);
   }
   /** Promote from follower to leader (after leader tab dies and lock is acquired) */
   promoteToLeader() {
     this.isFollower = false;
     this.isReady = false;
     this.brokerInitialized = false;
+    if (this.brokerHeartbeatTimer) {
+      clearInterval(this.brokerHeartbeatTimer);
+      this.brokerHeartbeatTimer = null;
+    }
+    if (this.brokerControlPort) {
+      try {
+        this.brokerControlPort.close();
+      } catch {
+      }
+      this.brokerControlPort = null;
+    }
     if (this.leaderChangeBc) {
       this.leaderChangeBc.close();
       this.leaderChangeBc = null;

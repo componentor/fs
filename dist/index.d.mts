@@ -359,6 +359,8 @@ declare class VFSFileSystem {
     private isFollower;
     private holdingLeaderLock;
     private brokerInitialized;
+    private brokerHeartbeatTimer;
+    private brokerControlPort;
     private leaderChangeBc;
     private _sync;
     private _async;
@@ -390,7 +392,31 @@ declare class VFSFileSystem {
     private connectToLeader;
     /** Register the VFS service worker and return the active SW */
     private getServiceWorker;
-    /** Register as leader with SW broker (receives follower ports via control channel) */
+    /** Register as leader with SW broker (receives follower ports via control channel).
+     *
+     *  Re-registers on a heartbeat so the broker survives SW idle-kill. Without this,
+     *  a follower opening a tab after the SW has been killed (≥30s idle on Chrome)
+     *  sees its `transfer-port` queued in the new SW's `pending` array forever:
+     *  the prior leader's `port2` was held by the dead SW instance, the new SW
+     *  starts with `serverPort=null`, and the leader has no way to know to
+     *  re-register.
+     *
+     *  Re-posting `register-server` is idempotent in the SW handler — it replaces
+     *  `serverPort` and flushes `pending` — so the heartbeat alone unsticks
+     *  followers without needing to disturb anyone else. The follower's queued
+     *  `mc.port2` rides through the pending-flush, and because it's a
+     *  MessageChannel, any messages the follower's sync-relay had already posted
+     *  on `port1` are buffered on `port2` until the leader's syncWorker starts
+     *  the received port. Standard MessageChannel semantics — no follower-side
+     *  notification required.
+     *
+     *  We deliberately do NOT broadcast `leader-changed` from the heartbeat:
+     *  followers receiving it call `connectToLeader()`, which tears down the
+     *  existing `leader-port` and resolves any in-flight sync FS request with
+     *  EIO (sync-relay.worker.ts: `pendingResolve(EIO)`). Broadcasting on every
+     *  tick would inject random EIOs into long-running ops on every connected
+     *  follower. Broadcast only fires once, at initial registration, to wake any
+     *  pre-existing followers (e.g. left over from a previous leader). */
     private initLeaderBroker;
     /** Promote from follower to leader (after leader tab dies and lock is acquired) */
     private promoteToLeader;
