@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.0.50
+
+- Fix OPFS mirror divergence when the rename source is a directory. `renameInOPFS` previously called `getFileHandle(basename(oldPath))` unconditionally — for a directory rename this throws `TypeMismatchError` (or `NotFoundError` depending on engine), so the worker logged a warning and skipped the operation entirely. The in-memory VFS rename fixed in 3.0.49 (e.g. Vite's `.vite/deps_temp_<hash>` → `.vite/deps`) therefore succeeded in the VFS but left the on-disk OPFS state diverged until the next full reconcile
+- On the file-handle TypeMismatchError, fall through to a new directory-aware path that removes the destination entry recursively (matching Node `rename` semantics for the common "replace target" case), recreates it as an empty directory, then walks the source tree copying every file via two sync access handles in 2 MB chunks. Peak memory stays at `RENAME_CHUNK` regardless of subtree size
+- Source is then removed via `removeEntry({ recursive: true })`
+
 ## 3.0.49
 
 - Fix `rename` over a non-empty directory leaving stale descendants behind. The previous behavior freed only the target directory's own inode and removed only its top-level pathIndex entry — descendant entries (e.g. `dst/foo.js`) survived, pointing at non-freed inodes. Source descendants were then renamed onto the same paths, overwriting some pathIndex entries (leaking those inodes) and leaving any descendant unique to the target as a zombie still reachable via `read`. Concrete consequence: Vite's deps optimization commit (`.vite/deps_temp_<hash>` → `.vite/deps`) on the second run produced a corrupt `.vite/deps` directory — requests for `vue.js`, `@unhead/vue`, etc. resolved to stale chunks from the previous round (or 404'd entirely). `rename(x, x)` was also corrupting: it freed the file's blocks and marked its inode FREE before re-pointing pathIndex at the same now-freed inode

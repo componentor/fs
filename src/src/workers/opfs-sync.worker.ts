@@ -242,14 +242,42 @@ async function mkdirInOPFS(path: string): Promise<void> {
 const RENAME_CHUNK = 2 * 1024 * 1024;
 
 async function renameInOPFS(oldPath: string, newPath: string): Promise<void> {
-  // OPFS has no native rename — copy + delete. Copy through two sync
-  // access handles in fixed-size chunks so a rename of a large file
-  // doesn't require materializing the whole file in memory.
+  // OPFS has no native rename — copy + delete. Try the file path first
+  // (which is the common case: write/copy/etc events). If `oldPath` is
+  // actually a directory (e.g. Vite committing `.vite/deps_temp_X` →
+  // `.vite/deps`), `getFileHandle` rejects with TypeMismatchError —
+  // fall through to the directory-aware branch which recursively walks
+  // the source tree.
   let srcAccess: FileSystemSyncAccessHandle | null = null;
   let dstAccess: FileSystemSyncAccessHandle | null = null;
+  let oldDir: FileSystemDirectoryHandle;
+  let oldHandle: FileSystemFileHandle;
   try {
-    const oldDir = await navigateToParent(oldPath);
-    const oldHandle = await oldDir.getFileHandle(basename(oldPath));
+    oldDir = await navigateToParent(oldPath);
+    oldHandle = await oldDir.getFileHandle(basename(oldPath));
+  } catch (err: any) {
+    // Not a file — try directory. (TypeMismatchError on Safari, plus
+    // generic "not a file" / "wrong handle type" messages on other
+    // engines.)
+    if (err?.name === 'TypeMismatchError' ||
+        err?.name === 'NotFoundError' ||
+        err?.message?.includes('TypeMismatch') ||
+        err?.message?.includes('not a file') ||
+        err?.message?.includes('not an entry of requested type')) {
+      try {
+        await renameDirInOPFS(oldPath, newPath);
+      } catch (dirErr) {
+        console.warn('[opfs-sync] rename (dir) failed:', oldPath, '→', newPath, dirErr);
+      }
+      return;
+    }
+    console.warn('[opfs-sync] rename failed:', oldPath, '→', newPath, err);
+    return;
+  }
+  // File rename — copy through two sync access handles in fixed-size
+  // chunks so a rename of a large file doesn't require materializing
+  // the whole file in memory.
+  try {
     srcAccess = await oldHandle.createSyncAccessHandle();
     const size = srcAccess.getSize();
 
@@ -284,6 +312,82 @@ async function renameInOPFS(oldPath: string, newPath: string): Promise<void> {
   } finally {
     if (dstAccess) { try { dstAccess.close(); } catch { /* ignore */ } }
     if (srcAccess) { try { srcAccess.close(); } catch { /* ignore */ } }
+  }
+}
+
+/**
+ * Directory-aware rename in OPFS — walks the source tree and copies
+ * each file via sync access handles, then deletes the source. Used
+ * when `renameInOPFS` discovers oldPath is a directory rather than
+ * a file.
+ *
+ * Replaces the destination directory entirely if it already exists,
+ * matching Node.js rename semantics for directories.
+ */
+async function renameDirInOPFS(oldPath: string, newPath: string): Promise<void> {
+  // Resolve the source directory handle.
+  const oldParent = await navigateToParent(oldPath);
+  const srcDir = await oldParent.getDirectoryHandle(basename(oldPath));
+
+  // Wipe the target if it exists (file or directory) so the rename
+  // is a clean replace, then recreate it as a fresh directory.
+  const newParent = await ensureParentDirs(newPath);
+  try {
+    await newParent.removeEntry(basename(newPath), { recursive: true });
+  } catch (e: any) {
+    // NotFoundError is expected when target doesn't exist; everything
+    // else we let bubble (caller logs a single warning).
+    if (e?.name !== 'NotFoundError') throw e;
+  }
+  const dstDir = await newParent.getDirectoryHandle(basename(newPath), { create: true });
+
+  await copyDirContents(srcDir, dstDir);
+
+  // Remove the now-copied source.
+  await oldParent.removeEntry(basename(oldPath), { recursive: true });
+}
+
+/**
+ * Recursively copy every entry under `src` into `dst`.
+ * Uses sync access handles for files (chunked) so memory peaks at
+ * RENAME_CHUNK regardless of file size.
+ */
+async function copyDirContents(
+  src: FileSystemDirectoryHandle,
+  dst: FileSystemDirectoryHandle,
+): Promise<void> {
+  // entries() is async-iterable: [name, FileSystemHandle]
+  for await (const [name, handle] of (src as any).entries()) {
+    if (handle.kind === 'directory') {
+      const childDst = await dst.getDirectoryHandle(name, { create: true });
+      await copyDirContents(handle as FileSystemDirectoryHandle, childDst);
+    } else {
+      const fileHandle = handle as FileSystemFileHandle;
+      const dstFile = await dst.getFileHandle(name, { create: true });
+      let srcAccess: FileSystemSyncAccessHandle | null = null;
+      let dstAccess: FileSystemSyncAccessHandle | null = null;
+      try {
+        srcAccess = await fileHandle.createSyncAccessHandle();
+        dstAccess = await dstFile.createSyncAccessHandle();
+        const size = srcAccess.getSize();
+        dstAccess.truncate(0);
+        if (size > 0) {
+          const chunk = new Uint8Array(Math.min(size, RENAME_CHUNK));
+          let offset = 0;
+          while (offset < size) {
+            const len = Math.min(chunk.length, size - offset);
+            const view = len === chunk.length ? chunk : chunk.subarray(0, len);
+            srcAccess.read(view, { at: offset });
+            dstAccess.write(view, { at: offset });
+            offset += len;
+          }
+        }
+        dstAccess.flush();
+      } finally {
+        if (dstAccess) { try { dstAccess.close(); } catch { /* ignore */ } }
+        if (srcAccess) { try { srcAccess.close(); } catch { /* ignore */ } }
+      }
+    }
   }
 }
 

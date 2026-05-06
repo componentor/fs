@@ -604,6 +604,12 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
 
+### v3.0.50 (2026)
+
+**Fixes:**
+- OPFS mirror no longer diverges from VFS state when the rename source is a directory. `renameInOPFS` previously hard-coded `getFileHandle`, which throws `TypeMismatchError` for directories — so the VFS rename fix in 3.0.49 (e.g. Vite's `deps_temp_<hash>` → `deps`) succeeded in-memory but the on-disk OPFS mirror silently warned-and-skipped, leaving the two diverged until the next full reconcile
+- On `TypeMismatchError`/`NotFoundError`, falls through to a directory-aware path: recursively `removeEntry` the destination (matching the engine's "rm-then-rename" semantics), recreate as an empty dir, walk the source tree copying every file via two sync access handles in 2 MB chunks (peak memory bounded by `RENAME_CHUNK` regardless of subtree size), then `removeEntry` the source
+
 ### v3.0.49 (2026)
 
 **Fixes:**

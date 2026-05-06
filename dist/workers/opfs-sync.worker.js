@@ -160,9 +160,24 @@ var RENAME_CHUNK = 2 * 1024 * 1024;
 async function renameInOPFS(oldPath, newPath) {
   let srcAccess = null;
   let dstAccess = null;
+  let oldDir;
+  let oldHandle;
   try {
-    const oldDir = await navigateToParent(oldPath);
-    const oldHandle = await oldDir.getFileHandle(basename(oldPath));
+    oldDir = await navigateToParent(oldPath);
+    oldHandle = await oldDir.getFileHandle(basename(oldPath));
+  } catch (err) {
+    if (err?.name === "TypeMismatchError" || err?.name === "NotFoundError" || err?.message?.includes("TypeMismatch") || err?.message?.includes("not a file") || err?.message?.includes("not an entry of requested type")) {
+      try {
+        await renameDirInOPFS(oldPath, newPath);
+      } catch (dirErr) {
+        console.warn("[opfs-sync] rename (dir) failed:", oldPath, "\u2192", newPath, dirErr);
+      }
+      return;
+    }
+    console.warn("[opfs-sync] rename failed:", oldPath, "\u2192", newPath, err);
+    return;
+  }
+  try {
     srcAccess = await oldHandle.createSyncAccessHandle();
     const size = srcAccess.getSize();
     const newDir = await ensureParentDirs(newPath);
@@ -205,6 +220,63 @@ async function renameInOPFS(oldPath, newPath) {
       try {
         srcAccess.close();
       } catch {
+      }
+    }
+  }
+}
+async function renameDirInOPFS(oldPath, newPath) {
+  const oldParent = await navigateToParent(oldPath);
+  const srcDir = await oldParent.getDirectoryHandle(basename(oldPath));
+  const newParent = await ensureParentDirs(newPath);
+  try {
+    await newParent.removeEntry(basename(newPath), { recursive: true });
+  } catch (e) {
+    if (e?.name !== "NotFoundError") throw e;
+  }
+  const dstDir = await newParent.getDirectoryHandle(basename(newPath), { create: true });
+  await copyDirContents(srcDir, dstDir);
+  await oldParent.removeEntry(basename(oldPath), { recursive: true });
+}
+async function copyDirContents(src, dst) {
+  for await (const [name, handle] of src.entries()) {
+    if (handle.kind === "directory") {
+      const childDst = await dst.getDirectoryHandle(name, { create: true });
+      await copyDirContents(handle, childDst);
+    } else {
+      const fileHandle = handle;
+      const dstFile = await dst.getFileHandle(name, { create: true });
+      let srcAccess = null;
+      let dstAccess = null;
+      try {
+        srcAccess = await fileHandle.createSyncAccessHandle();
+        dstAccess = await dstFile.createSyncAccessHandle();
+        const size = srcAccess.getSize();
+        dstAccess.truncate(0);
+        if (size > 0) {
+          const chunk = new Uint8Array(Math.min(size, RENAME_CHUNK));
+          let offset = 0;
+          while (offset < size) {
+            const len = Math.min(chunk.length, size - offset);
+            const view = len === chunk.length ? chunk : chunk.subarray(0, len);
+            srcAccess.read(view, { at: offset });
+            dstAccess.write(view, { at: offset });
+            offset += len;
+          }
+        }
+        dstAccess.flush();
+      } finally {
+        if (dstAccess) {
+          try {
+            dstAccess.close();
+          } catch {
+          }
+        }
+        if (srcAccess) {
+          try {
+            srcAccess.close();
+          } catch {
+          }
+        }
       }
     }
   }
