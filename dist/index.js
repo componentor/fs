@@ -4954,6 +4954,7 @@ var VFSEngine = class {
       this.writeInode(existingIdx, inode);
       tInode = this.debug ? performance.now() : 0;
     } else {
+      if (this.isImplicitDirectory(path)) return { status: CODE_TO_STATUS.EISDIR };
       const mode = DEFAULT_FILE_MODE & ~(this.umask & 511);
       this.createInode(path, INODE_TYPE.FILE, mode, data.byteLength, data);
       tAlloc = this.debug ? performance.now() : 0;
@@ -5243,15 +5244,33 @@ var VFSEngine = class {
     newPath = this.normalizePath(newPath);
     const idx = this.pathIndex.get(oldPath);
     if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (oldPath === newPath) return { status: 0 };
     const parentStatus = this.ensureParent(newPath);
     if (parentStatus !== 0) return { status: parentStatus };
     const existingIdx = this.pathIndex.get(newPath);
-    if (existingIdx !== void 0) {
-      const existingInode = this.readInode(existingIdx);
-      this.freeBlockRange(existingInode.firstBlock, existingInode.blockCount);
-      existingInode.type = INODE_TYPE.FREE;
-      this.writeInode(existingIdx, existingInode);
-      this.pathIndex.delete(newPath);
+    const targetIsImplicitDir = existingIdx === void 0 && this.isImplicitDirectory(newPath);
+    if (existingIdx !== void 0 || targetIsImplicitDir) {
+      let cleanDescendants = targetIsImplicitDir;
+      if (existingIdx !== void 0) {
+        const existingInode = this.readInode(existingIdx);
+        cleanDescendants = existingInode.type === INODE_TYPE.DIRECTORY;
+        this.freeBlockRange(existingInode.firstBlock, existingInode.blockCount);
+        existingInode.type = INODE_TYPE.FREE;
+        this.writeInode(existingIdx, existingInode);
+        this.pathIndex.delete(newPath);
+        if (existingIdx < this.freeInodeHint) this.freeInodeHint = existingIdx;
+      }
+      if (cleanDescendants) {
+        for (const desc of this.getAllDescendants(newPath)) {
+          const descIdx = this.pathIndex.get(desc);
+          const descInode = this.readInode(descIdx);
+          this.freeBlockRange(descInode.firstBlock, descInode.blockCount);
+          descInode.type = INODE_TYPE.FREE;
+          this.writeInode(descIdx, descInode);
+          this.pathIndex.delete(desc);
+          if (descIdx < this.freeInodeHint) this.freeInodeHint = descIdx;
+        }
+      }
     }
     const inode = this.readInode(idx);
     const { offset: pathOff, length: pathLen } = this.appendPath(newPath);
@@ -5355,7 +5374,7 @@ var VFSEngine = class {
     if (srcIdx === void 0) return { status: CODE_TO_STATUS.ENOENT };
     const srcInode = this.readInode(srcIdx);
     if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
-    if (flags & 1 && this.pathIndex.has(destPath)) {
+    if (flags & 1 && (this.pathIndex.has(destPath) || this.isImplicitDirectory(destPath))) {
       return { status: CODE_TO_STATUS.EEXIST };
     }
     if (srcPath === destPath) return { status: 0 };
@@ -5464,7 +5483,9 @@ var VFSEngine = class {
   // ---- SYMLINK ----
   symlink(target, linkPath) {
     linkPath = this.normalizePath(linkPath);
-    if (this.pathIndex.has(linkPath)) return { status: CODE_TO_STATUS.EEXIST };
+    if (this.pathIndex.has(linkPath) || this.isImplicitDirectory(linkPath)) {
+      return { status: CODE_TO_STATUS.EEXIST };
+    }
     const parentStatus = this.ensureParent(linkPath);
     if (parentStatus !== 0) return { status: parentStatus };
     const targetBytes = encoder10.encode(target);
@@ -5490,7 +5511,9 @@ var VFSEngine = class {
     if (srcIdx === void 0) return { status: CODE_TO_STATUS.ENOENT };
     const srcInode = this.readInode(srcIdx);
     if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EPERM };
-    if (this.pathIndex.has(newPath)) return { status: CODE_TO_STATUS.EEXIST };
+    if (this.pathIndex.has(newPath) || this.isImplicitDirectory(newPath)) {
+      return { status: CODE_TO_STATUS.EEXIST };
+    }
     const result = this.copy(existingPath, newPath);
     if (result.status !== 0) return result;
     srcInode.nlink++;

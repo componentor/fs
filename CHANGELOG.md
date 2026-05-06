@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.0.49
+
+- Fix `rename` over a non-empty directory leaving stale descendants behind. The previous behavior freed only the target directory's own inode and removed only its top-level pathIndex entry — descendant entries (e.g. `dst/foo.js`) survived, pointing at non-freed inodes. Source descendants were then renamed onto the same paths, overwriting some pathIndex entries (leaking those inodes) and leaving any descendant unique to the target as a zombie still reachable via `read`. Concrete consequence: Vite's deps optimization commit (`.vite/deps_temp_<hash>` → `.vite/deps`) on the second run produced a corrupt `.vite/deps` directory — requests for `vue.js`, `@unhead/vue`, etc. resolved to stale chunks from the previous round (or 404'd entirely). `rename(x, x)` was also corrupting: it freed the file's blocks and marked its inode FREE before re-pointing pathIndex at the same now-freed inode
+- Fix the same family of bugs across implicit-directory targets — paths with no inode of their own but with descendants in pathIndex (the state produced by bulk OPFS import). Several write-side guards historically only checked `pathIndex.has(path)`, missing this case and silently producing impossible filesystem states:
+  - `rename` over an implicit dir now frees its descendants (matching the explicit-dir branch)
+  - `write` at an implicit-dir path returns EISDIR instead of registering a regular FILE inode there while children remain — the resulting "file with children" state broke every subsequent read of the path and its subtree
+  - `symlink`, `link`, and `copy` (with `COPYFILE_EXCL`) now return EEXIST when the target is an implicit dir, instead of clobbering it
+- Add 5 regression tests in `implicit-dir-targets.test.ts` covering each fixed call site
+
 ## 3.0.48
 
 - Eliminate residual race in the SW broker heartbeat: stop calling `close()` on the previous control port at all. The 3.0.47 fix posted `register-server` before closing, but `close()` sends its disentangle signal to the SW on a separate IPC pipe with no FIFO guarantee against the SW main-channel queue. If the disentangle landed before the SW processed `register-server`, any follower `transfer-port` already in the SW inbox was dispatched against a now-detached `serverPort` and silently dropped (postMessage to a disentangled peer is a no-op per spec)

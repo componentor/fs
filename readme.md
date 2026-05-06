@@ -604,6 +604,15 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
 
+### v3.0.49 (2026)
+
+**Fixes:**
+- `rename` over a non-empty directory no longer leaves stale descendants. Previously the target's children survived in `pathIndex` while their inodes were never freed; source descendants were laid on top, leaking inodes and leaving zombies reachable via `read`. Surfaced as corrupt `.vite/deps` after Vite's `deps_temp_<hash>` → `deps` swap (stale chunks for `vue.js`, `@unhead/vue`, etc., or 404s)
+- `rename(x, x)` no longer destroys the file (it used to free its own blocks and mark its inode FREE before re-pointing the index)
+- Same descendant-cleanup logic now applies when the rename target is an *implicit* directory (path with no inode of its own but with descendants in `pathIndex` — the state produced by bulk OPFS import)
+- `write`, `symlink`, `link`, and `copy` (with `COPYFILE_EXCL`) now reject implicit-directory targets (EISDIR for `write`, EEXIST for the others). Previously these silently clobbered the implicit dir, e.g. registering a regular `FILE` inode at a path whose children still existed in `pathIndex` — breaking every subsequent read of that path and its subtree
+- Add 5 regression tests in `implicit-dir-targets.test.ts` covering each fixed call site
+
 ### v3.0.48 (2026)
 
 **Fixes:**

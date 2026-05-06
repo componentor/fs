@@ -1018,6 +1018,13 @@ export class VFSEngine {
       this.writeInode(existingIdx, inode);
       tInode = this.debug ? performance.now() : 0;
     } else {
+      // Refuse to create a regular file at a path that is an implicit
+      // directory (children exist beneath it but no inode for the path
+      // itself). Without this guard we'd register a FILE inode at `path`
+      // while its descendants stay in pathIndex — the resulting "file with
+      // children" state breaks every subsequent read of `path` and its
+      // subtree.
+      if (this.isImplicitDirectory(path)) return { status: CODE_TO_STATUS.EISDIR };
       // Create new file
       const mode = DEFAULT_FILE_MODE & ~(this.umask & 0o777);
       this.createInode(path, INODE_TYPE.FILE, mode, data.byteLength, data);
@@ -1416,18 +1423,62 @@ export class VFSEngine {
     const idx = this.pathIndex.get(oldPath);
     if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT };
 
+    // Same path → no-op (matches Node.js semantics)
+    if (oldPath === newPath) return { status: 0 };
+
     // Ensure parent of new path exists
     const parentStatus = this.ensureParent(newPath);
     if (parentStatus !== 0) return { status: parentStatus };
 
-    // If target exists, remove it
+    // If target exists, remove it. For directory targets we MUST recursively
+    // free every descendant inode and drop every descendant pathIndex entry —
+    // otherwise the source's children get added on top, leaving a mix of
+    // source children + leftover target children pointing at zombie inodes
+    // (the target's old children still appear in pathIndex, while their
+    // inodes are not freed so blocks are leaked too).
+    //
+    // Concrete consequence of the old behavior: Vite's deps optimization
+    // commit (`.vite/deps_temp_<hash>` → `.vite/deps`) on the second run
+    // returned success but produced a corrupt deps directory — subsequent
+    // requests for `vue.js`, `@unhead/vue`, etc. resolved to stale chunks
+    // from the previous round (or 404'd entirely).
+    //
+    // The target may also be an *implicit* directory (no inode of its own,
+    // but children exist under it — the state produced by bulk OPFS import).
+    // In that case there's no inode to free, but the descendants must still
+    // be cleaned up for the same reason.
     const existingIdx = this.pathIndex.get(newPath);
-    if (existingIdx !== undefined) {
-      const existingInode = this.readInode(existingIdx);
-      this.freeBlockRange(existingInode.firstBlock, existingInode.blockCount);
-      existingInode.type = INODE_TYPE.FREE;
-      this.writeInode(existingIdx, existingInode);
-      this.pathIndex.delete(newPath);
+    const targetIsImplicitDir =
+      existingIdx === undefined && this.isImplicitDirectory(newPath);
+
+    if (existingIdx !== undefined || targetIsImplicitDir) {
+      let cleanDescendants = targetIsImplicitDir;
+
+      if (existingIdx !== undefined) {
+        const existingInode = this.readInode(existingIdx);
+        cleanDescendants = existingInode.type === INODE_TYPE.DIRECTORY;
+        this.freeBlockRange(existingInode.firstBlock, existingInode.blockCount);
+        existingInode.type = INODE_TYPE.FREE;
+        this.writeInode(existingIdx, existingInode);
+        this.pathIndex.delete(newPath);
+        if (existingIdx < this.freeInodeHint) this.freeInodeHint = existingIdx;
+      }
+
+      if (cleanDescendants) {
+        // Free every descendant inode and remove its pathIndex entry.
+        // Use getAllDescendants for the deepest-first ordering (matches
+        // rmdir's recursive path) — though for a flat free pass order
+        // doesn't affect correctness here.
+        for (const desc of this.getAllDescendants(newPath)) {
+          const descIdx = this.pathIndex.get(desc)!;
+          const descInode = this.readInode(descIdx);
+          this.freeBlockRange(descInode.firstBlock, descInode.blockCount);
+          descInode.type = INODE_TYPE.FREE;
+          this.writeInode(descIdx, descInode);
+          this.pathIndex.delete(desc);
+          if (descIdx < this.freeInodeHint) this.freeInodeHint = descIdx;
+        }
+      }
     }
 
     // Update inode with new path
@@ -1563,7 +1614,7 @@ export class VFSEngine {
     if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
 
     // COPYFILE_EXCL check
-    if ((flags & 1) && this.pathIndex.has(destPath)) {
+    if ((flags & 1) && (this.pathIndex.has(destPath) || this.isImplicitDirectory(destPath))) {
       return { status: CODE_TO_STATUS.EEXIST };
     }
 
@@ -1716,7 +1767,9 @@ export class VFSEngine {
   // ---- SYMLINK ----
   symlink(target: string, linkPath: string): { status: number } {
     linkPath = this.normalizePath(linkPath);
-    if (this.pathIndex.has(linkPath)) return { status: CODE_TO_STATUS.EEXIST };
+    if (this.pathIndex.has(linkPath) || this.isImplicitDirectory(linkPath)) {
+      return { status: CODE_TO_STATUS.EEXIST };
+    }
 
     const parentStatus = this.ensureParent(linkPath);
     if (parentStatus !== 0) return { status: parentStatus };
@@ -1752,7 +1805,9 @@ export class VFSEngine {
     const srcInode = this.readInode(srcIdx);
     if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EPERM };
 
-    if (this.pathIndex.has(newPath)) return { status: CODE_TO_STATUS.EEXIST };
+    if (this.pathIndex.has(newPath) || this.isImplicitDirectory(newPath)) {
+      return { status: CODE_TO_STATUS.EEXIST };
+    }
 
     // Copy file data to new inode
     const result = this.copy(existingPath, newPath);
