@@ -4257,6 +4257,22 @@ var VFSEngine = class {
   // generation when implicitDirs was last rebuilt
   pathIndexGen = 0;
   // bumped on every pathIndex mutation
+  // Incrementally maintained "number of pathIndex entries that have this
+  // path as a strict ancestor" map. Lets `isImplicitDirectory` answer in
+  // O(1) — an implicit dir P is exactly !pathIndex.has(P) && descCount[P] > 0.
+  // Without this, every `isImplicitDirectory` call triggered an O(N×depth)
+  // rebuild of `implicitDirs`, and the 3.0.49 fix put one of those calls on
+  // the hot path of every fresh write/symlink/link/copy — making batch
+  // writes O(N²) on total path count.
+  descCount = /* @__PURE__ */ new Map();
+  // descCount is in sync with pathIndex iff descCountGen >= pathIndexGen.
+  // Helpers `setPathIndex`/`deletePathIndex` keep them in sync. Code that
+  // mutates `pathIndex` directly (only test scaffolding does this in
+  // practice — see the implicit-directory tests in vfs-engine.test.ts)
+  // bumps `pathIndexGen` without going through the helpers, which leaves
+  // descCount stale; `isImplicitDirectory` notices the mismatch and
+  // recomputes descCount on demand.
+  descCountGen = 0;
   // Configurable upper bounds
   maxInodes = 4e6;
   maxBlocks = 4e6;
@@ -4539,7 +4555,7 @@ var VFSEngine = class {
       if (!path.startsWith("/") || path.includes("\0")) {
         throw new Error(`Corrupt VFS: inode ${i} has invalid path "${path.substring(0, 50)}"`);
       }
-      this.pathIndex.set(path, i);
+      this.setPathIndex(path, i);
     }
     this.pathIndexGen++;
   }
@@ -4861,7 +4877,7 @@ var VFSEngine = class {
       gid: this.processGid
     };
     this.writeInode(idx, inode);
-    this.pathIndex.set(path, idx);
+    this.setPathIndex(path, idx);
     this.pathIndexGen++;
     return idx;
   }
@@ -5019,7 +5035,7 @@ var VFSEngine = class {
     this.freeBlockRange(inode.firstBlock, inode.blockCount);
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
-    this.pathIndex.delete(path);
+    this.deletePathIndex(path);
     this.pathIndexGen++;
     if (idx < this.freeInodeHint) this.freeInodeHint = idx;
     this.commitPending();
@@ -5141,7 +5157,7 @@ var VFSEngine = class {
             this.freeBlockRange(descInode.firstBlock, descInode.blockCount);
             descInode.type = INODE_TYPE.FREE;
             this.writeInode(descIdx, descInode);
-            this.pathIndex.delete(desc);
+            this.deletePathIndex(desc);
           }
           this.pathIndexGen++;
           this.commitPending();
@@ -5161,12 +5177,12 @@ var VFSEngine = class {
         this.freeBlockRange(childInode.firstBlock, childInode.blockCount);
         childInode.type = INODE_TYPE.FREE;
         this.writeInode(childIdx, childInode);
-        this.pathIndex.delete(child);
+        this.deletePathIndex(child);
       }
     }
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
-    this.pathIndex.delete(path);
+    this.deletePathIndex(path);
     this.pathIndexGen++;
     if (idx < this.freeInodeHint) this.freeInodeHint = idx;
     this.commitPending();
@@ -5257,7 +5273,7 @@ var VFSEngine = class {
         this.freeBlockRange(existingInode.firstBlock, existingInode.blockCount);
         existingInode.type = INODE_TYPE.FREE;
         this.writeInode(existingIdx, existingInode);
-        this.pathIndex.delete(newPath);
+        this.deletePathIndex(newPath);
         if (existingIdx < this.freeInodeHint) this.freeInodeHint = existingIdx;
       }
       if (cleanDescendants) {
@@ -5267,7 +5283,7 @@ var VFSEngine = class {
           this.freeBlockRange(descInode.firstBlock, descInode.blockCount);
           descInode.type = INODE_TYPE.FREE;
           this.writeInode(descIdx, descInode);
-          this.pathIndex.delete(desc);
+          this.deletePathIndex(desc);
           if (descIdx < this.freeInodeHint) this.freeInodeHint = descIdx;
         }
       }
@@ -5278,8 +5294,8 @@ var VFSEngine = class {
     inode.pathLength = pathLen;
     inode.mtime = Date.now();
     this.writeInode(idx, inode);
-    this.pathIndex.delete(oldPath);
-    this.pathIndex.set(newPath, idx);
+    this.deletePathIndex(oldPath);
+    this.setPathIndex(newPath, idx);
     this.pathIndexGen++;
     if (inode.type === INODE_TYPE.DIRECTORY) {
       const prefix = oldPath === "/" ? "/" : oldPath + "/";
@@ -5297,8 +5313,8 @@ var VFSEngine = class {
         childInode.pathOffset = cpo;
         childInode.pathLength = cpl;
         this.writeInode(i, childInode);
-        this.pathIndex.delete(p);
-        this.pathIndex.set(childNewPath, i);
+        this.deletePathIndex(p);
+        this.setPathIndex(childNewPath, i);
       }
     }
     this.commitPending();
@@ -5767,11 +5783,71 @@ var VFSEngine = class {
   /**
    * Check if a path is an implicit directory (exists because files exist under it,
    * but no explicit directory inode was created for it).
+   *
+   * O(1) via the incrementally maintained `descCount` map (an implicit dir
+   * is exactly !pathIndex.has(P) && descCount[P] > 0). If `pathIndex` was
+   * mutated directly without going through the helpers (test scaffolding),
+   * descCount is stale and we rebuild it from scratch — once — to resync.
    */
   isImplicitDirectory(path) {
     if (path === "/") return false;
-    this.rebuildImplicitDirs();
-    return this.implicitDirs.has(path);
+    if (this.pathIndex.has(path)) return false;
+    if (this.descCountGen < this.pathIndexGen) this.rebuildDescCount();
+    return (this.descCount.get(path) ?? 0) > 0;
+  }
+  /**
+   * Recompute `descCount` from scratch by walking every pathIndex entry's
+   * ancestor chain. O(N×depth). Only triggered when something bypassed the
+   * setPathIndex/deletePathIndex helpers — in production code that's
+   * never; the tests exercise this path.
+   */
+  rebuildDescCount() {
+    this.descCount.clear();
+    for (const path of this.pathIndex.keys()) {
+      this.bumpDescCount(path);
+    }
+    this.descCountGen = this.pathIndexGen;
+  }
+  // ---- pathIndex helpers — keep `descCount` in sync ----
+  // Every pathIndex.set/delete in the engine MUST go through these so the
+  // `descCount` map (used by `isImplicitDirectory`) stays correct. We
+  // anticipate the caller's `pathIndexGen++` by setting `descCountGen` to
+  // `pathIndexGen + 1`; idempotent across multiple helper calls within a
+  // single logical op (e.g. rmdir doing N deletes then one bump). Test
+  // code that mutates `pathIndex` directly leaves descCountGen behind,
+  // which is what triggers the rebuild path in `isImplicitDirectory`.
+  setPathIndex(path, idx) {
+    const had = this.pathIndex.has(path);
+    this.pathIndex.set(path, idx);
+    if (!had) this.bumpDescCount(path);
+    this.descCountGen = this.pathIndexGen + 1;
+  }
+  deletePathIndex(path) {
+    const had = this.pathIndex.delete(path);
+    if (had) this.decDescCount(path);
+    this.descCountGen = this.pathIndexGen + 1;
+    return had;
+  }
+  bumpDescCount(path) {
+    let pos = path.length;
+    while (true) {
+      pos = path.lastIndexOf("/", pos - 1);
+      if (pos <= 0) break;
+      const ancestor = path.substring(0, pos);
+      this.descCount.set(ancestor, (this.descCount.get(ancestor) ?? 0) + 1);
+    }
+  }
+  decDescCount(path) {
+    let pos = path.length;
+    while (true) {
+      pos = path.lastIndexOf("/", pos - 1);
+      if (pos <= 0) break;
+      const ancestor = path.substring(0, pos);
+      const cur = this.descCount.get(ancestor);
+      if (cur === void 0) break;
+      if (cur <= 1) this.descCount.delete(ancestor);
+      else this.descCount.set(ancestor, cur - 1);
+    }
   }
   /**
    * Get direct children of a directory path, including implicit subdirectories.

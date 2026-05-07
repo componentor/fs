@@ -604,6 +604,12 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
 
+### v3.0.51 (2026)
+
+**Fixes:**
+- Fix O(N²) regression introduced in 3.0.49. The implicit-directory guard added then (`isImplicitDirectory(path)` in `write`, `symlink`, `link`, `copy`, plus several stat-side methods) called `rebuildImplicitDirs` — O(N×depth) over all pathIndex entries — on every invocation, and `pathIndexGen` was bumped on every mutation, so the cache was always invalid by the next call. Batch workloads (Vite optimize, pnpm install, Strapi unpacks of thousands of files) went quadratic. Measured on a 5000-file write benchmark: **3.0.48 baseline 26 ms → 3.0.50 1725 ms (66× slower) → 3.0.51 23 ms (back to baseline)**
+- Replace the on-demand rebuild with an incrementally maintained `descCount` map. `isImplicitDirectory(P)` is now O(1): `!pathIndex.has(P) && descCount[P] > 0`. Maintenance is O(depth) per pathIndex mutation, behind two helpers (`setPathIndex`, `deletePathIndex`) that wrap the 12 mutation sites
+
 ### v3.0.50 (2026)
 
 **Fixes:**

@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.0.51
+
+- Fix O(N²) regression introduced in 3.0.49. The implicit-directory guard added in 3.0.49 (`isImplicitDirectory(path)` checks in `write`, `symlink`, `link`, `copy`, plus `mkdir`, `stat`, `lstat`, `access`, `realpath`, `exists`) called `rebuildImplicitDirs` on every invocation, which is O(N×depth) over total pathIndex entries. Combined with `pathIndexGen` being bumped on every pathIndex mutation (cache always invalid by the next call), batch operations like Vite/pnpm/Strapi unpacking thousands of files went quadratic. Measured on a synthetic 5000-file write benchmark: **3.0.48 baseline 26 ms → 3.0.50 1725 ms (66× slower) → 3.0.51 23 ms (back to baseline)**
+- Replace the on-demand rebuild with an incrementally maintained `descCount` map (number of pathIndex entries that have a given path as a strict ancestor). `isImplicitDirectory(P)` is now O(1): `!pathIndex.has(P) && descCount[P] > 0`. Maintenance is O(depth) per pathIndex mutation, hidden behind two new helpers (`setPathIndex`, `deletePathIndex`) that wrap the 12 mutation sites in `mount`, `createInode`, `unlink`, `rmdir`, and `rename`
+- For test scaffolding that pokes `pathIndex` directly to construct implicit-dir scenarios (see vfs-engine.test.ts), `descCountGen` falls behind `pathIndexGen` and `isImplicitDirectory` does a one-shot rebuild to resync. Production code never hits this path
+
 ## 3.0.50
 
 - Fix OPFS mirror divergence when the rename source is a directory. `renameInOPFS` previously called `getFileHandle(basename(oldPath))` unconditionally — for a directory rename this throws `TypeMismatchError` (or `NotFoundError` depending on engine), so the worker logged a warning and skipped the operation entirely. The in-memory VFS rename fixed in 3.0.49 (e.g. Vite's `.vite/deps_temp_<hash>` → `.vite/deps`) therefore succeeded in the VFS but left the on-disk OPFS state diverged until the next full reconcile
