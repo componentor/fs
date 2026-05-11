@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>VFS correctness harness</title>
+</head>
+<body>
+  <!--
+    Deliberately empty: served with the same COOP/COEP headers as the benchmark
+    page (see server.js) so `crossOriginIsolated` is true and the SAB-backed sync
+    API works. Correctness specs drive it entirely via page.evaluate(() => import('/index.js')).
+  -->
+  <p>VFS correctness harness — see tests/benchmark/*.spec.ts</p>
+</body>
+</html>

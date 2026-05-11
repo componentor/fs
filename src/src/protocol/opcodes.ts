@@ -65,7 +65,10 @@ export const SAB_OFFSETS = {
   CHUNK_LEN: 12,    // Int32 - bytes in this chunk
   TOTAL_LEN: 16,    // BigUint64 - full data size across all chunks
   CHUNK_IDX: 24,    // Int32 - 0-based chunk index
-  RESERVED: 28,     // Int32 - reserved
+  HEARTBEAT: 28,    // Int32 - liveness counter; the relay worker bumps this ~1×/s
+                    //         while its event loop is alive (incl. mid-await of a
+                    //         long op) so a spin-waiting main thread can tell
+                    //         "slow" from "dead". Never written by the main thread.
   HEADER_SIZE: 32,  // Data payload starts here
 } as const;
 

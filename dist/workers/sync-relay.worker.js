@@ -2469,8 +2469,11 @@ var SAB_OFFSETS = {
   // BigUint64 - full data size across all chunks
   CHUNK_IDX: 24,
   // Int32 - 0-based chunk index
-  RESERVED: 28,
-  // Int32 - reserved
+  HEARTBEAT: 28,
+  // Int32 - liveness counter; the relay worker bumps this ~1×/s
+  //         while its event loop is alive (incl. mid-await of a
+  //         long op) so a spin-waiting main thread can tell
+  //         "slow" from "dead". Never written by the main thread.
   HEADER_SIZE: 32
   // Data payload starts here
 };
@@ -2538,6 +2541,15 @@ var asyncSab = null;
 var asyncCtrl = null;
 var tabId = "";
 var HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
+var HEARTBEAT_INDEX = SAB_OFFSETS.HEARTBEAT >> 2;
+var HEARTBEAT_INTERVAL_MS = 1e3;
+var heartbeatTimer = null;
+function startHeartbeat() {
+  if (heartbeatTimer !== null || !ctrl) return;
+  heartbeatTimer = setInterval(() => {
+    Atomics.add(ctrl, HEARTBEAT_INDEX, 1);
+  }, HEARTBEAT_INTERVAL_MS);
+}
 var clientPorts = /* @__PURE__ */ new Map();
 var portQueue = [];
 var yieldChannel = new MessageChannel();
@@ -3744,6 +3756,7 @@ self.onmessage = async (e) => {
       readySab = msg.readySab;
       ctrl = new Int32Array(sab, 0, 8);
       readySignal = new Int32Array(readySab, 0, 1);
+      startHeartbeat();
     }
     if (msg.asyncSab) {
       asyncSab = msg.asyncSab;
@@ -3782,6 +3795,7 @@ self.onmessage = async (e) => {
       readySab = msg.readySab;
       ctrl = new Int32Array(sab, 0, 8);
       readySignal = new Int32Array(readySab, 0, 1);
+      startHeartbeat();
     }
     if (msg.asyncSab) {
       asyncSab = msg.asyncSab;
@@ -3818,6 +3832,7 @@ self.onmessage = async (e) => {
       readySab = msg.readySab;
       ctrl = new Int32Array(sab, 0, 8);
       readySignal = new Int32Array(readySab, 0, 1);
+      startHeartbeat();
     }
     if (msg.asyncSab) {
       asyncSab = msg.asyncSab;

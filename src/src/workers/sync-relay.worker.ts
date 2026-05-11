@@ -57,6 +57,22 @@ let asyncCtrl: Int32Array | null = null;
 let tabId: string = '';
 
 const HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
+const HEARTBEAT_INDEX = SAB_OFFSETS.HEARTBEAT >> 2;
+const HEARTBEAT_INTERVAL_MS = 1000;
+
+// Liveness heartbeat: the main thread can't Atomics.wait(), so it spin-waits and
+// needs a way to tell "this relay worker is slow" from "…is dead". This timer
+// bumps a counter in the control SAB whenever our event loop is alive — crucially
+// it still fires while we're parked on an `await` inside a long OPFS op (rename of
+// a huge tree, etc.), so a genuinely-progressing op never trips the main thread's
+// stall detector. It only goes quiet if the worker thread is wedged or gone.
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+function startHeartbeat(): void {
+  if (heartbeatTimer !== null || !ctrl) return;
+  heartbeatTimer = setInterval(() => {
+    Atomics.add(ctrl, HEARTBEAT_INDEX, 1);
+  }, HEARTBEAT_INTERVAL_MS);
+}
 
 // ========== Leader mode: client port management ==========
 
@@ -1477,6 +1493,7 @@ self.onmessage = async (e: MessageEvent) => {
       readySab = msg.readySab;
       ctrl = new Int32Array(sab, 0, 8);
       readySignal = new Int32Array(readySab, 0, 1);
+      startHeartbeat(); // begin pulsing before init work so a slow init isn't mistaken for a dead worker
     }
 
     if (msg.asyncSab) {
@@ -1528,6 +1545,7 @@ self.onmessage = async (e: MessageEvent) => {
       readySab = msg.readySab;
       ctrl = new Int32Array(sab, 0, 8);
       readySignal = new Int32Array(readySab, 0, 1);
+      startHeartbeat(); // begin pulsing before init work so a slow init isn't mistaken for a dead worker
     }
 
     if (msg.asyncSab) {
@@ -1572,6 +1590,7 @@ self.onmessage = async (e: MessageEvent) => {
       readySab = msg.readySab;
       ctrl = new Int32Array(sab, 0, 8);
       readySignal = new Int32Array(readySab, 0, 1);
+      startHeartbeat(); // begin pulsing before init work so a slow init isn't mistaken for a dead worker
     }
 
     if (msg.asyncSab) {

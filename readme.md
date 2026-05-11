@@ -604,6 +604,13 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
 
+### v3.0.52 (2026)
+
+**Fixes:**
+- Sync FS calls on the browser main thread (which can't use `Atomics.wait` and so spin on `Atomics.load`) no longer abort a legitimately slow operation. The old fixed timeout (10 s, briefly 60 s) killed in-flight `rename`/`copy` over large trees — e.g. `create-strapi-app`'s git init over a fresh `node_modules` — while a genuinely dead worker still blocked for the whole timeout. The relay worker now pulses a heartbeat counter in the control SAB every 1 s (it keeps ticking even while parked on an `await` inside a long op), and the spin-wait aborts only if that heartbeat stalls for 20 s — no upper bound on a progressing op
+- Fix corruption/hang on large sync writes. A `writeFileSync`/`writeSync`/`appendFileSync` of more than ~2 MB (the default SAB data window) is chunked over the SAB; the response-wait afterward waited on the wrong control-word sentinel (`REQUEST` instead of the last chunk's `CHUNK`), so it fell through immediately and read stale request bytes as the response, then wedged. Now waits on the frame it actually wrote last, matching the async path
+- Add a Playwright regression test round-tripping ≈2 MB / ≈5 MB payloads through the sync and promises write APIs with byte-for-byte verification; `playwright-report/` and `test-results/` are now gitignored
+
 ### v3.0.51 (2026)
 
 **Fixes:**

@@ -362,7 +362,12 @@ var OP = {
 var SAB_OFFSETS = {
   // Int32 - bytes in this chunk
   TOTAL_LEN: 16,
-  // Int32 - reserved
+  // Int32 - 0-based chunk index
+  HEARTBEAT: 28,
+  // Int32 - liveness counter; the relay worker bumps this ~1×/s
+  //         while its event loop is alive (incl. mid-await of a
+  //         long op) so a spin-waiting main thread can tell
+  //         "slow" from "dead". Never written by the main thread.
   HEADER_SIZE: 32
   // Data payload starts here
 };
@@ -2556,18 +2561,36 @@ var DEFAULT_SAB_SIZE = 2 * 1024 * 1024;
 var instanceRegistry = /* @__PURE__ */ new Map();
 var HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
 var _canAtomicsWait = typeof globalThis.WorkerGlobalScope !== "undefined";
-var SPIN_TIMEOUT_MS = 1e4;
-function spinWait(arr, index, value) {
+var SAB_HEARTBEAT_INDEX = SAB_OFFSETS.HEARTBEAT >> 2;
+var SPIN_STALL_TIMEOUT_MS = 2e4;
+var SPIN_NO_HEARTBEAT_TIMEOUT_MS = 3e4;
+function spinWait(arr, index, value, heartbeatArr) {
   if (_canAtomicsWait) {
     Atomics.wait(arr, index, value);
-  } else {
+    return;
+  }
+  if (!heartbeatArr) {
     const start = performance.now();
     while (Atomics.load(arr, index) === value) {
-      if (performance.now() - start > SPIN_TIMEOUT_MS) {
+      if (performance.now() - start > SPIN_NO_HEARTBEAT_TIMEOUT_MS) {
         throw new Error(
-          `VFS sync operation timed out after ${SPIN_TIMEOUT_MS / 1e3}s \u2014 SharedWorker may be unresponsive`
+          `VFS sync operation timed out after ${SPIN_NO_HEARTBEAT_TIMEOUT_MS / 1e3}s \u2014 relay worker did not respond`
         );
       }
+    }
+    return;
+  }
+  let lastBeat = Atomics.load(heartbeatArr, SAB_HEARTBEAT_INDEX);
+  let lastProgress = performance.now();
+  while (Atomics.load(arr, index) === value) {
+    const beat = Atomics.load(heartbeatArr, SAB_HEARTBEAT_INDEX);
+    if (beat !== lastBeat) {
+      lastBeat = beat;
+      lastProgress = performance.now();
+    } else if (performance.now() - lastProgress > SPIN_STALL_TIMEOUT_MS) {
+      throw new Error(
+        `VFS sync operation aborted: relay worker heartbeat stalled for ${SPIN_STALL_TIMEOUT_MS / 1e3}s \u2014 worker is unresponsive`
+      );
     }
   }
 }
@@ -3041,7 +3064,7 @@ var VFSFileSystem = class {
     if (signal === -1) {
       throw this.initError ?? new Error("VFS initialization failed");
     }
-    spinWait(this.readySignal, 0, 0);
+    spinWait(this.readySignal, 0, 0, this.ctrl);
     const finalSignal = Atomics.load(this.readySignal, 0);
     if (finalSignal === -1) {
       throw this.initError ?? new Error("VFS initialization failed");
@@ -3055,7 +3078,8 @@ var VFSFileSystem = class {
     const maxChunk = this.sab.byteLength - HEADER_SIZE;
     const requestBytes = new Uint8Array(requestBuf);
     const totalLenView = new BigUint64Array(this.sab, SAB_OFFSETS.TOTAL_LEN, 1);
-    if (requestBytes.byteLength <= maxChunk) {
+    const multiChunkRequest = requestBytes.byteLength > maxChunk;
+    if (!multiChunkRequest) {
       new Uint8Array(this.sab, HEADER_SIZE, requestBytes.byteLength).set(requestBytes);
       Atomics.store(this.ctrl, 3, requestBytes.byteLength);
       Atomics.store(totalLenView, 0, BigInt(requestBytes.byteLength));
@@ -3079,11 +3103,11 @@ var VFSFileSystem = class {
         Atomics.notify(this.ctrl, 0);
         sent += chunkSize;
         if (sent < requestBytes.byteLength) {
-          spinWait(this.ctrl, 0, sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK);
+          spinWait(this.ctrl, 0, sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK, this.ctrl);
         }
       }
     }
-    spinWait(this.ctrl, 0, SIGNAL.REQUEST);
+    spinWait(this.ctrl, 0, multiChunkRequest ? SIGNAL.CHUNK : SIGNAL.REQUEST, this.ctrl);
     const signal = Atomics.load(this.ctrl, 0);
     const respChunkLen = Atomics.load(this.ctrl, 3);
     const respTotalLen = Number(Atomics.load(totalLenView, 0));
@@ -3099,7 +3123,7 @@ var VFSFileSystem = class {
       while (received < respTotalLen) {
         Atomics.store(this.ctrl, 0, SIGNAL.CHUNK_ACK);
         Atomics.notify(this.ctrl, 0);
-        spinWait(this.ctrl, 0, SIGNAL.CHUNK_ACK);
+        spinWait(this.ctrl, 0, SIGNAL.CHUNK_ACK, this.ctrl);
         const nextLen = Atomics.load(this.ctrl, 3);
         responseBytes.set(new Uint8Array(this.sab, HEADER_SIZE, nextLen), received);
         received += nextLen;

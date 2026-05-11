@@ -66,25 +66,70 @@ const DEFAULT_SAB_SIZE = 2 * 1024 * 1024;
 const instanceRegistry = new Map<string, VFSFileSystem>();
 const HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
 
-// Atomics.wait() is disallowed on the browser main thread.
-// Use spin-wait (Atomics.load loop) as fallback.
+// Atomics.wait() is disallowed on the browser main thread, so the main thread
+// falls back to a spin-wait (Atomics.load loop). A spin-wait blocks the event
+// loop, so we must bail out if the relay worker servicing us has died — but we
+// must *not* bail merely because an op is slow. A single sync rename/copy can
+// legitimately stay busy for tens of seconds during e.g. `git add .` over a
+// freshly-installed node_modules; aborting it mid-flight is worse than waiting.
+//
+// So: liveness, not wall-clock. The relay worker bumps a heartbeat counter in
+// the control SAB (SAB_OFFSETS.HEARTBEAT) ~once a second whenever its event
+// loop is alive — including while it's parked on an `await` inside a long op.
+// The main thread watches that counter: while it keeps advancing we keep
+// waiting; if it stalls for SPIN_STALL_TIMEOUT_MS the worker is wedged/dead and
+// we throw. There is deliberately no upper bound on a *progressing* op.
 const _canAtomicsWait = typeof globalThis.WorkerGlobalScope !== 'undefined';
 
-// Main-thread spin-wait timeout: 10 seconds.
-// If SharedWorker is dead/broken, abort instead of blocking the main thread forever.
-const SPIN_TIMEOUT_MS = 10_000;
+// Int32 index of the heartbeat slot in a control SAB viewed as Int32Array.
+const SAB_HEARTBEAT_INDEX = SAB_OFFSETS.HEARTBEAT >> 2;
 
-function spinWait(arr: Int32Array, index: number, value: number): void {
+// How long the heartbeat may stall before we declare the worker unresponsive.
+// Must comfortably exceed the worker's heartbeat interval (~1s) plus the
+// longest Atomics.wait the relay loop can sit in uninterruptibly (~5s, and
+// potentially a couple back-to-back); 20s leaves generous margin.
+const SPIN_STALL_TIMEOUT_MS = 20_000;
+
+// Fallback timeout for spin-waits without a heartbeat channel (should not occur
+// in practice — every caller passes this.ctrl as the heartbeat source — but a
+// plain ceiling is safer than spinning forever if one ever doesn't).
+const SPIN_NO_HEARTBEAT_TIMEOUT_MS = 30_000;
+
+/**
+ * Block the calling thread until `arr[index]` changes away from `value`.
+ *
+ * In a worker: plain Atomics.wait. On the main thread: spin-wait, aborting if
+ * `heartbeatArr` (whose [SAB_HEARTBEAT_INDEX] slot the relay worker increments
+ * while alive) stalls for SPIN_STALL_TIMEOUT_MS — i.e. abort on a dead worker,
+ * not on a slow one. Without `heartbeatArr`, falls back to a plain ceiling.
+ */
+function spinWait(arr: Int32Array, index: number, value: number, heartbeatArr?: Int32Array): void {
   if (_canAtomicsWait) {
     Atomics.wait(arr, index, value);
-  } else {
+    return;
+  }
+  if (!heartbeatArr) {
     const start = performance.now();
     while (Atomics.load(arr, index) === value) {
-      if (performance.now() - start > SPIN_TIMEOUT_MS) {
+      if (performance.now() - start > SPIN_NO_HEARTBEAT_TIMEOUT_MS) {
         throw new Error(
-          `VFS sync operation timed out after ${SPIN_TIMEOUT_MS / 1000}s — SharedWorker may be unresponsive`
+          `VFS sync operation timed out after ${SPIN_NO_HEARTBEAT_TIMEOUT_MS / 1000}s — relay worker did not respond`
         );
       }
+    }
+    return;
+  }
+  let lastBeat = Atomics.load(heartbeatArr, SAB_HEARTBEAT_INDEX);
+  let lastProgress = performance.now();
+  while (Atomics.load(arr, index) === value) {
+    const beat = Atomics.load(heartbeatArr, SAB_HEARTBEAT_INDEX);
+    if (beat !== lastBeat) {
+      lastBeat = beat;
+      lastProgress = performance.now();
+    } else if (performance.now() - lastProgress > SPIN_STALL_TIMEOUT_MS) {
+      throw new Error(
+        `VFS sync operation aborted: relay worker heartbeat stalled for ${SPIN_STALL_TIMEOUT_MS / 1000}s — worker is unresponsive`
+      );
     }
   }
 }
@@ -686,8 +731,9 @@ export class VFSFileSystem {
       // Permanent failure (e.g. VFS corruption in vfs-only mode)
       throw this.initError ?? new Error('VFS initialization failed');
     }
-    // Block until ready
-    spinWait(this.readySignal, 0, 0);
+    // Block until ready (heartbeat lives in the control SAB, which is allocated
+    // before init starts, so it advances even while the worker is initializing).
+    spinWait(this.readySignal, 0, 0, this.ctrl);
     // Check again after wake — could be ready (1) or failed (-1)
     const finalSignal = Atomics.load(this.readySignal, 0);
     if (finalSignal === -1) {
@@ -705,7 +751,9 @@ export class VFSFileSystem {
     const requestBytes = new Uint8Array(requestBuf);
     const totalLenView = new BigUint64Array(this.sab, SAB_OFFSETS.TOTAL_LEN, 1);
 
-    if (requestBytes.byteLength <= maxChunk) {
+    const multiChunkRequest = requestBytes.byteLength > maxChunk;
+
+    if (!multiChunkRequest) {
       // Fast path: single chunk
       new Uint8Array(this.sab, HEADER_SIZE, requestBytes.byteLength).set(requestBytes);
       Atomics.store(this.ctrl, 3, requestBytes.byteLength); // chunk length
@@ -734,13 +782,27 @@ export class VFSFileSystem {
         sent += chunkSize;
         if (sent < requestBytes.byteLength) {
           // Wait for worker to ack
-          spinWait(this.ctrl, 0, sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK);
+          spinWait(this.ctrl, 0, sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK, this.ctrl);
         }
       }
     }
 
-    // Wait for response
-    spinWait(this.ctrl, 0, SIGNAL.REQUEST);
+    // Wait for the worker to produce the response.
+    //
+    // The frame the worker must transition away from is whatever we wrote last:
+    // REQUEST for a single-chunk request, or — for a multi-chunk request — the
+    // final chunk's CHUNK frame, since the worker only emits a CHUNK_ACK for
+    // *non-final* chunks (see readPayload in sync-relay.worker.ts; mirrors the
+    // async-relay's send path). Waiting on the wrong sentinel here makes the
+    // spin-wait fall through immediately and read the response area while it
+    // still holds stale request bytes.
+    //
+    // NOTE: this assumes a multi-chunk request is never answered by a
+    // multi-chunk response (the worker would set ctrl[0]=CHUNK again, an
+    // invisible no-op transition). True today — a request only exceeds maxChunk
+    // for WRITE/FWRITE/APPEND, whose responses are 8 bytes — but if that ever
+    // changes, readPayload must be made to ack the final chunk too.
+    spinWait(this.ctrl, 0, multiChunkRequest ? SIGNAL.CHUNK : SIGNAL.REQUEST, this.ctrl);
 
     // Read response — may be chunked
     const signal = Atomics.load(this.ctrl, 0);
@@ -766,7 +828,7 @@ export class VFSFileSystem {
         // Ack and wait for next chunk
         Atomics.store(this.ctrl, 0, SIGNAL.CHUNK_ACK);
         Atomics.notify(this.ctrl, 0);
-        spinWait(this.ctrl, 0, SIGNAL.CHUNK_ACK);
+        spinWait(this.ctrl, 0, SIGNAL.CHUNK_ACK, this.ctrl);
 
         const nextLen = Atomics.load(this.ctrl, 3);
         responseBytes.set(new Uint8Array(this.sab, HEADER_SIZE, nextLen), received);
