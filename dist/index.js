@@ -2616,6 +2616,12 @@ var VFSFileSystem = class {
   rejectReady;
   initError = null;
   isReady = false;
+  /** True while a leader transition is in flight (promotion to leader, etc.).
+   *  Cleared the moment the new sync-relay signals `ready`. Consumers can
+   *  combine this with `isReady` to know when sync FS ops are safe again. */
+  transitioning = false;
+  /** Listeners awaiting the next `ready` signal (used by `whenReady()`). */
+  readyListeners = /* @__PURE__ */ new Set();
   // Config (definite assignment — always set when constructor doesn't return singleton)
   config;
   tabId;
@@ -2691,8 +2697,10 @@ var VFSFileSystem = class {
       const msg = e.data;
       if (msg.type === "ready") {
         this.isReady = true;
+        this.transitioning = false;
         this.initAsyncRelay();
         this.resolveReady();
+        this.fireReadyListeners();
         if (!this.isFollower) {
           this.initLeaderBroker();
         }
@@ -2963,6 +2971,7 @@ var VFSFileSystem = class {
   promoteToLeader() {
     this.isFollower = false;
     this.isReady = false;
+    this.transitioning = true;
     this.brokerInitialized = false;
     if (this.brokerHeartbeatTimer) {
       clearInterval(this.brokerHeartbeatTimer);
@@ -2999,7 +3008,9 @@ var VFSFileSystem = class {
       const msg = e.data;
       if (msg.type === "ready") {
         this.isReady = true;
+        this.transitioning = false;
         this.resolveReady();
+        this.fireReadyListeners();
         this.initLeaderBroker();
       } else if (msg.type === "init-failed") {
         if (msg.error?.startsWith("Corrupt VFS:")) {
@@ -3614,6 +3625,44 @@ var VFSFileSystem = class {
       }
     });
   }
+  /** True only while the filesystem is fully ready for synchronous operations
+   *  AND no leader transition is in progress. Reflects the moment-in-time state;
+   *  use `whenReady()` to await readiness reliably. */
+  get ready() {
+    return this.isReady && !this.transitioning;
+  }
+  /** Resolves once the filesystem is fully ready for synchronous operations,
+   *  including any in-flight leader transition (promotion-to-leader, etc.).
+   *  If already ready and no transition is pending, resolves immediately.
+   *
+   *  Use this when coordinating with other Web-Lock-based systems (e.g. a
+   *  parent app that elects its own leader independently of the FS) — the
+   *  timing of the two elections isn't synchronized, so the FS may still be
+   *  reinitialising when the parent's lock fires. Calling `whenReady()`
+   *  after your own leader-acquisition guarantees the FS is back in a state
+   *  where sync ops won't stall the 20-second relay-worker heartbeat. */
+  whenReady() {
+    if (this.isReady && !this.transitioning) return Promise.resolve();
+    if (this.transitioning) {
+      return new Promise((resolve2) => {
+        this.readyListeners.add(resolve2);
+      });
+    }
+    return this.readyPromise.then(() => {
+    });
+  }
+  /** Internal — called by lifecycle handlers when sync-relay says 'ready'. */
+  fireReadyListeners() {
+    const listeners = Array.from(this.readyListeners);
+    this.readyListeners.clear();
+    for (const l of listeners) {
+      try {
+        l();
+      } catch (e) {
+        console.warn("[VFS] readyListener threw:", e);
+      }
+    }
+  }
   /** Switch the filesystem mode at runtime.
    *
    *  Typical flow for IDE corruption recovery:
@@ -3651,7 +3700,9 @@ var VFSFileSystem = class {
       const msg = e.data;
       if (msg.type === "ready") {
         this.isReady = true;
+        this.transitioning = false;
         this.resolveReady();
+        this.fireReadyListeners();
         if (!this.isFollower) {
           this.initLeaderBroker();
         }

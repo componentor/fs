@@ -162,6 +162,12 @@ export class VFSFileSystem {
   private rejectReady!: (err: Error) => void;
   private initError: Error | null = null;
   private isReady = false;
+  /** True while a leader transition is in flight (promotion to leader, etc.).
+   *  Cleared the moment the new sync-relay signals `ready`. Consumers can
+   *  combine this with `isReady` to know when sync FS ops are safe again. */
+  private transitioning = false;
+  /** Listeners awaiting the next `ready` signal (used by `whenReady()`). */
+  private readyListeners = new Set<() => void>();
 
 
   // Config (definite assignment — always set when constructor doesn't return singleton)
@@ -264,10 +270,12 @@ export class VFSFileSystem {
       const msg = e.data;
       if (msg.type === 'ready') {
         this.isReady = true;
+        this.transitioning = false;
         // Initialize async-relay AFTER sync-relay is ready to avoid
         // requests arriving before the leader loop is running.
         this.initAsyncRelay();
         this.resolveReady();
+        this.fireReadyListeners();
         if (!this.isFollower) {
           this.initLeaderBroker();
         }
@@ -604,6 +612,10 @@ export class VFSFileSystem {
   private promoteToLeader(): void {
     this.isFollower = false;
     this.isReady = false;
+    // Mark transition first thing so concurrent `whenReady()` callers wait
+    // for the new sync-relay 'ready' signal rather than seeing the stale
+    // resolved readyPromise from the previous lifecycle.
+    this.transitioning = true;
     this.brokerInitialized = false; // Allow re-registration with SW as new leader
 
     // Tear down the prior broker plumbing — initLeaderBroker will rebuild it
@@ -653,7 +665,9 @@ export class VFSFileSystem {
       const msg = e.data;
       if (msg.type === 'ready') {
         this.isReady = true;
+        this.transitioning = false;
         this.resolveReady();
+        this.fireReadyListeners();
         this.initLeaderBroker();
       } else if (msg.type === 'init-failed') {
         if (msg.error?.startsWith('Corrupt VFS:')) {
@@ -1429,6 +1443,49 @@ export class VFSFileSystem {
     });
   }
 
+  /** True only while the filesystem is fully ready for synchronous operations
+   *  AND no leader transition is in progress. Reflects the moment-in-time state;
+   *  use `whenReady()` to await readiness reliably. */
+  get ready(): boolean {
+    return this.isReady && !this.transitioning;
+  }
+
+  /** Resolves once the filesystem is fully ready for synchronous operations,
+   *  including any in-flight leader transition (promotion-to-leader, etc.).
+   *  If already ready and no transition is pending, resolves immediately.
+   *
+   *  Use this when coordinating with other Web-Lock-based systems (e.g. a
+   *  parent app that elects its own leader independently of the FS) — the
+   *  timing of the two elections isn't synchronized, so the FS may still be
+   *  reinitialising when the parent's lock fires. Calling `whenReady()`
+   *  after your own leader-acquisition guarantees the FS is back in a state
+   *  where sync ops won't stall the 20-second relay-worker heartbeat. */
+  whenReady(): Promise<void> {
+    if (this.isReady && !this.transitioning) return Promise.resolve();
+    if (this.transitioning) {
+      // Wait for the *next* ready signal — the readyPromise may be stale
+      // (resolved from the previous lifecycle and not yet reset).
+      return new Promise<void>((resolve) => {
+        this.readyListeners.add(resolve);
+      });
+    }
+    // Not yet ready, no transition recorded — wait on the current promise.
+    return this.readyPromise.then(() => {});
+  }
+
+  /** Internal — called by lifecycle handlers when sync-relay says 'ready'. */
+  private fireReadyListeners(): void {
+    const listeners = Array.from(this.readyListeners);
+    this.readyListeners.clear();
+    for (const l of listeners) {
+      try {
+        l();
+      } catch (e) {
+        console.warn('[VFS] readyListener threw:', e);
+      }
+    }
+  }
+
   /** Switch the filesystem mode at runtime.
    *
    *  Typical flow for IDE corruption recovery:
@@ -1475,7 +1532,11 @@ export class VFSFileSystem {
       const msg = e.data;
       if (msg.type === 'ready') {
         this.isReady = true;
+        // Clear any stale transition flag (e.g. a setMode that interrupted an
+        // in-flight promoteToLeader) so `ready`/`whenReady()` don't wedge.
+        this.transitioning = false;
         this.resolveReady();
+        this.fireReadyListeners();
         if (!this.isFollower) {
           this.initLeaderBroker();
         }

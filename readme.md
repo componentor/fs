@@ -400,6 +400,31 @@ await fs.setMode('hybrid' | 'vfs' | 'opfs'): Promise<void>
 
 // Non-blocking async init (waits for VFS to be ready)
 await fs.init(): Promise<void>
+
+// Moment-in-time readiness: true only when ready AND no leader transition is
+// in flight (equivalent to isReady && !transitioning)
+fs.ready: boolean
+
+// Await readiness reliably, INCLUDING through an in-flight leader promotion.
+// Resolves immediately if already ready; otherwise resolves on the next time
+// the sync-relay signals 'ready'. Use this to coordinate with another
+// navigator.locks-based leader election running independently of the FS:
+await fs.whenReady(): Promise<void>
+```
+
+The `fs.ready` / `fs.whenReady()` pair exists because the FS elects its own
+multi-tab leader via `navigator.locks`. When the leader tab dies and this tab is
+promoted, there's a window where the new sync-relay worker isn't looping yet —
+issuing a sync op then stalls until the worker's heartbeat watchdog fires. If
+your app also does its own leader election, await `fs.whenReady()` *after*
+acquiring your own lock to be sure the FS has finished any promotion first:
+
+```typescript
+navigator.locks.request('my-app-leader', async () => {
+  await fs.whenReady();      // FS promotion (if any) has completed
+  fs.writeFileSync('/state.json', data); // safe — won't stall the relay worker
+  await new Promise(() => {}); // hold the lock
+});
 ```
 
 ### Watch API
@@ -603,6 +628,12 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 ## Changelog
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
+
+### v3.0.53 (2026)
+
+**Features:**
+- Leader-transition readiness tracking. New `fs.whenReady()` resolves once the filesystem is fully ready *including* any in-flight promotion-to-leader, and a new `fs.ready` getter reports the moment-in-time state. Lets an embedding app that runs its own `navigator.locks` leader election coordinate with the FS's independent election — without it, the app can win its lock and issue sync calls while the FS is still mid-promotion, stalling against the 20 s heartbeat watchdog
+- During `promoteToLeader` the existing `readyPromise` is stale (resolved by the prior lifecycle), so awaiting it would return immediately even though the new sync-relay hasn't signalled `ready`. A `transitioning` flag now guards this: while set, `whenReady()` waits for the *next* `ready` rather than the stale promise. All three `ready` handlers (bootstrap, `promoteToLeader`, `setMode`) clear the flag and flush waiting callers consistently
 
 ### v3.0.52 (2026)
 

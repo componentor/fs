@@ -348,6 +348,12 @@ declare class VFSFileSystem {
     private rejectReady;
     private initError;
     private isReady;
+    /** True while a leader transition is in flight (promotion to leader, etc.).
+     *  Cleared the moment the new sync-relay signals `ready`. Consumers can
+     *  combine this with `isReady` to know when sync FS ops are safe again. */
+    private transitioning;
+    /** Listeners awaiting the next `ready` signal (used by `whenReady()`). */
+    private readyListeners;
     private config;
     private tabId;
     private _mode;
@@ -514,6 +520,23 @@ declare class VFSFileSystem {
      *  Rejects with corruption error if VFS was corrupt (but system falls back to OPFS mode).
      *  Callers can catch and continue — the fs API works in OPFS mode after rejection. */
     init(): Promise<void>;
+    /** True only while the filesystem is fully ready for synchronous operations
+     *  AND no leader transition is in progress. Reflects the moment-in-time state;
+     *  use `whenReady()` to await readiness reliably. */
+    get ready(): boolean;
+    /** Resolves once the filesystem is fully ready for synchronous operations,
+     *  including any in-flight leader transition (promotion-to-leader, etc.).
+     *  If already ready and no transition is pending, resolves immediately.
+     *
+     *  Use this when coordinating with other Web-Lock-based systems (e.g. a
+     *  parent app that elects its own leader independently of the FS) — the
+     *  timing of the two elections isn't synchronized, so the FS may still be
+     *  reinitialising when the parent's lock fires. Calling `whenReady()`
+     *  after your own leader-acquisition guarantees the FS is back in a state
+     *  where sync ops won't stall the 20-second relay-worker heartbeat. */
+    whenReady(): Promise<void>;
+    /** Internal — called by lifecycle handlers when sync-relay says 'ready'. */
+    private fireReadyListeners;
     /** Switch the filesystem mode at runtime.
      *
      *  Typical flow for IDE corruption recovery:
