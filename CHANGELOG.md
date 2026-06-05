@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.0.54
+
+- Fix dropped OPFS file renames on Safari caused by a transient `NotFoundError`. `renameInOPFS` resolves the source via `getFileHandle`; 3.0.50 routed *both* `TypeMismatchError` (genuinely a directory) and `NotFoundError` to the directory-aware branch. But Safari's OPFS has a brief consistency lag between a `createSyncAccessHandle` write and a subsequent `getFileHandle`, so a just-written source (e.g. `printf x > a; mv a b`) can momentarily report `NotFound` — which then *also* failed in the dir branch (`renameDirInOPFS` can't find the entry either), logging `rename (dir) failed: … NotFoundError` and silently dropping the rename, leaving the OPFS mirror diverged from the VFS
+- Now only `TypeMismatchError` (and the equivalent `not a file` / `not an entry of requested type` messages) routes straight to the directory branch. A `NotFoundError` instead triggers a bounded retry of the file lookup (6 attempts with incremental 8 ms backoff, ~120 ms total) to let OPFS catch up, falling back to the directory branch only as a last resort before warning
+- Fix a TypeScript regression along the way: the retry loop left `oldDir`/`oldHandle` flagged as possibly-unassigned at the file-rename use sites; added definite-assignment assertions (type-only, no change to emitted JS)
+
 ## 3.0.53
 
 - Add leader-transition readiness tracking so callers can tell when sync FS ops are actually safe across a leader handoff. New `fs.whenReady(): Promise<void>` resolves once the filesystem is fully ready *including* any in-flight promotion-to-leader, and a new `fs.ready: boolean` getter reports the moment-in-time state (`isReady && !transitioning`). Motivation: an embedding app that runs its own `navigator.locks`-based leader election independently of the FS can win its lock and start issuing sync calls while the FS is still mid-promotion — at which point the relay worker isn't looping yet and the call stalls against the 20 s heartbeat watchdog

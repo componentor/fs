@@ -629,6 +629,11 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
 
+### v3.0.54 (2026)
+
+**Fixes:**
+- OPFS file renames no longer get silently dropped on Safari after a just-written source. `renameInOPFS` lumped `NotFoundError` together with `TypeMismatchError` (3.0.50) and sent both to the directory-aware branch — but Safari's OPFS has a brief consistency lag between a `createSyncAccessHandle` write and a subsequent `getFileHandle`, so a freshly-written source (e.g. `printf x > a; mv a b`) momentarily reports `NotFound`, the dir branch then also fails, and the rename is lost (mirror diverges from VFS). Only genuine `TypeMismatchError` now routes to the dir branch; `NotFoundError` triggers a bounded file-lookup retry (6 attempts, ~120 ms) to let OPFS catch up, with the dir branch only as a last resort
+
 ### v3.0.53 (2026)
 
 **Features:**

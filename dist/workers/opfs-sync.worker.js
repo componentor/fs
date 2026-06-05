@@ -162,19 +162,39 @@ async function renameInOPFS(oldPath, newPath) {
   let dstAccess = null;
   let oldDir;
   let oldHandle;
-  try {
-    oldDir = await navigateToParent(oldPath);
-    oldHandle = await oldDir.getFileHandle(basename(oldPath));
-  } catch (err) {
-    if (err?.name === "TypeMismatchError" || err?.name === "NotFoundError" || err?.message?.includes("TypeMismatch") || err?.message?.includes("not a file") || err?.message?.includes("not an entry of requested type")) {
-      try {
-        await renameDirInOPFS(oldPath, newPath);
-      } catch (dirErr) {
-        console.warn("[opfs-sync] rename (dir) failed:", oldPath, "\u2192", newPath, dirErr);
+  let resolvedFile = false;
+  let lastErr = null;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      oldDir = await navigateToParent(oldPath);
+      oldHandle = await oldDir.getFileHandle(basename(oldPath));
+      resolvedFile = true;
+      break;
+    } catch (err) {
+      lastErr = err;
+      const msg = err?.message || "";
+      const isDir = err?.name === "TypeMismatchError" || msg.includes("TypeMismatch") || msg.includes("not a file") || msg.includes("not an entry of requested type");
+      if (isDir) {
+        try {
+          await renameDirInOPFS(oldPath, newPath);
+        } catch (dirErr) {
+          console.warn("[opfs-sync] rename (dir) failed:", oldPath, "\u2192", newPath, dirErr);
+        }
+        return;
       }
-      return;
+      if (attempt < 5) {
+        await new Promise((r) => setTimeout(r, 8 * (attempt + 1)));
+        continue;
+      }
     }
-    console.warn("[opfs-sync] rename failed:", oldPath, "\u2192", newPath, err);
+  }
+  if (!resolvedFile) {
+    try {
+      await renameDirInOPFS(oldPath, newPath);
+      return;
+    } catch {
+    }
+    console.warn("[opfs-sync] rename failed (source not found after retries):", oldPath, "\u2192", newPath, lastErr);
     return;
   }
   try {

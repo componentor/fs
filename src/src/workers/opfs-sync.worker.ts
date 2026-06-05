@@ -250,28 +250,67 @@ async function renameInOPFS(oldPath: string, newPath: string): Promise<void> {
   // the source tree.
   let srcAccess: FileSystemSyncAccessHandle | null = null;
   let dstAccess: FileSystemSyncAccessHandle | null = null;
-  let oldDir: FileSystemDirectoryHandle;
-  let oldHandle: FileSystemFileHandle;
-  try {
-    oldDir = await navigateToParent(oldPath);
-    oldHandle = await oldDir.getFileHandle(basename(oldPath));
-  } catch (err: any) {
-    // Not a file — try directory. (TypeMismatchError on Safari, plus
-    // generic "not a file" / "wrong handle type" messages on other
-    // engines.)
-    if (err?.name === 'TypeMismatchError' ||
-        err?.name === 'NotFoundError' ||
-        err?.message?.includes('TypeMismatch') ||
-        err?.message?.includes('not a file') ||
-        err?.message?.includes('not an entry of requested type')) {
-      try {
-        await renameDirInOPFS(oldPath, newPath);
-      } catch (dirErr) {
-        console.warn('[opfs-sync] rename (dir) failed:', oldPath, '→', newPath, dirErr);
+  // Definite-assignment: both are set inside the retry loop before
+  // `resolvedFile` flips true, and the file-rename path below is only
+  // reached when resolvedFile === true. TS can't correlate the flag with
+  // the assignments, so assert it.
+  let oldDir!: FileSystemDirectoryHandle;
+  let oldHandle!: FileSystemFileHandle;
+  // Resolve the source as a FILE. Two failure modes must be distinguished:
+  //   • TypeMismatchError  → oldPath is genuinely a DIRECTORY → dir branch.
+  //   • NotFoundError      → the file isn't visible (yet). On Safari, OPFS has
+  //                          a brief consistency lag between a createSyncAccess-
+  //                          Handle write and a subsequent getFileHandle, so a
+  //                          just-written source (e.g. `printf x > a; mv a b`)
+  //                          can momentarily report NotFound. Treating that as
+  //                          "it's a directory" (the old behavior) sent it down
+  //                          the dir branch, which ALSO failed →
+  //                          "rename (dir) failed: … NotFoundError". Instead we
+  //                          RETRY the file lookup a few times to let OPFS catch
+  //                          up, then fall back to the dir branch only as a last
+  //                          resort.
+  let resolvedFile = false;
+  let lastErr: any = null;
+  for (let attempt = 0; attempt < 6; attempt++) {
+    try {
+      oldDir = await navigateToParent(oldPath);
+      oldHandle = await oldDir.getFileHandle(basename(oldPath));
+      resolvedFile = true;
+      break;
+    } catch (err: any) {
+      lastErr = err;
+      const msg = err?.message || '';
+      const isDir =
+        err?.name === 'TypeMismatchError' ||
+        msg.includes('TypeMismatch') ||
+        msg.includes('not a file') ||
+        msg.includes('not an entry of requested type');
+      if (isDir) {
+        try {
+          await renameDirInOPFS(oldPath, newPath);
+        } catch (dirErr) {
+          console.warn('[opfs-sync] rename (dir) failed:', oldPath, '→', newPath, dirErr);
+        }
+        return;
       }
-      return;
+      // NotFoundError (or other transient): yield and retry so the OPFS
+      // mirror can catch up with the just-written source (Safari lag).
+      if (attempt < 5) {
+        await new Promise((r) => setTimeout(r, 8 * (attempt + 1)));
+        continue;
+      }
     }
-    console.warn('[opfs-sync] rename failed:', oldPath, '→', newPath, err);
+  }
+  if (!resolvedFile) {
+    // Exhausted file retries. Last resort: it may be a directory that Safari
+    // reported via NotFound rather than TypeMismatch — try the dir branch once.
+    try {
+      await renameDirInOPFS(oldPath, newPath);
+      return;
+    } catch {
+      /* fall through to the warning below */
+    }
+    console.warn('[opfs-sync] rename failed (source not found after retries):', oldPath, '→', newPath, lastErr);
     return;
   }
   // File rename — copy through two sync access handles in fixed-size
