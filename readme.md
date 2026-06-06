@@ -629,6 +629,12 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
 
+### v3.0.55 (2026)
+
+**Fixes:**
+- OPFS renames no longer report success while leaving the source behind. Both rename paths copy the source then delete the original, but the delete was fire-and-forget — the engine (`OPFSEngine.rename`) discarded the `unlink`/`rmdir` result and the sync worker only logged a warning on a bare `removeEntry` rejection. A transient OPFS lock/consistency hiccup right after a bulk copy/close could thus report a successful rename with the file or tree still present in *both* locations. The removal is now retried with incremental backoff (10/20/30 ms) and the final status is propagated — `removeSourceWithRetry` (engine) returns a genuine failure instead of a false success, `removeEntryWithRetry` (worker) treats `NotFoundError` as already-gone and rethrows only after exhausting retries
+- `OPFSEngine.rename`'s directory branch now replaces a pre-existing destination (recursive `rmdir` for a dir, `unlink` for a file) before recreating it, matching the "replace target" semantics the sync worker already had — previously the engine merged the source tree *into* an existing target directory
+
 ### v3.0.54 (2026)
 
 **Fixes:**

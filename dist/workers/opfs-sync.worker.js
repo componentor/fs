@@ -226,7 +226,7 @@ async function renameInOPFS(oldPath, newPath) {
     } catch {
     }
     srcAccess = null;
-    await oldDir.removeEntry(basename(oldPath));
+    await removeEntryWithRetry(oldDir, basename(oldPath));
   } catch (err) {
     console.warn("[opfs-sync] rename failed:", oldPath, "\u2192", newPath, err);
   } finally {
@@ -255,7 +255,21 @@ async function renameDirInOPFS(oldPath, newPath) {
   }
   const dstDir = await newParent.getDirectoryHandle(basename(newPath), { create: true });
   await copyDirContents(srcDir, dstDir);
-  await oldParent.removeEntry(basename(oldPath), { recursive: true });
+  await removeEntryWithRetry(oldParent, basename(oldPath), { recursive: true });
+}
+async function removeEntryWithRetry(dir, name, options) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      await dir.removeEntry(name, options);
+      return;
+    } catch (err) {
+      if (err?.name === "NotFoundError") return;
+      lastErr = err;
+      await new Promise((r) => setTimeout(r, 10 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
 }
 async function copyDirContents(src, dst) {
   for await (const [name, handle] of src.entries()) {

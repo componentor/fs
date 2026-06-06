@@ -377,24 +377,58 @@ export class OPFSEngine {
     oldPath = this.normalizePath(oldPath);
     newPath = this.normalizePath(newPath);
 
+    // Renaming a path onto itself is a no-op (matches VFSEngine.rename and
+    // POSIX). Must come before the target-replacement below, which would
+    // otherwise delete the source thinking it was a stale destination.
+    if (oldPath === newPath) return { status: OK, data: null };
+
     const entry = await this.getEntry(oldPath);
     if (!entry) return { status: ENOENT, data: null };
 
     if (entry.kind === 'file') {
-      // File rename: read → write new → delete old
+      // File rename: read → write new → delete old.
       const fh = entry.handle as FileSystemFileHandle;
       const file = await fh.getFile();
       const data = new Uint8Array(await file.arrayBuffer());
       const writeResult = await this.write(newPath, data);
       if (writeResult.status !== OK) return writeResult;
-      await this.unlink(oldPath);
+      // A rename must NOT leave the original behind. If removing the source
+      // fails the operation is only half-done, so surface that instead of
+      // reporting a false success (which would leave the file in both places).
+      const rm = await this.removeSourceWithRetry(() => this.unlink(oldPath));
+      if (rm.status !== OK) return rm;
     } else {
-      // Directory rename: recursive copy → delete old
-      await this.mkdir(newPath, 1);
+      // Directory rename: replace any existing target (Node semantics), then
+      // recursive copy → delete old.
+      const existingTarget = await this.getEntry(newPath);
+      if (existingTarget) {
+        const clear = existingTarget.kind === 'directory'
+          ? await this.rmdir(newPath, 1)
+          : await this.unlink(newPath);
+        if (clear.status !== OK) return clear;
+      }
+      const mkdirResult = await this.mkdir(newPath, 1);
+      if (mkdirResult.status !== OK && mkdirResult.status !== EEXIST) return mkdirResult;
       await this.copyDirectoryContents(oldPath, newPath);
-      await this.rmdir(oldPath, 1);
+      // Same invariant as the file path: the source directory must be gone once
+      // the copy lands, or the tree ends up duplicated in both locations.
+      const rm = await this.removeSourceWithRetry(() => this.rmdir(oldPath, 1));
+      if (rm.status !== OK) return rm;
     }
     return { status: OK, data: null };
+  }
+
+  // Remove a just-renamed source, retrying a few times to ride out transient
+  // OPFS lock / consistency hiccups (a handle that hasn't fully released yet).
+  // Returns the final status so the caller can propagate a genuine failure
+  // rather than silently leaving the source in place.
+  private async removeSourceWithRetry(fn: () => Promise<OPFSResult>): Promise<OPFSResult> {
+    let res = await fn();
+    for (let i = 0; i < 3 && res.status !== OK; i++) {
+      await new Promise((r) => setTimeout(r, 10 * (i + 1)));
+      res = await fn();
+    }
+    return res;
   }
 
   private async copyDirectoryContents(srcPath: string, dstPath: string): Promise<void> {

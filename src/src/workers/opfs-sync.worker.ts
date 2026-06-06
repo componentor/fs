@@ -345,7 +345,7 @@ async function renameInOPFS(oldPath: string, newPath: string): Promise<void> {
     try { srcAccess.close(); } catch { /* ignore */ }
     srcAccess = null;
 
-    await oldDir.removeEntry(basename(oldPath));
+    await removeEntryWithRetry(oldDir, basename(oldPath));
   } catch (err) {
     console.warn('[opfs-sync] rename failed:', oldPath, '→', newPath, err);
   } finally {
@@ -382,8 +382,34 @@ async function renameDirInOPFS(oldPath: string, newPath: string): Promise<void> 
 
   await copyDirContents(srcDir, dstDir);
 
-  // Remove the now-copied source.
-  await oldParent.removeEntry(basename(oldPath), { recursive: true });
+  // Remove the now-copied source. A rename must not leave the original behind,
+  // so retry a few times to ride out a transient OPFS lock/consistency hiccup
+  // (a child handle that hasn't fully released yet) before giving up.
+  await removeEntryWithRetry(oldParent, basename(oldPath), { recursive: true });
+}
+
+/**
+ * removeEntry with a short retry loop. OPFS occasionally rejects a removeEntry
+ * immediately after a bulk copy/close with a transient lock error; a couple of
+ * retries with backoff let the handles settle so the source is actually gone.
+ */
+async function removeEntryWithRetry(
+  dir: FileSystemDirectoryHandle,
+  name: string,
+  options?: { recursive?: boolean },
+): Promise<void> {
+  let lastErr: any = null;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      await dir.removeEntry(name, options);
+      return;
+    } catch (err: any) {
+      if (err?.name === 'NotFoundError') return; // already gone — success
+      lastErr = err;
+      await new Promise((r) => setTimeout(r, 10 * (attempt + 1)));
+    }
+  }
+  throw lastErr;
 }
 
 /**

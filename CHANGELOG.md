@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.0.55
+
+- Stop OPFS renames from silently leaving the source behind when the post-copy removal fails. Both rename paths copy the source to the destination and then delete the original, but the delete was fire-and-forget: in the relay-worker `OPFSEngine.rename` the `unlink`/`rmdir` result was discarded, and in the sync worker `removeEntry` was a bare `await` whose rejection only surfaced as a generic warning. A transient OPFS lock/consistency hiccup right after a bulk copy/close (a child handle that hasn't fully released yet) could therefore report a successful rename while the file/tree still existed in *both* locations — a divergence the next reconcile wouldn't necessarily repair
+- The removal is now retried with incremental backoff before giving up: `OPFSEngine.removeSourceWithRetry` (engine side, up to 3 retries at 10/20/30 ms) propagates the final non-`OK` status so a genuine failure is returned to the caller instead of a false success; the sync worker's `removeEntryWithRetry` (4 attempts at 10/20/30 ms) treats `NotFoundError` as success (already gone) and rethrows the last error only after exhausting retries
+- `OPFSEngine.rename`'s directory branch now also clears a pre-existing destination before recreating it (recursive `rmdir` for a dir target, `unlink` for a file target) and tolerates `EEXIST` from the subsequent `mkdir`, matching the "replace target" semantics the sync worker's `renameDirInOPFS` already had — previously the engine copied *into* an existing target directory, merging the two trees instead of replacing
+
 ## 3.0.54
 
 - Fix dropped OPFS file renames on Safari caused by a transient `NotFoundError`. `renameInOPFS` resolves the source via `getFileHandle`; 3.0.50 routed *both* `TypeMismatchError` (genuinely a directory) and `NotFoundError` to the directory-aware branch. But Safari's OPFS has a brief consistency lag between a `createSyncAccessHandle` write and a subsequent `getFileHandle`, so a just-written source (e.g. `printf x > a; mv a b`) can momentarily report `NotFound` — which then *also* failed in the dir branch (`renameDirInOPFS` can't find the entry either), logging `rename (dir) failed: … NotFoundError` and silently dropping the rename, leaving the OPFS mirror diverged from the VFS
