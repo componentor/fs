@@ -28,7 +28,9 @@ export const SUPERBLOCK = {
   DATA_OFFSET: 40,    // float64 - byte offset to data region
   BITMAP_OFFSET: 48,  // float64 - byte offset to free block bitmap
   PATH_USED: 56,      // uint32 - bytes used in path table
-  RESERVED: 60,       // uint32
+  CRC32: 60,          // uint32 - CRC-32 of superblock bytes 0..59.
+                      //   0 = legacy file written before checksumming existed
+                      //   (validation skipped; upgraded on next superblock write).
 } as const;
 
 // Inode entry layout (64 bytes each)

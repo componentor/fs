@@ -1,0 +1,34 @@
+[33mBenchmarking is an experimental feature.
+Breaking changes might not follow SemVer, please pin Vitest's version when using it.[39m
+
+[1m[46m RUN [49m[22m [36mv4.0.16 [39m[90m/Users/steffan/Desktop/git/fs/src[39m
+
+
+ [32m✓[39m tests/engine.bench.ts[2m > [22mreaddir hot path[33m 2432[2mms[22m[39m
+     [1mname                                            [22m  [1m      hz[22m  [1m   min[22m  [1m   max[22m  [1m  mean[22m  [1m   p75[22m  [1m   p99[22m  [1m  p995[22m  [1m  p999[22m  [1m   rme[22m  [1msamples[22m
+   [32m·[39m readdir one dir (100 entries) in 10k-file volume  [34m5,061.07[39m  [36m0.1301[39m  [36m0.4408[39m  [36m0.1976[39m  [36m0.2248[39m  [36m0.3497[39m  [36m0.3937[39m  [36m0.4293[39m  [2m±0.95%[22m  [2m   2531[22m
+   [32m·[39m readdir one dir (100 entries) in 50k-file volume  [34m1,127.59[39m  [36m0.5989[39m  [36m1.3140[39m  [36m0.8868[39m  [36m0.9705[39m  [36m1.1949[39m  [36m1.2452[39m  [36m1.3140[39m  [2m±1.16%[22m  [2m    564[22m
+   [32m·[39m readdir root (500+ entries) in 50k-file volume    [34m  420.52[39m  [36m1.8473[39m  [36m4.0241[39m  [36m2.3780[39m  [36m2.4735[39m  [36m3.0419[39m  [36m3.0934[39m  [36m4.0241[39m  [2m±1.32%[22m  [2m    211[22m
+   [32m·[39m readdir deep dir (1 entry) in 50k-file volume     [34m5,385.06[39m  [36m0.1005[39m  [36m0.4513[39m  [36m0.1857[39m  [36m0.2090[39m  [36m0.3205[39m  [36m0.3461[39m  [36m0.4158[39m  [2m±0.90%[22m  [2m   2693[22m
+
+ [32m✓[39m tests/engine.bench.ts[2m > [22mstat hot path[33m 1555[2mms[22m[39m
+     [1mname                        [22m  [1m          hz[22m  [1m   min[22m  [1m   max[22m  [1m  mean[22m  [1m   p75[22m  [1m   p99[22m  [1m  p995[22m  [1m  p999[22m  [1m   rme[22m  [1msamples[22m
+   [32m·[39m stat dir in 50k-file volume   [34m    1,168.42[39m  [36m0.6294[39m  [36m1.3168[39m  [36m0.8559[39m  [36m0.9030[39m  [36m1.1994[39m  [36m1.2211[39m  [36m1.3168[39m  [2m±0.91%[22m  [2m    585[22m
+   [32m·[39m stat file in 50k-file volume  [34m1,724,719.44[39m  [36m0.0003[39m  [36m0.1986[39m  [36m0.0006[39m  [36m0.0005[39m  [36m0.0030[39m  [36m0.0107[39m  [36m0.0225[39m  [2m±0.58%[22m  [2m 862372[22m
+
+ [32m✓[39m tests/engine.bench.ts[2m > [22mmixed OS-like workload[33m 642[2mms[22m[39m
+     [1mname                                             [22m  [1m     hz[22m  [1m    min[22m  [1m    max[22m  [1m   mean[22m  [1m    p75[22m  [1m    p99[22m  [1m   p995[22m  [1m   p999[22m  [1m   rme[22m  [1msamples[22m
+   [32m·[39m list-and-stat sweep of 10 dirs in 50k-file volume  [34m57.7947[39m  [36m16.7380[39m  [36m19.3250[39m  [36m17.3026[39m  [36m17.4028[39m  [36m19.3250[39m  [36m19.3250[39m  [36m19.3250[39m  [2m±1.24%[22m  [2m     29[22m
+
+[1m[46m BENCH [49m[22m [36mSummary
+[39m
+  readdir deep dir (1 entry) in 50k-file volume[2m - tests/engine.bench.ts[2m > [22m[2mreaddir hot path[22m
+[32m    1.06x [39m[90mfaster than [39mreaddir one dir (100 entries) in 10k-file volume
+[32m    4.78x [39m[90mfaster than [39mreaddir one dir (100 entries) in 50k-file volume
+[32m    12.81x [39m[90mfaster than [39mreaddir root (500+ entries) in 50k-file volume
+
+  stat file in 50k-file volume[2m - tests/engine.bench.ts[2m > [22m[2mstat hot path[22m
+[32m    1476.12x [39m[90mfaster than [39mstat dir in 50k-file volume
+
+  list-and-stat sweep of 10 dirs in 50k-file volume[2m - tests/engine.bench.ts[2m > [22m[2mmixed OS-like workload[22m
+

@@ -219,7 +219,7 @@ interface WatchFileOptions {
 }
 interface WatchEventType {
     eventType: 'rename' | 'change';
-    filename: string | null;
+    filename: string | Uint8Array | null;
 }
 interface FileHandle {
     fd: number;
@@ -267,7 +267,7 @@ interface FSWatcher {
     ref(): this;
     unref(): this;
 }
-type WatchListener = (eventType: 'rename' | 'change', filename: string | null) => void;
+type WatchListener = (eventType: 'rename' | 'change', filename: string | Uint8Array | null) => void;
 type WatchFileListener = (curr: Stats, prev: Stats) => void;
 /** Filesystem operating mode:
  *  - 'hybrid' (default): VFS binary + bidirectional OPFS sync. Best of both worlds.

@@ -87,8 +87,13 @@ const SAB_HEARTBEAT_INDEX = SAB_OFFSETS.HEARTBEAT >> 2;
 // How long the heartbeat may stall before we declare the worker unresponsive.
 // Must comfortably exceed the worker's heartbeat interval (~1s) plus the
 // longest Atomics.wait the relay loop can sit in uninterruptibly (~5s, and
-// potentially a couple back-to-back); 20s leaves generous margin.
-const SPIN_STALL_TIMEOUT_MS = 20_000;
+// potentially a couple back-to-back). It must ALSO exceed WebKit's internal
+// ~20s storage-IPC wait: an OPFS handle.truncate issued while this thread
+// busy-spins can block the worker (frozen heartbeat) for a full 20s and then
+// SUCCEED — aborting at 20s turns that recoverable hiccup into a spurious
+// failure. Idle pre-growth (engine.maybePreGrow) makes the case rare; 30s
+// makes it survivable.
+const SPIN_STALL_TIMEOUT_MS = 30_000;
 
 // Fallback timeout for spin-waits without a heartbeat channel (should not occur
 // in practice — every caller passes this.ctrl as the heartbeat source — but a

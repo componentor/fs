@@ -17,6 +17,7 @@
  */
 
 import { VFSEngine } from '../vfs/engine.js';
+import { crc32 } from '../vfs/crc32.js';
 import {
   VFS_MAGIC, VFS_VERSION, SUPERBLOCK, INODE, INODE_SIZE, INODE_TYPE,
   DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS,
@@ -173,7 +174,13 @@ async function handleRepair(root: string) {
 
   const magic = view.getUint32(SUPERBLOCK.MAGIC, true);
   const version = view.getUint32(SUPERBLOCK.VERSION, true);
-  const superblockValid = magic === VFS_MAGIC && version === VFS_VERSION;
+  // A failed checksum means the superblock fields can't be trusted even if
+  // they look plausible — e.g. a corrupt-but-small INODE_COUNT would
+  // silently truncate the recovery scan. Fall back to the default layout
+  // instead. CRC 0 = legacy pre-checksum file: accept as before.
+  const storedCrc = view.getUint32(SUPERBLOCK.CRC32, true);
+  const crcValid = storedCrc === 0 || crc32(raw, 0, SUPERBLOCK.CRC32) === storedCrc;
+  const superblockValid = magic === VFS_MAGIC && version === VFS_VERSION && crcValid;
 
   if (superblockValid) {
     inodeCount = view.getUint32(SUPERBLOCK.INODE_COUNT, true);

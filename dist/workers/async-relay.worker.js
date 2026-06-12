@@ -34,6 +34,24 @@ var OP = {
   FCHOWN: 32,
   FUTIMES: 33
 };
+var STATUS = {
+  OK: 0,
+  ENOENT: 1,
+  EEXIST: 2,
+  EISDIR: 3,
+  ENOTDIR: 4,
+  ENOTEMPTY: 5,
+  EACCES: 6,
+  EINVAL: 7,
+  EBADF: 8,
+  ELOOP: 9,
+  ENOSPC: 10,
+  // Transport-level failure: a follower→leader round trip was aborted
+  // (deadline expired, leader handoff, dead port). Distinct from any
+  // filesystem semantic error so callers can recognize "the operation may
+  // or may not have been applied" and retry at their own level.
+  EIO: 11
+};
 var SAB_OFFSETS = {
   CONTROL: 0,
   // Int32 - signal (0=idle, 1=request, 2=response, 3=chunk, 4=ack)
@@ -97,6 +115,32 @@ function encodeTwoPathRequest(op, path1, path2, flags = 0) {
   return encodeRequest(op, path1, flags, payload);
 }
 
+// src/protocol/sab-wait.ts
+var SAB_WAIT_DEADLINE_MS = 12e4;
+var WAIT_SLICE_MS = 1e3;
+var SabWaitTimeoutError = class extends Error {
+  constructor(detail) {
+    super(`SAB protocol wait timed out: ${detail}`);
+    this.name = "SabWaitTimeoutError";
+  }
+};
+function waitWhile(ctrl, value, deadlineAt, detail, sliceMs = WAIT_SLICE_MS) {
+  while (Atomics.load(ctrl, 0) === value) {
+    const remaining = deadlineAt - Date.now();
+    if (remaining <= 0) throw new SabWaitTimeoutError(detail);
+    Atomics.wait(ctrl, 0, value, Math.min(sliceMs, remaining));
+  }
+}
+function waitUntil(ctrl, accept, deadlineAt, detail) {
+  for (; ; ) {
+    const signal = Atomics.load(ctrl, 0);
+    if (accept.includes(signal)) return signal;
+    const remaining = deadlineAt - Date.now();
+    if (remaining <= 0) throw new SabWaitTimeoutError(detail);
+    Atomics.wait(ctrl, 0, signal, Math.min(WAIT_SLICE_MS, remaining));
+  }
+}
+
 // src/workers/async-relay.worker.ts
 var encoder2 = new TextEncoder();
 var HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
@@ -104,6 +148,18 @@ var asyncSab = null;
 var asyncCtrl = null;
 var wakeCtrl = null;
 function sabRequest(requestBuf) {
+  const deadlineAt = Date.now() + SAB_WAIT_DEADLINE_MS;
+  try {
+    return sabRequestInner(requestBuf, deadlineAt);
+  } catch (err) {
+    if (err instanceof SabWaitTimeoutError) {
+      Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
+      return { status: STATUS.EIO, data: null };
+    }
+    throw err;
+  }
+}
+function sabRequestInner(requestBuf, deadlineAt) {
   const maxChunk = asyncSab.byteLength - HEADER_SIZE;
   const requestBytes = new Uint8Array(requestBuf);
   const totalLenView = new BigUint64Array(asyncSab, SAB_OFFSETS.TOTAL_LEN, 1);
@@ -133,19 +189,17 @@ function sabRequest(requestBuf) {
       if (sent === 0 && wakeCtrl) Atomics.notify(wakeCtrl, 0);
       sent += chunkSize;
       if (sent < requestBytes.byteLength) {
-        Atomics.wait(asyncCtrl, 0, sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK);
+        waitWhile(
+          asyncCtrl,
+          sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK,
+          deadlineAt,
+          "request chunk ack"
+        );
       }
     }
-    while (Atomics.load(asyncCtrl, 0) === SIGNAL.CHUNK) {
-      Atomics.wait(asyncCtrl, 0, SIGNAL.CHUNK, 100);
-    }
+    waitWhile(asyncCtrl, SIGNAL.CHUNK, deadlineAt, "last request chunk ack");
   }
-  let signal;
-  for (; ; ) {
-    signal = Atomics.load(asyncCtrl, 0);
-    if (signal === SIGNAL.RESPONSE || signal === SIGNAL.CHUNK) break;
-    Atomics.wait(asyncCtrl, 0, signal, 1e3);
-  }
+  const signal = waitUntil(asyncCtrl, [SIGNAL.RESPONSE, SIGNAL.CHUNK], deadlineAt, "response");
   const respChunkLen = Atomics.load(asyncCtrl, 3);
   const respTotalLen = Number(Atomics.load(totalLenView, 0));
   let responseBytes;
@@ -159,7 +213,7 @@ function sabRequest(requestBuf) {
     while (received < respTotalLen) {
       Atomics.store(asyncCtrl, 0, SIGNAL.CHUNK_ACK);
       Atomics.notify(asyncCtrl, 0);
-      Atomics.wait(asyncCtrl, 0, SIGNAL.CHUNK_ACK);
+      waitWhile(asyncCtrl, SIGNAL.CHUNK_ACK, deadlineAt, "response chunk");
       const nextLen = Atomics.load(asyncCtrl, 3);
       responseBytes.set(new Uint8Array(asyncSab, HEADER_SIZE, nextLen), received);
       received += nextLen;

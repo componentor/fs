@@ -16,7 +16,7 @@
  * the page is crossOriginIsolated and the sync API is available).
  */
 
-import { test, expect } from '@playwright/test';
+import { test, expect } from './fixtures';
 
 // Sizes chosen to straddle the default 2 MB SAB window:
 //  - ~2.0 MB + a hair  → exactly 2 chunks, tiny final chunk
@@ -55,6 +55,15 @@ test.describe('SAB protocol — multi-chunk request round-trips', () => {
         for (let i = 0; i < want.byteLength; i++) if (got[i] !== want[i]) return i;
         return -1;
       };
+
+      // Start from clean storage: origin OPFS persists across test runs in
+      // some engines (WebKit shares it across Playwright persistent
+      // contexts), and a .vfs.bin torn by a previously killed session makes
+      // init() reject with its documented corruption error.
+      try {
+        const opfsRoot = await navigator.storage.getDirectory();
+        await opfsRoot.removeEntry('ct-multichunk', { recursive: true });
+      } catch { /* didn't exist */ }
 
       const mod = await import('/index.js') as unknown as { VFSFileSystem: new (cfg: unknown) => {
         init(): Promise<unknown>;

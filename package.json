@@ -1,6 +1,6 @@
 {
   "name": "@componentor/fs",
-  "version": "3.0.55",
+  "version": "3.1.0",
   "description": "High-performance OPFS-based Node.js fs polyfill with true sync API, VFS binary format, and bidirectional OPFS mirroring",
   "license": "MIT",
   "author": "Componentor",
@@ -31,8 +31,8 @@
     "test": "cd src && npx vitest run",
     "benchmark": "npm run build && playwright test",
     "benchmark:server": "node tests/benchmark/server.js",
-    "benchmark:open": "npm run build && node tests/benchmark/server.js",
-    "benchmark:open:no-coep": "npm run build && node tests/benchmark/server.js --no-coep",
+    "benchmark:open": "npm run build && PORT=3030 node tests/benchmark/server.js",
+    "benchmark:open:no-coep": "npm run build && PORT=3030 node tests/benchmark/server.js --no-coep",
     "typecheck": "tsc -p src/tsconfig.json --noEmit"
   },
   "devDependencies": {

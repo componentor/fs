@@ -244,7 +244,8 @@ export interface WatchFileOptions {
 
 export interface WatchEventType {
   eventType: 'rename' | 'change';
-  filename: string | null;
+  // Uint8Array (Node: Buffer) when the watcher uses encoding: 'buffer'.
+  filename: string | Uint8Array | null;
 }
 
 export interface FileHandle {
@@ -281,7 +282,9 @@ export interface FSWatcher {
   unref(): this;
 }
 
-export type WatchListener = (eventType: 'rename' | 'change', filename: string | null) => void;
+// filename is a Uint8Array (Node passes a Buffer, a Uint8Array subclass)
+// when the watcher was created with encoding: 'buffer'.
+export type WatchListener = (eventType: 'rename' | 'change', filename: string | Uint8Array | null) => void;
 export type WatchFileListener = (curr: Stats, prev: Stats) => void;
 
 /** Filesystem operating mode:

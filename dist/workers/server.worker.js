@@ -28,8 +28,10 @@ var SUPERBLOCK = {
   // float64 - byte offset to free block bitmap
   PATH_USED: 56,
   // uint32 - bytes used in path table
-  RESERVED: 60
-  // uint32
+  CRC32: 60
+  // uint32 - CRC-32 of superblock bytes 0..59.
+  //   0 = legacy file written before checksumming existed
+  //   (validation skipped; upgraded on next superblock write).
 };
 var INODE = {
   TYPE: 0,
@@ -97,6 +99,26 @@ function calculateLayout(inodeCount = DEFAULT_INODE_COUNT, blockSize = DEFAULT_B
   };
 }
 
+// src/vfs/crc32.ts
+var TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 3988292384 ^ c >>> 1 : c >>> 1;
+    }
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+function crc32(bytes, start = 0, end = bytes.byteLength) {
+  let crc = 4294967295;
+  for (let i = start; i < end; i++) {
+    crc = TABLE[(crc ^ bytes[i]) & 255] ^ crc >>> 8;
+  }
+  return (crc ^ 4294967295) >>> 0;
+}
+
 // src/errors.ts
 var CODE_TO_STATUS = {
   OK: 0,
@@ -109,11 +131,13 @@ var CODE_TO_STATUS = {
   EINVAL: 7,
   EBADF: 8,
   ELOOP: 9,
-  ENOSPC: 10
+  ENOSPC: 10,
+  EIO: 11
 };
 
 // src/vfs/engine.ts
 var encoder = new TextEncoder();
+var PREGROW_HEADROOM_BLOCKS = 16384;
 var decoder = new TextDecoder();
 var VFSEngine = class {
   handle;
@@ -180,6 +204,17 @@ var VFSEngine = class {
   // descCount stale; `isImplicitDirectory` notices the mismatch and
   // recomputes descCount on demand.
   descCountGen = 0;
+  // Incrementally maintained directory-children index: parent dir path →
+  // (child name → number of pathIndex entries whose path passes through
+  // parent/name). Lets getDirectChildren / getDirectChildrenWithImplicit
+  // answer in O(children) instead of scanning every path in the volume,
+  // which made readdir and directory-stat O(total files) per call.
+  // A child name with refcount > 0 but no pathIndex entry of its own is an
+  // implicit directory. Same staleness contract as descCount: in sync iff
+  // childIndexGen >= pathIndexGen, rebuilt from scratch on demand when test
+  // scaffolding mutates pathIndex directly.
+  childIndex = /* @__PURE__ */ new Map();
+  childIndexGen = 0;
   // Configurable upper bounds
   maxInodes = 4e6;
   maxBlocks = 4e6;
@@ -258,6 +293,15 @@ var VFSEngine = class {
     const version = v.getUint32(SUPERBLOCK.VERSION, true);
     if (version !== VFS_VERSION) {
       throw new Error(`Corrupt VFS: unsupported version ${version} (expected ${VFS_VERSION})`);
+    }
+    const storedCrc = v.getUint32(SUPERBLOCK.CRC32, true);
+    if (storedCrc !== 0) {
+      const computedCrc = crc32(this.superblockBuf, 0, SUPERBLOCK.CRC32);
+      if (computedCrc !== storedCrc) {
+        throw new Error(
+          `Corrupt VFS: superblock checksum mismatch (stored 0x${storedCrc.toString(16)}, computed 0x${computedCrc.toString(16)})`
+        );
+      }
     }
     const inodeCount = v.getUint32(SUPERBLOCK.INODE_COUNT, true);
     const blockSize = v.getUint32(SUPERBLOCK.BLOCK_SIZE, true);
@@ -347,6 +391,7 @@ var VFSEngine = class {
     v.setFloat64(SUPERBLOCK.DATA_OFFSET, this.dataOffset, true);
     v.setFloat64(SUPERBLOCK.BITMAP_OFFSET, this.bitmapOffset, true);
     v.setUint32(SUPERBLOCK.PATH_USED, this.pathTableUsed, true);
+    v.setUint32(SUPERBLOCK.CRC32, crc32(this.superblockBuf, 0, SUPERBLOCK.CRC32), true);
     this.handle.write(this.superblockBuf, { at: 0 });
   }
   /** Flush pending bitmap and superblock writes to disk (one write each) */
@@ -371,34 +416,81 @@ var VFSEngine = class {
       this.superblockDirty = false;
     }
   }
-  /** Shrink the OPFS file by removing trailing free blocks from the data region.
-   *  Scans bitmap from end to find the last used block, then truncates. */
-  trimTrailingBlocks() {
+  /** Find the last used block index (-1 if the data region is empty). */
+  findLastUsedBlock() {
     const bitmap = this.bitmap;
-    let lastUsed = -1;
     for (let byteIdx = Math.ceil(this.totalBlocks / 8) - 1; byteIdx >= 0; byteIdx--) {
       if (bitmap[byteIdx] !== 0) {
         for (let bit = 7; bit >= 0; bit--) {
           const blockIdx = byteIdx * 8 + bit;
           if (blockIdx < this.totalBlocks && bitmap[byteIdx] & 1 << bit) {
-            lastUsed = blockIdx;
-            break;
+            return blockIdx;
           }
         }
-        break;
       }
     }
-    const newTotal = Math.max(lastUsed + 1, INITIAL_DATA_BLOCKS);
+    return -1;
+  }
+  /** Shrink the OPFS file by removing trailing free blocks from the data region.
+   *  Keeps PREGROW_HEADROOM_BLOCKS of free tail (see maybePreGrow) so trim and
+   *  idle pre-growth don't oscillate — each truncate is a storage-IPC round
+   *  trip that can stall badly on WebKit while a sync caller spins. */
+  trimTrailingBlocks() {
+    const lastUsed = this.findLastUsedBlock();
+    const newTotal = Math.max(lastUsed + 1 + PREGROW_HEADROOM_BLOCKS, INITIAL_DATA_BLOCKS);
     if (newTotal >= this.totalBlocks) return;
     this.handle.truncate(this.dataOffset + newTotal * this.blockSize);
     const newBitmapSize = Math.ceil(newTotal / 8);
-    this.bitmap = bitmap.slice(0, newBitmapSize);
+    this.bitmap = this.bitmap.slice(0, newBitmapSize);
     const trimmed = this.totalBlocks - newTotal;
     this.freeBlocks -= trimmed;
     this.totalBlocks = newTotal;
     this.superblockDirty = true;
     this.bitmapDirtyLo = 0;
     this.bitmapDirtyHi = newBitmapSize - 1;
+  }
+  // Throttle for maybePreGrow's tail scan (cheap, but no need to run it
+  // thousands of times per second from the dispatch loop's idle phase).
+  lastPreGrowCheck = 0;
+  /**
+   * Idle-time data-region pre-growth — call from the dispatch loop when no
+   * request is pending.
+   *
+   * Growing the VFS file (`handle.truncate`) is the one engine operation
+   * that can block on a storage-IPC round trip for ~20 seconds on WebKit
+   * while a sync caller busy-spins the page's main thread (observed:
+   * FWRITE engine time of exactly ~20s when allocation landed on a growth
+   * boundary). Growing during idle — when nobody is spinning — takes
+   * milliseconds. This keeps PREGROW_HEADROOM_BLOCKS of CONTIGUOUS trailing
+   * free space (allocation is contiguous, so scattered free blocks don't
+   * prevent an in-request growth), so request-path growth only happens for
+   * single writes larger than the headroom.
+   *
+   * Returns true if the file was grown.
+   */
+  maybePreGrow(force = false) {
+    if (!this.bitmap) return false;
+    const now = Date.now();
+    if (!force && now - this.lastPreGrowCheck < 250) return false;
+    this.lastPreGrowCheck = now;
+    const trailingFree = this.totalBlocks - (this.findLastUsedBlock() + 1);
+    if (trailingFree >= PREGROW_HEADROOM_BLOCKS) return false;
+    const wanted = Math.ceil((PREGROW_HEADROOM_BLOCKS - trailingFree) / 8) * 8;
+    const addedBlocks = Math.min(wanted, this.maxBlocks - this.totalBlocks);
+    if (addedBlocks <= 0) return false;
+    const newTotal = this.totalBlocks + addedBlocks;
+    this.handle.truncate(this.dataOffset + newTotal * this.blockSize);
+    const newBitmapSize = Math.ceil(newTotal / 8);
+    if (newBitmapSize > this.bitmap.byteLength) {
+      const newBitmap = new Uint8Array(newBitmapSize);
+      newBitmap.set(this.bitmap);
+      this.bitmap = newBitmap;
+    }
+    this.totalBlocks = newTotal;
+    this.freeBlocks += addedBlocks;
+    this.superblockDirty = true;
+    this.commitPending();
+    return true;
   }
   /** Rebuild in-memory path→inode index from disk.
    *  Bulk-reads the entire inode table + path table in 2 I/O calls,
@@ -1650,15 +1742,14 @@ var VFSEngine = class {
   }
   // ========== Helpers ==========
   getDirectChildren(dirPath) {
+    this.ensureChildIndex();
+    const names = this.childIndex.get(dirPath);
+    if (!names) return [];
     const prefix = dirPath === "/" ? "/" : dirPath + "/";
     const children = [];
-    for (const path of this.pathIndex.keys()) {
-      if (path === dirPath) continue;
-      if (!path.startsWith(prefix)) continue;
-      const rest = path.substring(prefix.length);
-      if (!rest.includes("/")) {
-        children.push(path);
-      }
+    for (const name of names.keys()) {
+      const full = prefix + name;
+      if (this.pathIndex.has(full)) children.push(full);
     }
     return children.sort();
   }
@@ -1726,13 +1817,21 @@ var VFSEngine = class {
   setPathIndex(path, idx) {
     const had = this.pathIndex.has(path);
     this.pathIndex.set(path, idx);
-    if (!had) this.bumpDescCount(path);
+    if (!had) {
+      this.bumpDescCount(path);
+      this.bumpChildIndex(path);
+    }
     this.descCountGen = this.pathIndexGen + 1;
+    this.childIndexGen = this.pathIndexGen + 1;
   }
   deletePathIndex(path) {
     const had = this.pathIndex.delete(path);
-    if (had) this.decDescCount(path);
+    if (had) {
+      this.decDescCount(path);
+      this.decChildIndex(path);
+    }
     this.descCountGen = this.pathIndexGen + 1;
+    this.childIndexGen = this.pathIndexGen + 1;
     return had;
   }
   bumpDescCount(path) {
@@ -1756,32 +1855,79 @@ var VFSEngine = class {
       else this.descCount.set(ancestor, cur - 1);
     }
   }
+  // ---- children index maintenance ----
+  // For path /a/b/c.txt, registers: '/'→'a', '/a'→'b', '/a/b'→'c.txt',
+  // each with a refcount of how many pathIndex entries pass through that edge.
+  bumpChildIndex(path) {
+    if (path === "/" || path.length === 0) return;
+    let parent = "/";
+    let start = 1;
+    while (start <= path.length) {
+      let end = path.indexOf("/", start);
+      if (end === -1) end = path.length;
+      const name = path.substring(start, end);
+      if (name.length > 0) {
+        let children = this.childIndex.get(parent);
+        if (!children) {
+          children = /* @__PURE__ */ new Map();
+          this.childIndex.set(parent, children);
+        }
+        children.set(name, (children.get(name) ?? 0) + 1);
+        parent = parent === "/" ? "/" + name : parent + "/" + name;
+      }
+      start = end + 1;
+    }
+  }
+  decChildIndex(path) {
+    if (path === "/" || path.length === 0) return;
+    let parent = "/";
+    let start = 1;
+    while (start <= path.length) {
+      let end = path.indexOf("/", start);
+      if (end === -1) end = path.length;
+      const name = path.substring(start, end);
+      if (name.length > 0) {
+        const children = this.childIndex.get(parent);
+        if (!children) break;
+        const cur = children.get(name);
+        if (cur === void 0) break;
+        if (cur <= 1) {
+          children.delete(name);
+          if (children.size === 0) this.childIndex.delete(parent);
+        } else {
+          children.set(name, cur - 1);
+        }
+        parent = parent === "/" ? "/" + name : parent + "/" + name;
+      }
+      start = end + 1;
+    }
+  }
+  /**
+   * Resync childIndex with pathIndex if test scaffolding (or repair paths)
+   * mutated pathIndex directly. Mirrors the descCount staleness contract.
+   */
+  ensureChildIndex() {
+    if (this.childIndexGen >= this.pathIndexGen) return;
+    this.childIndex.clear();
+    for (const path of this.pathIndex.keys()) {
+      this.bumpChildIndex(path);
+    }
+    this.childIndexGen = this.pathIndexGen;
+  }
   /**
    * Get direct children of a directory path, including implicit subdirectories.
    * Returns unique child full paths. Each entry is tagged with whether it's a
    * real inode or an implicit directory.
    */
   getDirectChildrenWithImplicit(dirPath) {
+    this.ensureChildIndex();
+    const names = this.childIndex.get(dirPath);
+    if (!names) return [];
     const prefix = dirPath === "/" ? "/" : dirPath + "/";
-    const childNames = /* @__PURE__ */ new Map();
-    for (const path of this.pathIndex.keys()) {
-      if (path === dirPath) continue;
-      if (!path.startsWith(prefix)) continue;
-      const rest = path.substring(prefix.length);
-      const slashPos = rest.indexOf("/");
-      if (slashPos === -1) {
-        childNames.set(rest, "real");
-      } else {
-        const childName = rest.substring(0, slashPos);
-        if (!childNames.has(childName)) {
-          const childFullPath = prefix + childName;
-          childNames.set(childName, this.pathIndex.has(childFullPath) ? "real" : "implicit");
-        }
-      }
-    }
     const result = [];
-    for (const [name, type] of childNames) {
-      result.push({ path: prefix + name, type });
+    for (const name of names.keys()) {
+      const full = prefix + name;
+      result.push({ path: full, type: this.pathIndex.has(full) ? "real" : "implicit" });
     }
     result.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
     return result;

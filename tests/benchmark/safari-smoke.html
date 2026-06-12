@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>VFS Safari smoke test</title>
+  <style>
+    body { font-family: -apple-system, sans-serif; margin: 2rem; max-width: 720px; }
+    #banner { padding: 1rem; border-radius: 8px; font-size: 1.4rem; font-weight: 700; margin-bottom: 1rem; }
+    .pending { background: #fef3c7; }
+    .pass { background: #bbf7d0; }
+    .fail { background: #fecaca; }
+    li { margin: 0.2rem 0; font-family: ui-monospace, monospace; font-size: 0.85rem; }
+    li.ok::before { content: "✅ "; }
+    li.err::before { content: "❌ "; }
+  </style>
+</head>
+<body>
+  <h1>@componentor/fs — real-Safari sync API smoke test</h1>
+  <div id="banner" class="pending">Running…</div>
+  <ul id="log"></ul>
+  <script type="module">
+    const log = document.getElementById('log');
+    const banner = document.getElementById('banner');
+    const failures = [];
+    const step = (label, ok, detail = '') => {
+      const li = document.createElement('li');
+      li.className = ok ? 'ok' : 'err';
+      li.textContent = label + (detail ? ` — ${detail}` : '');
+      log.appendChild(li);
+      if (!ok) failures.push(label + ' ' + detail);
+    };
+
+    try {
+      step('crossOriginIsolated', crossOriginIsolated === true);
+      step('SharedArrayBuffer available', typeof SharedArrayBuffer !== 'undefined');
+
+      // Clean slate (origin OPFS persists across runs)
+      try {
+        const opfsRoot = await navigator.storage.getDirectory();
+        await opfsRoot.removeEntry('safari-smoke', { recursive: true });
+      } catch { /* didn't exist */ }
+
+      const mod = await import('/index.js');
+      const fs = new mod.VFSFileSystem({ root: '/safari-smoke' });
+      await fs.init();
+      step('init()', true);
+
+      const enc = new TextEncoder();
+      const small = enc.encode('hello safari');
+
+      // --- small sync ops ---
+      fs.writeFileSync('/hello.txt', small);
+      const r1 = fs.readFileSync('/hello.txt');
+      step('writeFileSync + readFileSync (small)', r1.byteLength === small.byteLength);
+
+      fs.mkdirSync('/dir/sub', { recursive: true });
+      for (let i = 0; i < 50; i++) fs.writeFileSync(`/dir/f${i}.txt`, small);
+      step('readdirSync (50 entries)', fs.readdirSync('/dir').length === 51);
+      step('statSync dir', fs.statSync('/dir').isDirectory() === true);
+
+      fs.renameSync('/dir/sub', '/dir/renamed');
+      step('renameSync', fs.existsSync('/dir/renamed') && !fs.existsSync('/dir/sub'));
+
+      let code = '';
+      try { fs.readFileSync('/nope.txt'); } catch (e) { code = e.code; }
+      step('ENOENT error code', code === 'ENOENT', code);
+
+      // --- multi-chunk sync ops (the formerly-hanging path) ---
+      const pattern = (n) => { const a = new Uint8Array(n); for (let i = 0; i < n; i++) a[i] = (i + (i >>> 7)) & 0xff; return a; };
+      const verify = (a, b) => { if (a.byteLength !== b.byteLength) return false; for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false; return true; };
+
+      for (const size of [2 * 1024 * 1024 + 777, 5 * 1024 * 1024 + 0xCAFE]) {
+        const data = pattern(size);
+        const t0 = performance.now();
+        fs.writeFileSync(`/big-${size}.bin`, data);
+        const wMs = Math.round(performance.now() - t0);
+        const back = fs.readFileSync(`/big-${size}.bin`);
+        step(`sync ${(size / 1048576).toFixed(1)}MB write+read round-trip`, verify(back, data), `write ${wMs}ms`);
+
+        const fd = fs.openSync(`/fd-${size}.bin`, 'w');
+        fs.writeSync(fd, data, 0, size, 0);
+        fs.closeSync(fd);
+        step(`fd writeSync ${(size / 1048576).toFixed(1)}MB`, verify(fs.readFileSync(`/fd-${size}.bin`), data));
+
+        await fs.promises.writeFile(`/async-${size}.bin`, data);
+        const asyncBack = await fs.promises.readFile(`/async-${size}.bin`);
+        step(`async ${(size / 1048576).toFixed(1)}MB write+read`, verify(asyncBack, data));
+      }
+
+      // --- burst: 200 small sync writes back-to-back ---
+      fs.mkdirSync('/burst'); // writes don't auto-create parents (Node semantics)
+      const tb = performance.now();
+      for (let i = 0; i < 200; i++) fs.writeFileSync(`/burst/f${i}.txt`, small);
+      step('200-write sync burst', fs.readdirSync('/burst').length === 200, `${Math.round(performance.now() - tb)}ms`);
+
+      await fs.promises.flush();
+      step('flush()', true);
+    } catch (e) {
+      step('UNCAUGHT: ' + e.message, false);
+    }
+
+    banner.className = failures.length ? 'fail' : 'pass';
+    banner.textContent = failures.length
+      ? `FAIL — ${failures.length} step(s) failed (see list)`
+      : `PASS — all sync + async operations work in this browser (${navigator.userAgent.match(/Version\/[\d.]+ Safari/)?.[0] ?? 'engine'})`;
+  </script>
+</body>
+</html>

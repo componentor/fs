@@ -32,6 +32,7 @@ export const ErrorCodes = {
   EPERM: -1,
   ENOSYS: -38,
   ELOOP: -40,
+  EIO: -5,
 } as const;
 
 /** Binary protocol status codes → error code mapping */
@@ -47,6 +48,7 @@ export const STATUS_TO_CODE: Record<number, string> = {
   8: 'EBADF',
   9: 'ELOOP',
   10: 'ENOSPC',
+  11: 'EIO',
 };
 
 /** Error code → binary protocol status mapping */
@@ -62,6 +64,7 @@ export const CODE_TO_STATUS: Record<string, number> = {
   EBADF: 8,
   ELOOP: 9,
   ENOSPC: 10,
+  EIO: 11,
 };
 
 export function createError(code: string, syscall: string, path: string): FSError {
@@ -77,6 +80,7 @@ export function createError(code: string, syscall: string, path: string): FSErro
     EBADF: 'bad file descriptor',
     ELOOP: 'too many symbolic links encountered',
     ENOSPC: 'no space left on device',
+    EIO: 'i/o error',
   };
   const msg = messages[code] ?? 'unknown error';
   return new FSError(code, errno, `${code}: ${msg}, ${syscall} '${path}'`, syscall, path);

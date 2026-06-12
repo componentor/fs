@@ -18,10 +18,11 @@
  */
 
 import {
-  SAB_OFFSETS, SIGNAL,
+  SAB_OFFSETS, SIGNAL, STATUS,
   encodeRequest, encodeTwoPathRequest, decodeResponse,
   OP,
 } from '../protocol/opcodes.js';
+import { waitWhile, waitUntil, SabWaitTimeoutError, SAB_WAIT_DEADLINE_MS } from '../protocol/sab-wait.js';
 
 const encoder = new TextEncoder();
 const HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
@@ -38,6 +39,25 @@ let wakeCtrl: Int32Array | null = null;
  * Send a request via asyncSAB and block until response (leader mode).
  */
 function sabRequest(requestBuf: ArrayBuffer): { status: number; data: Uint8Array | null } {
+  // Every blocking wait in this exchange shares one overall deadline. If the
+  // sync-relay dies mid-protocol (terminated during a leader handoff, OPFS
+  // wedge), the request fails with EIO instead of blocking this worker —
+  // and every queued async op behind it — forever.
+  const deadlineAt = Date.now() + SAB_WAIT_DEADLINE_MS;
+  try {
+    return sabRequestInner(requestBuf, deadlineAt);
+  } catch (err) {
+    if (err instanceof SabWaitTimeoutError) {
+      // Best-effort protocol reset so a later revival isn't poisoned by a
+      // half-finished exchange.
+      Atomics.store(asyncCtrl!, 0, SIGNAL.IDLE);
+      return { status: STATUS.EIO, data: null };
+    }
+    throw err;
+  }
+}
+
+function sabRequestInner(requestBuf: ArrayBuffer, deadlineAt: number): { status: number; data: Uint8Array | null } {
   const maxChunk = asyncSab!.byteLength - HEADER_SIZE;
   const requestBytes = new Uint8Array(requestBuf);
   const totalLenView = new BigUint64Array(asyncSab!, SAB_OFFSETS.TOTAL_LEN, 1);
@@ -76,15 +96,18 @@ function sabRequest(requestBuf: ArrayBuffer): { status: number; data: Uint8Array
       sent += chunkSize;
       if (sent < requestBytes.byteLength) {
         // Wait for sync-relay to ack non-final chunk
-        Atomics.wait(asyncCtrl!, 0, sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK);
+        waitWhile(
+          asyncCtrl!,
+          sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK,
+          deadlineAt,
+          'request chunk ack'
+        );
       }
     }
     // Wait for sync-relay to ack the LAST chunk before looking for response.
     // Without this, ctrl[0] is still our SIGNAL.CHUNK and we can't distinguish
     // it from a response CHUNK signal.
-    while (Atomics.load(asyncCtrl!, 0) === SIGNAL.CHUNK) {
-      Atomics.wait(asyncCtrl!, 0, SIGNAL.CHUNK, 100);
-    }
+    waitWhile(asyncCtrl!, SIGNAL.CHUNK, deadlineAt, 'last request chunk ack');
   }
 
   // Wait for sync-relay to write the response.
@@ -92,12 +115,7 @@ function sabRequest(requestBuf: ArrayBuffer): { status: number; data: Uint8Array
   // After multi-chunk: ctrl transitions CHUNK → CHUNK_ACK → RESPONSE (or CHUNK for multi-response)
   // At this point ctrl[0] is NOT our CHUNK (we waited above). It's either
   // CHUNK_ACK (sync still processing), RESPONSE (done), or CHUNK (multi-response first chunk).
-  let signal: number;
-  for (;;) {
-    signal = Atomics.load(asyncCtrl!, 0);
-    if (signal === SIGNAL.RESPONSE || signal === SIGNAL.CHUNK) break;
-    Atomics.wait(asyncCtrl!, 0, signal, 1000);
-  }
+  const signal = waitUntil(asyncCtrl!, [SIGNAL.RESPONSE, SIGNAL.CHUNK], deadlineAt, 'response');
 
   // Read response (may be multi-chunk)
   const respChunkLen = Atomics.load(asyncCtrl!, 3);
@@ -119,7 +137,7 @@ function sabRequest(requestBuf: ArrayBuffer): { status: number; data: Uint8Array
     while (received < respTotalLen) {
       Atomics.store(asyncCtrl!, 0, SIGNAL.CHUNK_ACK);
       Atomics.notify(asyncCtrl!, 0);
-      Atomics.wait(asyncCtrl!, 0, SIGNAL.CHUNK_ACK);
+      waitWhile(asyncCtrl!, SIGNAL.CHUNK_ACK, deadlineAt, 'response chunk');
 
       const nextLen = Atomics.load(asyncCtrl!, 3);
       responseBytes.set(new Uint8Array(asyncSab!, HEADER_SIZE, nextLen), received);

@@ -1,5 +1,9 @@
 # Changelog
 
+## 3.1.0
+
+- fs sync support on safari
+
 ## 3.0.55
 
 - Stop OPFS renames from silently leaving the source behind when the post-copy removal fails. Both rename paths copy the source to the destination and then delete the original, but the delete was fire-and-forget: in the relay-worker `OPFSEngine.rename` the `unlink`/`rmdir` result was discarded, and in the sync worker `removeEntry` was a bare `await` whose rejection only surfaced as a generic warning. A transient OPFS lock/consistency hiccup right after a bulk copy/close (a child handle that hasn't fully released yet) could therefore report a successful rename while the file/tree still existed in *both* locations — a divergence the next reconcile wouldn't necessarily repair

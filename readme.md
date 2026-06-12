@@ -629,6 +629,10 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
 
+## v3.1.0 (2026)
+
+- fs sync support on safari
+
 ### v3.0.55 (2026)
 
 **Fixes:**

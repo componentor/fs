@@ -55,6 +55,11 @@ export const STATUS = {
   EBADF: 8,
   ELOOP: 9,
   ENOSPC: 10,
+  // Transport-level failure: a follower→leader round trip was aborted
+  // (deadline expired, leader handoff, dead port). Distinct from any
+  // filesystem semantic error so callers can recognize "the operation may
+  // or may not have been applied" and retry at their own level.
+  EIO: 11,
 } as const;
 
 // SAB layout offsets

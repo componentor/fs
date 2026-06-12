@@ -8,6 +8,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { VFSEngine } from '../src/vfs/engine.js';
 import { VFS_MAGIC, VFS_VERSION, SUPERBLOCK, INODE_TYPE, INODE_SIZE, DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS, INITIAL_PATH_TABLE_SIZE, calculateLayout } from '../src/vfs/layout.js';
+import { crc32 } from '../src/vfs/crc32.js';
 
 /**
  * Mock FileSystemSyncAccessHandle backed by an ArrayBuffer.
@@ -601,11 +602,22 @@ describe('VFSEngine', () => {
       return h;
     }
 
+    /** Recompute the superblock CRC after a manual field patch, so these
+     *  tests exercise the FIELD validators rather than the checksum check
+     *  (torn-write/checksum behavior is covered in superblock-crc.test.ts). */
+    function resealCrc(h: MockSyncHandle): void {
+      const sb = new Uint8Array(SUPERBLOCK.SIZE);
+      h.read(sb, { at: 0 });
+      new DataView(sb.buffer).setUint32(SUPERBLOCK.CRC32, crc32(sb, 0, SUPERBLOCK.CRC32), true);
+      h.write(sb, { at: 0 });
+    }
+
     /** Overwrite uint32 at byte offset */
     function patchU32(h: MockSyncHandle, offset: number, value: number): void {
       const buf = new Uint8Array(4);
       new DataView(buf.buffer).setUint32(0, value, true);
       h.write(buf, { at: offset });
+      resealCrc(h);
     }
 
     /** Overwrite float64 at byte offset */
@@ -613,6 +625,7 @@ describe('VFSEngine', () => {
       const buf = new Uint8Array(8);
       new DataView(buf.buffer).setFloat64(0, value, true);
       h.write(buf, { at: offset });
+      resealCrc(h);
     }
 
     it('should reject file too small for superblock', () => {

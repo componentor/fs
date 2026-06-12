@@ -28,8 +28,10 @@ var SUPERBLOCK = {
   // float64 - byte offset to free block bitmap
   PATH_USED: 56,
   // uint32 - bytes used in path table
-  RESERVED: 60
-  // uint32
+  CRC32: 60
+  // uint32 - CRC-32 of superblock bytes 0..59.
+  //   0 = legacy file written before checksumming existed
+  //   (validation skipped; upgraded on next superblock write).
 };
 var INODE = {
   TYPE: 0,
@@ -97,6 +99,26 @@ function calculateLayout(inodeCount = DEFAULT_INODE_COUNT, blockSize = DEFAULT_B
   };
 }
 
+// src/vfs/crc32.ts
+var TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 3988292384 ^ c >>> 1 : c >>> 1;
+    }
+    table[i] = c >>> 0;
+  }
+  return table;
+})();
+function crc32(bytes, start = 0, end = bytes.byteLength) {
+  let crc = 4294967295;
+  for (let i = start; i < end; i++) {
+    crc = TABLE[(crc ^ bytes[i]) & 255] ^ crc >>> 8;
+  }
+  return (crc ^ 4294967295) >>> 0;
+}
+
 // src/errors.ts
 var CODE_TO_STATUS = {
   OK: 0,
@@ -109,11 +131,13 @@ var CODE_TO_STATUS = {
   EINVAL: 7,
   EBADF: 8,
   ELOOP: 9,
-  ENOSPC: 10
+  ENOSPC: 10,
+  EIO: 11
 };
 
 // src/vfs/engine.ts
 var encoder = new TextEncoder();
+var PREGROW_HEADROOM_BLOCKS = 16384;
 var decoder = new TextDecoder();
 var VFSEngine = class {
   handle;
@@ -180,6 +204,17 @@ var VFSEngine = class {
   // descCount stale; `isImplicitDirectory` notices the mismatch and
   // recomputes descCount on demand.
   descCountGen = 0;
+  // Incrementally maintained directory-children index: parent dir path →
+  // (child name → number of pathIndex entries whose path passes through
+  // parent/name). Lets getDirectChildren / getDirectChildrenWithImplicit
+  // answer in O(children) instead of scanning every path in the volume,
+  // which made readdir and directory-stat O(total files) per call.
+  // A child name with refcount > 0 but no pathIndex entry of its own is an
+  // implicit directory. Same staleness contract as descCount: in sync iff
+  // childIndexGen >= pathIndexGen, rebuilt from scratch on demand when test
+  // scaffolding mutates pathIndex directly.
+  childIndex = /* @__PURE__ */ new Map();
+  childIndexGen = 0;
   // Configurable upper bounds
   maxInodes = 4e6;
   maxBlocks = 4e6;
@@ -258,6 +293,15 @@ var VFSEngine = class {
     const version = v.getUint32(SUPERBLOCK.VERSION, true);
     if (version !== VFS_VERSION) {
       throw new Error(`Corrupt VFS: unsupported version ${version} (expected ${VFS_VERSION})`);
+    }
+    const storedCrc = v.getUint32(SUPERBLOCK.CRC32, true);
+    if (storedCrc !== 0) {
+      const computedCrc = crc32(this.superblockBuf, 0, SUPERBLOCK.CRC32);
+      if (computedCrc !== storedCrc) {
+        throw new Error(
+          `Corrupt VFS: superblock checksum mismatch (stored 0x${storedCrc.toString(16)}, computed 0x${computedCrc.toString(16)})`
+        );
+      }
     }
     const inodeCount = v.getUint32(SUPERBLOCK.INODE_COUNT, true);
     const blockSize = v.getUint32(SUPERBLOCK.BLOCK_SIZE, true);
@@ -347,6 +391,7 @@ var VFSEngine = class {
     v.setFloat64(SUPERBLOCK.DATA_OFFSET, this.dataOffset, true);
     v.setFloat64(SUPERBLOCK.BITMAP_OFFSET, this.bitmapOffset, true);
     v.setUint32(SUPERBLOCK.PATH_USED, this.pathTableUsed, true);
+    v.setUint32(SUPERBLOCK.CRC32, crc32(this.superblockBuf, 0, SUPERBLOCK.CRC32), true);
     this.handle.write(this.superblockBuf, { at: 0 });
   }
   /** Flush pending bitmap and superblock writes to disk (one write each) */
@@ -371,34 +416,81 @@ var VFSEngine = class {
       this.superblockDirty = false;
     }
   }
-  /** Shrink the OPFS file by removing trailing free blocks from the data region.
-   *  Scans bitmap from end to find the last used block, then truncates. */
-  trimTrailingBlocks() {
+  /** Find the last used block index (-1 if the data region is empty). */
+  findLastUsedBlock() {
     const bitmap = this.bitmap;
-    let lastUsed = -1;
     for (let byteIdx = Math.ceil(this.totalBlocks / 8) - 1; byteIdx >= 0; byteIdx--) {
       if (bitmap[byteIdx] !== 0) {
         for (let bit = 7; bit >= 0; bit--) {
           const blockIdx = byteIdx * 8 + bit;
           if (blockIdx < this.totalBlocks && bitmap[byteIdx] & 1 << bit) {
-            lastUsed = blockIdx;
-            break;
+            return blockIdx;
           }
         }
-        break;
       }
     }
-    const newTotal = Math.max(lastUsed + 1, INITIAL_DATA_BLOCKS);
+    return -1;
+  }
+  /** Shrink the OPFS file by removing trailing free blocks from the data region.
+   *  Keeps PREGROW_HEADROOM_BLOCKS of free tail (see maybePreGrow) so trim and
+   *  idle pre-growth don't oscillate — each truncate is a storage-IPC round
+   *  trip that can stall badly on WebKit while a sync caller spins. */
+  trimTrailingBlocks() {
+    const lastUsed = this.findLastUsedBlock();
+    const newTotal = Math.max(lastUsed + 1 + PREGROW_HEADROOM_BLOCKS, INITIAL_DATA_BLOCKS);
     if (newTotal >= this.totalBlocks) return;
     this.handle.truncate(this.dataOffset + newTotal * this.blockSize);
     const newBitmapSize = Math.ceil(newTotal / 8);
-    this.bitmap = bitmap.slice(0, newBitmapSize);
+    this.bitmap = this.bitmap.slice(0, newBitmapSize);
     const trimmed = this.totalBlocks - newTotal;
     this.freeBlocks -= trimmed;
     this.totalBlocks = newTotal;
     this.superblockDirty = true;
     this.bitmapDirtyLo = 0;
     this.bitmapDirtyHi = newBitmapSize - 1;
+  }
+  // Throttle for maybePreGrow's tail scan (cheap, but no need to run it
+  // thousands of times per second from the dispatch loop's idle phase).
+  lastPreGrowCheck = 0;
+  /**
+   * Idle-time data-region pre-growth — call from the dispatch loop when no
+   * request is pending.
+   *
+   * Growing the VFS file (`handle.truncate`) is the one engine operation
+   * that can block on a storage-IPC round trip for ~20 seconds on WebKit
+   * while a sync caller busy-spins the page's main thread (observed:
+   * FWRITE engine time of exactly ~20s when allocation landed on a growth
+   * boundary). Growing during idle — when nobody is spinning — takes
+   * milliseconds. This keeps PREGROW_HEADROOM_BLOCKS of CONTIGUOUS trailing
+   * free space (allocation is contiguous, so scattered free blocks don't
+   * prevent an in-request growth), so request-path growth only happens for
+   * single writes larger than the headroom.
+   *
+   * Returns true if the file was grown.
+   */
+  maybePreGrow(force = false) {
+    if (!this.bitmap) return false;
+    const now = Date.now();
+    if (!force && now - this.lastPreGrowCheck < 250) return false;
+    this.lastPreGrowCheck = now;
+    const trailingFree = this.totalBlocks - (this.findLastUsedBlock() + 1);
+    if (trailingFree >= PREGROW_HEADROOM_BLOCKS) return false;
+    const wanted = Math.ceil((PREGROW_HEADROOM_BLOCKS - trailingFree) / 8) * 8;
+    const addedBlocks = Math.min(wanted, this.maxBlocks - this.totalBlocks);
+    if (addedBlocks <= 0) return false;
+    const newTotal = this.totalBlocks + addedBlocks;
+    this.handle.truncate(this.dataOffset + newTotal * this.blockSize);
+    const newBitmapSize = Math.ceil(newTotal / 8);
+    if (newBitmapSize > this.bitmap.byteLength) {
+      const newBitmap = new Uint8Array(newBitmapSize);
+      newBitmap.set(this.bitmap);
+      this.bitmap = newBitmap;
+    }
+    this.totalBlocks = newTotal;
+    this.freeBlocks += addedBlocks;
+    this.superblockDirty = true;
+    this.commitPending();
+    return true;
   }
   /** Rebuild in-memory path→inode index from disk.
    *  Bulk-reads the entire inode table + path table in 2 I/O calls,
@@ -1650,15 +1742,14 @@ var VFSEngine = class {
   }
   // ========== Helpers ==========
   getDirectChildren(dirPath) {
+    this.ensureChildIndex();
+    const names = this.childIndex.get(dirPath);
+    if (!names) return [];
     const prefix = dirPath === "/" ? "/" : dirPath + "/";
     const children = [];
-    for (const path of this.pathIndex.keys()) {
-      if (path === dirPath) continue;
-      if (!path.startsWith(prefix)) continue;
-      const rest = path.substring(prefix.length);
-      if (!rest.includes("/")) {
-        children.push(path);
-      }
+    for (const name of names.keys()) {
+      const full = prefix + name;
+      if (this.pathIndex.has(full)) children.push(full);
     }
     return children.sort();
   }
@@ -1726,13 +1817,21 @@ var VFSEngine = class {
   setPathIndex(path, idx) {
     const had = this.pathIndex.has(path);
     this.pathIndex.set(path, idx);
-    if (!had) this.bumpDescCount(path);
+    if (!had) {
+      this.bumpDescCount(path);
+      this.bumpChildIndex(path);
+    }
     this.descCountGen = this.pathIndexGen + 1;
+    this.childIndexGen = this.pathIndexGen + 1;
   }
   deletePathIndex(path) {
     const had = this.pathIndex.delete(path);
-    if (had) this.decDescCount(path);
+    if (had) {
+      this.decDescCount(path);
+      this.decChildIndex(path);
+    }
     this.descCountGen = this.pathIndexGen + 1;
+    this.childIndexGen = this.pathIndexGen + 1;
     return had;
   }
   bumpDescCount(path) {
@@ -1756,32 +1855,79 @@ var VFSEngine = class {
       else this.descCount.set(ancestor, cur - 1);
     }
   }
+  // ---- children index maintenance ----
+  // For path /a/b/c.txt, registers: '/'→'a', '/a'→'b', '/a/b'→'c.txt',
+  // each with a refcount of how many pathIndex entries pass through that edge.
+  bumpChildIndex(path) {
+    if (path === "/" || path.length === 0) return;
+    let parent = "/";
+    let start = 1;
+    while (start <= path.length) {
+      let end = path.indexOf("/", start);
+      if (end === -1) end = path.length;
+      const name = path.substring(start, end);
+      if (name.length > 0) {
+        let children = this.childIndex.get(parent);
+        if (!children) {
+          children = /* @__PURE__ */ new Map();
+          this.childIndex.set(parent, children);
+        }
+        children.set(name, (children.get(name) ?? 0) + 1);
+        parent = parent === "/" ? "/" + name : parent + "/" + name;
+      }
+      start = end + 1;
+    }
+  }
+  decChildIndex(path) {
+    if (path === "/" || path.length === 0) return;
+    let parent = "/";
+    let start = 1;
+    while (start <= path.length) {
+      let end = path.indexOf("/", start);
+      if (end === -1) end = path.length;
+      const name = path.substring(start, end);
+      if (name.length > 0) {
+        const children = this.childIndex.get(parent);
+        if (!children) break;
+        const cur = children.get(name);
+        if (cur === void 0) break;
+        if (cur <= 1) {
+          children.delete(name);
+          if (children.size === 0) this.childIndex.delete(parent);
+        } else {
+          children.set(name, cur - 1);
+        }
+        parent = parent === "/" ? "/" + name : parent + "/" + name;
+      }
+      start = end + 1;
+    }
+  }
+  /**
+   * Resync childIndex with pathIndex if test scaffolding (or repair paths)
+   * mutated pathIndex directly. Mirrors the descCount staleness contract.
+   */
+  ensureChildIndex() {
+    if (this.childIndexGen >= this.pathIndexGen) return;
+    this.childIndex.clear();
+    for (const path of this.pathIndex.keys()) {
+      this.bumpChildIndex(path);
+    }
+    this.childIndexGen = this.pathIndexGen;
+  }
   /**
    * Get direct children of a directory path, including implicit subdirectories.
    * Returns unique child full paths. Each entry is tagged with whether it's a
    * real inode or an implicit directory.
    */
   getDirectChildrenWithImplicit(dirPath) {
+    this.ensureChildIndex();
+    const names = this.childIndex.get(dirPath);
+    if (!names) return [];
     const prefix = dirPath === "/" ? "/" : dirPath + "/";
-    const childNames = /* @__PURE__ */ new Map();
-    for (const path of this.pathIndex.keys()) {
-      if (path === dirPath) continue;
-      if (!path.startsWith(prefix)) continue;
-      const rest = path.substring(prefix.length);
-      const slashPos = rest.indexOf("/");
-      if (slashPos === -1) {
-        childNames.set(rest, "real");
-      } else {
-        const childName = rest.substring(0, slashPos);
-        if (!childNames.has(childName)) {
-          const childFullPath = prefix + childName;
-          childNames.set(childName, this.pathIndex.has(childFullPath) ? "real" : "implicit");
-        }
-      }
-    }
     const result = [];
-    for (const [name, type] of childNames) {
-      result.push({ path: prefix + name, type });
+    for (const name of names.keys()) {
+      const full = prefix + name;
+      result.push({ path: full, type: this.pathIndex.has(full) ? "real" : "implicit" });
     }
     result.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
     return result;
@@ -2477,6 +2623,24 @@ var OP = {
   FCHOWN: 32,
   FUTIMES: 33
 };
+var STATUS = {
+  OK: 0,
+  ENOENT: 1,
+  EEXIST: 2,
+  EISDIR: 3,
+  ENOTDIR: 4,
+  ENOTEMPTY: 5,
+  EACCES: 6,
+  EINVAL: 7,
+  EBADF: 8,
+  ELOOP: 9,
+  ENOSPC: 10,
+  // Transport-level failure: a follower→leader round trip was aborted
+  // (deadline expired, leader handoff, dead port). Distinct from any
+  // filesystem semantic error so callers can recognize "the operation may
+  // or may not have been applied" and retry at their own level.
+  EIO: 11
+};
 var SAB_OFFSETS = {
   CONTROL: 0,
   // Int32 - signal (0=idle, 1=request, 2=response, 3=chunk, 4=ack)
@@ -2542,7 +2706,125 @@ function decodeSecondPath(data) {
   return decoder2.decode(data.subarray(4, 4 + pathLen));
 }
 
+// src/protocol/follower-forward.ts
+var FORWARD_DEADLINE_MS = 1e4;
+var FollowerForwarder = class {
+  constructor(getTabId, deadlineMs = FORWARD_DEADLINE_MS) {
+    this.getTabId = getTabId;
+    this.deadlineMs = deadlineMs;
+  }
+  port = null;
+  pendingResolve = null;
+  /** Sequence id of the in-flight (or last abandoned) request. */
+  pendingSeq = 0;
+  /** True when pendingSeq timed out and its late response should be swallowed. */
+  pendingAbandoned = false;
+  seqCounter = 0;
+  timer = null;
+  get hasPort() {
+    return this.port !== null;
+  }
+  /** Attach a (new) leader port. Aborts any in-flight request with EIO. */
+  setPort(port) {
+    if (this.port && this.port !== port) {
+      this.port.close();
+      this.abortPending();
+    }
+    this.port = port;
+  }
+  /** Post a non-tracked message on the leader port (no-SAB async relay path). */
+  postRaw(message, transfer) {
+    this.port?.postMessage(message, transfer);
+  }
+  /**
+   * Forward a request payload to the leader. Resolves with the response
+   * buffer, or with an encoded EIO response after the deadline.
+   */
+  forward(payload) {
+    if (this.pendingResolve) this.abortPending();
+    return new Promise((resolve) => {
+      const seq = ++this.seqCounter;
+      this.pendingSeq = seq;
+      this.pendingAbandoned = false;
+      this.pendingResolve = resolve;
+      const buf = payload.buffer.byteLength === payload.byteLength ? payload.buffer : payload.slice().buffer;
+      this.port.postMessage({ id: seq, tabId: this.getTabId(), buffer: buf }, [buf]);
+      this.timer = setTimeout(() => {
+        this.timer = null;
+        if (this.pendingSeq === seq && this.pendingResolve) {
+          const r = this.pendingResolve;
+          this.pendingResolve = null;
+          this.pendingAbandoned = true;
+          r(encodeResponse(STATUS.EIO));
+        }
+      }, this.deadlineMs);
+    });
+  }
+  /**
+   * Offer a response message to the forwarder.
+   * Returns true if it was consumed (matched the in-flight request, or was
+   * the late echo of an abandoned one); false if it belongs to another
+   * consumer (the no-SAB async-relay path).
+   */
+  handleResponse(id, buffer) {
+    if (id === this.pendingSeq) {
+      if (this.pendingResolve) {
+        this.clearTimer();
+        const r = this.pendingResolve;
+        this.pendingResolve = null;
+        r(buffer);
+        return true;
+      }
+      if (this.pendingAbandoned) {
+        this.pendingAbandoned = false;
+        return true;
+      }
+    }
+    return false;
+  }
+  /** Abort the in-flight request (if any) with an EIO response. */
+  abortPending() {
+    this.clearTimer();
+    if (this.pendingResolve) {
+      const r = this.pendingResolve;
+      this.pendingResolve = null;
+      this.pendingAbandoned = false;
+      r(encodeResponse(STATUS.EIO));
+    }
+  }
+  clearTimer() {
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+};
+
+// src/protocol/sab-wait.ts
+var SAB_WAIT_DEADLINE_MS = 12e4;
+var WAIT_SLICE_MS = 1e3;
+var SabWaitTimeoutError = class extends Error {
+  constructor(detail) {
+    super(`SAB protocol wait timed out: ${detail}`);
+    this.name = "SabWaitTimeoutError";
+  }
+};
+function waitWhile(ctrl2, value, deadlineAt, detail, sliceMs = WAIT_SLICE_MS) {
+  while (Atomics.load(ctrl2, 0) === value) {
+    const remaining = deadlineAt - Date.now();
+    if (remaining <= 0) throw new SabWaitTimeoutError(detail);
+    Atomics.wait(ctrl2, 0, value, Math.min(sliceMs, remaining));
+  }
+}
+
 // src/workers/sync-relay.worker.ts
+self.addEventListener("error", (e) => {
+  console.error("[sync-relay] uncaught error:", e.message, e.filename, e.lineno);
+});
+self.addEventListener("unhandledrejection", (e) => {
+  const reason = e.reason;
+  console.error("[sync-relay] unhandled rejection:", reason?.message ?? String(reason), reason?.stack ?? "");
+});
 var engine = new VFSEngine();
 var opfsEngine = null;
 var opfsMode = false;
@@ -2577,9 +2859,34 @@ var yieldChannel = new MessageChannel();
 yieldChannel.port2.start();
 function yieldToEventLoop() {
   return new Promise((resolve) => {
-    yieldChannel.port2.onmessage = () => resolve();
+    let settled = false;
+    let timer = null;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      resolve();
+    };
+    yieldChannel.port2.onmessage = done;
     yieldChannel.port1.postMessage(null);
+    timer = setTimeout(done, 1);
   });
+}
+function safeHandleRequest(reqTabId, buffer) {
+  try {
+    return handleRequest(reqTabId, buffer);
+  } catch (err) {
+    console.error("[sync-relay] handleRequest threw:", err?.message, err?.stack);
+    return { status: STATUS.EIO };
+  }
+}
+async function safeHandleRequestOPFS(reqTabId, buffer) {
+  try {
+    return await handleRequestOPFS(reqTabId, buffer);
+  } catch (err) {
+    console.error("[sync-relay] handleRequestOPFS threw:", err?.message, err?.stack);
+    return { status: STATUS.EIO };
+  }
 }
 function registerClientPort(clientTabId, port) {
   port.onmessage = async (e) => {
@@ -2592,7 +2899,7 @@ function registerClientPort(clientTabId, port) {
           buffer: e.data.buffer
         });
       } else {
-        const result = opfsMode ? await handleRequestOPFS(clientTabId, e.data.buffer) : handleRequest(clientTabId, e.data.buffer);
+        const result = opfsMode ? await safeHandleRequestOPFS(clientTabId, e.data.buffer) : safeHandleRequest(clientTabId, e.data.buffer);
         const response = encodeResponse(result.status, result.data);
         port.postMessage({ id: e.data.id, buffer: response }, [response]);
         if (!opfsMode && result._op !== void 0) notifyOPFSSync(result._op, result._path, result._newPath);
@@ -2617,7 +2924,7 @@ function removeClientPort(clientTabId) {
 function drainPortQueue() {
   while (portQueue.length > 0) {
     const msg = portQueue.shift();
-    const result = handleRequest(msg.tabId, msg.buffer);
+    const result = safeHandleRequest(msg.tabId, msg.buffer);
     const response = encodeResponse(result.status, result.data);
     msg.port.postMessage({ id: msg.id, buffer: response }, [response]);
     if (result._op !== void 0) notifyOPFSSync(result._op, result._path, result._newPath);
@@ -2626,31 +2933,20 @@ function drainPortQueue() {
 async function drainPortQueueAsync() {
   while (portQueue.length > 0) {
     const msg = portQueue.shift();
-    const result = await handleRequestOPFS(msg.tabId, msg.buffer);
+    const result = await safeHandleRequestOPFS(msg.tabId, msg.buffer);
     const response = encodeResponse(result.status, result.data);
     msg.port.postMessage({ id: msg.id, buffer: response }, [response]);
   }
 }
-var leaderPort = null;
-var pendingResolve = null;
+var forwarder = new FollowerForwarder(() => tabId);
 var asyncRelayPort = null;
 function forwardToLeader(payload) {
-  return new Promise((resolve) => {
-    pendingResolve = resolve;
-    const buf = payload.buffer.byteLength === payload.byteLength ? payload.buffer : payload.slice().buffer;
-    leaderPort.postMessage(
-      { id: tabId, tabId, buffer: buf },
-      [buf]
-    );
-  });
+  return forwarder.forward(payload);
 }
 function onLeaderMessage(e) {
   if (e.data.buffer instanceof ArrayBuffer) {
-    if (pendingResolve) {
-      const resolve = pendingResolve;
-      pendingResolve = null;
-      resolve(e.data.buffer);
-    } else if (asyncRelayPort) {
+    if (forwarder.handleResponse(e.data.id, e.data.buffer)) return;
+    if (asyncRelayPort) {
       asyncRelayPort.postMessage({ id: e.data.id, buffer: e.data.buffer }, [e.data.buffer]);
     }
   }
@@ -3237,10 +3533,11 @@ function readPayload(targetSab, targetCtrl) {
   let offset = 0;
   fullBuffer.set(new Uint8Array(targetSab, HEADER_SIZE, chunkLen), offset);
   offset += chunkLen;
+  const chunkDeadline = Date.now() + SAB_WAIT_DEADLINE_MS;
   while (offset < totalLen) {
     Atomics.store(targetCtrl, 0, SIGNAL.CHUNK_ACK);
     Atomics.notify(targetCtrl, 0);
-    Atomics.wait(targetCtrl, 0, SIGNAL.CHUNK_ACK);
+    waitWhile(targetCtrl, SIGNAL.CHUNK_ACK, chunkDeadline, "request chunk from caller", 50);
     const nextLen = Atomics.load(targetCtrl, 3);
     if (nextLen <= 0 || nextLen > maxChunk) {
       console.error(`[sync-relay] readPayload: invalid nextLen=${nextLen} at offset=${offset}`);
@@ -3296,11 +3593,57 @@ function writeResponse(targetSab, targetCtrl, responseData) {
       Atomics.store(targetCtrl, 0, isLast ? SIGNAL.RESPONSE : SIGNAL.CHUNK);
       Atomics.notify(targetCtrl, 0);
       if (!isLast) {
-        Atomics.wait(targetCtrl, 0, SIGNAL.CHUNK);
+        waitWhile(targetCtrl, SIGNAL.CHUNK, Date.now() + SAB_WAIT_DEADLINE_MS, "response chunk ack from caller", 50);
       }
       sent += chunkSize;
     }
   }
+}
+var PREGROW_QUIET_MS = 25;
+var lastRequestAt = 0;
+function preGrowIfQuiet() {
+  try {
+    if (Date.now() - lastRequestAt < PREGROW_QUIET_MS) return;
+    if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST) return;
+    if (asyncCtrl && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) return;
+    engine.maybePreGrow(true);
+  } catch (err) {
+    console.error("[sync-relay] pre-grow failed:", err?.message);
+  }
+}
+function awaitResponseConsumed(targetCtrl, budgetMs) {
+  const deadline = Date.now() + budgetMs;
+  while (Atomics.load(targetCtrl, 0) === SIGNAL.RESPONSE) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    Atomics.wait(targetCtrl, 0, SIGNAL.RESPONSE, Math.min(5, remaining));
+  }
+  return true;
+}
+var leaderLoopCrashes = 0;
+var LEADER_LOOP_MAX_CRASHES = 5;
+function startLeaderLoop(loop, name) {
+  loop().catch((err) => {
+    leaderLoopRunning = false;
+    console.error(`[sync-relay] ${name} crashed:`, err?.message, err?.stack);
+    try {
+      if (ctrl && Atomics.load(ctrl, 0) === SIGNAL.REQUEST) {
+        writeDirectResponse(sab, ctrl, STATUS.EIO);
+      }
+      if (asyncCtrl && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) {
+        writeDirectResponse(asyncSab, asyncCtrl, STATUS.EIO);
+      }
+    } catch (_) {
+    }
+    if (++leaderLoopCrashes <= LEADER_LOOP_MAX_CRASHES) {
+      startLeaderLoop(loop, name);
+    } else {
+      self.postMessage({
+        type: "leader-loop-fatal",
+        error: err?.message ?? String(err)
+      });
+    }
+  });
 }
 async function leaderLoop() {
   leaderLoopRunning = true;
@@ -3317,7 +3660,7 @@ async function leaderLoop() {
         const lt0 = debug ? performance.now() : 0;
         const payload = readPayload(sab, ctrl);
         const lt1 = debug ? performance.now() : 0;
-        const reqResult = handleRequest(tabId, payload.buffer);
+        const reqResult = safeHandleRequest(tabId, payload.buffer);
         const lt2 = debug ? performance.now() : 0;
         writeDirectResponse(sab, ctrl, reqResult.status, reqResult.data);
         if (reqResult._op !== void 0) notifyOPFSSync(reqResult._op, reqResult._path, reqResult._newPath);
@@ -3325,21 +3668,20 @@ async function leaderLoop() {
         if (debug) {
           console.log(`[leaderLoop] readPayload=${(lt1 - lt0).toFixed(3)}ms handleRequest=${(lt2 - lt1).toFixed(3)}ms writeResponse=${(lt3 - lt2).toFixed(3)}ms TOTAL=${(lt3 - lt0).toFixed(3)}ms`);
         }
-        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 100);
-        if (waitResult === "timed-out") {
+        if (!awaitResponseConsumed(ctrl, 100)) {
           Atomics.store(ctrl, 0, SIGNAL.IDLE);
         }
+        lastRequestAt = Date.now();
         processed = true;
         continue;
       }
       if (asyncCtrl && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) {
         const payload = readPayload(asyncSab, asyncCtrl);
-        const asyncResult = handleRequest(tabId, payload.buffer);
+        const asyncResult = safeHandleRequest(tabId, payload.buffer);
         writeDirectResponse(asyncSab, asyncCtrl, asyncResult.status, asyncResult.data);
         if (asyncResult._op !== void 0) notifyOPFSSync(asyncResult._op, asyncResult._path, asyncResult._newPath);
-        if (Atomics.load(asyncCtrl, 0) !== SIGNAL.IDLE) {
-          Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 5e3);
-        }
+        awaitResponseConsumed(asyncCtrl, 5e3);
+        lastRequestAt = Date.now();
         processed = true;
         continue;
       }
@@ -3348,12 +3690,23 @@ async function leaderLoop() {
         processed = true;
         continue;
       }
+      if (Date.now() - lastRequestAt < 20) {
+        const spinStart = performance.now();
+        while (performance.now() - spinStart < 0.25) {
+          if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST || asyncCtrl !== null && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) {
+            processed = true;
+            break;
+          }
+        }
+      }
     }
     await yieldToEventLoop();
-    if (clientPorts.size === 0 && !opfsSyncEnabled) {
+    preGrowIfQuiet();
+    if (clientPorts.size === 0) {
       const currentSignal = Atomics.load(ctrl, 0);
-      if (currentSignal !== SIGNAL.REQUEST) {
-        Atomics.wait(ctrl, 0, currentSignal, 50);
+      const asyncPending = asyncCtrl !== null && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST;
+      if (currentSignal !== SIGNAL.REQUEST && !asyncPending) {
+        Atomics.wait(ctrl, 0, currentSignal, opfsSyncEnabled ? 5 : 50);
       }
     }
   }
@@ -3371,10 +3724,9 @@ async function leaderLoopOPFS() {
       }
       if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST) {
         const payload = readPayload(sab, ctrl);
-        const reqResult = await handleRequestOPFS(tabId, payload.buffer);
+        const reqResult = await safeHandleRequestOPFS(tabId, payload.buffer);
         writeDirectResponse(sab, ctrl, reqResult.status, reqResult.data);
-        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 100);
-        if (waitResult === "timed-out") {
+        if (!awaitResponseConsumed(ctrl, 100)) {
           Atomics.store(ctrl, 0, SIGNAL.IDLE);
         }
         processed = true;
@@ -3382,10 +3734,9 @@ async function leaderLoopOPFS() {
       }
       if (asyncCtrl && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) {
         const payload = readPayload(asyncSab, asyncCtrl);
-        const asyncResult = await handleRequestOPFS(tabId, payload.buffer);
+        const asyncResult = await safeHandleRequestOPFS(tabId, payload.buffer);
         writeDirectResponse(asyncSab, asyncCtrl, asyncResult.status, asyncResult.data);
-        const waitResult = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 100);
-        if (waitResult === "timed-out") {
+        if (!awaitResponseConsumed(asyncCtrl, 100)) {
           Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
         }
         processed = true;
@@ -3400,7 +3751,8 @@ async function leaderLoopOPFS() {
     await yieldToEventLoop();
     if (clientPorts.size === 0) {
       const currentSignal = Atomics.load(ctrl, 0);
-      if (currentSignal !== SIGNAL.REQUEST) {
+      const asyncPending = asyncCtrl !== null && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST;
+      if (currentSignal !== SIGNAL.REQUEST && !asyncPending) {
         Atomics.wait(ctrl, 0, currentSignal, 50);
       }
     }
@@ -3412,8 +3764,7 @@ async function followerLoop() {
       const payload = readPayload(sab, ctrl);
       const response = await forwardToLeader(payload);
       writeResponse(sab, ctrl, new Uint8Array(response));
-      const result = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 100);
-      if (result === "timed-out") {
+      if (!awaitResponseConsumed(ctrl, 100)) {
         Atomics.store(ctrl, 0, SIGNAL.IDLE);
       }
       continue;
@@ -3422,8 +3773,7 @@ async function followerLoop() {
       const payload = readPayload(asyncSab, asyncCtrl);
       const response = await forwardToLeader(payload);
       writeResponse(asyncSab, asyncCtrl, new Uint8Array(response));
-      const result = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 100);
-      if (result === "timed-out") {
+      if (!awaitResponseConsumed(asyncCtrl, 100)) {
         Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
       }
       continue;
@@ -3587,6 +3937,11 @@ async function initEngine(config) {
       { type: "init", root: config.opfsSyncRoot ?? config.root },
       [mc.port2]
     );
+  }
+  try {
+    engine.maybePreGrow(true);
+  } catch (err) {
+    console.error("[sync-relay] init pre-grow failed:", err?.message);
   }
   watchBc = new BroadcastChannel(`${config.ns}-watch`);
 }
@@ -3753,13 +4108,13 @@ self.onmessage = async (e) => {
       port.onmessage = async (ev) => {
         if (ev.data.buffer instanceof ArrayBuffer) {
           if (leaderInitialized) {
-            const result = opfsMode ? await handleRequestOPFS(tabId || "nosab", ev.data.buffer) : handleRequest(tabId || "nosab", ev.data.buffer);
+            const result = opfsMode ? await safeHandleRequestOPFS(tabId || "nosab", ev.data.buffer) : safeHandleRequest(tabId || "nosab", ev.data.buffer);
             const response = encodeResponse(result.status, result.data);
             port.postMessage({ id: ev.data.id, buffer: response }, [response]);
             if (!opfsMode && result._op !== void 0) notifyOPFSSync(result._op, result._path, result._newPath);
-          } else if (leaderPort) {
+          } else if (forwarder.hasPort) {
             const buf = ev.data.buffer;
-            leaderPort.postMessage({ id: ev.data.id, tabId, buffer: buf }, [buf]);
+            forwarder.postRaw({ id: ev.data.id, tabId, buffer: buf }, [buf]);
           }
         }
       };
@@ -3802,7 +4157,7 @@ self.onmessage = async (e) => {
       self.postMessage({ type: "ready" });
     }
     if (hasSAB) {
-      leaderLoop();
+      startLeaderLoop(leaderLoop, "leaderLoop");
     }
     return;
   }
@@ -3841,7 +4196,7 @@ self.onmessage = async (e) => {
       self.postMessage({ type: "ready", mode: "opfs" });
     }
     if (hasSAB) {
-      leaderLoopOPFS();
+      startLeaderLoop(leaderLoopOPFS, "leaderLoopOPFS");
     }
     return;
   }
@@ -3865,15 +4220,7 @@ self.onmessage = async (e) => {
     if (leaderInitialized) return;
     const newPort = msg.port ?? e.ports[0];
     if (!newPort) return;
-    if (leaderPort) {
-      leaderPort.close();
-      if (pendingResolve) {
-        const errorBuf = encodeResponse(5);
-        pendingResolve(errorBuf);
-        pendingResolve = null;
-      }
-    }
-    leaderPort = newPort;
+    forwarder.setPort(newPort);
     newPort.onmessage = onLeaderMessage;
     newPort.start();
     if (!readySent) {

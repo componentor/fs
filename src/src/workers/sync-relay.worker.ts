@@ -22,7 +22,19 @@
 
 import { VFSEngine } from '../vfs/engine.js';
 import { OPFSEngine } from '../opfs-engine.js';
-import { SAB_OFFSETS, SIGNAL, OP, decodeRequest, decodeSecondPath, encodeResponse } from '../protocol/opcodes.js';
+import { SAB_OFFSETS, SIGNAL, OP, STATUS, decodeRequest, decodeSecondPath, encodeResponse } from '../protocol/opcodes.js';
+import { FollowerForwarder } from '../protocol/follower-forward.js';
+import { waitWhile, SAB_WAIT_DEADLINE_MS } from '../protocol/sab-wait.js';
+
+// A silent worker death is the worst failure mode this architecture has —
+// the heartbeat keeps ticking while every request hangs. Surface everything.
+self.addEventListener('error', (e) => {
+  console.error('[sync-relay] uncaught error:', (e as ErrorEvent).message, (e as ErrorEvent).filename, (e as ErrorEvent).lineno);
+});
+self.addEventListener('unhandledrejection', (e) => {
+  const reason = (e as PromiseRejectionEvent).reason;
+  console.error('[sync-relay] unhandled rejection:', reason?.message ?? String(reason), reason?.stack ?? '');
+});
 import { VFS_MAGIC, VFS_VERSION, SUPERBLOCK, INODE_SIZE } from '../vfs/layout.js';
 
 const engine = new VFSEngine();
@@ -79,15 +91,58 @@ function startHeartbeat(): void {
 const clientPorts = new Map<string, MessagePort>();
 const portQueue: Array<{ port: MessagePort; tabId: string; id: string; buffer: ArrayBuffer }> = [];
 
-// Fast macrotask yield via MessageChannel self-post (~0.1ms)
+// Fast macrotask yield via MessageChannel self-post (~0.1ms), raced against
+// a short timer as a starvation fallback.
+//
+// The fallback matters on WebKit: MessagePort delivery is brokered through
+// the process main thread, so when a sync caller busy-spins the page's main
+// thread waiting on the SAB, the self-ping never arrives and the dispatch
+// loop would park here forever — deadlock: the main thread spins on a
+// response the worker never produces, while the heartbeat timer keeps
+// ticking so stall detection rightly stays quiet. Timers fire on the
+// worker's own event loop regardless of main-thread state, so the race
+// always settles. On Chromium/Firefox the ping wins (~0.1ms) and behavior
+// is unchanged.
 const yieldChannel = new MessageChannel();
 yieldChannel.port2.start();
 
 function yieldToEventLoop(): Promise<void> {
   return new Promise(resolve => {
-    yieldChannel.port2.onmessage = () => resolve();
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const done = (): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) clearTimeout(timer);
+      resolve();
+    };
+    yieldChannel.port2.onmessage = done;
     yieldChannel.port1.postMessage(null);
+    timer = setTimeout(done, 1);
   });
+}
+
+// Engine methods return { status } for expected filesystem errors, but an
+// unexpected throw (e.g. WebKit's OPFS sync handles throwing transient
+// errors Chromium never produces) must degrade to an EIO response for THAT
+// request — never propagate out and kill the dispatch loop. A dead loop
+// with a live heartbeat hangs every subsequent request with no diagnostic.
+function safeHandleRequest(reqTabId: string, buffer: ArrayBuffer): ReturnType<typeof handleRequest> {
+  try {
+    return handleRequest(reqTabId, buffer);
+  } catch (err) {
+    console.error('[sync-relay] handleRequest threw:', (err as Error)?.message, (err as Error)?.stack);
+    return { status: STATUS.EIO };
+  }
+}
+
+async function safeHandleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): ReturnType<typeof handleRequestOPFS> {
+  try {
+    return await handleRequestOPFS(reqTabId, buffer);
+  } catch (err) {
+    console.error('[sync-relay] handleRequestOPFS threw:', (err as Error)?.message, (err as Error)?.stack);
+    return { status: STATUS.EIO };
+  }
 }
 
 function registerClientPort(clientTabId: string, port: MessagePort): void {
@@ -104,8 +159,8 @@ function registerClientPort(clientTabId: string, port: MessagePort): void {
       } else {
         // No leader loop (no-SAB mode): handle directly
         const result = opfsMode
-          ? await handleRequestOPFS(clientTabId, e.data.buffer)
-          : handleRequest(clientTabId, e.data.buffer);
+          ? await safeHandleRequestOPFS(clientTabId, e.data.buffer)
+          : safeHandleRequest(clientTabId, e.data.buffer);
         const response = encodeResponse(result.status, result.data);
         port.postMessage({ id: e.data.id, buffer: response }, [response]);
         if (!opfsMode && result._op !== undefined) notifyOPFSSync(result._op, result._path!, result._newPath);
@@ -132,7 +187,7 @@ function removeClientPort(clientTabId: string): void {
 function drainPortQueue(): void {
   while (portQueue.length > 0) {
     const msg = portQueue.shift()!;
-    const result = handleRequest(msg.tabId, msg.buffer);
+    const result = safeHandleRequest(msg.tabId, msg.buffer);
     const response = encodeResponse(result.status, result.data);
     msg.port.postMessage({ id: msg.id, buffer: response }, [response]);
     if (result._op !== undefined) notifyOPFSSync(result._op, result._path!, result._newPath);
@@ -142,7 +197,7 @@ function drainPortQueue(): void {
 async function drainPortQueueAsync(): Promise<void> {
   while (portQueue.length > 0) {
     const msg = portQueue.shift()!;
-    const result = await handleRequestOPFS(msg.tabId, msg.buffer);
+    const result = await safeHandleRequestOPFS(msg.tabId, msg.buffer);
     const response = encodeResponse(result.status, result.data);
     msg.port.postMessage({ id: msg.id, buffer: response }, [response]);
   }
@@ -150,33 +205,24 @@ async function drainPortQueueAsync(): Promise<void> {
 
 // ========== Follower mode: leader port ==========
 
-let leaderPort: MessagePort | null = null;
-let pendingResolve: ((buf: ArrayBuffer) => void) | null = null;
+// Follower→leader forwarding: sequence-id matching + per-request deadline.
+// See FollowerForwarder for the reliability contract (no stale-response
+// resolution, EIO instead of infinite hang on a lost response, no blind
+// retry of possibly-applied mutations).
+const forwarder = new FollowerForwarder(() => tabId);
 
 // No-SAB mode: async-relay port (for forwarding in follower mode)
 let asyncRelayPort: MessagePort | null = null;
 
 function forwardToLeader(payload: Uint8Array): Promise<ArrayBuffer> {
-  return new Promise(resolve => {
-    pendingResolve = resolve;
-    const buf = payload.buffer.byteLength === payload.byteLength
-      ? payload.buffer
-      : payload.slice().buffer;
-    leaderPort!.postMessage(
-      { id: tabId, tabId, buffer: buf },
-      [buf]
-    );
-  });
+  return forwarder.forward(payload);
 }
 
 function onLeaderMessage(e: MessageEvent): void {
   if (e.data.buffer instanceof ArrayBuffer) {
-    if (pendingResolve) {
-      // SAB follower: resolve sync relay promise
-      const resolve = pendingResolve;
-      pendingResolve = null;
-      resolve(e.data.buffer);
-    } else if (asyncRelayPort) {
+    // Sequence-matched sync response (or late echo of an abandoned one)?
+    if (forwarder.handleResponse(e.data.id, e.data.buffer)) return;
+    if (asyncRelayPort) {
       // No-SAB follower: forward response back to async-relay
       asyncRelayPort.postMessage({ id: e.data.id, buffer: e.data.buffer }, [e.data.buffer]);
     }
@@ -732,11 +778,16 @@ function readPayload(targetSab: SharedArrayBuffer, targetCtrl: Int32Array): Uint
   fullBuffer.set(new Uint8Array(targetSab, HEADER_SIZE, chunkLen), offset);
   offset += chunkLen;
 
-  // Ack and wait for more chunks
+  // Ack and wait for more chunks. Bounded 50ms slices: an unbounded wait
+  // here wedged the worker forever (frozen heartbeat → 20s stall abort on
+  // the main thread) when a cross-thread notify was lost under a
+  // busy-spinning main thread (observed on WebKit); slicing re-reads the
+  // value so a lost wake costs at most 50ms instead of the whole request.
+  const chunkDeadline = Date.now() + SAB_WAIT_DEADLINE_MS;
   while (offset < totalLen) {
     Atomics.store(targetCtrl, 0, SIGNAL.CHUNK_ACK);
     Atomics.notify(targetCtrl, 0);
-    Atomics.wait(targetCtrl, 0, SIGNAL.CHUNK_ACK); // Wait for next chunk
+    waitWhile(targetCtrl, SIGNAL.CHUNK_ACK, chunkDeadline, 'request chunk from caller', 50);
     const nextLen = Atomics.load(targetCtrl, 3);
     if (nextLen <= 0 || nextLen > maxChunk) {
       console.error(`[sync-relay] readPayload: invalid nextLen=${nextLen} at offset=${offset}`);
@@ -815,7 +866,8 @@ function writeResponse(targetSab: SharedArrayBuffer, targetCtrl: Int32Array, res
       Atomics.notify(targetCtrl, 0);
 
       if (!isLast) {
-        Atomics.wait(targetCtrl, 0, SIGNAL.CHUNK); // Wait for reader ack
+        // Bounded slices for the same lost-wake reason as readPayload above.
+        waitWhile(targetCtrl, SIGNAL.CHUNK, Date.now() + SAB_WAIT_DEADLINE_MS, 'response chunk ack from caller', 50);
       }
       sent += chunkSize;
     }
@@ -823,6 +875,87 @@ function writeResponse(targetSab: SharedArrayBuffer, targetCtrl: Int32Array, res
 }
 
 // ========== Leader mode: main loop ==========
+
+/**
+ * Top up the VFS file's free-tail headroom (engine.maybePreGrow) — but only
+ * after a genuine quiet period with no request pending on either SAB.
+ *
+ * On WebKit, ANY size-changing OPFS call blocks until the page's main
+ * thread returns to its event loop, so growth started moments before a
+ * sync caller posts-and-spins deadlocks until the caller's stall guard
+ * aborts. A bare "no request pending right now" check loses that race
+ * (verified: back-to-back sync writes post within the growth's own
+ * duration). Requiring 25ms of quiet keeps growth to genuine gaps between
+ * bursts; the large headroom (engine.PREGROW_HEADROOM_BLOCKS) ensures
+ * bursts don't exhaust the tail before the next gap.
+ */
+const PREGROW_QUIET_MS = 25;
+let lastRequestAt = 0;
+
+function preGrowIfQuiet(): void {
+  try {
+    if (Date.now() - lastRequestAt < PREGROW_QUIET_MS) return;
+    if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST) return;
+    if (asyncCtrl && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) return;
+    engine.maybePreGrow(true);
+  } catch (err) {
+    console.error('[sync-relay] pre-grow failed:', (err as Error)?.message);
+  }
+}
+
+/**
+ * Lost-wake-proof wait for the counterpart to consume a response: sleep in
+ * short slices and re-read the value, so a dropped cross-thread
+ * Atomics.notify (observed on WebKit/Safari while the main thread spins)
+ * costs one 5ms slice instead of the full budget — a plain
+ * `Atomics.wait(ctrl, 0, RESPONSE, 100)` turned each lost wake into a
+ * 100ms stall, which is exactly the erratic sync latency the maintainer
+ * measured in Safari (e.g. 2.6ms/op average on a 500-op batch read).
+ * Returns false if the response still wasn't consumed within budgetMs.
+ */
+function awaitResponseConsumed(targetCtrl: Int32Array, budgetMs: number): boolean {
+  const deadline = Date.now() + budgetMs;
+  while (Atomics.load(targetCtrl, 0) === SIGNAL.RESPONSE) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return false;
+    Atomics.wait(targetCtrl, 0, SIGNAL.RESPONSE, Math.min(5, remaining));
+  }
+  return true;
+}
+
+// Run a dispatch loop with crash containment. The loops are infinite async
+// functions invoked fire-and-forget; without this, one uncaught throw kills
+// dispatch silently (heartbeat keeps ticking, every request hangs forever).
+// On crash: log loudly, fail the in-flight request with EIO so the blocked
+// caller unwinds, and restart. After repeated crashes, give up and tell the
+// main thread so the failure is visible instead of a mystery hang.
+let leaderLoopCrashes = 0;
+const LEADER_LOOP_MAX_CRASHES = 5;
+
+function startLeaderLoop(loop: () => Promise<void>, name: string): void {
+  loop().catch((err: Error) => {
+    leaderLoopRunning = false;
+    console.error(`[sync-relay] ${name} crashed:`, err?.message, err?.stack);
+    try {
+      if (ctrl && Atomics.load(ctrl, 0) === SIGNAL.REQUEST) {
+        writeDirectResponse(sab, ctrl, STATUS.EIO);
+      }
+      if (asyncCtrl && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) {
+        writeDirectResponse(asyncSab!, asyncCtrl, STATUS.EIO);
+      }
+    } catch (_) {
+      // Best effort — the SAB protocol may be mid-handshake.
+    }
+    if (++leaderLoopCrashes <= LEADER_LOOP_MAX_CRASHES) {
+      startLeaderLoop(loop, name);
+    } else {
+      (self as unknown as Worker).postMessage({
+        type: 'leader-loop-fatal',
+        error: err?.message ?? String(err),
+      });
+    }
+  });
+}
 
 async function leaderLoop(): Promise<void> {
   leaderLoopRunning = true;
@@ -846,7 +979,7 @@ async function leaderLoop(): Promise<void> {
         const lt0 = debug ? performance.now() : 0;
         const payload = readPayload(sab, ctrl);
         const lt1 = debug ? performance.now() : 0;
-        const reqResult = handleRequest(tabId, payload.buffer as ArrayBuffer);
+        const reqResult = safeHandleRequest(tabId, payload.buffer as ArrayBuffer);
         const lt2 = debug ? performance.now() : 0;
         writeDirectResponse(sab, ctrl, reqResult.status, reqResult.data);
         if (reqResult._op !== undefined) notifyOPFSSync(reqResult._op, reqResult._path!, reqResult._newPath);
@@ -854,13 +987,14 @@ async function leaderLoop(): Promise<void> {
         if (debug) {
           console.log(`[leaderLoop] readPayload=${(lt1-lt0).toFixed(3)}ms handleRequest=${(lt2-lt1).toFixed(3)}ms writeResponse=${(lt3-lt2).toFixed(3)}ms TOTAL=${(lt3-lt0).toFixed(3)}ms`);
         }
-        // Wait for main thread to consume response (10ms safety timeout).
-        // Main thread sets IDLE without notify — worker stays asleep until the
-        // NEXT request's notify wakes it. This gives ONE wake per operation.
-        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 100);
-        if (waitResult === 'timed-out') {
+        // Wait (in lost-wake-proof slices) for main to consume the response.
+        // Main sets IDLE without notify; the next request's notify normally
+        // wakes us — but on WebKit that notify can be lost, so slices cap
+        // the damage at 5ms instead of the full budget.
+        if (!awaitResponseConsumed(ctrl, 100)) {
           Atomics.store(ctrl, 0, SIGNAL.IDLE);
         }
+        lastRequestAt = Date.now();
         processed = true;
         continue;
       }
@@ -868,16 +1002,15 @@ async function leaderLoop(): Promise<void> {
       // Priority 2: own tab's async requests
       if (asyncCtrl && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) {
         const payload = readPayload(asyncSab!, asyncCtrl);
-        const asyncResult = handleRequest(tabId, payload.buffer as ArrayBuffer);
+        const asyncResult = safeHandleRequest(tabId, payload.buffer as ArrayBuffer);
         writeDirectResponse(asyncSab!, asyncCtrl, asyncResult.status, asyncResult.data);
         if (asyncResult._op !== undefined) notifyOPFSSync(asyncResult._op, asyncResult._path!, asyncResult._newPath);
-        // Wait for async-relay to consume response and reset to IDLE.
-        // writeResponse handles multi-chunk handshake internally; when it
-        // returns the async-relay has all data but may need one more tick
-        // to set IDLE. Use Atomics.wait with a reasonable timeout.
-        if (Atomics.load(asyncCtrl, 0) !== SIGNAL.IDLE) {
-          Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 5000);
-        }
+        // Wait (in lost-wake-proof slices) for the async-relay to consume
+        // the response. writeResponse handles the multi-chunk handshake
+        // internally; when it returns the async-relay has all data but may
+        // need one more tick to set IDLE.
+        awaitResponseConsumed(asyncCtrl, 5000);
+        lastRequestAt = Date.now();
         processed = true;
         continue;
       }
@@ -888,6 +1021,29 @@ async function leaderLoop(): Promise<void> {
         processed = true;
         continue;
       }
+
+      // Nothing pending this instant — but in a stream of back-to-back ops
+      // the NEXT request lands within ~100µs (the caller is just decoding
+      // the previous response and encoding the next request). Busy-poll
+      // briefly before falling out to the yield+park path: catching the
+      // request here keeps the hot path free of yields, parks, and
+      // cross-thread wakes entirely — which is what makes sync throughput
+      // CONSISTENT on Safari, where the yield can cost a 1ms starved-timer
+      // tick and a park's wake notify can be lost outright. When truly
+      // idle this costs one 0.25ms spin before sleeping. Only worth doing
+      // mid-stream — when the last request was served moments ago.
+      if (Date.now() - lastRequestAt < 20) {
+        const spinStart = performance.now();
+        while (performance.now() - spinStart < 0.25) {
+          if (
+            Atomics.load(ctrl, 0) === SIGNAL.REQUEST ||
+            (asyncCtrl !== null && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST)
+          ) {
+            processed = true;
+            break;
+          }
+        }
+      }
     }
 
     // === All queues empty — yield to process MessagePort events ===
@@ -895,11 +1051,37 @@ async function leaderLoop(): Promise<void> {
     // client registrations via self.onmessage — both need the event loop.
     await yieldToEventLoop();
 
-    // If no clients and no new SAB work, block briefly for next request
-    if (clientPorts.size === 0 && !opfsSyncEnabled) {
+    // Idle housekeeping: keep free-tail headroom in the VFS file so the
+    // request path never needs handle.truncate growth (a storage-IPC call
+    // that can stall ~20s on WebKit while a sync caller spins the main
+    // thread). A failure here must never kill the loop.
+    preGrowIfQuiet();
+
+    // If no client tabs, park in a bounded Atomics.wait so the next
+    // request's notify wakes us INSTANTLY instead of waiting out a yield.
+    // This matters enormously on WebKit: while a sync caller busy-spins the
+    // main thread, MessageChannel pings are starved and the yield above
+    // resolves via its 1ms fallback timer — making every sync op pay a
+    // timer tick (~2ms/op measured in Safari). An Atomics wake bypasses the
+    // starved broker entirely. (Async requests wake us here too — the
+    // async-relay notifies this ctrl as its wake hint after staging a
+    // request on asyncCtrl.)
+    //
+    // MUST check BOTH SABs before blocking: an async request that landed
+    // while we were yielding has already fired its wake hint — blocking
+    // anyway stalls it for the full timeout (this exact miss cost the
+    // promises path ~25× on a benchmark run).
+    //
+    // With opfsSync enabled, external-change messages arrive on a
+    // MessagePort, so cap the block at 5ms to keep servicing the event
+    // loop (those messages tolerate ms-scale delay; their echo-suppression
+    // windows are measured in seconds). Without opfsSync, 50ms as before.
+    // With client tabs connected, don't block at all (port latency rules).
+    if (clientPorts.size === 0) {
       const currentSignal = Atomics.load(ctrl, 0);
-      if (currentSignal !== SIGNAL.REQUEST) {
-        Atomics.wait(ctrl, 0, currentSignal, 50);
+      const asyncPending = asyncCtrl !== null && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST;
+      if (currentSignal !== SIGNAL.REQUEST && !asyncPending) {
+        Atomics.wait(ctrl, 0, currentSignal, opfsSyncEnabled ? 5 : 50);
       }
     }
   }
@@ -923,10 +1105,9 @@ async function leaderLoopOPFS(): Promise<void> {
       // Priority 1: own tab's sync requests
       if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST) {
         const payload = readPayload(sab, ctrl);
-        const reqResult = await handleRequestOPFS(tabId, payload.buffer as ArrayBuffer);
+        const reqResult = await safeHandleRequestOPFS(tabId, payload.buffer as ArrayBuffer);
         writeDirectResponse(sab, ctrl, reqResult.status, reqResult.data);
-        const waitResult = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 100);
-        if (waitResult === 'timed-out') {
+        if (!awaitResponseConsumed(ctrl, 100)) {
           Atomics.store(ctrl, 0, SIGNAL.IDLE);
         }
         processed = true;
@@ -936,10 +1117,9 @@ async function leaderLoopOPFS(): Promise<void> {
       // Priority 2: own tab's async requests
       if (asyncCtrl && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) {
         const payload = readPayload(asyncSab!, asyncCtrl);
-        const asyncResult = await handleRequestOPFS(tabId, payload.buffer as ArrayBuffer);
+        const asyncResult = await safeHandleRequestOPFS(tabId, payload.buffer as ArrayBuffer);
         writeDirectResponse(asyncSab!, asyncCtrl, asyncResult.status, asyncResult.data);
-        const waitResult = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 100);
-        if (waitResult === 'timed-out') {
+        if (!awaitResponseConsumed(asyncCtrl, 100)) {
           Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
         }
         processed = true;
@@ -956,9 +1136,12 @@ async function leaderLoopOPFS(): Promise<void> {
 
     await yieldToEventLoop();
 
+    // Same both-SABs guard as leaderLoop: never block while an async
+    // request is already staged on asyncCtrl (its wake hint has fired).
     if (clientPorts.size === 0) {
       const currentSignal = Atomics.load(ctrl, 0);
-      if (currentSignal !== SIGNAL.REQUEST) {
+      const asyncPending = asyncCtrl !== null && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST;
+      if (currentSignal !== SIGNAL.REQUEST && !asyncPending) {
         Atomics.wait(ctrl, 0, currentSignal, 50);
       }
     }
@@ -976,8 +1159,7 @@ async function followerLoop(): Promise<void> {
       writeResponse(sab, ctrl, new Uint8Array(response));
       // Wait for main thread to consume response (safety timeout to prevent deadlock —
       // main thread stores IDLE without notify)
-      const result = Atomics.wait(ctrl, 0, SIGNAL.RESPONSE, 100);
-      if (result === 'timed-out') {
+      if (!awaitResponseConsumed(ctrl, 100)) {
         Atomics.store(ctrl, 0, SIGNAL.IDLE);
       }
       continue;
@@ -988,8 +1170,7 @@ async function followerLoop(): Promise<void> {
       const payload = readPayload(asyncSab!, asyncCtrl);
       const response = await forwardToLeader(payload);
       writeResponse(asyncSab!, asyncCtrl, new Uint8Array(response));
-      const result = Atomics.wait(asyncCtrl, 0, SIGNAL.RESPONSE, 100);
-      if (result === 'timed-out') {
+      if (!awaitResponseConsumed(asyncCtrl, 100)) {
         Atomics.store(asyncCtrl, 0, SIGNAL.IDLE);
       }
       continue;
@@ -1240,6 +1421,16 @@ async function initEngine(config: {
     );
   }
 
+  // Pre-grow the free-tail headroom NOW, before 'ready' is posted: the main
+  // thread is provably awaiting init (not spinning), so the size-changing
+  // OPFS call is safe and fast. On WebKit, growth while a sync caller spins
+  // deadlocks until the caller's stall guard aborts — see maybePreGrow.
+  try {
+    engine.maybePreGrow(true);
+  } catch (err) {
+    console.error('[sync-relay] init pre-grow failed:', (err as Error)?.message);
+  }
+
   // Watch broadcast channel — fires on every VFS mutation for fs.watch() support
   watchBc = new BroadcastChannel(`${config.ns}-watch`);
 }
@@ -1463,15 +1654,18 @@ self.onmessage = async (e: MessageEvent) => {
           if (leaderInitialized) {
             // Leader mode: handle locally (engine available)
             const result = opfsMode
-              ? await handleRequestOPFS(tabId || 'nosab', ev.data.buffer)
-              : handleRequest(tabId || 'nosab', ev.data.buffer);
+              ? await safeHandleRequestOPFS(tabId || 'nosab', ev.data.buffer)
+              : safeHandleRequest(tabId || 'nosab', ev.data.buffer);
             const response = encodeResponse(result.status, result.data);
             port.postMessage({ id: ev.data.id, buffer: response }, [response]);
             if (!opfsMode && result._op !== undefined) notifyOPFSSync(result._op, result._path!, result._newPath);
-          } else if (leaderPort) {
-            // Follower mode: forward to leader via leader port
+          } else if (forwarder.hasPort) {
+            // Follower mode: forward to leader via leader port. Not tracked
+            // by the forwarder — the async-relay matches responses by its
+            // own string ids (which can never collide with the forwarder's
+            // numeric sequence ids).
             const buf = ev.data.buffer;
-            leaderPort.postMessage({ id: ev.data.id, tabId, buffer: buf }, [buf]);
+            forwarder.postRaw({ id: ev.data.id, tabId, buffer: buf }, [buf]);
           }
         }
       };
@@ -1525,7 +1719,7 @@ self.onmessage = async (e: MessageEvent) => {
 
     // Start leader loop only when SABs are available (it uses Atomics.wait)
     if (hasSAB) {
-      leaderLoop();
+      startLeaderLoop(leaderLoop, 'leaderLoop');
     }
     // When no SAB, requests arrive only via MessagePorts (async-port handler above)
     return;
@@ -1575,7 +1769,7 @@ self.onmessage = async (e: MessageEvent) => {
     }
 
     if (hasSAB) {
-      leaderLoopOPFS();
+      startLeaderLoop(leaderLoopOPFS, 'leaderLoopOPFS');
     }
     return;
   }
@@ -1610,18 +1804,9 @@ self.onmessage = async (e: MessageEvent) => {
     const newPort = msg.port ?? e.ports[0];
     if (!newPort) return;
 
-    // Reconnection: close old port and unblock any pending forwardToLeader()
-    if (leaderPort) {
-      leaderPort.close();
-      if (pendingResolve) {
-        // Resolve with EIO error response to unblock followerLoop
-        const errorBuf = encodeResponse(5); // EIO
-        pendingResolve(errorBuf);
-        pendingResolve = null;
-      }
-    }
-
-    leaderPort = newPort;
+    // Reconnection: setPort closes the old port and aborts any pending
+    // forwardToLeader() with a (correctly-labeled) EIO response.
+    forwarder.setPort(newPort);
     newPort.onmessage = onLeaderMessage;
     newPort.start();
 

@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(sed -n '628,680p' readme.md)",
+      "Bash(sed -n '1,40p' CHANGELOG.md)",
+      "Bash(git -C /Users/steffan/Desktop/git/fs stash)",
+      "Bash(git -C /Users/steffan/Desktop/git/fs stash pop)",
+      "Bash(ls \"/Applications\" | grep -i \"edge\\\\|firefox\" ; npx playwright --version; ls ~/Library/Caches/ms-playwright 2>/dev/null | head)",
+      "Read(//Applications/**)",
+      "Bash(node --input-type=module -e \"await import\\('/Users/steffan/Desktop/git/fs/dist/index.js'\\).then\\(\\(\\)=>console.log\\('dist imports OK in node'\\)\\).catch\\(e=>console.log\\('IMPORT FAIL:', e.message\\)\\)\")",
+      "Bash(PORT=3517 npx playwright test sab-chunking cross-browser-correctness --project=chromium --project=firefox --project=webkit)",
+      "Bash(PORT=3519 node tests/benchmark/server.js)",
+      "Bash(node /tmp/webkit-probe.mjs)",
+      "Bash(PORT=3519 npx playwright test cross-browser-correctness --project=webkit)",
+      "Bash(grep -v \"^\\\\s*$\")",
+      "Bash(git -C /Users/steffan/Desktop/git/fs status --short)",
+      "Bash(git -C /Users/steffan/Desktop/git/fs diff --stat)",
+      "Bash(git -C /Users/steffan/Desktop/git/fs diff src/src/vfs/engine.ts)",
+      "Bash(PORT=3519 npx playwright test sab-chunking cross-browser-correctness --project=chromium --project=firefox --project=webkit)",
+      "Bash(perl -i -pe ' *)",
+      "Bash(perl -i -pe 's/^\\(\\\\s*\\)leaderLoop\\\\\\(\\\\\\);$/$1startLeaderLoop\\(leaderLoop, '\"'\"'leaderLoop'\"'\"'\\);/; s/^\\(\\\\s*\\)leaderLoopOPFS\\\\\\(\\\\\\);$/$1startLeaderLoop\\(leaderLoopOPFS, '\"'\"'leaderLoopOPFS'\"'\"'\\);/' src/workers/sync-relay.worker.ts)",
+      "Bash(echo \"=== exit: $?\")",
+      "Bash(perl -i -pe 'if \\($. == 894 || $. == 977\\) { $_ = \"    loopIterations++; // TEMP probe\\\\n$_\"; }' src/src/workers/sync-relay.worker.ts)",
+      "Bash(sed -n '892,896p;976,980p' src/src/workers/sync-relay.worker.ts)",
+      "Bash(perl -i -ne 'print unless /loopIterations\\\\+\\\\+; \\\\/\\\\/ TEMP probe/' src/src/workers/sync-relay.worker.ts)",
+      "Bash(PORT=3519 npx playwright test sab-chunking --project=webkit)",
+      "Bash(PORT=3519 npx playwright test sab-chunking --project=chromium)",
+      "Bash(PORT=3519 npx playwright test sab-chunking cross-browser-correctness --project=chromium)",
+      "Bash(pkill -f \"tests/benchmark/server.js\")",
+      "Bash(pkill -f \"sync-throughput\")",
+      "Bash(perl -0777 -i -pe ' *)",
+      "Bash(pkill -f \"ms-playwright\")"
+    ]
+  }
+}

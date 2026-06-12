@@ -13,9 +13,25 @@ import {
   MAX_SYMLINK_DEPTH, INITIAL_DATA_BLOCKS, INITIAL_PATH_TABLE_SIZE,
   calculateLayout,
 } from './layout.js';
+import { crc32 } from './crc32.js';
 import { CODE_TO_STATUS } from '../errors.js';
 
 const encoder = new TextEncoder();
+
+// Free trailing-block headroom maintained by pre-growth (maybePreGrow) and
+// preserved by trimTrailingBlocks. 16384 blocks = 64MB at the default 4KB
+// block size.
+//
+// Why so large: on WebKit, ANY size-changing OPFS call (truncate or
+// extending write — both verified empirically) blocks until the page's
+// main thread returns to its event loop. A busy-spinning sync caller
+// therefore DEADLOCKS file growth until the caller's stall guard gives up.
+// Growth is consequently only performed at provably-safe moments (engine
+// init, ≥25ms-quiet idle), and the headroom must be large enough that a
+// burst of back-to-back sync writes never exhausts it mid-burst. Bursts
+// writing more than this between quiet periods fall back to in-request
+// growth, which on WebKit costs a stall-guard abort (EIO) for that one op.
+const PREGROW_HEADROOM_BLOCKS = 16384;
 const decoder = new TextDecoder();
 
 interface Inode {
@@ -108,6 +124,18 @@ export class VFSEngine {
   // descCount stale; `isImplicitDirectory` notices the mismatch and
   // recomputes descCount on demand.
   private descCountGen = 0;
+
+  // Incrementally maintained directory-children index: parent dir path →
+  // (child name → number of pathIndex entries whose path passes through
+  // parent/name). Lets getDirectChildren / getDirectChildrenWithImplicit
+  // answer in O(children) instead of scanning every path in the volume,
+  // which made readdir and directory-stat O(total files) per call.
+  // A child name with refcount > 0 but no pathIndex entry of its own is an
+  // implicit directory. Same staleness contract as descCount: in sync iff
+  // childIndexGen >= pathIndexGen, rebuilt from scratch on demand when test
+  // scaffolding mutates pathIndex directly.
+  private childIndex = new Map<string, Map<string, number>>();
+  private childIndexGen = 0;
 
   // Configurable upper bounds
   private maxInodes = 4_000_000;
@@ -221,6 +249,20 @@ export class VFSEngine {
       throw new Error(`Corrupt VFS: unsupported version ${version} (expected ${VFS_VERSION})`);
     }
 
+    // Validate checksum (0 = legacy pre-CRC file: skip, upgraded on next
+    // superblock write). A mismatch means the superblock was torn or
+    // corrupted — fail mount so the repair path takes over rather than
+    // trusting bogus layout fields.
+    const storedCrc = v.getUint32(SUPERBLOCK.CRC32, true);
+    if (storedCrc !== 0) {
+      const computedCrc = crc32(this.superblockBuf, 0, SUPERBLOCK.CRC32);
+      if (computedCrc !== storedCrc) {
+        throw new Error(
+          `Corrupt VFS: superblock checksum mismatch (stored 0x${storedCrc.toString(16)}, computed 0x${computedCrc.toString(16)})`
+        );
+      }
+    }
+
     // Read superblock fields
     const inodeCount = v.getUint32(SUPERBLOCK.INODE_COUNT, true);
     const blockSize = v.getUint32(SUPERBLOCK.BLOCK_SIZE, true);
@@ -332,6 +374,9 @@ export class VFSEngine {
     v.setFloat64(SUPERBLOCK.DATA_OFFSET, this.dataOffset, true);
     v.setFloat64(SUPERBLOCK.BITMAP_OFFSET, this.bitmapOffset, true);
     v.setUint32(SUPERBLOCK.PATH_USED, this.pathTableUsed, true);
+    // Checksum everything before the CRC field; written in the same 64-byte
+    // write so a torn superblock write is detectable at mount.
+    v.setUint32(SUPERBLOCK.CRC32, crc32(this.superblockBuf, 0, SUPERBLOCK.CRC32), true);
     this.handle.write(this.superblockBuf, { at: 0 });
   }
 
@@ -361,28 +406,30 @@ export class VFSEngine {
     }
   }
 
-  /** Shrink the OPFS file by removing trailing free blocks from the data region.
-   *  Scans bitmap from end to find the last used block, then truncates. */
-  private trimTrailingBlocks(): void {
+  /** Find the last used block index (-1 if the data region is empty). */
+  private findLastUsedBlock(): number {
     const bitmap = this.bitmap!;
-
-    // Find the last used block by scanning bitmap from the end
-    let lastUsed = -1;
     for (let byteIdx = Math.ceil(this.totalBlocks / 8) - 1; byteIdx >= 0; byteIdx--) {
       if (bitmap[byteIdx] !== 0) {
-        // Find highest set bit in this byte
         for (let bit = 7; bit >= 0; bit--) {
           const blockIdx = byteIdx * 8 + bit;
           if (blockIdx < this.totalBlocks && (bitmap[byteIdx] & (1 << bit))) {
-            lastUsed = blockIdx;
-            break;
+            return blockIdx;
           }
         }
-        break;
       }
     }
+    return -1;
+  }
 
-    const newTotal = Math.max(lastUsed + 1, INITIAL_DATA_BLOCKS);
+  /** Shrink the OPFS file by removing trailing free blocks from the data region.
+   *  Keeps PREGROW_HEADROOM_BLOCKS of free tail (see maybePreGrow) so trim and
+   *  idle pre-growth don't oscillate — each truncate is a storage-IPC round
+   *  trip that can stall badly on WebKit while a sync caller spins. */
+  private trimTrailingBlocks(): void {
+    const lastUsed = this.findLastUsedBlock();
+
+    const newTotal = Math.max(lastUsed + 1 + PREGROW_HEADROOM_BLOCKS, INITIAL_DATA_BLOCKS);
     if (newTotal >= this.totalBlocks) return; // nothing to trim
 
     // Truncate the OPFS file
@@ -390,7 +437,7 @@ export class VFSEngine {
 
     // Shrink in-memory bitmap
     const newBitmapSize = Math.ceil(newTotal / 8);
-    this.bitmap = bitmap.slice(0, newBitmapSize);
+    this.bitmap = this.bitmap!.slice(0, newBitmapSize);
 
     // Update counters
     const trimmed = this.totalBlocks - newTotal;
@@ -401,6 +448,57 @@ export class VFSEngine {
     // Re-mark entire bitmap dirty so the smaller bitmap is flushed
     this.bitmapDirtyLo = 0;
     this.bitmapDirtyHi = newBitmapSize - 1;
+  }
+
+  // Throttle for maybePreGrow's tail scan (cheap, but no need to run it
+  // thousands of times per second from the dispatch loop's idle phase).
+  private lastPreGrowCheck = 0;
+
+  /**
+   * Idle-time data-region pre-growth — call from the dispatch loop when no
+   * request is pending.
+   *
+   * Growing the VFS file (`handle.truncate`) is the one engine operation
+   * that can block on a storage-IPC round trip for ~20 seconds on WebKit
+   * while a sync caller busy-spins the page's main thread (observed:
+   * FWRITE engine time of exactly ~20s when allocation landed on a growth
+   * boundary). Growing during idle — when nobody is spinning — takes
+   * milliseconds. This keeps PREGROW_HEADROOM_BLOCKS of CONTIGUOUS trailing
+   * free space (allocation is contiguous, so scattered free blocks don't
+   * prevent an in-request growth), so request-path growth only happens for
+   * single writes larger than the headroom.
+   *
+   * Returns true if the file was grown.
+   */
+  maybePreGrow(force = false): boolean {
+    if (!this.bitmap) return false;
+    const now = Date.now();
+    if (!force && now - this.lastPreGrowCheck < 250) return false;
+    this.lastPreGrowCheck = now;
+
+    const trailingFree = this.totalBlocks - (this.findLastUsedBlock() + 1);
+    if (trailingFree >= PREGROW_HEADROOM_BLOCKS) return false;
+
+    // Round to whole bitmap bytes; respect the configured block ceiling.
+    const wanted = Math.ceil((PREGROW_HEADROOM_BLOCKS - trailingFree) / 8) * 8;
+    const addedBlocks = Math.min(wanted, this.maxBlocks - this.totalBlocks);
+    if (addedBlocks <= 0) return false;
+
+    const newTotal = this.totalBlocks + addedBlocks;
+    this.handle.truncate(this.dataOffset + newTotal * this.blockSize);
+
+    const newBitmapSize = Math.ceil(newTotal / 8);
+    if (newBitmapSize > this.bitmap.byteLength) {
+      const newBitmap = new Uint8Array(newBitmapSize);
+      newBitmap.set(this.bitmap);
+      this.bitmap = newBitmap;
+    }
+
+    this.totalBlocks = newTotal;
+    this.freeBlocks += addedBlocks;
+    this.superblockDirty = true;
+    this.commitPending(); // flush now, while idle
+    return true;
   }
 
   /** Rebuild in-memory path→inode index from disk.
@@ -2114,17 +2212,18 @@ export class VFSEngine {
   // ========== Helpers ==========
 
   private getDirectChildren(dirPath: string): string[] {
+    this.ensureChildIndex();
+    const names = this.childIndex.get(dirPath);
+    if (!names) return [];
+
     const prefix = dirPath === '/' ? '/' : dirPath + '/';
     const children: string[] = [];
-
-    for (const path of this.pathIndex.keys()) {
-      if (path === dirPath) continue;
-      if (!path.startsWith(prefix)) continue;
-      // Direct child: no more slashes after prefix
-      const rest = path.substring(prefix.length);
-      if (!rest.includes('/')) {
-        children.push(path);
-      }
+    for (const name of names.keys()) {
+      const full = prefix + name;
+      // Only children that exist as real pathIndex entries (matching the
+      // previous full-scan semantics); names with only deeper descendants
+      // are implicit dirs and excluded here.
+      if (this.pathIndex.has(full)) children.push(full);
     }
 
     return children.sort();
@@ -2203,14 +2302,22 @@ export class VFSEngine {
   private setPathIndex(path: string, idx: number): void {
     const had = this.pathIndex.has(path);
     this.pathIndex.set(path, idx);
-    if (!had) this.bumpDescCount(path);
+    if (!had) {
+      this.bumpDescCount(path);
+      this.bumpChildIndex(path);
+    }
     this.descCountGen = this.pathIndexGen + 1;
+    this.childIndexGen = this.pathIndexGen + 1;
   }
 
   private deletePathIndex(path: string): boolean {
     const had = this.pathIndex.delete(path);
-    if (had) this.decDescCount(path);
+    if (had) {
+      this.decDescCount(path);
+      this.decChildIndex(path);
+    }
     this.descCountGen = this.pathIndexGen + 1;
+    this.childIndexGen = this.pathIndexGen + 1;
     return had;
   }
 
@@ -2237,37 +2344,86 @@ export class VFSEngine {
     }
   }
 
+  // ---- children index maintenance ----
+  // For path /a/b/c.txt, registers: '/'→'a', '/a'→'b', '/a/b'→'c.txt',
+  // each with a refcount of how many pathIndex entries pass through that edge.
+
+  private bumpChildIndex(path: string): void {
+    if (path === '/' || path.length === 0) return; // root is nobody's child
+    let parent = '/';
+    let start = 1;
+    while (start <= path.length) {
+      let end = path.indexOf('/', start);
+      if (end === -1) end = path.length;
+      const name = path.substring(start, end);
+      if (name.length > 0) {
+        let children = this.childIndex.get(parent);
+        if (!children) {
+          children = new Map<string, number>();
+          this.childIndex.set(parent, children);
+        }
+        children.set(name, (children.get(name) ?? 0) + 1);
+        parent = parent === '/' ? '/' + name : parent + '/' + name;
+      }
+      start = end + 1;
+    }
+  }
+
+  private decChildIndex(path: string): void {
+    if (path === '/' || path.length === 0) return;
+    let parent = '/';
+    let start = 1;
+    while (start <= path.length) {
+      let end = path.indexOf('/', start);
+      if (end === -1) end = path.length;
+      const name = path.substring(start, end);
+      if (name.length > 0) {
+        const children = this.childIndex.get(parent);
+        if (!children) break; // index out of sync — staleness rebuild will fix
+        const cur = children.get(name);
+        if (cur === undefined) break;
+        if (cur <= 1) {
+          children.delete(name);
+          if (children.size === 0) this.childIndex.delete(parent);
+        } else {
+          children.set(name, cur - 1);
+        }
+        parent = parent === '/' ? '/' + name : parent + '/' + name;
+      }
+      start = end + 1;
+    }
+  }
+
+  /**
+   * Resync childIndex with pathIndex if test scaffolding (or repair paths)
+   * mutated pathIndex directly. Mirrors the descCount staleness contract.
+   */
+  private ensureChildIndex(): void {
+    if (this.childIndexGen >= this.pathIndexGen) return;
+    this.childIndex.clear();
+    for (const path of this.pathIndex.keys()) {
+      this.bumpChildIndex(path);
+    }
+    this.childIndexGen = this.pathIndexGen;
+  }
+
   /**
    * Get direct children of a directory path, including implicit subdirectories.
    * Returns unique child full paths. Each entry is tagged with whether it's a
    * real inode or an implicit directory.
    */
   private getDirectChildrenWithImplicit(dirPath: string): { path: string; type: 'real' | 'implicit' }[] {
+    this.ensureChildIndex();
+    const names = this.childIndex.get(dirPath);
+    if (!names) return [];
+
     const prefix = dirPath === '/' ? '/' : dirPath + '/';
-    const childNames = new Map<string, 'real' | 'implicit'>();
-
-    for (const path of this.pathIndex.keys()) {
-      if (path === dirPath) continue;
-      if (!path.startsWith(prefix)) continue;
-      const rest = path.substring(prefix.length);
-      const slashPos = rest.indexOf('/');
-      if (slashPos === -1) {
-        // Direct child file/dir — it's a real inode
-        childNames.set(rest, 'real');
-      } else {
-        // Deeper descendant — the first segment is an implicit subdirectory
-        const childName = rest.substring(0, slashPos);
-        if (!childNames.has(childName)) {
-          // Only mark as implicit if there's no real inode for it
-          const childFullPath = prefix + childName;
-          childNames.set(childName, this.pathIndex.has(childFullPath) ? 'real' : 'implicit');
-        }
-      }
-    }
-
     const result: { path: string; type: 'real' | 'implicit' }[] = [];
-    for (const [name, type] of childNames) {
-      result.push({ path: prefix + name, type });
+    for (const name of names.keys()) {
+      const full = prefix + name;
+      // A child with its own pathIndex entry is a real inode; one that only
+      // exists because deeper descendants pass through it is implicit.
+      result.push({ path: full, type: this.pathIndex.has(full) ? 'real' : 'implicit' });
     }
     result.sort((a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
     return result;
