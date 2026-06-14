@@ -311,6 +311,27 @@ interface VFSConfig {
      *  `'./${ns}/'` (relative to the SW script URL) so it won't collide
      *  with the host application's service worker. */
     swScope?: string;
+    /**
+     * Service-worker broker bridge port, for running a VFS instance INSIDE a
+     * worker (e.g. an OS/runtime worker that needs `readFileSync` to work in a
+     * follower tab on Safari).
+     *
+     * `navigator.serviceWorker` is unavailable in worker scopes on Safari and
+     * Firefox, so a worker-hosted instance cannot broker its own multi-tab
+     * connection. Provide a `MessagePort` whose peer is driven on the main
+     * thread by `createServiceWorkerBridge(peerPort, { swUrl, swScope })`; the
+     * instance forwards its SW `postMessage`s (with transferred ports) through
+     * this port. Return-path messages flow directly through the transferred
+     * MessageChannel ports, so the bridge only forwards outbound.
+     *
+     * Why this matters: a follower's synchronous FS op busy-waits. On the main
+     * thread that means a spin-loop, and WebKit gates a worker's MessagePort
+     * delivery on the parent main thread's event loop — so the leader's reply
+     * can never arrive and the op fails (EIO). In a worker the wait is a real
+     * `Atomics.wait`, the main thread stays free to pump delivery, and follower
+     * sync works on Safari too.
+     */
+    swBridge?: MessagePort;
     /** Upper bounds for VFS validation (prevents corrupt data from causing OOM/hangs). */
     limits?: VFSLimits;
 }
@@ -396,7 +417,10 @@ declare class VFSFileSystem {
     private startAsFollower;
     /** Send a new port to sync-relay for connecting to the current leader */
     private connectToLeader;
-    /** Register the VFS service worker and return the active SW */
+    /** Register the VFS service worker and return something that can post
+     *  messages to it. When running inside a worker (`swBridge` provided),
+     *  returns a proxy that forwards postMessages — including transferred
+     *  ports — to a main-thread bridge that owns the real `navigator.serviceWorker`. */
     private getServiceWorker;
     /** Register as leader with SW broker (receives follower ports via control channel).
      *
@@ -726,6 +750,46 @@ declare class VFSPromises {
 }
 
 /**
+ * Main-thread service-worker bridge for worker-hosted VFS instances.
+ *
+ * `navigator.serviceWorker` is not exposed in worker scopes on Safari and
+ * Firefox, so a VFS instance running inside a worker cannot register or
+ * message the multi-tab broker service worker itself. This helper runs on the
+ * main thread, owns the real `navigator.serviceWorker`, and forwards the
+ * worker instance's broker messages (including transferred MessagePorts) to it.
+ *
+ * Only OUTBOUND messages (worker → SW) need forwarding: the SW's replies to a
+ * leader's control port, and a follower's leader-port traffic, all flow
+ * directly through the MessageChannel ports that were transferred along with
+ * those outbound messages — they never pass back through this bridge.
+ *
+ * Usage:
+ *   // main thread
+ *   const channel = new MessageChannel();
+ *   createServiceWorkerBridge(channel.port1, { ns: 'app' });
+ *   worker.postMessage({ swBridge: channel.port2 }, [channel.port2]);
+ *
+ *   // worker
+ *   const fs = new VFSFileSystem({ root: '/app', swBridge: receivedPort });
+ */
+interface ServiceWorkerBridgeOptions {
+    /** Namespace — must match the VFS instance's namespace (derived from root). */
+    ns: string;
+    /** Service worker script URL. Defaults to the bundled broker resolved
+     *  relative to this module. Override when bundled elsewhere. */
+    swUrl?: string;
+    /** Registration scope. Defaults to `./${ns}/` relative to the SW URL. */
+    swScope?: string;
+}
+/**
+ * Begin bridging a worker-hosted VFS instance's service-worker broker
+ * messages to the real service worker on this (main) thread.
+ *
+ * Returns a function that tears the bridge down.
+ */
+declare function createServiceWorkerBridge(bridgePort: MessagePort, opts: ServiceWorkerBridgeOptions): () => void;
+
+/**
  * Minimal Node.js-compatible stream classes for use in browser/OPFS environments.
  *
  * These do NOT depend on Node.js built-ins — they provide just enough API surface
@@ -1016,4 +1080,4 @@ declare function getDefaultFS(): VFSFileSystem;
 /** Async init helper — avoids blocking main thread */
 declare function init(): Promise<void>;
 
-export { type BigIntStats, type CpOptions, type Dir, type Dirent, type Encoding, FSError, type FSMode, type FSReadStream, type FSWatcher, type FSWriteStream, type FileHandle, type LoadResult, type MkdirOptions, NodeReadable, NodeWritable, type OpenAsBlobOptions, type PathLike, type ReadOptions, NodeReadable as ReadStream, type ReadStreamOptions, type ReaddirOptions, type RepairResult, type RmOptions, type RmdirOptions, SimpleEventEmitter, type StatFs, type StatOptions, type Stats, type UnpackResult, type VFSConfig, VFSFileSystem, type VFSLimits, type WatchEventType, type WatchFileListener, type WatchListener, type WatchOptions, type WriteOptions, NodeWritable as WriteStream, type WriteStreamOptions, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path, repairVFS, statusToError, unpackToOPFS };
+export { type BigIntStats, type CpOptions, type Dir, type Dirent, type Encoding, FSError, type FSMode, type FSReadStream, type FSWatcher, type FSWriteStream, type FileHandle, type LoadResult, type MkdirOptions, NodeReadable, NodeWritable, type OpenAsBlobOptions, type PathLike, type ReadOptions, NodeReadable as ReadStream, type ReadStreamOptions, type ReaddirOptions, type RepairResult, type RmOptions, type RmdirOptions, type ServiceWorkerBridgeOptions, SimpleEventEmitter, type StatFs, type StatOptions, type Stats, type UnpackResult, type VFSConfig, VFSFileSystem, type VFSLimits, type WatchEventType, type WatchFileListener, type WatchListener, type WatchOptions, type WriteOptions, NodeWritable as WriteStream, type WriteStreamOptions, constants, createError, createFS, createServiceWorkerBridge, getDefaultFS, init, loadFromOPFS, path, repairVFS, statusToError, unpackToOPFS };

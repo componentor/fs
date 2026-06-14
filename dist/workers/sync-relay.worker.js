@@ -2708,7 +2708,7 @@ function decodeSecondPath(data) {
 
 // src/protocol/follower-forward.ts
 var FORWARD_DEADLINE_MS = 1e4;
-var FollowerForwarder = class {
+var FollowerForwarder = class _FollowerForwarder {
   constructor(getTabId, deadlineMs = FORWARD_DEADLINE_MS) {
     this.getTabId = getTabId;
     this.deadlineMs = deadlineMs;
@@ -2736,11 +2736,38 @@ var FollowerForwarder = class {
   postRaw(message, transfer) {
     this.port?.postMessage(message, transfer);
   }
+  /** Until this epoch-ms timestamp, the port is suspected dead-under-spin
+   *  and fail-fast-eligible requests fail immediately. 0 = healthy. */
+  portSuspectUntil = 0;
+  /** How long a deadline timeout keeps the port "suspect". */
+  static SUSPECT_WINDOW_MS = 3e4;
+  /**
+   * True while a recent forward timed out and nothing has been delivered
+   * since. On WebKit this is the signature of the architectural follower
+   * deadlock: a SYNC caller busy-spins the page's main thread, and WebKit
+   * brokers this tab's MessagePort traffic through that same main thread —
+   * the leader's response cannot arrive until the caller gives up.
+   */
+  get portSuspect() {
+    return Date.now() < this.portSuspectUntil;
+  }
   /**
    * Forward a request payload to the leader. Resolves with the response
    * buffer, or with an encoded EIO response after the deadline.
+   *
+   * `failFastEligible` marks requests whose caller is busy-spinning the
+   * main thread (the sync SAB path). While the port is suspect — a recent
+   * forward already timed out — such requests fail IMMEDIATELY with EIO
+   * instead of freezing the tab for the full deadline again: on WebKit the
+   * response provably cannot arrive while the caller spins. Async-path
+   * requests (caller not spinning) always attempt, and any delivered
+   * response clears the suspicion — so a recovered or healthy port heals
+   * automatically.
    */
-  forward(payload) {
+  forward(payload, failFastEligible = false) {
+    if (failFastEligible && this.portSuspect) {
+      return Promise.resolve(encodeResponse(STATUS.EIO));
+    }
     if (this.pendingResolve) this.abortPending();
     return new Promise((resolve) => {
       const seq = ++this.seqCounter;
@@ -2755,6 +2782,7 @@ var FollowerForwarder = class {
           const r = this.pendingResolve;
           this.pendingResolve = null;
           this.pendingAbandoned = true;
+          this.portSuspectUntil = Date.now() + _FollowerForwarder.SUSPECT_WINDOW_MS;
           r(encodeResponse(STATUS.EIO));
         }
       }, this.deadlineMs);
@@ -2767,6 +2795,7 @@ var FollowerForwarder = class {
    * consumer (the no-SAB async-relay path).
    */
   handleResponse(id, buffer) {
+    this.portSuspectUntil = 0;
     if (id === this.pendingSeq) {
       if (this.pendingResolve) {
         this.clearTimer();
@@ -3762,7 +3791,7 @@ async function followerLoop() {
   while (true) {
     if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST) {
       const payload = readPayload(sab, ctrl);
-      const response = await forwardToLeader(payload);
+      const response = await forwarder.forward(payload, true);
       writeResponse(sab, ctrl, new Uint8Array(response));
       if (!awaitResponseConsumed(ctrl, 100)) {
         Atomics.store(ctrl, 0, SIGNAL.IDLE);

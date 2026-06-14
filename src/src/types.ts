@@ -331,6 +331,27 @@ export interface VFSConfig {
    *  `'./${ns}/'` (relative to the SW script URL) so it won't collide
    *  with the host application's service worker. */
   swScope?: string;
+  /**
+   * Service-worker broker bridge port, for running a VFS instance INSIDE a
+   * worker (e.g. an OS/runtime worker that needs `readFileSync` to work in a
+   * follower tab on Safari).
+   *
+   * `navigator.serviceWorker` is unavailable in worker scopes on Safari and
+   * Firefox, so a worker-hosted instance cannot broker its own multi-tab
+   * connection. Provide a `MessagePort` whose peer is driven on the main
+   * thread by `createServiceWorkerBridge(peerPort, { swUrl, swScope })`; the
+   * instance forwards its SW `postMessage`s (with transferred ports) through
+   * this port. Return-path messages flow directly through the transferred
+   * MessageChannel ports, so the bridge only forwards outbound.
+   *
+   * Why this matters: a follower's synchronous FS op busy-waits. On the main
+   * thread that means a spin-loop, and WebKit gates a worker's MessagePort
+   * delivery on the parent main thread's event loop — so the leader's reply
+   * can never arrive and the op fails (EIO). In a worker the wait is a real
+   * `Atomics.wait`, the main thread stays free to pump delivery, and follower
+   * sync works on Safari too.
+   */
+  swBridge?: MessagePort;
   /** Upper bounds for VFS validation (prevents corrupt data from causing OOM/hangs). */
   limits?: VFSLimits;
 }

@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>VFS multi-tab sync demo (worker-hosted)</title>
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; margin: 2rem; max-width: 640px; }
+    h1 { font-size: 1.2rem; }
+    #status { padding: .6rem .8rem; border-radius: 6px; background: #fef3c7; font-weight: 600; }
+    #status.ready { background: #bbf7d0; }
+    #status.err { background: #fecaca; }
+    input, button { font-size: 1rem; padding: .4rem .6rem; }
+    #files { margin-top: 1rem; border-collapse: collapse; width: 100%; }
+    #files td { border-bottom: 1px solid #eee; padding: .3rem .5rem; font-family: ui-monospace, monospace; font-size: .85rem; }
+    .muted { color: #666; font-size: .85rem; }
+  </style>
+</head>
+<body>
+  <h1>VFS multi-tab sync demo — worker-hosted (works on Safari)</h1>
+  <p class="muted">
+    Open this page in two or more tabs (Safari included). The VFS instance runs
+    inside a worker, so synchronous <code>readFileSync</code>/<code>writeFileSync</code>
+    work in every tab — leader or follower. Type a value, click Write, and watch
+    it appear in the other tabs' file list (which is refreshed via synchronous
+    <code>readdirSync</code> + <code>readFileSync</code> every second).
+  </p>
+  <div id="status">Starting…</div>
+  <p>
+    <input id="key" placeholder="filename" value="note" />
+    <input id="val" placeholder="value" value="hello" />
+    <button id="write">Write (sync)</button>
+    <span id="tabid" class="muted"></span>
+  </p>
+  <table id="files"></table>
+
+  <script type="module">
+    import { createServiceWorkerBridge } from '/index.js';
+
+    const ROOT = '/multitab-demo';
+    const NS = 'vfs-' + ROOT.replace(/[^a-zA-Z0-9]/g, '_');
+    const status = document.getElementById('status');
+    const filesEl = document.getElementById('files');
+    document.getElementById('tabid').textContent = 'tab ' + Math.random().toString(36).slice(2, 7);
+
+    // Host the VFS instance in a worker; bridge the service worker from here.
+    const worker = new Worker('/follower-worker.js', { type: 'module' });
+    const ch = new MessageChannel();
+    createServiceWorkerBridge(ch.port1, { ns: NS });
+
+    const pending = new Map();
+    worker.addEventListener('message', (e) => {
+      const { type } = e.data;
+      const r = pending.get(type);
+      if (r) { pending.delete(type); r(e.data); }
+    });
+    const call = (msg, replyType, transfer) => new Promise((resolve) => {
+      pending.set(replyType, resolve);
+      worker.postMessage(msg, transfer || []);
+    });
+
+    (async () => {
+      const init = await call({ type: 'init', root: ROOT, swBridge: ch.port2 }, 'inited', [ch.port2]);
+      if (init.error) { status.textContent = 'init failed: ' + init.error; status.className = 'err'; return; }
+      status.textContent = 'Ready — sync FS running in a worker (this tab can read/write synchronously)';
+      status.className = 'ready';
+
+      document.getElementById('write').onclick = async () => {
+        const name = document.getElementById('key').value.trim() || 'note';
+        const text = document.getElementById('val').value;
+        const w = await call({ type: 'sync-write', path: '/' + name, text }, 'write-result');
+        if (w.error) { status.textContent = 'write failed: ' + w.error; status.className = 'err'; }
+      };
+
+      // Poll the shared filesystem every second using SYNC ops in the worker.
+      const refresh = async () => {
+        const list = await call({ type: 'list' }, 'list-result');
+        if (list.error) { return; }
+        filesEl.innerHTML = '';
+        for (const f of list.files) {
+          const tr = document.createElement('tr');
+          tr.innerHTML = `<td>/${f.name}</td><td>${f.text}</td>`;
+          filesEl.appendChild(tr);
+        }
+      };
+      setInterval(refresh, 1000);
+      refresh();
+    })();
+  </script>
+</body>
+</html>

@@ -1152,10 +1152,14 @@ async function leaderLoopOPFS(): Promise<void> {
 
 async function followerLoop(): Promise<void> {
   while (true) {
-    // Check own sync SAB
+    // Check own sync SAB. failFastEligible: the caller is busy-spinning the
+    // main thread, which on WebKit starves this tab's port brokering — once
+    // a forward has timed out, further sync ops fail immediately with EIO
+    // instead of freezing the tab for the full deadline each time (async
+    // ops keep working and heal the suspicion on any delivery).
     if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST) {
       const payload = readPayload(sab, ctrl);
-      const response = await forwardToLeader(payload);
+      const response = await forwarder.forward(payload, true);
       writeResponse(sab, ctrl, new Uint8Array(response));
       // Wait for main thread to consume response (safety timeout to prevent deadlock —
       // main thread stores IDLE without notify)

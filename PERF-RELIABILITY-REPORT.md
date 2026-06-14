@@ -4,6 +4,61 @@ Working-tree changes only — **nothing committed or pushed**; every change is
 staged for human review. All claims below are backed by checked-in tests or
 saved benchmark output.
 
+## Safari multi-tab follower SYNC — fixed via worker-hosted instances (2026-06-14)
+
+**Result: follower sync works on Safari/WebKit, Chromium and Firefox when the
+follower instance runs inside a worker.** Verified end-to-end on all three
+engines (`tests/benchmark/multitab-worker.spec.ts`): a follower reads the
+leader's file and writes its own, synchronously, and the leader sees the write
+— 7ms on WebKit.
+
+Why it was thought impossible, and what changed — established with isolated
+probes (kept under the session notes, reproducible):
+
+1. **Sync XHR is NOT intercepted by the service worker in WebKit.** An async
+   `fetch` to the same path round-trips through the SW fine; a synchronous XHR
+   bypasses the SW and hits the network. So the classic "sync-XHR-through-SW"
+   (webcontainer) trick is dead on Safari.
+2. **A worker's MessagePort delivery is gated on the parent main thread's
+   event loop in WebKit.** Probe: a worker that should receive a port message
+   and write a SAB received NOTHING during a 3s main-thread spin on WebKit,
+   vs 35ms on Chromium. This is the real reason follower sync deadlocked: a
+   follower's main-thread spin freezes its relay worker's intake, so the
+   leader's reply never arrives.
+3. **But from a WORKER context it works** — the sync wait becomes a real
+   `Atomics.wait` (allowed off-main-thread), the main thread stays free to
+   pump delivery, and the relay receives the leader's reply. Probe: value
+   delivered, `waitResult: "ok"`, on both WebKit and Chromium.
+
+The fix (surgical — the only main-thread-only dependency was the SW broker):
+- New config `swBridge?: MessagePort` ([types.ts](src/src/types.ts)). When
+  set, `getServiceWorker()` returns a proxy that forwards the instance's
+  broker `postMessage`s (with transferred ports) through the bridge
+  ([filesystem.ts](src/src/filesystem.ts)). Only OUTBOUND forwarding is
+  needed — SW→leader→worker replies flow directly through the transferred
+  MessageChannel ports.
+- New exported helper `createServiceWorkerBridge(peerPort, { ns })`
+  ([sw-bridge.ts](src/src/sw-bridge.ts)) — runs on the main thread, owns the
+  real `navigator.serviceWorker`, forwards bridge messages to it.
+- Everything else the instance needs (`navigator.locks`, `location`,
+  SAB/Atomics, nested workers) already works in a worker on WebKit ≥ 16.4.
+
+Deployment pattern (also in the Safari doc): run the follower's VFS instance
+in a worker, wire the bridge on the main thread:
+```js
+// main thread (per follower tab)
+const ch = new MessageChannel();
+createServiceWorkerBridge(ch.port1, { ns: 'vfs-_app' }); // ns = `vfs-${root with non-alnum → _}`
+worker.postMessage({ swBridge: ch.port2 }, [ch.port2]);
+// inside the worker
+const fs = new VFSFileSystem({ root: '/app', swBridge: receivedPort });
+fs.readFileSync('/x'); // works in a follower tab, Safari included
+```
+Backward compatible: `swBridge` unset → `getServiceWorker()` behaves exactly
+as before, so main-thread and Chrome/FF multi-tab paths are unchanged. The
+main-thread follower-sync contract on Safari (fail-fast EIO) still stands for
+instances that run on the main thread — see `multitab.spec.ts`.
+
 ## Summary of changes
 
 ### 1. Directory children index — readdir/stat no longer O(total files)
@@ -277,9 +332,26 @@ taken).
   the worker is executing synchronously)
 - `getAllDescendants` could reuse the children index (rmdir/rename of huge
   trees still does a full path scan)
-- multi-tab WebKit followers: a follower's spinning main thread may starve
-  its own MessagePort hop to the leader the same way — the 10s follower
-  deadline turns that into EIO rather than a hang, but a WebKit-specific
-  multi-tab test pass is worth doing
+- multi-tab WebKit followers — INVESTIGATED AND CHARACTERIZED (see
+  `tests/benchmark/multitab.spec.ts`): multi-tab sync + async works fully
+  on Chromium and Firefox (verified both directions, current build). On
+  WebKit, async cross-tab works fully; follower SYNC ops are
+  architecturally blocked: the sync caller busy-spins the follower's main
+  thread, and WebKit brokers that tab's MessagePort traffic through that
+  same main thread, so the leader's response cannot arrive (identical
+  deadlock on unmodified 3.0.55, where it hung the tab forever; now it
+  fails with EIO). The forwarder additionally fails FAST after the first
+  timeout (instant EIO for ~30s instead of 10s of frozen tab per op) and
+  self-heals on any delivered response — async ops keep working throughout
+  and clear the suspicion. A real fix would need a transport whose
+  delivery doesn't depend on the spinning tab's main thread; the known
+  candidate is synchronous XHR intercepted by the service worker (the
+  webcontainer-style escape hatch) — a substantial feature, listed below.
 - the 64MB pre-growth headroom is a constant (`PREGROW_HEADROOM_BLOCKS`);
   consider exposing it via `limits` config for quota-sensitive deployments
+- Safari follower SYNC transport: implement sync-XHR-through-service-worker
+  relay (request encoded into a synchronous XMLHttpRequest the SW
+  intercepts and forwards to the leader; sync XHR blocks the main thread
+  below the JS event loop, so SW fetch handling proceeds in its own
+  process). This is the only known way to give WebKit follower tabs a
+  working sync API.

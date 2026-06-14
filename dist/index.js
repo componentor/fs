@@ -2674,6 +2674,7 @@ var VFSFileSystem = class {
       debug: config.debug ?? false,
       swUrl: config.swUrl,
       swScope: config.swScope,
+      swBridge: config.swBridge,
       limits: config.limits
     };
     this.tabId = crypto.randomUUID();
@@ -2891,8 +2892,17 @@ var VFSFileSystem = class {
       mc.port2.close();
     });
   }
-  /** Register the VFS service worker and return the active SW */
+  /** Register the VFS service worker and return something that can post
+   *  messages to it. When running inside a worker (`swBridge` provided),
+   *  returns a proxy that forwards postMessages — including transferred
+   *  ports — to a main-thread bridge that owns the real `navigator.serviceWorker`. */
   async getServiceWorker() {
+    if (this.config.swBridge) {
+      const bridge = this.config.swBridge;
+      return {
+        postMessage: (message, transfer) => bridge.postMessage(message, transfer ?? [])
+      };
+    }
     if (!this.swReg) {
       const swUrl = this.config.swUrl ? new URL(this.config.swUrl, location.origin) : new URL("./workers/service.worker.js", import.meta.url);
       const scope = this.config.swScope ?? new URL(`./${this.ns}/`, swUrl).href;
@@ -4290,6 +4300,53 @@ var VFSPromises = class {
   async purge() {
   }
 };
+
+// src/sw-bridge.ts
+function createServiceWorkerBridge(bridgePort, opts) {
+  let regPromise = null;
+  const resolveSW = () => {
+    if (regPromise) return regPromise;
+    regPromise = (async () => {
+      const swUrl = opts.swUrl ? new URL(opts.swUrl, location.origin) : new URL("./workers/service.worker.js", import.meta.url);
+      const scope = opts.swScope ?? new URL(`./${opts.ns}/`, swUrl).href;
+      const reg = await navigator.serviceWorker.register(swUrl.href, { scope });
+      if (reg.active) return reg.active;
+      const sw = reg.installing || reg.waiting;
+      if (!sw) throw new Error("No service worker found");
+      await new Promise((resolve2, reject) => {
+        const timer = setTimeout(() => {
+          sw.removeEventListener("statechange", onState);
+          reject(new Error("Service worker activation timeout"));
+        }, 5e3);
+        const onState = () => {
+          if (sw.state === "activated") {
+            clearTimeout(timer);
+            sw.removeEventListener("statechange", onState);
+            resolve2();
+          } else if (sw.state === "redundant") {
+            clearTimeout(timer);
+            sw.removeEventListener("statechange", onState);
+            reject(new Error("SW redundant"));
+          }
+        };
+        sw.addEventListener("statechange", onState);
+        onState();
+      });
+      return reg.active;
+    })();
+    return regPromise;
+  };
+  const onMessage = (event) => {
+    const transfer = event.ports.length ? Array.from(event.ports) : void 0;
+    resolveSW().then((sw) => sw.postMessage(event.data, transfer)).catch((err) => console.error("[VFS sw-bridge] forward failed:", err.message));
+  };
+  bridgePort.addEventListener("message", onMessage);
+  bridgePort.start();
+  return () => {
+    bridgePort.removeEventListener("message", onMessage);
+    bridgePort.close();
+  };
+}
 
 // src/vfs/crc32.ts
 var TABLE = (() => {
@@ -6528,6 +6585,6 @@ function init() {
   return getDefaultFS().init();
 }
 
-export { FSError, NodeReadable, NodeWritable, NodeReadable as ReadStream, SimpleEventEmitter, VFSFileSystem, NodeWritable as WriteStream, constants, createError, createFS, getDefaultFS, init, loadFromOPFS, path_exports as path, repairVFS, statusToError, unpackToOPFS };
+export { FSError, NodeReadable, NodeWritable, NodeReadable as ReadStream, SimpleEventEmitter, VFSFileSystem, NodeWritable as WriteStream, constants, createError, createFS, createServiceWorkerBridge, getDefaultFS, init, loadFromOPFS, path_exports as path, repairVFS, statusToError, unpackToOPFS };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map

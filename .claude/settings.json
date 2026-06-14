@@ -29,7 +29,25 @@
       "Bash(pkill -f \"tests/benchmark/server.js\")",
       "Bash(pkill -f \"sync-throughput\")",
       "Bash(perl -0777 -i -pe ' *)",
-      "Bash(pkill -f \"ms-playwright\")"
+      "Bash(pkill -f \"ms-playwright\")",
+      "Bash(PORT=3519 npx playwright test multitab sab-chunking cross-browser-correctness --project=chromium --project=firefox --project=webkit)",
+      "Bash(PORT=3519 npx playwright test multitab-worker multitab sab-chunking cross-browser-correctness --project=chromium --project=firefox --project=webkit)",
+      "Bash(PORT=3519 npx playwright test multitab-worker --project=chromium --project=firefox --project=webkit)",
+      "Bash(PORT=3519 npx playwright test --project=chromium --project=firefox --project=webkit)",
+      "Bash(PORT=3519 npx playwright test multitab-worker --project=chromium)",
+      "Bash(pkill -9 -f \"ms-playwright\")",
+      "Bash(pkill -9 -f \"Chromium\")",
+      "Bash(PORT=3519 npx playwright test multitab-worker multitab sab-chunking cross-browser-correctness --project=chromium --project=firefox --project=webkit --workers=1)",
+      "Bash(sed -n '205,233p' tests/benchmark/index.html)",
+      "Bash(sed -n '178,200p' tests/benchmark/index.html)",
+      "Bash(sed -n '1155,1162p' tests/benchmark/index.html)",
+      "Bash(sed -n '1242,1247p' tests/benchmark/index.html)",
+      "Bash(awk '/<script type=\"module\">/{f=1;next} /<\\\\/script>/{f=0} f' tests/benchmark/index.html)",
+      "Bash(node --check /tmp/page-script.js)",
+      "Bash(PORT=3519 npx playwright test benchmark.spec --project=chromium)",
+      "Bash(sed -n '100,108p' tests/benchmark/benchmark.spec.ts)",
+      "Bash(PORT=3519 npx playwright test benchmark.spec --project=chromium -g \"Write performance\")",
+      "Bash(perl -i -pe 's/\"version\": \"3\\\\.1\\\\.0\"/\"version\": \"3.2.0\"/' package.json)"
     ]
   }
 }

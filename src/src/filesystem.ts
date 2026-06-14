@@ -176,7 +176,7 @@ export class VFSFileSystem {
 
 
   // Config (definite assignment — always set when constructor doesn't return singleton)
-  private config!: Omit<Required<VFSConfig>, 'opfsSyncRoot' | 'swUrl' | 'swScope' | 'mode' | 'limits'> & { opfsSyncRoot?: string; swUrl?: string; swScope?: string; limits?: VFSConfig['limits'] };
+  private config!: Omit<Required<VFSConfig>, 'opfsSyncRoot' | 'swUrl' | 'swScope' | 'mode' | 'limits' | 'swBridge'> & { opfsSyncRoot?: string; swUrl?: string; swScope?: string; swBridge?: MessagePort; limits?: VFSConfig['limits'] };
   private tabId!: string;
   private _mode!: FSMode;
   private corruptionError: Error | null = null;
@@ -228,6 +228,7 @@ export class VFSFileSystem {
       debug: config.debug ?? false,
       swUrl: config.swUrl,
       swScope: config.swScope,
+      swBridge: config.swBridge,
       limits: config.limits,
     };
 
@@ -495,8 +496,18 @@ export class VFSFileSystem {
     });
   }
 
-  /** Register the VFS service worker and return the active SW */
-  private async getServiceWorker(): Promise<ServiceWorker> {
+  /** Register the VFS service worker and return something that can post
+   *  messages to it. When running inside a worker (`swBridge` provided),
+   *  returns a proxy that forwards postMessages — including transferred
+   *  ports — to a main-thread bridge that owns the real `navigator.serviceWorker`. */
+  private async getServiceWorker(): Promise<{ postMessage(message: unknown, transfer?: Transferable[]): void }> {
+    if (this.config.swBridge) {
+      const bridge = this.config.swBridge;
+      return {
+        postMessage: (message: unknown, transfer?: Transferable[]) =>
+          bridge.postMessage(message, (transfer ?? []) as Transferable[]),
+      };
+    }
     if (!this.swReg) {
       const swUrl = this.config.swUrl
         ? new URL(this.config.swUrl, location.origin)

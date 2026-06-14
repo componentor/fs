@@ -73,11 +73,41 @@ export class FollowerForwarder {
     this.port?.postMessage(message, transfer);
   }
 
+  /** Until this epoch-ms timestamp, the port is suspected dead-under-spin
+   *  and fail-fast-eligible requests fail immediately. 0 = healthy. */
+  private portSuspectUntil = 0;
+  /** How long a deadline timeout keeps the port "suspect". */
+  static readonly SUSPECT_WINDOW_MS = 30_000;
+
+  /**
+   * True while a recent forward timed out and nothing has been delivered
+   * since. On WebKit this is the signature of the architectural follower
+   * deadlock: a SYNC caller busy-spins the page's main thread, and WebKit
+   * brokers this tab's MessagePort traffic through that same main thread —
+   * the leader's response cannot arrive until the caller gives up.
+   */
+  get portSuspect(): boolean {
+    return Date.now() < this.portSuspectUntil;
+  }
+
   /**
    * Forward a request payload to the leader. Resolves with the response
    * buffer, or with an encoded EIO response after the deadline.
+   *
+   * `failFastEligible` marks requests whose caller is busy-spinning the
+   * main thread (the sync SAB path). While the port is suspect — a recent
+   * forward already timed out — such requests fail IMMEDIATELY with EIO
+   * instead of freezing the tab for the full deadline again: on WebKit the
+   * response provably cannot arrive while the caller spins. Async-path
+   * requests (caller not spinning) always attempt, and any delivered
+   * response clears the suspicion — so a recovered or healthy port heals
+   * automatically.
    */
-  forward(payload: Uint8Array): Promise<ArrayBuffer> {
+  forward(payload: Uint8Array, failFastEligible = false): Promise<ArrayBuffer> {
+    if (failFastEligible && this.portSuspect) {
+      return Promise.resolve(encodeResponse(STATUS.EIO));
+    }
+
     // The follower loop is strictly serial, but guard anyway: a second
     // forward while one is pending aborts the first instead of leaking it.
     if (this.pendingResolve) this.abortPending();
@@ -103,6 +133,7 @@ export class FollowerForwarder {
           // Keep pendingSeq + mark abandoned so a late echo of this id is
           // recognized as ours and swallowed rather than leaking onward.
           this.pendingAbandoned = true;
+          this.portSuspectUntil = Date.now() + FollowerForwarder.SUSPECT_WINDOW_MS;
           r(encodeResponse(STATUS.EIO));
         }
       }, this.deadlineMs);
@@ -116,6 +147,9 @@ export class FollowerForwarder {
    * consumer (the no-SAB async-relay path).
    */
   handleResponse(id: unknown, buffer: ArrayBuffer): boolean {
+    // Any delivery proves the port works — clear the dead-under-spin
+    // suspicion so sync requests resume attempting.
+    this.portSuspectUntil = 0;
     if (id === this.pendingSeq) {
       if (this.pendingResolve) {
         this.clearTimer();

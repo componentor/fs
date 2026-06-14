@@ -11,6 +11,7 @@
 - As of **Safari 16.4 (March 2023)** every primitive the sync path *nominally* needs exists in WebKit: `SharedArrayBuffer` + `Atomics` under COOP/COEP (15.2), nested dedicated workers (16.4), module workers (15), fully synchronous `FileSystemSyncAccessHandle` methods (16.4), `Atomics.waitAsync` (16.4), and Web Locks / BroadcastChannel (15.4). The README's blanket "Safari doesn't support SharedArrayBuffer in the required context" footnote reflects the pre-16.4 world and is now an over-simplification.
 - What still genuinely hurts on Safari today is **operational, not API-surface**: an observed OPFS write→lookup **visibility lag** after `createSyncAccessHandle` writes (worked around in [`src/src/workers/opfs-sync.worker.ts`](src/src/workers/opfs-sync.worker.ts)); **no `FileSystemObserver`** (external-change sync silently unavailable); **no `createSyncAccessHandle({ mode })`** (always exclusive single-handle locking); historically aggressive **service-worker termination** (the multi-tab port broker depends on a SW); and aggressive **background-tab suspension** that can freeze the leader tab's heartbeat and make follower tabs' spin-waits abort.
 - Concrete WebKit wish-list: ship `FileSystemObserver`, ship the `mode` option (`readwrite-unsafe`) for sync access handles, fix OPFS metadata-visibility lag after sync-handle writes, keep service workers with live transferred `MessagePort`s alive, and exempt cross-origin-isolated pages holding Web Locks from full tab suspension. None of these is currently announced for a Safari release.
+- **Multi-tab sync is solved for Safari** (§10): single-tab / leader sync works on the main thread, and *follower* sync works too **when the instance runs inside a worker** (the natural shape for an OS/runtime-in-browser). The only combination that is genuinely impossible on Safari is *follower + main-thread caller* — because the blocker is cross-tab MessagePort delivery to the follower's relay worker while the main thread busy-spins, not the SAB transfer itself.
 
 ---
 
@@ -212,4 +213,81 @@ by design.
 
 ---
 
-*Compiled from the sources linked inline; browser version data from [mdn/browser-compat-data](https://github.com/mdn/browser-compat-data) (June 2026). §9 added from first-hand debugging in this repository.*
+## 10. Multi-tab follower SYNC on Safari — solved via worker-hosted instances (2026-06-14)
+
+Follower tabs (those that don't hold the OPFS sync handle) relay sync ops to
+the leader. On Safari this deadlocked from the **main thread**, and three
+isolated probes established exactly why — and the way around it:
+
+1. **Sync XHR is not intercepted by the service worker in WebKit.** An async
+   `fetch` to a path the SW handles round-trips fine; a *synchronous* XHR to
+   the same path bypasses the SW and hits the network. The classic
+   "sync-XHR-through-service-worker" (webcontainer) escape hatch therefore
+   does **not** work on Safari.
+2. **A worker's MessagePort delivery is gated on the parent page's main-thread
+   event loop in WebKit.** Probe: a worker that should receive a port message
+   and write a `SharedArrayBuffer` got *nothing* during a 3-second main-thread
+   spin on WebKit, versus 35 ms on Chromium. This is the actual deadlock: a
+   follower's synchronous op busy-spins its main thread, which freezes its own
+   relay worker's message intake, so the leader's reply can never arrive →
+   the op fails with `EIO` (see `tests/benchmark/multitab.spec.ts`).
+3. **From a worker context it works.** When the sync call runs in a worker the
+   wait is a real `Atomics.wait` (permitted off-main-thread), the main thread
+   stays free to pump the relay worker's delivery, and the leader's reply
+   arrives. Probe: value delivered, `waitResult: "ok"`, on WebKit and Chromium
+   alike.
+
+### What is *not* the problem: the SAB worker→main transfer
+
+The performant part of the sync path — a relay worker writing the response
+into a `SharedArrayBuffer` that the calling thread reads synchronously — works
+fine on Safari and is **fully intact**. It is exactly how leader/single-tab
+`readFileSync` returns synchronously (0.005–0.15 ms/op on real Safari): the
+tab's own relay worker owns the VFS engine, computes the answer locally, and
+writes the SAB; nothing has to be *received* from elsewhere.
+
+The follower deadlock is **not** about getting data worker→main; it is about
+the follower's relay worker never *receiving* the leader's reply (a cross-tab
+MessagePort message) while the same tab's main thread spins. No SAB trick can
+substitute, because a `SharedArrayBuffer` cannot be shared across tabs
+(separate agent clusters), so the leader can't write the follower's SAB
+directly either. Moving the caller into a worker keeps the *same* fast SAB
+transfer — just worker→worker, with the main thread free to pump the cross-tab
+delivery.
+
+**Solution shipped:** run the follower's VFS instance inside a worker. The one
+main-thread-only dependency — `navigator.serviceWorker` (unavailable in worker
+scopes on Safari/Firefox, [w3c/ServiceWorker#1552](https://github.com/w3c/ServiceWorker/issues/1552))
+— is delegated to a tiny main-thread bridge:
+
+```js
+// main thread (per follower tab)
+import { createServiceWorkerBridge } from '@componentor/fs';
+const ch = new MessageChannel();
+createServiceWorkerBridge(ch.port1, { ns: 'vfs-_app' });
+worker.postMessage({ swBridge: ch.port2 }, [ch.port2]);
+
+// inside the worker
+import { VFSFileSystem } from '@componentor/fs';
+const fs = new VFSFileSystem({ root: '/app', swBridge: receivedPort });
+fs.readFileSync('/x'); // works in a follower tab — Safari included
+```
+
+Verified end-to-end on WebKit, Chromium and Firefox
+(`tests/benchmark/multitab-worker.spec.ts`): follower sync read of the
+leader's file, follower sync write, leader observing the follower's write —
+7 ms on WebKit. Main-thread follower instances keep the fail-fast `EIO`
+contract; this is purely additive.
+
+**Try it / benchmark it.** `tests/benchmark/multitab-demo.html` is a runnable
+two-tab demo (open in multiple Safari tabs). The benchmark page
+(`tests/benchmark/index.html`, `npm run benchmark:open`) has a **"Run in
+worker"** checkbox that runs the entire benchmark through this worker-hosted
+path — which is what lets it produce results in secondary Safari tabs (with
+the box unchecked it runs on the main thread as before, where secondary Safari
+tabs cannot do sync). Worker mode measured `vfsSync ≈ 0.49 ms/op` in a Safari
+*follower* tab.
+
+---
+
+*Compiled from the sources linked inline; browser version data from [mdn/browser-compat-data](https://github.com/mdn/browser-compat-data) (June 2026). §9–10 added from first-hand debugging in this repository.*

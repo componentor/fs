@@ -200,6 +200,46 @@ describe('FollowerForwarder', () => {
     expect(new FollowerForwarder(() => 't').hasPort).toBe(false);
   });
 
+  it('a deadline timeout marks the port suspect; fail-fast requests then fail instantly', async () => {
+    const p1 = forwarder.forward(payload, true);
+    vi.advanceTimersByTime(FORWARD_DEADLINE_MS + 1);
+    expect(statusOf(await p1)).toBe(STATUS.EIO);
+    expect(forwarder.portSuspect).toBe(true);
+    // Next fail-fast-eligible request: instant EIO, nothing posted
+    const postedBefore = port.posted.length;
+    const p2 = forwarder.forward(payload, true);
+    expect(statusOf(await p2)).toBe(STATUS.EIO);
+    expect(port.posted.length).toBe(postedBefore);
+  });
+
+  it('non-fail-fast requests still attempt while suspect, and delivery heals it', async () => {
+    const p1 = forwarder.forward(payload, true);
+    vi.advanceTimersByTime(FORWARD_DEADLINE_MS + 1);
+    await p1;
+    expect(forwarder.portSuspect).toBe(true);
+    // Async-path request (not fail-fast-eligible) goes out on the port
+    const p2 = forwarder.forward(payload, false);
+    const id2 = port.posted[port.posted.length - 1].message.id;
+    const response = makeResponse();
+    expect(forwarder.handleResponse(id2, response)).toBe(true);
+    await expect(p2).resolves.toBe(response);
+    // Delivery healed the suspicion — sync attempts resume
+    expect(forwarder.portSuspect).toBe(false);
+    const p3 = forwarder.forward(payload, true);
+    const id3 = port.posted[port.posted.length - 1].message.id;
+    forwarder.handleResponse(id3, makeResponse());
+    expect(statusOf(await p3)).toBe(STATUS.OK);
+  });
+
+  it('suspicion expires on its own after the suspect window', async () => {
+    const p1 = forwarder.forward(payload, true);
+    vi.advanceTimersByTime(FORWARD_DEADLINE_MS + 1);
+    await p1;
+    expect(forwarder.portSuspect).toBe(true);
+    vi.advanceTimersByTime(FollowerForwarder.SUSPECT_WINDOW_MS + 1);
+    expect(forwarder.portSuspect).toBe(false);
+  });
+
   it('EIO maps to a distinct status code (11), not ENOTEMPTY (5)', async () => {
     // Regression guard for the old mislabeled `encodeResponse(5) // EIO`,
     // which actually surfaced reconnection aborts as ENOTEMPTY.

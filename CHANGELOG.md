@@ -1,5 +1,13 @@
 # Changelog
 
+## 3.2.0
+
+- Multi-tab synchronous FS now works on Safari for **follower** tabs, by running the VFS instance inside a worker. A follower's sync op busy-waits the calling thread; on the main thread that is a spin-loop, and WebKit gates a worker's MessagePort delivery on the parent page's main thread — so the leader's reply can never arrive and the op deadlocks. Run the instance in a worker and the wait becomes a real `Atomics.wait`, the main thread stays free to pump delivery, and follower sync works (the same fast SAB transfer, worker→worker). The only combination still impossible on Safari is *follower + main-thread caller* (a fundamental WebKit limit); leader/single-tab sync and the async API are unaffected
+- New `createServiceWorkerBridge(port, { ns })` export + `swBridge?: MessagePort` config option: `navigator.serviceWorker` is not exposed in worker scopes on Safari/Firefox, so a worker-hosted instance delegates its multi-tab broker `postMessage`s (with transferred ports) to a tiny main-thread bridge. Fully optional and backward compatible — when `swBridge` is unset the initialization path is unchanged. Verified follower sync read/write across tabs on WebKit, Chromium and Firefox (`tests/benchmark/multitab-worker.spec.ts`)
+- Follower→leader sync requests now **fail fast** after a transport timeout instead of freezing the tab: a main-thread follower on Safari (where the relay can't deliver) gets an immediate `EIO` for ~30 s after the first timeout and self-heals on any delivered async response, rather than a 10 s hang per op
+- Benchmark page (`tests/benchmark/index.html`) gained a **"Run in worker"** toggle that runs the whole suite through the worker-hosted path, so it produces results in secondary Safari tabs (unchecked = main-thread, as before). Logic extracted to a shared `benchmark-core.js` used by both the page and a benchmark worker. Added `tests/benchmark/multitab-demo.html` (runnable two-tab demo) and `multitab.spec.ts` / `multitab-worker.spec.ts`
+- See `SAFARI-SYNC-LIMITATIONS.md` §10 for the full investigation (three isolated probes establishing exactly why main-thread follower sync is impossible and why the worker path works)
+
 ## 3.1.0
 
 - fs sync support on safari

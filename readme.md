@@ -84,6 +84,9 @@ const fs = new VFSFileSystem({
   debug: false,           // Enable debug logging (default: false)
   swUrl: undefined,       // URL of the service worker script (default: auto-resolved)
   swScope: undefined,     // Custom service worker scope (default: auto-scoped per root)
+  swBridge: undefined,    // MessagePort to a main-thread service-worker bridge, for
+                          // running this instance inside a worker (enables follower
+                          // sync on Safari). See "Multi-Tab Sync on Safari" below.
   limits: {               // Upper bounds for VFS validation (prevents corrupt data from causing OOM)
     maxInodes: 4_000_000,   // Max inode count (default: 4M)
     maxBlocks: 4_000_000,   // Max data blocks (default: 4M)
@@ -184,6 +187,66 @@ const fs = new VFSFileSystem({ swUrl: '/vfs-service-worker.js' });
 ```
 
 If you only use a single tab, the service worker is not needed — the tab always runs as the leader.
+
+### Multi-Tab Sync on Safari (worker-hosted instances)
+
+In secondary ("follower") tabs, a synchronous FS call relays to the leader tab.
+On **Chrome, Edge and Firefox** this works from the main thread. On **Safari it
+does not** — and cannot, by the platform's design: a follower's sync call must
+busy-wait the calling thread, and WebKit gates a worker's message delivery on
+the parent page's main thread, so while the main thread spins the leader's reply
+can never arrive. (A follower's main-thread sync op therefore fails fast with
+`EIO` on Safari; the **async** API — `fs.promises.*` — works cross-tab on Safari
+without any of this.)
+
+The fix is to run the VFS instance **inside a worker**, where the wait becomes a
+real `Atomics.wait` and the main thread stays free. Because `navigator.serviceWorker`
+is not exposed in worker scopes on Safari/Firefox, the multi-tab broker is
+delegated to the main thread with `createServiceWorkerBridge`:
+
+```typescript
+// ---- main thread (per tab) ----
+import { createServiceWorkerBridge } from '@componentor/fs';
+
+const worker = new Worker('/my-fs-worker.js', { type: 'module' });
+const channel = new MessageChannel();
+// ns is `vfs-${root}` with every non-alphanumeric char replaced by `_`
+createServiceWorkerBridge(channel.port1, { ns: 'vfs-_my_app' });
+worker.postMessage({ swBridge: channel.port2 }, [channel.port2]);
+
+// ---- inside /my-fs-worker.js ----
+import { VFSFileSystem } from '@componentor/fs';
+
+let fs;
+self.onmessage = async (e) => {
+  if (e.data.swBridge) {
+    fs = new VFSFileSystem({ root: '/my-app', swBridge: e.data.swBridge });
+    await fs.init();
+    // fs.readFileSync(...) / fs.writeFileSync(...) now work in EVERY tab,
+    // Safari included — leader or follower.
+  }
+};
+```
+
+`swBridge` is fully optional and backward compatible: when omitted, the
+initialization path is unchanged and the instance uses `navigator.serviceWorker`
+directly (correct on the main thread and in Chrome workers).
+
+**Why a worker (and what's actually limited).** The fast part of the sync path —
+a relay worker writing the result into a `SharedArrayBuffer` that the caller
+reads synchronously — works on Safari and is unchanged; it's how single-tab /
+leader `readFileSync` returns synchronously. What Safari can't do is deliver the
+*leader's cross-tab reply* to a follower's relay worker while that tab's **main
+thread** busy-spins. Running the caller in a worker uses `Atomics.wait` instead
+of a spin, so the main thread stays free to pump that delivery — same fast SAB
+transfer, just worker→worker. The only thing impossible on Safari is calling a
+**follower's** `readFileSync` from the **main thread**; an instance in a worker
+has no such limit, and the leader tab is unaffected either way.
+
+**Try it.** `tests/benchmark/multitab-demo.html` is a runnable two-tab demo
+(open it in multiple Safari tabs). The benchmark page (`npm run benchmark:open`)
+has a **"Run in worker"** checkbox that runs the whole suite through this path,
+which is what makes it produce results in secondary Safari tabs.
 
 ## COOP/COEP Headers
 

@@ -18,6 +18,8 @@
  */
 
 export { VFSFileSystem } from './filesystem.js';
+export { createServiceWorkerBridge } from './sw-bridge.js';
+export type { ServiceWorkerBridgeOptions } from './sw-bridge.js';
 export { NodeReadable, NodeWritable, SimpleEventEmitter } from './node-streams.js';
 export { NodeReadable as ReadStream, NodeWritable as WriteStream } from './node-streams.js';
 export { constants } from './constants.js';
