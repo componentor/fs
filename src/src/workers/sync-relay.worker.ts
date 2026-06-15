@@ -103,6 +103,22 @@ const portQueue: Array<{ port: MessagePort; tabId: string; id: string; buffer: A
 // worker's own event loop regardless of main-thread state, so the race
 // always settles. On Chromium/Firefox the ping wins (~0.1ms) and behavior
 // is unchanged.
+// EXPERIMENTAL (mobile-perf investigation, not committed). The busy-poll spin
+// and the starvation-timer yield fallback below exist ONLY to defeat WebKit's
+// lost cross-thread Atomics.notify + main-thread-brokered MessagePort delivery
+// (a sync caller spinning the page main thread starves both). On Chromium and
+// Gecko those wakes are reliable, so the spin is pure overhead — and on a
+// core-constrained Android device it actively contends for a CPU with the
+// spinning main thread and the exec worker, prolonging every op. Gate the
+// WebKit-only spinning to WebKit. A runtime escape hatch
+// (`self.__fs_force_spin`) lets the embedding app A/B test without a rebuild.
+const _relayUa = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+const IS_WEBKIT = /AppleWebKit/.test(_relayUa) && !/Chrome|Chromium|Android|Edg|OPR/.test(_relayUa);
+function spinningNeeded(): boolean {
+  const forced = (self as any).__fs_force_spin;
+  return forced === undefined ? IS_WEBKIT : !!forced;
+}
+
 const yieldChannel = new MessageChannel();
 yieldChannel.port2.start();
 
@@ -118,7 +134,14 @@ function yieldToEventLoop(): Promise<void> {
     };
     yieldChannel.port2.onmessage = done;
     yieldChannel.port1.postMessage(null);
-    timer = setTimeout(done, 1);
+    // EXPERIMENTAL (mobile-perf): the racing 1ms timer is the WebKit
+    // starvation fallback — there the self-ping is brokered through the
+    // spinning page main thread and may never arrive. On Chromium/Firefox
+    // the ping is a reliable same-worker macrotask, so the timer is pure
+    // churn (a setTimeout/clearTimeout per yield, thousands/sec during a
+    // burst) that contends for the CPU on a core-constrained device. Gate
+    // it to WebKit; elsewhere rely on the ping.
+    if (spinningNeeded()) timer = setTimeout(done, 1);
   });
 }
 
@@ -931,6 +954,16 @@ function preGrowIfQuiet(): void {
  * Returns false if the response still wasn't consumed within budgetMs.
  */
 function awaitResponseConsumed(targetCtrl: Int32Array, budgetMs: number): boolean {
+  // EXPERIMENTAL (mobile-perf): the 5ms slicing is the WebKit lost-wake
+  // workaround. On Chromium/Firefox cross-thread Atomics are reliable, so a
+  // single bounded wait suffices — it returns the instant the consumer flips
+  // the signal away from RESPONSE (or via the next request's notify), exactly
+  // as pre-3.2.0 did. Slicing there just adds repeated re-reads/timer churn
+  // that contend for the CPU on a core-constrained device. `true` = consumed.
+  if (!spinningNeeded()) {
+    Atomics.wait(targetCtrl, 0, SIGNAL.RESPONSE, budgetMs);
+    return Atomics.load(targetCtrl, 0) !== SIGNAL.RESPONSE;
+  }
   const deadline = Date.now() + budgetMs;
   while (Atomics.load(targetCtrl, 0) === SIGNAL.RESPONSE) {
     const remaining = deadline - Date.now();
@@ -1049,7 +1082,7 @@ async function leaderLoop(): Promise<void> {
       // tick and a park's wake notify can be lost outright. When truly
       // idle this costs one 0.25ms spin before sleeping. Only worth doing
       // mid-stream — when the last request was served moments ago.
-      if (Date.now() - lastRequestAt < 20) {
+      if (spinningNeeded() && Date.now() - lastRequestAt < 20) {
         const spinStart = performance.now();
         while (performance.now() - spinStart < 0.25) {
           if (

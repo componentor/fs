@@ -2970,6 +2970,12 @@ function startHeartbeat() {
 }
 var clientPorts = /* @__PURE__ */ new Map();
 var portQueue = [];
+var _relayUa = typeof navigator !== "undefined" && navigator.userAgent || "";
+var IS_WEBKIT = /AppleWebKit/.test(_relayUa) && !/Chrome|Chromium|Android|Edg|OPR/.test(_relayUa);
+function spinningNeeded() {
+  const forced = self.__fs_force_spin;
+  return forced === void 0 ? IS_WEBKIT : !!forced;
+}
 var yieldChannel = new MessageChannel();
 yieldChannel.port2.start();
 function yieldToEventLoop() {
@@ -2984,7 +2990,7 @@ function yieldToEventLoop() {
     };
     yieldChannel.port2.onmessage = done;
     yieldChannel.port1.postMessage(null);
-    timer = setTimeout(done, 1);
+    if (spinningNeeded()) timer = setTimeout(done, 1);
   });
 }
 function safeHandleRequest(reqTabId, buffer) {
@@ -3735,6 +3741,10 @@ function preGrowIfQuiet() {
   }
 }
 function awaitResponseConsumed(targetCtrl, budgetMs) {
+  if (!spinningNeeded()) {
+    Atomics.wait(targetCtrl, 0, SIGNAL.RESPONSE, budgetMs);
+    return Atomics.load(targetCtrl, 0) !== SIGNAL.RESPONSE;
+  }
   const deadline = Date.now() + budgetMs;
   while (Atomics.load(targetCtrl, 0) === SIGNAL.RESPONSE) {
     const remaining = deadline - Date.now();
@@ -3813,7 +3823,7 @@ async function leaderLoop() {
         processed = true;
         continue;
       }
-      if (Date.now() - lastRequestAt < 20) {
+      if (spinningNeeded() && Date.now() - lastRequestAt < 20) {
         const spinStart = performance.now();
         while (performance.now() - spinStart < 0.25) {
           if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST || asyncCtrl !== null && Atomics.load(asyncCtrl, 0) === SIGNAL.REQUEST) {
