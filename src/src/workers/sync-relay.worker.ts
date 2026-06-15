@@ -25,6 +25,7 @@ import { OPFSEngine } from '../opfs-engine.js';
 import { SAB_OFFSETS, SIGNAL, OP, STATUS, decodeRequest, decodeSecondPath, encodeResponse } from '../protocol/opcodes.js';
 import { FollowerForwarder } from '../protocol/follower-forward.js';
 import { waitWhile, SAB_WAIT_DEADLINE_MS } from '../protocol/sab-wait.js';
+import { planRenameMirror } from './opfs-sync-plan.js';
 
 // A silent worker death is the worst failure mode this architecture has —
 // the heartbeat keeps ticking while every request hangs. Surface everything.
@@ -1595,15 +1596,32 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
       break;
     case OP.RENAME:
       if (newPath) {
-        // Reroute any pending sync on the old path to the new path so
-        // the content ends up at the final location after the burst.
-        const pending = pendingPathSyncs.get(path);
-        if (pending) {
-          clearTimeout(pending);
-          pendingPathSyncs.delete(path);
-          schedulePathSync(newPath);
+        // Cancel any pending debounced syncs for BOTH the old and new paths:
+        // after the rename the source is gone (a deferred read would fail), and
+        // we emit the destination's content synchronously below.
+        const pendingOld = pendingPathSyncs.get(path);
+        if (pendingOld) { clearTimeout(pendingOld); pendingPathSyncs.delete(path); }
+        const pendingNew = pendingPathSyncs.get(newPath);
+        if (pendingNew) { clearTimeout(pendingNew); pendingPathSyncs.delete(newPath); }
+        // Atomic-write pattern: apps write a temp file then rename(temp → final).
+        // The temp is frequently created AND renamed within the write-debounce
+        // window (SYNC_DEBOUNCE_MS), so it was NEVER mirrored to OPFS —
+        // forwarding a 'rename' op then fails in the mirror ("source not found").
+        // The destination's authoritative bytes are readable from the engine at
+        // `newPath` (the rename already succeeded), so mirror a regular-file
+        // rename as write(newPath) + delete(path): deterministic, independent of
+        // whether the temp source was ever mirrored. Directory renames
+        // (engine.read fails — not a regular file) fall back to a real 'rename'
+        // op, which the mirror handles via renameDirInOPFS (the source directory
+        // WAS mirrored, unlike a write-temp). See planRenameMirror (unit-tested).
+        const plan = planRenameMirror(engine, path, newPath, ts);
+        for (const msg of plan.messages) {
+          if (msg.op === 'write' && plan.transfers.includes(msg.data)) {
+            opfsSyncPort.postMessage(msg, [msg.data]);
+          } else {
+            opfsSyncPort.postMessage(msg);
+          }
         }
-        opfsSyncPort.postMessage({ op: 'rename', path, newPath, ts });
       }
       break;
   }

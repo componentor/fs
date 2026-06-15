@@ -2846,6 +2846,28 @@ function waitWhile(ctrl2, value, deadlineAt, detail, sliceMs = WAIT_SLICE_MS) {
   }
 }
 
+// src/workers/opfs-sync-plan.ts
+function planRenameMirror(engine2, path, newPath, ts) {
+  try {
+    const r = engine2.read(newPath);
+    if (r.status === 0) {
+      const messages = [];
+      const transfers = [];
+      if (r.data && r.data.byteLength > 0) {
+        const buf = r.data.buffer.byteLength === r.data.byteLength ? r.data.buffer : r.data.slice().buffer;
+        messages.push({ op: "write", path: newPath, data: buf, ts });
+        transfers.push(buf);
+      } else {
+        messages.push({ op: "write", path: newPath, data: new ArrayBuffer(0), ts });
+      }
+      messages.push({ op: "delete", path, ts });
+      return { messages, transfers };
+    }
+  } catch {
+  }
+  return { messages: [{ op: "rename", path, newPath, ts }], transfers: [] };
+}
+
 // src/workers/sync-relay.worker.ts
 self.addEventListener("error", (e) => {
   console.error("[sync-relay] uncaught error:", e.message, e.filename, e.lineno);
@@ -4084,13 +4106,24 @@ function notifyOPFSSync(op, path, newPath) {
       break;
     case OP.RENAME:
       if (newPath) {
-        const pending = pendingPathSyncs.get(path);
-        if (pending) {
-          clearTimeout(pending);
+        const pendingOld = pendingPathSyncs.get(path);
+        if (pendingOld) {
+          clearTimeout(pendingOld);
           pendingPathSyncs.delete(path);
-          schedulePathSync(newPath);
         }
-        opfsSyncPort.postMessage({ op: "rename", path, newPath, ts });
+        const pendingNew = pendingPathSyncs.get(newPath);
+        if (pendingNew) {
+          clearTimeout(pendingNew);
+          pendingPathSyncs.delete(newPath);
+        }
+        const plan = planRenameMirror(engine, path, newPath, ts);
+        for (const msg of plan.messages) {
+          if (msg.op === "write" && plan.transfers.includes(msg.data)) {
+            opfsSyncPort.postMessage(msg, [msg.data]);
+          } else {
+            opfsSyncPort.postMessage(msg);
+          }
+        }
       }
       break;
   }

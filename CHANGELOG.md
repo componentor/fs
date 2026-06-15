@@ -1,5 +1,11 @@
 # Changelog
 
+## 3.2.1
+
+- Fix atomic-write renames (`write temp → rename(temp, final)`) silently dropping from the OPFS mirror. The relay's `notifyOPFSSync` debounces write bursts (`SYNC_DEBOUNCE_MS`) before reading the file and mirroring it; but a temp file in the atomic-write pattern is created *and* renamed within that window, so its pending sync was cancelled and it was **never** mirrored. Forwarding a plain `rename` op to the sync worker then failed with "source not found" because the source never existed in OPFS — the destination diverged from the VFS. (This is the root cause the 3.0.54/3.0.55 mirror-side retries were papering over for the file-rename case.)
+- A regular-file rename is now mirrored deterministically as `write(newPath)` + `delete(path)` using the destination's authoritative bytes read straight from the engine at `newPath` (the rename already succeeded in the VFS), instead of a copy-the-source `rename` op — so it no longer depends on whether the temp source was ever mirrored. The pending debounced syncs for **both** the old and new paths are cancelled first. Directory renames (`engine.read` returns `EISDIR`) still fall back to a real `rename` op, which the sync worker handles via `renameDirInOPFS` — the source directory *was* mirrored, unlike a write-temp
+- Add `tests/opfs-sync-rename.test.ts` covering the `notifyOPFSSync` RENAME branch: an atomic-write rename whose temp source was never mirrored emits `write(final)` + `delete(temp)` (not a `rename` op); a directory rename (engine reports `EISDIR`) falls back to a `rename` op; and pending debounced syncs on both the old and new paths are cancelled
+
 ## 3.2.0
 
 - Multi-tab synchronous FS now works on Safari for **follower** tabs, by running the VFS instance inside a worker. A follower's sync op busy-waits the calling thread; on the main thread that is a spin-loop, and WebKit gates a worker's MessagePort delivery on the parent page's main thread — so the leader's reply can never arrive and the op deadlocks. Run the instance in a worker and the wait becomes a real `Atomics.wait`, the main thread stays free to pump delivery, and follower sync works (the same fast SAB transfer, worker→worker). The only combination still impossible on Safari is *follower + main-thread caller* (a fundamental WebKit limit); leader/single-tab sync and the async API are unaffected
