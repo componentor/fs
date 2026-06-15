@@ -1265,6 +1265,12 @@ var VFSEngine = class {
     const existingIdx = this.pathIndex.get(newPath);
     const targetIsImplicitDir = existingIdx === void 0 && this.isImplicitDirectory(newPath);
     if (existingIdx !== void 0 || targetIsImplicitDir) {
+      const srcIsDir = this.readInode(idx).type === INODE_TYPE.DIRECTORY;
+      const dstIsDir = targetIsImplicitDir || existingIdx !== void 0 && this.readInode(existingIdx).type === INODE_TYPE.DIRECTORY;
+      if (srcIsDir && !dstIsDir) return { status: CODE_TO_STATUS.ENOTDIR };
+      if (!srcIsDir && dstIsDir) return { status: CODE_TO_STATUS.EISDIR };
+    }
+    if (existingIdx !== void 0 || targetIsImplicitDir) {
       let cleanDescendants = targetIsImplicitDir;
       if (existingIdx !== void 0) {
         const existingInode = this.readInode(existingIdx);

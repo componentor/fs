@@ -1614,6 +1614,42 @@ function resyncSymlinksUnder(path: string): void {
   }
 }
 
+// ---- Shared rename/remove bookkeeping (used by BOTH the outbound notify path
+// and the inbound external-change path, so external mutations get the same
+// pending-reroute and symlink-alias maintenance local mutations do). ----
+
+function cancelPendingSync(path: string): void {
+  const t = pendingPathSyncs.get(path);
+  if (t) { clearTimeout(t); pendingPathSyncs.delete(path); }
+}
+
+/** Re-key pending debounced child syncs from an old directory prefix to the new one. */
+function reroutePendingChildSyncs(oldPath: string, newPath: string): void {
+  for (const { from, to } of planPendingReroutes(pendingPathSyncs.keys(), oldPath, newPath)) {
+    cancelPendingSync(from);
+    schedulePathSync(to);
+  }
+}
+
+/** Re-key symlink aliases the rename moved (the link itself, or links under a renamed dir). */
+function rekeySymlinkAliasesForRename(oldPath: string, newPath: string): void {
+  for (const oldLink of collectKeysUnder(linkToTarget.keys(), oldPath)) {
+    deregisterLink(symlinkTargets, linkToTarget, oldLink);
+    registerSymlink(oldLink === oldPath ? newPath : newPath + oldLink.slice(oldPath.length));
+  }
+}
+
+/** Drop symlink aliases a removal invalidates: one unlinked link, or every link under a removed dir. */
+function dropSymlinkAliasesForRemove(path: string, isDir: boolean): void {
+  if (isDir) {
+    for (const link of collectKeysUnder(linkToTarget.keys(), path)) {
+      deregisterLink(symlinkTargets, linkToTarget, link);
+    }
+  } else {
+    deregisterLink(symlinkTargets, linkToTarget, path);
+  }
+}
+
 function schedulePathSync(path: string): void {
   const prev = pendingPathSyncs.get(path);
   if (prev) clearTimeout(prev);
@@ -1655,17 +1691,9 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
     case OP.RMDIR: {
       // Cancel any pending debounced sync for this path — the file no
       // longer exists, we'd just fail the read.
-      const pending = pendingPathSyncs.get(path);
-      if (pending) { clearTimeout(pending); pendingPathSyncs.delete(path); }
-      // Drop symlink aliases this removal invalidates: a single unlinked link
-      // (O(1)), or every link under a recursively-removed directory.
-      if (op === OP.RMDIR) {
-        for (const link of collectKeysUnder(linkToTarget.keys(), path)) {
-          deregisterLink(symlinkTargets, linkToTarget, link);
-        }
-      } else {
-        deregisterLink(symlinkTargets, linkToTarget, path);
-      }
+      cancelPendingSync(path);
+      // Drop symlink aliases this removal invalidates (single link or whole dir).
+      dropSymlinkAliasesForRemove(path, op === OP.RMDIR);
       opfsSyncPort.postMessage({ op: 'delete', path, ts });
       // If the removed path was the TARGET of other symlinks, those links are
       // now dangling — re-mirror them so their snapshot becomes the empty
@@ -1679,31 +1707,13 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
       break;
     case OP.RENAME:
       if (newPath) {
-        // Cancel any pending debounced syncs for BOTH the old and new paths:
-        // after the rename the source is gone (a deferred read would fail), and
-        // we emit the destination's content synchronously below.
-        const pendingOld = pendingPathSyncs.get(path);
-        if (pendingOld) { clearTimeout(pendingOld); pendingPathSyncs.delete(path); }
-        const pendingNew = pendingPathSyncs.get(newPath);
-        if (pendingNew) { clearTimeout(pendingNew); pendingPathSyncs.delete(newPath); }
-        // Directory rename: re-key any pending child syncs to the new location.
-        // `engine.rename` moves the whole subtree in one op, so a child written
-        // inside the debounce window now lives under `newPath` — a sync still
-        // keyed under the old prefix would read a vanished path and drop the
-        // child from the mirror. Reschedule under the new prefix so it flushes
-        // against its real location, landing after the rename op below.
-        for (const { from, to } of planPendingReroutes(pendingPathSyncs.keys(), path, newPath)) {
-          const t = pendingPathSyncs.get(from);
-          if (t) { clearTimeout(t); pendingPathSyncs.delete(from); }
-          schedulePathSync(to);
-        }
-        // Re-key symlink aliases the rename moved (the link itself, or any link
-        // under a renamed directory): drop the old mapping and re-register at the
-        // new path, where `engine.readlink` now resolves the moved link.
-        for (const oldLink of collectKeysUnder(linkToTarget.keys(), path)) {
-          deregisterLink(symlinkTargets, linkToTarget, oldLink);
-          registerSymlink(oldLink === path ? newPath : newPath + oldLink.slice(path.length));
-        }
+        // Cancel pending syncs for BOTH old and new paths (the source is gone;
+        // we emit the destination's content below), then re-key pending child
+        // syncs and symlink aliases the rename moved.
+        cancelPendingSync(path);
+        cancelPendingSync(newPath);
+        reroutePendingChildSyncs(path, newPath);
+        rekeySymlinkAliasesForRename(path, newPath);
         // Atomic-write pattern: apps write a temp file then rename(temp → final).
         // The temp is frequently created AND renamed within the write-debounce
         // window (SYNC_DEBOUNCE_MS), so it was NEVER mirrored to OPFS —
@@ -1733,30 +1743,55 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
   }
 }
 
+// Apply a change the FileSystemObserver detected in OPFS back into the
+// authoritative VFS engine. The external mutation is ALREADY in OPFS, so this
+// must NOT re-mirror the primary change — but it must run the same pending-sync
+// and symlink-alias bookkeeping the outbound path does, or external mutations
+// silently bypass it (stale dependent links, lost pending child writes, leaking
+// alias entries). Dependent SYMLINK snapshots are separate files that DO need
+// re-mirroring (resyncSymlinks*), and those re-mirror writes are echo-suppressed
+// by the mirror worker, so there is no loop.
 function handleExternalChange(msg: { op: string; path: string; newPath?: string; data?: ArrayBuffer }): void {
   switch (msg.op) {
     case 'external-write': {
-      const result = engine.write(msg.path, new Uint8Array(msg.data!), 0);
-      if (result.status === 0) broadcastWatch(OP.WRITE, msg.path);
+      let result = engine.write(msg.path, new Uint8Array(msg.data!), 0);
+      if (result.status === STATUS.EISDIR) {
+        // OPFS replaced a directory with a file at this path — converge the VFS
+        // by removing the conflicting directory tree, then writing the file.
+        engine.rmdir(msg.path, 1);
+        result = engine.write(msg.path, new Uint8Array(msg.data!), 0);
+      }
+      if (result.status === 0) {
+        resyncSymlinksFor(msg.path); // links pointing at this now-updated target
+        broadcastWatch(OP.WRITE, msg.path);
+      }
       console.log('[sync-relay] external-write:', msg.path, `${msg.data?.byteLength ?? 0}B`, `status=${result.status}`);
       break;
     }
     case 'external-delete': {
-      const result = engine.unlink(msg.path);
-      if (result.status !== 0) {
-        const rmdirResult = engine.rmdir(msg.path, 1);
-        if (rmdirResult.status === 0) broadcastWatch(OP.RMDIR, msg.path);
-        console.log('[sync-relay] external-delete (rmdir):', msg.path, `status=${rmdirResult.status}`);
-      } else {
-        broadcastWatch(OP.UNLINK, msg.path);
-        console.log('[sync-relay] external-delete:', msg.path, `status=${result.status}`);
+      cancelPendingSync(msg.path);
+      let wasDir = false;
+      let ok = engine.unlink(msg.path).status === 0;
+      if (!ok) { ok = engine.rmdir(msg.path, 1).status === 0; wasDir = ok; }
+      if (ok) {
+        dropSymlinkAliasesForRemove(msg.path, wasDir);
+        resyncSymlinksUnder(msg.path); // links whose target vanished → placeholder
+        broadcastWatch(wasDir ? OP.RMDIR : OP.UNLINK, msg.path);
       }
+      console.log('[sync-relay] external-delete:', msg.path, `dir=${wasDir}`, `ok=${ok}`);
       break;
     }
     case 'external-rename':
       if (msg.newPath) {
         const result = engine.rename(msg.path, msg.newPath);
-        if (result.status === 0) broadcastWatch(OP.RENAME, msg.path, msg.newPath);
+        if (result.status === 0) {
+          cancelPendingSync(msg.path);
+          cancelPendingSync(msg.newPath);
+          reroutePendingChildSyncs(msg.path, msg.newPath); // pending local child writes → new path
+          rekeySymlinkAliasesForRename(msg.path, msg.newPath);
+          resyncSymlinksUnder(msg.path); // links pointing at the renamed-away target
+          broadcastWatch(OP.RENAME, msg.path, msg.newPath);
+        }
         console.log('[sync-relay] external-rename:', msg.path, '→', msg.newPath, `status=${result.status}`);
       }
       break;

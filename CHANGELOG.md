@@ -1,5 +1,14 @@
 # Changelog
 
+## 3.2.6
+
+Fixes the three audit findings deferred from 3.2.5.
+
+- **The inbound external-change path now runs the same bookkeeping as the outbound path.** `handleExternalChange` (applied when the `FileSystemObserver` detects an external OPFS change) updated the engine directly but skipped all the symlink-alias and pending-sync maintenance `notifyOPFSSync` does, so external mutations silently bypassed it. Extracted that maintenance into shared helpers (`cancelPendingSync`, `reroutePendingChildSyncs`, `rekeySymlinkAliasesForRename`, `dropSymlinkAliasesForRemove`) used by both paths. Now an external write to a symlink's target re-mirrors the dependent links; an external rename reroutes pending child syncs and re-keys aliases; an external delete drops aliases and re-mirrors now-dangling links; and an external write onto a path that is a directory in the VFS converges (removes the dir, writes the file) instead of being dropped with `EISDIR`
+- **Echo suppression is now content-based, so a genuine external write within the 3 s grace window is no longer mistaken for our own echo.** The mirror worker records a content hash of every byte range it writes; an observed `modified`/`appeared` is suppressed only when the bytes match what we wrote (within the window) rather than on timestamp alone. A freshly-created file can fire `appeared` with a stale empty snapshot that wouldn't match our hash — so when the observed bytes differ but we recently wrote the path, the worker re-reads the current bytes once before treating it as external, preventing a 0-byte bounce that would clobber the file. (`disappeared`/`moved`, which carry no content, keep the time-based check.)
+- **`rename()` now rejects POSIX type conflicts.** The engine would overwrite a directory with a file (or vice versa), diverging from Node and producing a mirror that can't represent the result (a `write` can't turn an OPFS directory into a file). `rename` now returns `EISDIR` for file→existing-directory and `ENOTDIR` for directory→existing-file. Replacing a non-empty *directory* with another directory stays allowed — Vite's `.vite/deps_temp_<hash>` → `.vite/deps` commit relies on it, and the mirror handles it via `renameDirInOPFS`
+- Tests: unit tests for the rename type guards (file→dir / dir→file rejected; file→file and dir→dir replace still allowed); the `opfs-mirror-external` E2E spec now asserts a within-grace external write reaches the VFS (#2) and that an external target change re-mirrors its dependent link (inbound symlink) — both verified to fail before these fixes
+
 ## 3.2.5
 
 Fixes from a multi-agent adversarial audit of the OPFS-mirroring system. Five confirmed mirror-vs-VFS divergences, all affecting normal (single-tab, local) usage:

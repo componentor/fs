@@ -1265,6 +1265,12 @@ var VFSEngine = class {
     const existingIdx = this.pathIndex.get(newPath);
     const targetIsImplicitDir = existingIdx === void 0 && this.isImplicitDirectory(newPath);
     if (existingIdx !== void 0 || targetIsImplicitDir) {
+      const srcIsDir = this.readInode(idx).type === INODE_TYPE.DIRECTORY;
+      const dstIsDir = targetIsImplicitDir || existingIdx !== void 0 && this.readInode(existingIdx).type === INODE_TYPE.DIRECTORY;
+      if (srcIsDir && !dstIsDir) return { status: CODE_TO_STATUS.ENOTDIR };
+      if (!srcIsDir && dstIsDir) return { status: CODE_TO_STATUS.EISDIR };
+    }
+    if (existingIdx !== void 0 || targetIsImplicitDir) {
       let cleanDescendants = targetIsImplicitDir;
       if (existingIdx !== void 0) {
         const existingInode = this.readInode(existingIdx);
@@ -4153,6 +4159,34 @@ function resyncSymlinksUnder(path) {
     if (target !== path) resyncSymlinksFor(target);
   }
 }
+function cancelPendingSync(path) {
+  const t = pendingPathSyncs.get(path);
+  if (t) {
+    clearTimeout(t);
+    pendingPathSyncs.delete(path);
+  }
+}
+function reroutePendingChildSyncs(oldPath, newPath) {
+  for (const { from, to } of planPendingReroutes(pendingPathSyncs.keys(), oldPath, newPath)) {
+    cancelPendingSync(from);
+    schedulePathSync(to);
+  }
+}
+function rekeySymlinkAliasesForRename(oldPath, newPath) {
+  for (const oldLink of collectKeysUnder(linkToTarget.keys(), oldPath)) {
+    deregisterLink(symlinkTargets, linkToTarget, oldLink);
+    registerSymlink(oldLink === oldPath ? newPath : newPath + oldLink.slice(oldPath.length));
+  }
+}
+function dropSymlinkAliasesForRemove(path, isDir) {
+  if (isDir) {
+    for (const link of collectKeysUnder(linkToTarget.keys(), path)) {
+      deregisterLink(symlinkTargets, linkToTarget, link);
+    }
+  } else {
+    deregisterLink(symlinkTargets, linkToTarget, path);
+  }
+}
 function schedulePathSync(path) {
   const prev = pendingPathSyncs.get(path);
   if (prev) clearTimeout(prev);
@@ -4180,18 +4214,8 @@ function notifyOPFSSync(op, path, newPath) {
     }
     case OP.UNLINK:
     case OP.RMDIR: {
-      const pending = pendingPathSyncs.get(path);
-      if (pending) {
-        clearTimeout(pending);
-        pendingPathSyncs.delete(path);
-      }
-      if (op === OP.RMDIR) {
-        for (const link of collectKeysUnder(linkToTarget.keys(), path)) {
-          deregisterLink(symlinkTargets, linkToTarget, link);
-        }
-      } else {
-        deregisterLink(symlinkTargets, linkToTarget, path);
-      }
+      cancelPendingSync(path);
+      dropSymlinkAliasesForRemove(path, op === OP.RMDIR);
       opfsSyncPort.postMessage({ op: "delete", path, ts });
       resyncSymlinksUnder(path);
       break;
@@ -4202,28 +4226,10 @@ function notifyOPFSSync(op, path, newPath) {
       break;
     case OP.RENAME:
       if (newPath) {
-        const pendingOld = pendingPathSyncs.get(path);
-        if (pendingOld) {
-          clearTimeout(pendingOld);
-          pendingPathSyncs.delete(path);
-        }
-        const pendingNew = pendingPathSyncs.get(newPath);
-        if (pendingNew) {
-          clearTimeout(pendingNew);
-          pendingPathSyncs.delete(newPath);
-        }
-        for (const { from, to } of planPendingReroutes(pendingPathSyncs.keys(), path, newPath)) {
-          const t = pendingPathSyncs.get(from);
-          if (t) {
-            clearTimeout(t);
-            pendingPathSyncs.delete(from);
-          }
-          schedulePathSync(to);
-        }
-        for (const oldLink of collectKeysUnder(linkToTarget.keys(), path)) {
-          deregisterLink(symlinkTargets, linkToTarget, oldLink);
-          registerSymlink(oldLink === path ? newPath : newPath + oldLink.slice(path.length));
-        }
+        cancelPendingSync(path);
+        cancelPendingSync(newPath);
+        reroutePendingChildSyncs(path, newPath);
+        rekeySymlinkAliasesForRename(path, newPath);
         const plan = planRenameMirror(engine, path, newPath, ts);
         for (const msg of plan.messages) {
           if (msg.op === "write" && plan.transfers.includes(msg.data)) {
@@ -4240,27 +4246,45 @@ function notifyOPFSSync(op, path, newPath) {
 function handleExternalChange(msg) {
   switch (msg.op) {
     case "external-write": {
-      const result = engine.write(msg.path, new Uint8Array(msg.data), 0);
-      if (result.status === 0) broadcastWatch(OP.WRITE, msg.path);
+      let result = engine.write(msg.path, new Uint8Array(msg.data), 0);
+      if (result.status === STATUS.EISDIR) {
+        engine.rmdir(msg.path, 1);
+        result = engine.write(msg.path, new Uint8Array(msg.data), 0);
+      }
+      if (result.status === 0) {
+        resyncSymlinksFor(msg.path);
+        broadcastWatch(OP.WRITE, msg.path);
+      }
       console.log("[sync-relay] external-write:", msg.path, `${msg.data?.byteLength ?? 0}B`, `status=${result.status}`);
       break;
     }
     case "external-delete": {
-      const result = engine.unlink(msg.path);
-      if (result.status !== 0) {
-        const rmdirResult = engine.rmdir(msg.path, 1);
-        if (rmdirResult.status === 0) broadcastWatch(OP.RMDIR, msg.path);
-        console.log("[sync-relay] external-delete (rmdir):", msg.path, `status=${rmdirResult.status}`);
-      } else {
-        broadcastWatch(OP.UNLINK, msg.path);
-        console.log("[sync-relay] external-delete:", msg.path, `status=${result.status}`);
+      cancelPendingSync(msg.path);
+      let wasDir = false;
+      let ok = engine.unlink(msg.path).status === 0;
+      if (!ok) {
+        ok = engine.rmdir(msg.path, 1).status === 0;
+        wasDir = ok;
       }
+      if (ok) {
+        dropSymlinkAliasesForRemove(msg.path, wasDir);
+        resyncSymlinksUnder(msg.path);
+        broadcastWatch(wasDir ? OP.RMDIR : OP.UNLINK, msg.path);
+      }
+      console.log("[sync-relay] external-delete:", msg.path, `dir=${wasDir}`, `ok=${ok}`);
       break;
     }
     case "external-rename":
       if (msg.newPath) {
         const result = engine.rename(msg.path, msg.newPath);
-        if (result.status === 0) broadcastWatch(OP.RENAME, msg.path, msg.newPath);
+        if (result.status === 0) {
+          cancelPendingSync(msg.path);
+          cancelPendingSync(msg.newPath);
+          reroutePendingChildSyncs(msg.path, msg.newPath);
+          rekeySymlinkAliasesForRename(msg.path, msg.newPath);
+          resyncSymlinksUnder(msg.path);
+          broadcastWatch(OP.RENAME, msg.path, msg.newPath);
+        }
         console.log("[sync-relay] external-rename:", msg.path, "\u2192", msg.newPath, `status=${result.status}`);
       }
       break;

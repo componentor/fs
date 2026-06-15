@@ -54,6 +54,12 @@ function pathSegments(p: string): string[] {
 //   Added when processing completes, removed ONLY by periodic cleanup.
 //   Grace window catches delayed/batched observer events after processing.
 //
+// lastWriteHash (Map<path, hash>): content hash of the bytes we last wrote to a
+//   path. Lets a 'modified'/'appeared' echo be distinguished from a GENUINE
+//   external change that lands inside the grace window: a timestamp match alone
+//   would wrongly suppress a real external write within 3s of our own write to
+//   the same path. We suppress only when the observed bytes match what we wrote.
+//
 // Parent path check (opt-in): if /dir was deleted by us, /dir/file disappearing
 // is also our echo (recursive removeEntry fires per-child events).
 // ONLY used for 'disappeared' events — NOT for 'appeared'/'modified', since
@@ -61,6 +67,30 @@ function pathSegments(p: string): string[] {
 
 const pendingPaths = new Set<string>();
 const completedPaths = new Map<string, number>();
+const lastWriteHash = new Map<string, number>();
+
+/** Fast FNV-1a 32-bit content hash for echo detection (collision → at worst one suppressed real change, ~1/2^32). */
+function hashBytes(b: Uint8Array): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < b.length; i++) {
+    h ^= b[i];
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0) ^ b.length; // fold length in so same-prefix different-length differ
+}
+
+/**
+ * Is an observed write to `path` carrying `bytes` our own echo? True only if the
+ * bytes match what we last wrote within the grace window. A genuine external
+ * write (different bytes) is NOT suppressed even inside the window.
+ */
+function isOurWriteEcho(path: string, bytes: Uint8Array): boolean {
+  path = normalizePath(path);
+  if (pendingPaths.has(path)) return true; // our write is still mid-flight
+  const ts = completedPaths.get(path);
+  if (!ts || Date.now() - ts >= GRACE_MS) return false;
+  return lastWriteHash.get(path) === hashBytes(bytes);
+}
 const GRACE_MS = 3000;
 
 function trackPending(path: string): void {
@@ -108,7 +138,7 @@ function isOurEcho(path: string, checkParents = false): boolean {
 setInterval(() => {
   const cutoff = Date.now() - GRACE_MS;
   for (const [p, ts] of completedPaths) {
-    if (ts < cutoff) completedPaths.delete(p);
+    if (ts < cutoff) { completedPaths.delete(p); lastWriteHash.delete(p); }
   }
 }, 5000);
 
@@ -231,16 +261,20 @@ async function writeToOPFS(path: string, data: ArrayBuffer): Promise<void> {
   const dir = await ensureParentDirs(path);
   const name = basename(path);
   const fileHandle = await dir.getFileHandle(name, { create: true });
+  const bytes = new Uint8Array(data);
   // Use createSyncAccessHandle for reliable writes in Worker context
   // (createWritable can silently fail in nested workers for OPFS files)
   const accessHandle = await fileHandle.createSyncAccessHandle();
   try {
     accessHandle.truncate(0);
-    accessHandle.write(new Uint8Array(data), { at: 0 });
+    accessHandle.write(bytes, { at: 0 });
     accessHandle.flush();
   } finally {
     accessHandle.close();
   }
+  // Record what we wrote so the observer can tell our echo from a genuine
+  // external change to the same path within the grace window (see isOurWriteEcho).
+  lastWriteHash.set(normalizePath(path), hashBytes(bytes));
 }
 
 async function deleteFromOPFS(path: string): Promise<void> {
@@ -507,25 +541,23 @@ function setupObserver(): void {
       // Skip VFS binary file and internal files
       if (path === '/.vfs.bin' || path === '/.vfs' || path.startsWith('/.vfs')) continue;
 
-      // Echo suppression — check parents only for 'disappeared' (recursive delete cascading)
-      const isDelete = record.type === 'disappeared';
-      if (isOurEcho(path, isDelete)) {
-        //console.log('[opfs-sync] suppressed (echo):', record.type, path);
-        continue;
-      }
-
-      //console.log('[opfs-sync] external:', record.type, path);
       switch (record.type) {
         case 'appeared':
         case 'modified':
+          // Echo check is CONTENT-based and happens inside syncExternalChange
+          // (after reading the file), so a genuine external write within the
+          // grace window is no longer mistaken for our own echo.
           syncExternalChange(path, record.changedHandle);
           break;
         case 'disappeared':
+          // No content to compare for a delete — fall back to the time-based
+          // echo check (incl. the parent walk for recursive-delete cascades).
+          if (isOurEcho(path, true)) continue;
           syncExternalDelete(path);
           break;
         case 'moved': {
           const from = normalizePath('/' + record.relativePathMovedFrom!.join('/'));
-          //console.log('[opfs-sync] external: moved from', from, '→', path);
+          if (isOurEcho(path) || isOurEcho(from)) continue;
           syncExternalRename(from, path);
           break;
         }
@@ -541,8 +573,23 @@ async function syncExternalChange(path: string, handle: FileSystemHandle | null)
     if (!handle || handle.kind !== 'file') return;
 
     const fileHandle = handle as FileSystemFileHandle;
-    const file = await fileHandle.getFile();
-    const data = await file.arrayBuffer();
+    let data = await fileHandle.getFile().then((f) => f.arrayBuffer());
+
+    // Our own echo? Suppress only when the observed bytes match what we wrote
+    // within the grace window — a genuine external change (different bytes) is
+    // forwarded even if it lands inside the window.
+    if (isOurWriteEcho(path, new Uint8Array(data))) return;
+
+    // The observer's snapshot can LAG our own write: a freshly-created file
+    // fires 'appeared' and getFile() may return the empty creation state even
+    // though our synchronous write already filled it. That stale read doesn't
+    // match our recorded hash, so it would look "external" and bounce back an
+    // empty write, clobbering the file. If we recently wrote this path, re-read
+    // the current bytes once and re-check before forwarding.
+    if (completedPaths.has(normalizePath(path))) {
+      data = await fileHandle.getFile().then((f) => f.arrayBuffer());
+      if (isOurWriteEcho(path, new Uint8Array(data))) return;
+    }
 
     serverPort.postMessage({
       op: 'external-write',

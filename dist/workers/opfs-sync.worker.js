@@ -54,6 +54,22 @@ function pathSegments(p) {
 }
 var pendingPaths = /* @__PURE__ */ new Set();
 var completedPaths = /* @__PURE__ */ new Map();
+var lastWriteHash = /* @__PURE__ */ new Map();
+function hashBytes(b) {
+  let h = 2166136261;
+  for (let i = 0; i < b.length; i++) {
+    h ^= b[i];
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0 ^ b.length;
+}
+function isOurWriteEcho(path, bytes) {
+  path = normalizePath(path);
+  if (pendingPaths.has(path)) return true;
+  const ts = completedPaths.get(path);
+  if (!ts || Date.now() - ts >= GRACE_MS) return false;
+  return lastWriteHash.get(path) === hashBytes(bytes);
+}
 var GRACE_MS = 3e3;
 function trackPending(path) {
   pendingPaths.add(normalizePath(path));
@@ -86,7 +102,10 @@ function isOurEcho(path, checkParents = false) {
 setInterval(() => {
   const cutoff = Date.now() - GRACE_MS;
   for (const [p, ts] of completedPaths) {
-    if (ts < cutoff) completedPaths.delete(p);
+    if (ts < cutoff) {
+      completedPaths.delete(p);
+      lastWriteHash.delete(p);
+    }
   }
 }, 5e3);
 var queue = [];
@@ -172,14 +191,16 @@ async function writeToOPFS(path, data) {
   const dir = await ensureParentDirs(path);
   const name = basename(path);
   const fileHandle = await dir.getFileHandle(name, { create: true });
+  const bytes = new Uint8Array(data);
   const accessHandle = await fileHandle.createSyncAccessHandle();
   try {
     accessHandle.truncate(0);
-    accessHandle.write(new Uint8Array(data), { at: 0 });
+    accessHandle.write(bytes, { at: 0 });
     accessHandle.flush();
   } finally {
     accessHandle.close();
   }
+  lastWriteHash.set(normalizePath(path), hashBytes(bytes));
 }
 async function deleteFromOPFS(path) {
   try {
@@ -372,20 +393,18 @@ function setupObserver() {
     for (const record of records) {
       const path = normalizePath("/" + record.relativePathComponents.join("/"));
       if (path === "/.vfs.bin" || path === "/.vfs" || path.startsWith("/.vfs")) continue;
-      const isDelete = record.type === "disappeared";
-      if (isOurEcho(path, isDelete)) {
-        continue;
-      }
       switch (record.type) {
         case "appeared":
         case "modified":
           syncExternalChange(path, record.changedHandle);
           break;
         case "disappeared":
+          if (isOurEcho(path, true)) continue;
           syncExternalDelete(path);
           break;
         case "moved": {
           const from = normalizePath("/" + record.relativePathMovedFrom.join("/"));
+          if (isOurEcho(path) || isOurEcho(from)) continue;
           syncExternalRename(from, path);
           break;
         }
@@ -398,8 +417,12 @@ async function syncExternalChange(path, handle) {
   try {
     if (!handle || handle.kind !== "file") return;
     const fileHandle = handle;
-    const file = await fileHandle.getFile();
-    const data = await file.arrayBuffer();
+    let data = await fileHandle.getFile().then((f) => f.arrayBuffer());
+    if (isOurWriteEcho(path, new Uint8Array(data))) return;
+    if (completedPaths.has(normalizePath(path))) {
+      data = await fileHandle.getFile().then((f) => f.arrayBuffer());
+      if (isOurWriteEcho(path, new Uint8Array(data))) return;
+    }
     serverPort.postMessage({
       op: "external-write",
       path,

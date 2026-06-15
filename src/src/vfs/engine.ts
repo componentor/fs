@@ -1566,6 +1566,22 @@ export class VFSEngine {
     const targetIsImplicitDir =
       existingIdx === undefined && this.isImplicitDirectory(newPath);
 
+    // POSIX type-conflict guards. Without these the replace logic below would
+    // overwrite a directory with a file (or vice versa), diverging from Node —
+    // and the OPFS mirror cannot represent a file-replaces-directory (a `write`
+    // can't convert an OPFS directory into a file), so the mirror would silently
+    // keep the stale directory tree. Reject the type-mismatch combinations the
+    // way Node does. (Replacing a non-empty *directory* with another directory
+    // is deliberately allowed — Vite's `.vite/deps_temp_<hash>` → `.vite/deps`
+    // commit relies on it, and the mirror handles it via renameDirInOPFS.)
+    if (existingIdx !== undefined || targetIsImplicitDir) {
+      const srcIsDir = this.readInode(idx).type === INODE_TYPE.DIRECTORY;
+      const dstIsDir = targetIsImplicitDir ||
+        (existingIdx !== undefined && this.readInode(existingIdx).type === INODE_TYPE.DIRECTORY);
+      if (srcIsDir && !dstIsDir) return { status: CODE_TO_STATUS.ENOTDIR };
+      if (!srcIsDir && dstIsDir) return { status: CODE_TO_STATUS.EISDIR };
+    }
+
     if (existingIdx !== undefined || targetIsImplicitDir) {
       let cleanDescendants = targetIsImplicitDir;
 

@@ -73,6 +73,52 @@ const TS = 12345;
 const bytes = (m: OpfsSyncMessage) =>
   m.op === 'write' ? new Uint8Array(m.data) : new Uint8Array(0);
 
+describe('engine.rename POSIX type-conflict guards', () => {
+  let engine: VFSEngine;
+  // Status codes from protocol/opcodes CODE_TO_STATUS.
+  const EISDIR = 3, ENOTDIR = 4;
+
+  beforeEach(() => {
+    engine = new VFSEngine();
+    engine.init(new MockSyncHandle(0) as unknown as FileSystemSyncAccessHandle);
+  });
+
+  it('rejects renaming a FILE onto an existing DIRECTORY with EISDIR', () => {
+    engine.write('/a', enc.encode('file'));
+    engine.mkdir('/b');
+    engine.write('/b/child.txt', enc.encode('x'));
+    expect(engine.rename('/a', '/b').status).toBe(EISDIR);
+    // Nothing changed: /a still a file, /b still a dir with its child.
+    expect(engine.read('/a').status).toBe(0);
+    expect(engine.read('/b/child.txt').status).toBe(0);
+  });
+
+  it('rejects renaming a DIRECTORY onto an existing FILE with ENOTDIR', () => {
+    engine.mkdir('/d');
+    engine.write('/d/x', enc.encode('x'));
+    engine.write('/f', enc.encode('file'));
+    expect(engine.rename('/d', '/f').status).toBe(ENOTDIR);
+    expect(engine.read('/f').status).toBe(0);
+    expect(engine.read('/d/x').status).toBe(0);
+  });
+
+  it('still allows file→file and dir→dir (incl. non-empty target) replacement', () => {
+    engine.write('/src.txt', enc.encode('new'));
+    engine.write('/dst.txt', enc.encode('old'));
+    expect(engine.rename('/src.txt', '/dst.txt').status).toBe(0);
+    expect(dec.decode(engine.read('/dst.txt').data!)).toBe('new');
+
+    // dir → non-empty dir replace is deliberately permitted (Vite deps commit).
+    engine.mkdir('/srcdir');
+    engine.write('/srcdir/keep.js', enc.encode('keep'));
+    engine.mkdir('/dstdir');
+    engine.write('/dstdir/stale.js', enc.encode('stale'));
+    expect(engine.rename('/srcdir', '/dstdir').status).toBe(0);
+    expect(engine.read('/dstdir/keep.js').status).toBe(0);
+    expect(engine.read('/dstdir/stale.js').status).not.toBe(0); // replaced, not merged
+  });
+});
+
 describe('planRenameMirror', () => {
   let engine: VFSEngine;
 
