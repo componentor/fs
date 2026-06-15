@@ -1,5 +1,9 @@
 # Changelog
 
+## 3.2.7
+
+- Docs only. Overhauled the README: sharper intro + badges, a "Choosing a mode (performance)" section documenting the `vfs`/`hybrid`/`opfs` trade-off (the OPFS mirror is the main write-cost knob; reads are unaffected), and honest benchmark framing. Removed the ~320-line stale inline changelog (it duplicated and lagged `CHANGELOG.md`). Corrected the browser-support table: Safari 16.4+ sync is supported (with the documented main-thread-follower limitation), and Firefox needs no flag on 114+ (module workers have been default since then). Fixed a stale test count. No code or behavior changes.
+
 ## 3.2.6
 
 Fixes the three audit findings deferred from 3.2.5.

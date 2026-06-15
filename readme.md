@@ -1,8 +1,20 @@
 # @componentor/fs
 
-**High-performance OPFS-based Node.js `fs` polyfill for the browser**
+[![npm version](https://img.shields.io/npm/v/@componentor/fs.svg)](https://www.npmjs.com/package/@componentor/fs)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
+[![types: included](https://img.shields.io/badge/types-included-blue.svg)](#)
 
-A virtual filesystem powered by a custom binary format (VFS), SharedArrayBuffer + Atomics for true synchronous APIs, multi-tab coordination via Web Locks, and bidirectional OPFS mirroring.
+**A real, synchronous `fs` for the browser — backed by persistent storage, safe across tabs.**
+
+`@componentor/fs` is a Node.js `fs` polyfill that gives you a *true* synchronous API
+(`readFileSync`, `writeFileSync`, …) on top of real, persistent storage — not an in-memory
+shim. It pairs a custom binary virtual filesystem (VFS) with SharedArrayBuffer + Atomics for
+blocking sync calls, mirrors every change to real OPFS files so external tools can see them, and
+coordinates multiple tabs with a leader/follower model and automatic failover.
+
+If you've wanted `import fs from 'fs'` to *just work* in the browser — for isomorphic-git, a web
+IDE, an in-browser bundler, or any Node-shaped tooling — that's the gap this fills. ~90 `fs`
+methods are implemented across the sync, `promises`, callback, stream, and file-descriptor APIs.
 
 ```typescript
 import { VFSFileSystem } from '@componentor/fs';
@@ -20,15 +32,15 @@ const content = await fs.promises.readFile('/async.txt', 'utf8');
 
 ## Features
 
-- **True Sync API** — `readFileSync`, `writeFileSync`, etc. via SharedArrayBuffer + Atomics
-- **Async API** — `promises.readFile`, `promises.writeFile` — works without COOP/COEP
-- **VFS Binary Format** — All data in a single `.vfs.bin` file for maximum throughput
-- **OPFS Sync** — Bidirectional mirror to real OPFS files (enabled by default)
-- **Multi-tab Safe** — Leader/follower architecture with automatic failover via `navigator.locks`
-- **FileSystemObserver** — External OPFS changes synced back to VFS automatically (Chrome 129+)
-- **isomorphic-git Ready** — Full compatibility with git operations
-- **Zero Config** — Workers inlined at build time, no external worker files needed
-- **TypeScript First** — Complete type definitions included
+- **True sync API** — blocking `readFileSync`/`writeFileSync`/… via SharedArrayBuffer + Atomics, not callbacks pretending to be sync.
+- **Async API too** — `fs.promises.*` works everywhere, even without COOP/COEP headers.
+- **Broad `fs` coverage** — ~90 methods: streams, file descriptors (`open`/`read`/`writev`), `watch`, `glob`, `cp`, `mkdtemp`, `realpath`, `statfs`, bigint stats, and more.
+- **Real persistence** — a compact binary VFS (`.vfs.bin`) in OPFS, plus an optional bidirectional mirror to real OPFS files DevTools and other tools can see.
+- **Multi-tab safe** — leader/follower architecture with automatic failover via `navigator.locks`; works on Safari (incl. worker-hosted followers).
+- **External-change aware** — a `FileSystemObserver` syncs outside OPFS edits back into the VFS (Chrome 129+).
+- **isomorphic-git ready** — battle-tested against real git operations.
+- **Zero config** — workers are inlined at build time; no separate worker files to host.
+- **TypeScript-first** — complete type definitions included.
 
 ## Installation
 
@@ -122,10 +134,20 @@ const safeFs = new VFSFileSystem({ mode: 'opfs' });
 
 **Hybrid mode** mirrors all VFS mutations to real OPFS files in the background:
 
-- **VFS → OPFS**: Every write, delete, mkdir, rename is replicated after the sync operation completes (zero performance impact on the hot path)
-- **OPFS → VFS**: A `FileSystemObserver` watches for external changes and syncs them back (Chrome 129+)
+- **VFS → OPFS**: Every write, delete, mkdir, rename is replicated *after* the sync operation responds, so it never adds latency to an individual call. Bursts to the same path are coalesced.
+- **OPFS → VFS**: A `FileSystemObserver` watches for external changes and syncs them back (Chrome 129+).
 
-This allows external tools (browser DevTools, OPFS extensions) to see and modify files while VFS handles all the fast read/write operations internally.
+This lets external tools (browser DevTools, OPFS extensions) see and modify files while VFS handles all the fast read/write operations internally.
+
+#### Choosing a mode (performance)
+
+The mirror is the main performance knob. It persists every change a second time as a real OPFS file, and on Safari each of those writes opens a fresh sync-access handle, which is comparatively slow. Reads never touch the mirror, so they're fast in every mode.
+
+- **`vfs`** (VFS binary only) — fastest writes; data is still fully persistent in `.vfs.bin`. Choose this when you don't need other tools to see individual files.
+- **`hybrid`** (default) — adds the real-OPFS mirror so DevTools/extensions/other code can read your files. Expect writes to cost roughly ~2× `vfs` (more on Safari) in exchange; read speed is unaffected.
+- **`opfs`** — no VFS binary; operates directly on OPFS files. Highest external compatibility, slowest.
+
+A good rule of thumb: use `vfs` for pure app storage, `hybrid` when real OPFS visibility matters. You can switch at runtime with `setMode()`.
 
 #### Corruption Fallback
 
@@ -313,25 +335,25 @@ if (crossOriginIsolated) {
 
 ## Benchmarks
 
-Tested against LightningFS (IndexedDB-based) in Chrome with `crossOriginIsolated` enabled:
+Versus LightningFS (IndexedDB-based), in Chrome with `crossOriginIsolated` enabled, hybrid mode:
 
-| Operation | LightningFS | VFS Sync | VFS Promises | Winner |
-|-----------|------------|----------|-------------|--------|
-| Write 100 x 1KB | 46ms | **12ms** | 23ms | **VFS 4x** |
-| Write 100 x 4KB | 36ms | **13ms** | 22ms | **VFS 2.8x** |
-| Read 100 x 1KB | 19ms | **2ms** | 14ms | **VFS 9x** |
-| Read 100 x 4KB | 62ms | **2ms** | 13ms | **VFS 28x** |
-| Large 10 x 1MB | 11ms | **10ms** | 17ms | **VFS 1.1x** |
-| Batch Write 500 x 256B | 138ms | **50ms** | 75ms | **VFS 2.8x** |
-| Batch Read 500 x 256B | 73ms | **7ms** | 91ms | **VFS 10x** |
+| Operation | LightningFS | VFS Sync | VFS Promises |
+|-----------|------------|----------|-------------|
+| Write 100 × 1KB | 46ms | **12ms** | 23ms |
+| Write 100 × 4KB | 36ms | **13ms** | 22ms |
+| Read 100 × 1KB | 19ms | **2ms** | 14ms |
+| Read 100 × 4KB | 62ms | **2ms** | 13ms |
+| Large 10 × 1MB | 11ms | **10ms** | 17ms |
+| Batch write 500 × 256B | 138ms | **50ms** | 75ms |
+| Batch read 500 × 256B | 73ms | **7ms** | 91ms |
 
-**Key takeaways:**
-- **Reads are 9-28x faster** — VFS binary format eliminates IndexedDB overhead
-- **Writes are 2.8-4x faster** — Single binary file vs individual OPFS/IDB entries
-- **Batch operations are 2.8-10x faster** — VFS excels at many small operations
-- VFS Sync is the fastest path (SharedArrayBuffer + Atomics, zero async overhead)
+**Takeaways:**
+- **Reads are 9–28× faster** — the binary VFS format avoids per-entry IndexedDB/OPFS overhead, and the sync path (SharedArrayBuffer + Atomics) has no async overhead.
+- **Writes are ~3–4× faster** here, and faster still in `vfs` mode where the OPFS mirror is off.
 
-Run benchmarks yourself:
+**Reading these honestly:** numbers vary by browser and warm/cold state — measure your own workload. In-memory libraries like `memfs` will beat this on raw ops (no persistence to do), so the fair comparison is against other *persistent* browser filesystems. Writes are the work; reads are essentially free. On Safari, writes cost more because of slower OPFS sync-access handles (see [mode selection](#choosing-a-mode-performance)).
+
+Run the suite yourself:
 
 ```bash
 npm run benchmark:open
@@ -657,14 +679,14 @@ Multi-tab (via Service Worker + navigator.locks):
 
 | Browser | Sync API | Async API |
 |---------|----------|-----------|
-| Chrome 102+ | Yes | Yes |
-| Edge 102+ | Yes | Yes |
-| Firefox 111+ | Yes* | Yes |
-| Safari 15.2+ | No** | Yes |
+| Chrome / Edge 102+ | Yes | Yes |
+| Firefox 114+ | Yes | Yes |
+| Safari 16.4+ | Yes* | Yes |
 | Opera 88+ | Yes | Yes |
 
-\* Firefox requires `dom.workers.modules.enabled` flag
-\** Safari doesn't support `SharedArrayBuffer` in the required context
+The sync API needs `SharedArrayBuffer`, which requires a `crossOriginIsolated` page (COOP/COEP headers — see above). The async API (`fs.promises.*`) works everywhere without those headers. (Firefox needs 114+ for the module workers this library uses — enabled by default since then; older 111–113 required the `dom.workers.modules.enabled` flag.)
+
+\* Safari supports the sync API for single-tab and leader tabs. In multi-tab mode, a *follower* tab can only do sync I/O when its instance runs inside a worker — a main-thread follower on Safari is a fundamental WebKit limitation. See [Multi-Tab Sync on Safari](#multi-tab-sync-on-safari-worker-hosted-instances) and [SAFARI-SYNC-LIMITATIONS.md](./SAFARI-SYNC-LIMITATIONS.md).
 
 ## Troubleshooting
 
@@ -692,336 +714,18 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
 
-## v3.1.0 (2026)
-
-- fs sync support on safari
-
-### v3.0.55 (2026)
-
-**Fixes:**
-- OPFS renames no longer report success while leaving the source behind. Both rename paths copy the source then delete the original, but the delete was fire-and-forget — the engine (`OPFSEngine.rename`) discarded the `unlink`/`rmdir` result and the sync worker only logged a warning on a bare `removeEntry` rejection. A transient OPFS lock/consistency hiccup right after a bulk copy/close could thus report a successful rename with the file or tree still present in *both* locations. The removal is now retried with incremental backoff (10/20/30 ms) and the final status is propagated — `removeSourceWithRetry` (engine) returns a genuine failure instead of a false success, `removeEntryWithRetry` (worker) treats `NotFoundError` as already-gone and rethrows only after exhausting retries
-- `OPFSEngine.rename`'s directory branch now replaces a pre-existing destination (recursive `rmdir` for a dir, `unlink` for a file) before recreating it, matching the "replace target" semantics the sync worker already had — previously the engine merged the source tree *into* an existing target directory
-
-### v3.0.54 (2026)
-
-**Fixes:**
-- OPFS file renames no longer get silently dropped on Safari after a just-written source. `renameInOPFS` lumped `NotFoundError` together with `TypeMismatchError` (3.0.50) and sent both to the directory-aware branch — but Safari's OPFS has a brief consistency lag between a `createSyncAccessHandle` write and a subsequent `getFileHandle`, so a freshly-written source (e.g. `printf x > a; mv a b`) momentarily reports `NotFound`, the dir branch then also fails, and the rename is lost (mirror diverges from VFS). Only genuine `TypeMismatchError` now routes to the dir branch; `NotFoundError` triggers a bounded file-lookup retry (6 attempts, ~120 ms) to let OPFS catch up, with the dir branch only as a last resort
-
-### v3.0.53 (2026)
-
-**Features:**
-- Leader-transition readiness tracking. New `fs.whenReady()` resolves once the filesystem is fully ready *including* any in-flight promotion-to-leader, and a new `fs.ready` getter reports the moment-in-time state. Lets an embedding app that runs its own `navigator.locks` leader election coordinate with the FS's independent election — without it, the app can win its lock and issue sync calls while the FS is still mid-promotion, stalling against the 20 s heartbeat watchdog
-- During `promoteToLeader` the existing `readyPromise` is stale (resolved by the prior lifecycle), so awaiting it would return immediately even though the new sync-relay hasn't signalled `ready`. A `transitioning` flag now guards this: while set, `whenReady()` waits for the *next* `ready` rather than the stale promise. All three `ready` handlers (bootstrap, `promoteToLeader`, `setMode`) clear the flag and flush waiting callers consistently
-
-### v3.0.52 (2026)
-
-**Fixes:**
-- Sync FS calls on the browser main thread (which can't use `Atomics.wait` and so spin on `Atomics.load`) no longer abort a legitimately slow operation. The old fixed timeout (10 s, briefly 60 s) killed in-flight `rename`/`copy` over large trees — e.g. `create-strapi-app`'s git init over a fresh `node_modules` — while a genuinely dead worker still blocked for the whole timeout. The relay worker now pulses a heartbeat counter in the control SAB every 1 s (it keeps ticking even while parked on an `await` inside a long op), and the spin-wait aborts only if that heartbeat stalls for 20 s — no upper bound on a progressing op
-- Fix corruption/hang on large sync writes. A `writeFileSync`/`writeSync`/`appendFileSync` of more than ~2 MB (the default SAB data window) is chunked over the SAB; the response-wait afterward waited on the wrong control-word sentinel (`REQUEST` instead of the last chunk's `CHUNK`), so it fell through immediately and read stale request bytes as the response, then wedged. Now waits on the frame it actually wrote last, matching the async path
-- Add a Playwright regression test round-tripping ≈2 MB / ≈5 MB payloads through the sync and promises write APIs with byte-for-byte verification; `playwright-report/` and `test-results/` are now gitignored
-
-### v3.0.51 (2026)
-
-**Fixes:**
-- Fix O(N²) regression introduced in 3.0.49. The implicit-directory guard added then (`isImplicitDirectory(path)` in `write`, `symlink`, `link`, `copy`, plus several stat-side methods) called `rebuildImplicitDirs` — O(N×depth) over all pathIndex entries — on every invocation, and `pathIndexGen` was bumped on every mutation, so the cache was always invalid by the next call. Batch workloads (Vite optimize, pnpm install, Strapi unpacks of thousands of files) went quadratic. Measured on a 5000-file write benchmark: **3.0.48 baseline 26 ms → 3.0.50 1725 ms (66× slower) → 3.0.51 23 ms (back to baseline)**
-- Replace the on-demand rebuild with an incrementally maintained `descCount` map. `isImplicitDirectory(P)` is now O(1): `!pathIndex.has(P) && descCount[P] > 0`. Maintenance is O(depth) per pathIndex mutation, behind two helpers (`setPathIndex`, `deletePathIndex`) that wrap the 12 mutation sites
-
-### v3.0.50 (2026)
-
-**Fixes:**
-- OPFS mirror no longer diverges from VFS state when the rename source is a directory. `renameInOPFS` previously hard-coded `getFileHandle`, which throws `TypeMismatchError` for directories — so the VFS rename fix in 3.0.49 (e.g. Vite's `deps_temp_<hash>` → `deps`) succeeded in-memory but the on-disk OPFS mirror silently warned-and-skipped, leaving the two diverged until the next full reconcile
-- On `TypeMismatchError`/`NotFoundError`, falls through to a directory-aware path: recursively `removeEntry` the destination (matching the engine's "rm-then-rename" semantics), recreate as an empty dir, walk the source tree copying every file via two sync access handles in 2 MB chunks (peak memory bounded by `RENAME_CHUNK` regardless of subtree size), then `removeEntry` the source
-
-### v3.0.49 (2026)
-
-**Fixes:**
-- `rename` over a non-empty directory no longer leaves stale descendants. Previously the target's children survived in `pathIndex` while their inodes were never freed; source descendants were laid on top, leaking inodes and leaving zombies reachable via `read`. Surfaced as corrupt `.vite/deps` after Vite's `deps_temp_<hash>` → `deps` swap (stale chunks for `vue.js`, `@unhead/vue`, etc., or 404s)
-- `rename(x, x)` no longer destroys the file (it used to free its own blocks and mark its inode FREE before re-pointing the index)
-- Same descendant-cleanup logic now applies when the rename target is an *implicit* directory (path with no inode of its own but with descendants in `pathIndex` — the state produced by bulk OPFS import)
-- `write`, `symlink`, `link`, and `copy` (with `COPYFILE_EXCL`) now reject implicit-directory targets (EISDIR for `write`, EEXIST for the others). Previously these silently clobbered the implicit dir, e.g. registering a regular `FILE` inode at a path whose children still existed in `pathIndex` — breaking every subsequent read of that path and its subtree
-- Add 5 regression tests in `implicit-dir-targets.test.ts` covering each fixed call site
-
-### v3.0.48 (2026)
-
-**Fixes:**
-- Close the residual race left in the 3.0.47 broker-heartbeat fix: stop calling `close()` on the prior control port. The disentangle signal travels on a separate IPC pipe from the SW main channel with no ordering guarantee against `register-server`, so a `transfer-port` already queued in the SW inbox could still be dispatched against a detached `serverPort` and silently dropped. Letting the old port live until both endpoints become unreferenced (and GC-collected) keeps it routable through the swap and removes the window entirely
-
-### v3.0.47 (2026)
-
-**Fixes:**
-- Multi-tab broker survives service-worker idle-kill (≥30s on Chrome). Secondary tabs no longer fail with `[Shell] Failed to load cwd` after the SW is restarted — the leader re-registers on a 5 s heartbeat and the SW flushes any queued follower `transfer-port` messages to the new control port
-- Eliminate a race where heartbeat re-registration could silently drop in-flight follower `transfer-port` messages (new control port is now posted to the SW before the old one is closed)
-- `leader-changed` is broadcast exactly once at initial registration instead of on every heartbeat tick — prevents spurious EIO errors on long-running follower operations from leader-port reconnect churn
-
-### v3.0.46 (2026)
-
-**Features:**
-- Implicit directory support: directories implied by file paths are now recognized by `stat`, `lstat`, `readdir`, `opendir`, `access`, `realpath`, `exists`, `mkdir`, and `ensureParent`
-- Generation-counter cache for lazy implicit-dir rebuild
-
-**Fixes:**
-- Fix crash on `fstat`/`fchmod`/`fchown`/`futimes` when fd was opened via `opendir` on an implicit directory
-- `rmdir` on implicit directories now returns ENOTEMPTY (non-recursive) or deletes descendants (recursive) instead of ENOENT
-- `nlink` for real directories now counts implicit subdirectories, consistent with `readdir`
-- Implicit directory timestamps are stable across repeated `stat()` calls
-
-**Tests:**
-- 14 new tests for implicit directory behavior
-
-### v3.0.45 (2026)
-
-**Fixes:**
-- Eliminate "Array buffer allocation failed" on multi-hundred-MB VFS operations (pnpm install of large monorepos like Directus): every hot path that previously staged a full-file or full-data-region buffer now streams through a bounded 4 MB scratch buffer via the underlying sync access handle — `growPathTable`, `fwrite` grow, `append`, `truncate` extend, and `copy`
-- Fix POSIX "hole" semantics: writes past EOF and extending `truncate` now zero-fill the gap instead of exposing stale bytes from previously-freed blocks
-
-**Tests:**
-- Sparse-write coverage (in-block hole, cross-block hole, pos === size)
-- Chunk-boundary coverage for `append`, `fwrite` grow, `truncate` extend, and `copy` across 5 MB buffers
-- Self-copy and `COPYFILE_EXCL` regression tests
-
-### v3.0.44 (2026)
-
-**Fixes:**
-- Coalesce per-path OPFS sync notifications in `sync-relay.worker.ts` — a single chunked 100 MB upload now triggers one full-file read instead of ~1500, eliminating `RangeError: Array buffer allocation failed` on repeated large uploads (e.g. Strapi multipart)
-- Cancel pending debounced syncs on `UNLINK`/`RMDIR`; reroute on `RENAME`
-- Route `OP.SYMLINK` mirror through the same debounced flusher
-
-**Memory:**
-- Replace `scanOPFSEntries` with streaming `populateVFSFromOPFS`: chunked `SyncAccessHandle` + `engine.append`, init peak memory bounded by 2 MB instead of sum of all OPFS file sizes
-- `renameInOPFS` copies via two `SyncAccessHandle`s in 2 MB chunks instead of `file.arrayBuffer()`
-- Coalesce pending `write` events for the same path in the OPFS sync queue — newer payload supersedes older, frees stale `ArrayBuffer` for GC
-
-**Tests:**
-- Update `vfs-engine` test for the 100K default inode count
-
-### v3.0.43 (2026)
-
-**Docs:**
-- Update README changelog section and link to `CHANGELOG.md`
-
-### v3.0.42 (2026)
-
-**Features:**
-- Implement real `fchmod`/`fchown`/`futimes` (sync, promises, and `FileHandle.utimes`) — previously no-ops
-- Add wire opcodes `FCHMOD`/`FCHOWN`/`FUTIMES` (31/32/33) wired through VFS and OPFS engines, server worker, and sync-relay
-- Sync-relay broadcasts fd-based ops as path-based equivalents via `getPathForFd` so watchers still fire
-- Rewrite `glob`/`globSync`: brace expansion, character classes with `[!...]` negation, escapes, `withFileTypes`, `string[]` patterns, `URL` cwd, dedupe, trailing-`**` self-match
-- `watch`: per-microtask `(event, filename)` coalescing, `encoding: 'buffer'` support, reclassify `COPY` as `change` to match libuv
-
-### v3.0.41 (2026)
-
-**Features:**
-- Increase default inode count from 10,000 to 100,000 to support large projects (e.g. Strapi)
-- Strengthen readdir-through-symlink test assertions
-
-### v3.0.19-v3.0.20 (2026)
-
-**Features:**
-- Add `swUrl` config option to specify a custom service worker URL for multi-tab support in bundled environments where the default auto-resolved URL doesn't work
-- Remove `type: 'module'` from service worker registration (built output is plain script, not ESM)
-
-### v3.0.18 (2026)
-
-**Features:**
-- Configurable VFS limits via `limits` option: `maxInodes`, `maxBlocks`, `maxPathTable`, `maxVFSSize`, `maxPayload`
-
-**Fixes:**
-- Pre-validate superblock before `engine.init()` to prevent hangs from corrupt values causing huge allocations
-- Add upper bounds in `mount()`: max 4M inodes, 4M blocks, 256MB path table, 100GB total VFS size
-- Ensure all mount errors are prefixed with `Corrupt VFS:` for consistent corruption fallback
-- Cap `readPayload()` at 2GB (configurable) and validate each chunk length in the multi-chunk loop to prevent OOM/infinite loops from corrupt SAB data
-- Cap `MemoryHandle.grow()` at 4GB to prevent OOM from corrupt VFS offsets on main-thread fallback
-
-### v3.0.17 (2026)
-
-**Features:**
-- Auto-populate VFS from existing OPFS files when `.vfs.bin` doesn't exist — seamless transition from OPFS mode back to hybrid mode without manual `loadFromOPFS()` call
-
-### v3.0.16 (2026)
-
-**Fixes:**
-- Add 10s timeout to main-thread spin-wait — prevents infinite busy loop if SharedWorker is dead or unresponsive
-
-### v3.0.15 (2026)
-
-**Fixes:**
-- Add bounds validation to `decodeRequest` — rejects truncated SAB payloads instead of reading out-of-bounds
-- Wrap `decodeRequest` in try/catch in both VFS and OPFS leader loop handlers — corrupt buffers return `status: -1` instead of crashing the leader loop
-- Guard `readPayload` against zero/negative/overflow chunk lengths from stale SAB data
-
-### v3.0.14 (2026)
-
-**Fixes:**
-- Fix `PATH_USED` not persisted after `write()` without flush flag — `commitPending()` now runs unconditionally after every write, preventing "path out of bounds" corruption on reload
-- Repair inode scanner uses the full allocated path table region instead of `PATH_USED` from the superblock — recovers files even when the superblock counter was stale
-
-### v3.0.13 (2026)
-
-**Fixes:**
-- Revert `.d.ts` extension override in `outExtension` — `dts: true` handles it correctly
-
-### v3.0.12 (2026)
-
-**Fixes:**
-- Fix `.d.ts` output extension mapping so declaration files resolve correctly
-
-### v3.0.11 (2026)
-
-**Fixes:**
-- Emit TypeScript declaration files (`dts: true` in tsup config)
-
-### v3.0.10 (2026)
-
-**New: Three filesystem modes (`hybrid`, `vfs`, `opfs`)**
-- `mode: 'hybrid'` (default) — VFS binary + bidirectional OPFS sync
-- `mode: 'vfs'` — VFS binary only, no OPFS mirroring (fastest)
-- `mode: 'opfs'` — Pure OPFS files, no VFS binary (most resilient)
-- New `OPFSEngine` implements all fs operations directly on OPFS files
-
-**Automatic corruption fallback**
-- Hybrid mode auto-falls back to OPFS mode on VFS corruption
-- `await fs.init()` rejects with descriptive error while system works in OPFS mode
-- `fs.mode` getter reflects current mode (changes to `'opfs'` on fallback)
-
-**Runtime mode switching**
-- `await fs.setMode('hybrid' | 'vfs' | 'opfs')` for switching modes at runtime
-- IDE workflow: corruption → OPFS fallback → repair → `setMode('hybrid')`
-
-**Corruption detection improvements**
-- `rebuildIndex()` validates every inode: type, path bounds, data block range, path format
-- Fixed `format()` not persisting `pathTableUsed` after root inode creation
-
-**Repair safety**
-- Dedicated repair worker with `createSyncAccessHandle` — no RAM bloat
-- Original `.vfs.bin` is never deleted until replacement is verified via re-mount
-- Copy-then-delete swap: crash mid-copy leaves `.vfs.bin.tmp` intact for retry
-- `loadFromOPFS` builds in temp file first — original untouched until verified
-- Strict UTF-8 decoding for recovered paths and symlink targets (rejects invalid sequences)
-- `contentLost` flag on repair entries distinguishes empty files from files with lost data
-- Repair aborts after 5 critical `mkdir` failures (fail-fast threshold)
-- Orphaned `.vfs.bin.tmp` files cleaned up automatically on repair entry
-
-### v3.0.9 (2026)
-
-**Improvements:**
-- `unpackToOPFS`, `loadFromOPFS`, and `repairVFS` now accept an optional `fs` parameter (a running `VFSFileSystem` instance) so they work from any tab — leader or follower — without stopping the VFS
-- When `fs` is not provided, falls back to direct `.vfs.bin` access via VFSEngine (requires VFS to be stopped or a Worker context)
-- `repairVFS` with a running instance uses OPFS as source of truth: rebuilds VFS from OPFS, then syncs back for full consistency
-
-### v3.0.8 (2026)
-
-**Improvements:**
-- Add VFS helper functions: `unpackToOPFS`, `loadFromOPFS`, and `repairVFS` for VFS maintenance, migration, and recovery
-- Helpers work in both Worker (sync access handle) and main thread (in-memory buffer + async writable) contexts
-- Remove redundant I/O call in `unpackToOPFS` directory creation
-
-### v3.0.7 (2026)
-
-**Fixes:**
-- Fix `fs.watch()` path matching for root `/` watchers — watching `/` now correctly matches all child paths instead of missing them due to an off-by-one boundary check
-
-### v3.0.6 (2026)
-
-**Performance:**
-- Bulk-read inode + path tables during mount — 2 I/O calls instead of 10,000+, dramatically faster initialization for large VFS files
-- All active inodes pre-populated in cache on mount (no cold-read penalty for first operations)
-
-**Fixes:**
-- `.vfs.bin` now auto-shrinks: trailing free blocks are trimmed on every commit, reclaiming disk space when files are deleted
-- Minimum of 1024 data blocks (4MB) retained to avoid excessive re-growth on small create/delete cycles
-
-### v3.0.5 (2026)
-
-**Fixes:**
-- Scope the internal service worker by default so it won't collide with the host application's own service worker
-- Remove unnecessary `clients.claim()` from the service worker — it only acts as a MessagePort broker and never needs to control pages
-- Namespace leader lock, BroadcastChannel, and SW scope by `root` so multiple `VFSFileSystem` instances with different roots don't collide
-- Add `swScope` config option for custom service worker scope override
-- Singleton registry: multiple `new VFSFileSystem()` calls with the same root return the same instance (no duplicate workers)
-- Namespace `vfs-watch` BroadcastChannel by root so watch events don't leak between different roots
-
-### v3.0.4 (2026)
-
-**Features:**
-- Add `unpackToOPFS(root?)` — export all VFS contents to real OPFS files
-- Add `loadFromOPFS(root?)` — rebuild VFS from real OPFS files (deletes and recreates `.vfs.bin`)
-- Add `repairVFS(root?)` — scan corrupt VFS binary for recoverable inodes and rebuild a clean VFS
-- Add `VFSEngine.exportAll()` for extracting all files/dirs/symlinks with their data
-
-**Bug Fixes:**
-- VFS corruption detection on init — validates magic, version, block size, inode count, section offsets, file size, and root directory existence
-- Release sync access handle on init failure (previously leaked, blocking re-acquisition)
-
-### v3.0.3 (2026)
-
-**Features:**
-- Implement `fs.watch()`, `fs.watchFile()`, `fs.unwatchFile()`, and `promises.watch()` as Node.js-compatible polyfills
-- Watch events propagate across all tabs via `BroadcastChannel`
-- `fs.watch()` supports `recursive` option and `AbortSignal` for cleanup
-- `fs.watchFile()` supports stat-based polling with configurable `interval` (default 5007ms per Node.js)
-- `promises.watch()` returns an async iterable of watch events
-
-**Internal:**
-- Leader broadcasts `{ eventType, path }` on every successful VFS mutation (no new opcodes or protocol changes)
-- Mutation tracking now runs unconditionally (previously gated on `opfsSync`)
-
-### v3.0.2 (2026)
-
-**Bug Fixes:**
-- Fix symlink resolution when resolved target path contains intermediate symlinks — `resolvePath` now falls back to component-by-component resolution instead of failing on direct lookup
-- Add ELOOP depth tracking to `resolvePathComponents` to prevent infinite recursion on circular symlinks
-- Mirror symlinks to OPFS as regular files (OPFS has no symlink concept) — reads through the symlink and writes the target's content
-
-### v3.0.1 (2026)
-
-**Bug Fixes:**
-- Fix empty files (e.g. `.gitkeep`) not being mirrored to OPFS — both the sync-relay (skipped sending empty data) and opfs-sync worker (skipped writing 0-byte files) now handle empty files correctly
-
-**Benchmark:**
-- Add memfs (in-memory) to the benchmark suite for comparison
-
-### v3.0.0 (2026)
-
-**Complete architecture rewrite — VFS binary format with SharedArrayBuffer.**
-
-**New Architecture:**
-- VFS binary format — all data stored in a single `.vfs.bin` file (Superblock → Inode Table → Path Table → Bitmap → Data Region)
-- SharedArrayBuffer + Atomics for true zero-overhead synchronous operations
-- Multi-tab leader/follower architecture with automatic failover via `navigator.locks` + Service Worker
-- Bidirectional OPFS sync — VFS mutations mirrored to real OPFS files, external changes synced back via `FileSystemObserver`
-- Workers inlined as blob URLs at build time (zero config, no external worker files)
-- Echo suppression for OPFS sync (prevents infinite sync loops)
-
-**Performance:**
-- 9-28x faster reads vs LightningFS
-- 2.8-4x faster writes vs LightningFS
-- 2.8-10x faster batch operations vs LightningFS
-- Fire-and-forget OPFS sync — zero impact on hot path
-
-**Breaking Changes:**
-- New API: `new VFSFileSystem(config)` instead of default `fs` singleton
-- `createFS(config)` and `getDefaultFS()` helpers available
-- Requires `crossOriginIsolated` for sync API (async API works everywhere)
-- Complete internal rewrite — not backwards compatible with v2 internals
-
-### v2.0.0 (2025)
-
-Major rewrite with sync API support via OPFS sync access handles and performance tiers.
-
-### v1.0.0 (2024)
-
-Initial release — async-only OPFS filesystem with `fs.promises` API.
-
 ## Contributing
 
 ```bash
 git clone https://github.com/componentor/fs
 cd fs
 npm install
-npm run build       # Build the library
-npm test            # Run unit tests (107 tests)
-npm run benchmark:open  # Run benchmarks in browser
+npm run build           # Build the library
+npm test                # Run the unit suite (700+ tests)
+npm run benchmark:open  # Run benchmarks in a real browser
 ```
+
+Cross-browser correctness and OPFS-mirror end-to-end specs run under Playwright in `tests/benchmark/*.spec.ts` (Chromium, Firefox, WebKit).
 
 ## License
 
