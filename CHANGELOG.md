@@ -1,5 +1,10 @@
 # Changelog
 
+## 3.2.4
+
+- Tighten the symlink→target alias tracking added in 3.2.3 so it no longer leaks entries. The map was forward-only (target → links), so a link removed by `unlink`, moved by `rename`, or replaced by a re-created symlink left a stale entry that accumulated over a long session. Added a reverse map (link → target) and routed all mutations through `registerLink`/`deregisterLink`, which keep both maps consistent and prune a target's set once it empties. A single `unlink` deregisters in O(1); a recursive `rmdir` or a directory `rename` deregisters every link under the prefix (`collectKeysUnder`), and a `rename` re-registers the moved links at their new paths so they keep tracking their target. Stale entries no longer accumulate
+- Tests: unit tests for `registerLink`/`deregisterLink` (no-leak/prune-on-empty/move-on-recreate) and `collectKeysUnder` (exact + strict-descendant matching); the `opfs-mirror-symlink` E2E spec gained a case that renames a symlink and confirms it still re-syncs when its target is later rewritten
+
 ## 3.2.3
 
 Two more OPFS-mirror divergence bugs found while auditing the mirroring path (separate from the 3.2.1/3.2.2 rename family). Neither touches the read/write hot path — the changes are confined to the symlink and external-change branches.

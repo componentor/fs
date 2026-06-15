@@ -15,7 +15,15 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { VFSEngine } from '../src/vfs/engine.js';
-import { planRenameMirror, planPendingReroutes, resolveLinkTarget, type OpfsSyncMessage } from '../src/workers/opfs-sync-plan.js';
+import {
+  planRenameMirror,
+  planPendingReroutes,
+  resolveLinkTarget,
+  registerLink,
+  deregisterLink,
+  collectKeysUnder,
+  type OpfsSyncMessage,
+} from '../src/workers/opfs-sync-plan.js';
 
 // Minimal in-memory sync access handle (same shape used by the other engine tests).
 class MockSyncHandle {
@@ -178,5 +186,61 @@ describe('resolveLinkTarget', () => {
 
   it('resolves a relative target for a link at the root', () => {
     expect(resolveLinkTarget('/link', 't')).toBe('/t');
+  });
+});
+
+describe('symlink alias bookkeeping (registerLink / deregisterLink)', () => {
+  let forward: Map<string, Set<string>>;
+  let reverse: Map<string, string>;
+  beforeEach(() => { forward = new Map(); reverse = new Map(); });
+
+  it('registers a link under its target and reverse-maps it', () => {
+    registerLink(forward, reverse, '/link', '/target');
+    expect([...forward.get('/target')!]).toEqual(['/link']);
+    expect(reverse.get('/link')).toBe('/target');
+  });
+
+  it('deregister fully removes the link and prunes an emptied target set (no leak)', () => {
+    registerLink(forward, reverse, '/link', '/target');
+    deregisterLink(forward, reverse, '/link');
+    expect(reverse.has('/link')).toBe(false);
+    expect(forward.has('/target')).toBe(false); // set emptied → key pruned
+  });
+
+  it('keeps other links when one of several under the same target is removed', () => {
+    registerLink(forward, reverse, '/a', '/target');
+    registerLink(forward, reverse, '/b', '/target');
+    deregisterLink(forward, reverse, '/a');
+    expect([...forward.get('/target')!]).toEqual(['/b']);
+    expect(reverse.has('/a')).toBe(false);
+  });
+
+  it('re-registering a link to a new target moves it (clears the old mapping)', () => {
+    registerLink(forward, reverse, '/link', '/old');
+    registerLink(forward, reverse, '/link', '/new');
+    expect(forward.has('/old')).toBe(false);            // old target pruned
+    expect([...forward.get('/new')!]).toEqual(['/link']);
+    expect(reverse.get('/link')).toBe('/new');
+  });
+
+  it('deregister is a no-op for an unknown link', () => {
+    registerLink(forward, reverse, '/link', '/target');
+    deregisterLink(forward, reverse, '/missing');
+    expect([...forward.get('/target')!]).toEqual(['/link']);
+  });
+});
+
+describe('collectKeysUnder', () => {
+  it('matches the exact path and strict descendants, not sibling prefixes', () => {
+    const keys = ['/d', '/d/a', '/d/sub/b', '/d2/x', '/other'];
+    expect(collectKeysUnder(keys, '/d').sort()).toEqual(['/d', '/d/a', '/d/sub/b']);
+  });
+
+  it('matches a single exact key (unlinked link)', () => {
+    expect(collectKeysUnder(['/link', '/link2'], '/link')).toEqual(['/link']);
+  });
+
+  it('returns nothing when no key is under the dir', () => {
+    expect(collectKeysUnder(['/a', '/b'], '/c')).toEqual([]);
   });
 });

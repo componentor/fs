@@ -128,3 +128,51 @@ export function resolveLinkTarget(linkPath: string, rawTarget: string): string {
   const dir = slash <= 0 ? '/' : linkPath.slice(0, slash);
   return normalizeAbs(dir + '/' + rawTarget);
 }
+
+// ---- Symlink alias bookkeeping (target ⇄ link reverse-mapped, no leaks) ----
+//
+// `forward` maps a resolved target path → the set of link paths pointing at it
+// (used to re-mirror links when the target is written). `reverse` maps each link
+// path → its target, so a link can be cleanly removed from `forward` when it is
+// unlinked, renamed, or recreated — without it, stale link entries would
+// accumulate. The two are kept consistent only through these helpers.
+
+/** Add (or move) a link→target mapping, first clearing any prior mapping for the link. */
+export function registerLink(
+  forward: Map<string, Set<string>>,
+  reverse: Map<string, string>,
+  linkPath: string,
+  resolvedTarget: string,
+): void {
+  deregisterLink(forward, reverse, linkPath);
+  reverse.set(linkPath, resolvedTarget);
+  let set = forward.get(resolvedTarget);
+  if (!set) { set = new Set(); forward.set(resolvedTarget, set); }
+  set.add(linkPath);
+}
+
+/** Remove a link's mapping from both maps, dropping the target's set when it empties. */
+export function deregisterLink(
+  forward: Map<string, Set<string>>,
+  reverse: Map<string, string>,
+  linkPath: string,
+): void {
+  const target = reverse.get(linkPath);
+  if (target === undefined) return;
+  reverse.delete(linkPath);
+  const set = forward.get(target);
+  if (set) {
+    set.delete(linkPath);
+    if (set.size === 0) forward.delete(target);
+  }
+}
+
+/** Keys equal to `dir` or strictly under `dir + '/'` — the link paths a remove/rename of `dir` affects. */
+export function collectKeysUnder(keys: Iterable<string>, dir: string): string[] {
+  const prefix = dir.endsWith('/') ? dir : dir + '/';
+  const out: string[] = [];
+  for (const k of keys) {
+    if (k === dir || k.startsWith(prefix)) out.push(k);
+  }
+  return out;
+}

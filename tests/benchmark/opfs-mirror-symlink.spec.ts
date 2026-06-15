@@ -91,7 +91,19 @@ test.describe('OPFS mirror — symlinks', () => {
       fs.writeFileSync('/pkg/not-yet.js', enc.encode('now-exists'));
       const danglingHealed = await waitMirror('pkg/dangling.js', 'now-exists', 8000);
 
-      return { env, linkInitial, linkUpdated, relInitial, relUpdated, danglingPlaceholder, danglingHealed };
+      // --- 4) renaming a symlink keeps the alias tracking its target ---
+      fs.writeFileSync('/pkg/mv-target.js', enc.encode('mv-1'));
+      fs.symlinkSync('/pkg/mv-target.js', '/pkg/mv-link.js');
+      const mvInitial = await waitMirror('pkg/mv-link.js', 'mv-1', 8000);
+      fs.renameSync('/pkg/mv-link.js', '/pkg/mv-link-renamed.js');
+      const mvRenamed = await waitMirror('pkg/mv-link-renamed.js', 'mv-1', 8000);
+      fs.writeFileSync('/pkg/mv-target.js', enc.encode('mv-2'));
+      const mvTracksAfterRename = await waitMirror('pkg/mv-link-renamed.js', 'mv-2', 8000);
+
+      return {
+        env, linkInitial, linkUpdated, relInitial, relUpdated,
+        danglingPlaceholder, danglingHealed, mvInitial, mvRenamed, mvTracksAfterRename,
+      };
     });
 
     console.log('symlink report:', JSON.stringify(report, null, 2));
@@ -103,6 +115,9 @@ test.describe('OPFS mirror — symlinks', () => {
     expect(report.relUpdated.ok, `relative link must track update: ${report.relUpdated.last}`).toBe(true);
     expect(report.danglingPlaceholder.ok, `dangling link must be mirrored: ${report.danglingPlaceholder.last}`).toBe(true);
     expect(report.danglingHealed.ok, `dangling link must heal once target appears: ${report.danglingHealed.last}`).toBe(true);
+    expect(report.mvInitial.ok, `renamed link initial: ${report.mvInitial.last}`).toBe(true);
+    expect(report.mvRenamed.ok, `link content present at the renamed path: ${report.mvRenamed.last}`).toBe(true);
+    expect(report.mvTracksAfterRename.ok, `renamed link must still track its target: ${report.mvTracksAfterRename.last}`).toBe(true);
     expect(consoleErrors, `no console errors:\n${consoleErrors.join('\n')}`).toEqual([]);
   });
 });

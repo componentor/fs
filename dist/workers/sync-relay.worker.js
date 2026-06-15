@@ -2898,6 +2898,34 @@ function resolveLinkTarget(linkPath, rawTarget) {
   const dir = slash <= 0 ? "/" : linkPath.slice(0, slash);
   return normalizeAbs(dir + "/" + rawTarget);
 }
+function registerLink(forward, reverse, linkPath, resolvedTarget) {
+  deregisterLink(forward, reverse, linkPath);
+  reverse.set(linkPath, resolvedTarget);
+  let set = forward.get(resolvedTarget);
+  if (!set) {
+    set = /* @__PURE__ */ new Set();
+    forward.set(resolvedTarget, set);
+  }
+  set.add(linkPath);
+}
+function deregisterLink(forward, reverse, linkPath) {
+  const target = reverse.get(linkPath);
+  if (target === void 0) return;
+  reverse.delete(linkPath);
+  const set = forward.get(target);
+  if (set) {
+    set.delete(linkPath);
+    if (set.size === 0) forward.delete(target);
+  }
+}
+function collectKeysUnder(keys, dir) {
+  const prefix = dir.endsWith("/") ? dir : dir + "/";
+  const out = [];
+  for (const k of keys) {
+    if (k === dir || k.startsWith(prefix)) out.push(k);
+  }
+  return out;
+}
 
 // src/workers/sync-relay.worker.ts
 self.addEventListener("error", (e) => {
@@ -4078,6 +4106,13 @@ function broadcastWatch(op, path, newPath) {
 var pendingPathSyncs = /* @__PURE__ */ new Map();
 var SYNC_DEBOUNCE_MS = 50;
 var symlinkTargets = /* @__PURE__ */ new Map();
+var linkToTarget = /* @__PURE__ */ new Map();
+function registerSymlink(linkPath) {
+  const raw = engine.readlink(linkPath);
+  if (raw.status !== 0 || !raw.data) return;
+  const target = resolveLinkTarget(linkPath, new TextDecoder().decode(raw.data));
+  registerLink(symlinkTargets, linkToTarget, linkPath, target);
+}
 function flushPathSync(path) {
   pendingPathSyncs.delete(path);
   if (!opfsSyncPort) return;
@@ -4124,16 +4159,7 @@ function notifyOPFSSync(op, path, newPath) {
       break;
     }
     case OP.SYMLINK: {
-      const rawTarget = engine.readlink(path);
-      if (rawTarget.status === 0 && rawTarget.data) {
-        const target = resolveLinkTarget(path, new TextDecoder().decode(rawTarget.data));
-        let set = symlinkTargets.get(target);
-        if (!set) {
-          set = /* @__PURE__ */ new Set();
-          symlinkTargets.set(target, set);
-        }
-        set.add(path);
-      }
+      registerSymlink(path);
       schedulePathSync(path);
       break;
     }
@@ -4143,6 +4169,13 @@ function notifyOPFSSync(op, path, newPath) {
       if (pending) {
         clearTimeout(pending);
         pendingPathSyncs.delete(path);
+      }
+      if (op === OP.RMDIR) {
+        for (const link of collectKeysUnder(linkToTarget.keys(), path)) {
+          deregisterLink(symlinkTargets, linkToTarget, link);
+        }
+      } else {
+        deregisterLink(symlinkTargets, linkToTarget, path);
       }
       opfsSyncPort.postMessage({ op: "delete", path, ts });
       break;
@@ -4170,6 +4203,10 @@ function notifyOPFSSync(op, path, newPath) {
             pendingPathSyncs.delete(from);
           }
           schedulePathSync(to);
+        }
+        for (const oldLink of collectKeysUnder(linkToTarget.keys(), path)) {
+          deregisterLink(symlinkTargets, linkToTarget, oldLink);
+          registerSymlink(oldLink === path ? newPath : newPath + oldLink.slice(path.length));
         }
         const plan = planRenameMirror(engine, path, newPath, ts);
         for (const msg of plan.messages) {

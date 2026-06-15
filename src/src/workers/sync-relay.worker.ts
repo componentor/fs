@@ -25,7 +25,7 @@ import { OPFSEngine } from '../opfs-engine.js';
 import { SAB_OFFSETS, SIGNAL, OP, STATUS, decodeRequest, decodeSecondPath, encodeResponse } from '../protocol/opcodes.js';
 import { FollowerForwarder } from '../protocol/follower-forward.js';
 import { waitWhile, SAB_WAIT_DEADLINE_MS } from '../protocol/sab-wait.js';
-import { planRenameMirror, planPendingReroutes, resolveLinkTarget } from './opfs-sync-plan.js';
+import { planRenameMirror, planPendingReroutes, resolveLinkTarget, registerLink, deregisterLink, collectKeysUnder } from './opfs-sync-plan.js';
 
 // A silent worker death is the worst failure mode this architecture has —
 // the heartbeat keeps ticking while every request hangs. Surface everything.
@@ -1530,9 +1530,20 @@ const SYNC_DEBOUNCE_MS = 50;
 // `engine.read`). That snapshot goes stale when the target is later rewritten,
 // because a write notifies the *target's* path, not the link's. Track which
 // link paths resolve to each target path so a target write also re-mirrors its
-// links. Keyed by resolved absolute target. Entries for removed links leak
-// benignly — a stale link just triggers one extra flush that reads ENOENT.
+// links. `symlinkTargets` (target → links) drives re-sync; `linkToTarget` is the
+// reverse map that lets a link be cleanly removed when it is unlinked, renamed,
+// or recreated, so no stale entries accumulate. Mutate both only via
+// registerLink/deregisterLink to keep them consistent.
 const symlinkTargets = new Map<string, Set<string>>();
+const linkToTarget = new Map<string, string>();
+
+/** Register `linkPath` against its current target (reads the link from the engine). */
+function registerSymlink(linkPath: string): void {
+  const raw = engine.readlink(linkPath);
+  if (raw.status !== 0 || !raw.data) return;
+  const target = resolveLinkTarget(linkPath, new TextDecoder().decode(raw.data));
+  registerLink(symlinkTargets, linkToTarget, linkPath, target);
+}
 
 function flushPathSync(path: string): void {
   pendingPathSyncs.delete(path);
@@ -1601,13 +1612,7 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
       // content. Route through the same debounced flusher so this also
       // benefits from coalescing if the symlink target is being actively
       // written in the same burst.
-      const rawTarget = engine.readlink(path);
-      if (rawTarget.status === 0 && rawTarget.data) {
-        const target = resolveLinkTarget(path, new TextDecoder().decode(rawTarget.data));
-        let set = symlinkTargets.get(target);
-        if (!set) { set = new Set(); symlinkTargets.set(target, set); }
-        set.add(path);
-      }
+      registerSymlink(path);
       schedulePathSync(path);
       break;
     }
@@ -1617,6 +1622,15 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
       // longer exists, we'd just fail the read.
       const pending = pendingPathSyncs.get(path);
       if (pending) { clearTimeout(pending); pendingPathSyncs.delete(path); }
+      // Drop symlink aliases this removal invalidates: a single unlinked link
+      // (O(1)), or every link under a recursively-removed directory.
+      if (op === OP.RMDIR) {
+        for (const link of collectKeysUnder(linkToTarget.keys(), path)) {
+          deregisterLink(symlinkTargets, linkToTarget, link);
+        }
+      } else {
+        deregisterLink(symlinkTargets, linkToTarget, path);
+      }
       opfsSyncPort.postMessage({ op: 'delete', path, ts });
       break;
     }
@@ -1643,6 +1657,13 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
           const t = pendingPathSyncs.get(from);
           if (t) { clearTimeout(t); pendingPathSyncs.delete(from); }
           schedulePathSync(to);
+        }
+        // Re-key symlink aliases the rename moved (the link itself, or any link
+        // under a renamed directory): drop the old mapping and re-register at the
+        // new path, where `engine.readlink` now resolves the moved link.
+        for (const oldLink of collectKeysUnder(linkToTarget.keys(), path)) {
+          deregisterLink(symlinkTargets, linkToTarget, oldLink);
+          registerSymlink(oldLink === path ? newPath : newPath + oldLink.slice(path.length));
         }
         // Atomic-write pattern: apps write a temp file then rename(temp → final).
         // The temp is frequently created AND renamed within the write-debounce
