@@ -2672,6 +2672,7 @@ var VFSFileSystem = class {
       strictPermissions: config.strictPermissions ?? false,
       sabSize: config.sabSize ?? DEFAULT_SAB_SIZE,
       debug: config.debug ?? false,
+      forceSpin: config.forceSpin,
       swUrl: config.swUrl,
       swScope: config.swScope,
       swBridge: config.swBridge,
@@ -2790,6 +2791,7 @@ var VFSFileSystem = class {
         umask: this.config.umask,
         strictPermissions: this.config.strictPermissions,
         debug: this.config.debug,
+        forceSpin: this.config.forceSpin,
         limits: this.config.limits
       }
     });

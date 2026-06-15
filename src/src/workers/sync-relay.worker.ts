@@ -114,8 +114,12 @@ const portQueue: Array<{ port: MessagePort; tabId: string; id: string; buffer: A
 // (`self.__fs_force_spin`) lets the embedding app A/B test without a rebuild.
 const _relayUa = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
 const IS_WEBKIT = /AppleWebKit/.test(_relayUa) && !/Chrome|Chromium|Android|Edg|OPR/.test(_relayUa);
+// Embedding-app override from the init config (`VFSConfig.forceSpin`). The
+// runtime global `self.__fs_force_spin` takes precedence over both, so a value
+// can still be flipped live in the console; then the config; then UA auto-detect.
+let _forceSpinConfig: boolean | undefined = undefined;
 function spinningNeeded(): boolean {
-  const forced = (self as any).__fs_force_spin;
+  const forced = (self as any).__fs_force_spin ?? _forceSpinConfig;
   return forced === undefined ? IS_WEBKIT : !!forced;
 }
 
@@ -1403,9 +1407,11 @@ async function initEngine(config: {
   umask: number;
   strictPermissions: boolean;
   debug?: boolean;
+  forceSpin?: boolean;
   limits?: Partial<ResolvedLimits>;
 }): Promise<void> {
   debug = config.debug ?? false;
+  _forceSpinConfig = config.forceSpin;
   activeLimits = resolveLimits(config.limits);
 
   // Navigate to configured OPFS root

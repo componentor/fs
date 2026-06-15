@@ -2972,8 +2972,9 @@ var clientPorts = /* @__PURE__ */ new Map();
 var portQueue = [];
 var _relayUa = typeof navigator !== "undefined" && navigator.userAgent || "";
 var IS_WEBKIT = /AppleWebKit/.test(_relayUa) && !/Chrome|Chromium|Android|Edg|OPR/.test(_relayUa);
+var _forceSpinConfig = void 0;
 function spinningNeeded() {
-  const forced = self.__fs_force_spin;
+  const forced = self.__fs_force_spin ?? _forceSpinConfig;
   return forced === void 0 ? IS_WEBKIT : !!forced;
 }
 var yieldChannel = new MessageChannel();
@@ -4016,6 +4017,7 @@ function quickValidateVFS(handle, fileSize, limits) {
 }
 async function initEngine(config) {
   debug = config.debug ?? false;
+  _forceSpinConfig = config.forceSpin;
   activeLimits = resolveLimits(config.limits);
   let rootDir = await navigator.storage.getDirectory();
   if (config.root && config.root !== "/") {

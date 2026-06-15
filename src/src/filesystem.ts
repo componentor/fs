@@ -176,7 +176,7 @@ export class VFSFileSystem {
 
 
   // Config (definite assignment — always set when constructor doesn't return singleton)
-  private config!: Omit<Required<VFSConfig>, 'opfsSyncRoot' | 'swUrl' | 'swScope' | 'mode' | 'limits' | 'swBridge'> & { opfsSyncRoot?: string; swUrl?: string; swScope?: string; swBridge?: MessagePort; limits?: VFSConfig['limits'] };
+  private config!: Omit<Required<VFSConfig>, 'opfsSyncRoot' | 'swUrl' | 'swScope' | 'mode' | 'limits' | 'swBridge' | 'forceSpin'> & { opfsSyncRoot?: string; swUrl?: string; swScope?: string; swBridge?: MessagePort; limits?: VFSConfig['limits']; forceSpin?: boolean };
   private tabId!: string;
   private _mode!: FSMode;
   private corruptionError: Error | null = null;
@@ -226,6 +226,7 @@ export class VFSFileSystem {
       strictPermissions: config.strictPermissions ?? false,
       sabSize: config.sabSize ?? DEFAULT_SAB_SIZE,
       debug: config.debug ?? false,
+      forceSpin: config.forceSpin,
       swUrl: config.swUrl,
       swScope: config.swScope,
       swBridge: config.swBridge,
@@ -372,6 +373,7 @@ export class VFSFileSystem {
         umask: this.config.umask,
         strictPermissions: this.config.strictPermissions,
         debug: this.config.debug,
+        forceSpin: this.config.forceSpin,
         limits: this.config.limits,
       },
     });

@@ -303,6 +303,13 @@ interface VFSConfig {
     strictPermissions?: boolean;
     sabSize?: number;
     debug?: boolean;
+    /** Override the relay worker's `IS_WEBKIT` auto-detection for the three
+     *  WebKit-only dispatch-loop workarounds (busy-poll spin, starvation-timer
+     *  yield, 5ms-sliced response wait). `undefined` = auto (spin only on WebKit);
+     *  `true`/`false` force them on/off — for A/B testing the sync hot path on a
+     *  given device without a rebuild. Mirrors the `self.__fs_force_spin` runtime
+     *  escape hatch, but settable from the embedding app's config. */
+    forceSpin?: boolean;
     /** URL of the service worker script. Defaults to `'./workers/service.worker.js'`
      *  relative to `import.meta.url`. Override when the library is bundled and the
      *  default relative URL no longer resolves to the correct location. */
