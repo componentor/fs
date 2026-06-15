@@ -149,6 +149,19 @@ The mirror is the main performance knob. It persists every change a second time 
 
 A good rule of thumb: use `vfs` for pure app storage, `hybrid` when real OPFS visibility matters. You can switch at runtime with `setMode()`.
 
+#### Sync-relay spinning (WebKit-gated)
+
+The sync-relay leader loop carries three latency workarounds — a post-response busy-poll spin, a starvation-timer race in its event-loop yield, and a sliced response-consume wait — that exist **only** to defeat WebKit/Safari's lost cross-thread `Atomics.notify` and its main-thread-brokered `MessagePort` delivery (a sync caller busy-spinning the page's main thread starves both). On Chromium and Firefox those wakes are reliable, so the workarounds are pure overhead; on a core-constrained device (e.g. an Android phone — few cores, big.LITTLE, thermal/background-thread throttling) the relay worker's spinning can contend for a CPU with the spinning leader thread and slow every op.
+
+Since **3.2.8** the spinning is gated to WebKit by user-agent detection, so Chromium/Firefox (desktop *and* mobile) take a quiet park-on-`Atomics.wait` path automatically — no configuration needed. A runtime escape hatch lets you override the detection for A/B testing, set **inside the sync-relay worker scope** before it begins dispatching:
+
+```js
+// In the sync-relay worker (e.g. injected at worker bootstrap):
+self.__fs_force_spin = false; // force the quiet path (skip all spinning)
+self.__fs_force_spin = true;  // force the WebKit spinning path everywhere
+// unset (default) → auto-detect: spin only on WebKit
+```
+
 #### Corruption Fallback
 
 In `hybrid` mode, if VFS corruption is detected during initialization, the filesystem automatically falls back to `opfs` mode. The `init()` call rejects with an error describing the corruption, but all filesystem operations continue working via OPFS:
