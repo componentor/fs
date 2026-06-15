@@ -93,7 +93,10 @@ const fs = new VFSFileSystem({
   umask: 0o022,           // File creation mask (default: 0o022)
   strictPermissions: false, // Enforce Unix permissions (default: false)
   sabSize: 4194304,       // SharedArrayBuffer size in bytes (default: 4MB)
-  debug: false,           // Enable debug logging (default: false)
+  debug: false,           // Per-op timing logs (caller roundTrip + relay handleRequest) (default: false)
+  forceSpin: undefined,   // Override the WebKit-only sync workarounds (spin/yield/slice + pre-grow).
+                          // undefined = auto (on only for WebKit); true/false force on/off — an
+                          // A/B escape hatch. You should not need this; see "Performance" below.
   swUrl: undefined,       // URL of the service worker script (default: auto-resolved)
   swScope: undefined,     // Custom service worker scope (default: auto-scoped per root)
   swBridge: undefined,    // MessagePort to a main-thread service-worker bridge, for
@@ -700,6 +703,21 @@ Multi-tab (via Service Worker + navigator.locks):
 The sync API needs `SharedArrayBuffer`, which requires a `crossOriginIsolated` page (COOP/COEP headers — see above). The async API (`fs.promises.*`) works everywhere without those headers. (Firefox needs 114+ for the module workers this library uses — enabled by default since then; older 111–113 required the `dom.workers.modules.enabled` flag.)
 
 \* Safari supports the sync API for single-tab and leader tabs. In multi-tab mode, a *follower* tab can only do sync I/O when its instance runs inside a worker — a main-thread follower on Safari is a fundamental WebKit limitation. See [Multi-Tab Sync on Safari](#multi-tab-sync-on-safari-worker-hosted-instances) and [SAFARI-SYNC-LIMITATIONS.md](./SAFARI-SYNC-LIMITATIONS.md).
+
+**Works out of the box — no per-browser tuning.** The library auto-detects the engine and only enables WebKit-specific workarounds on WebKit; everywhere else it takes the fast path. You don't set any flags for this. See Performance below for what those workarounds are and the one override (`forceSpin`) if you ever need it.
+
+## Performance
+
+The sync hot path is a `SharedArrayBuffer` request/response to a relay worker that owns the OPFS handle. On **Chromium, Firefox and (importantly) mobile Chrome/Android** the library runs the lean path: a parked `Atomics.wait`, and **on-demand file growth**. On **WebKit/Safari** it additionally enables a set of workarounds for one underlying fact — *MessagePort delivery and size-changing OPFS calls (`truncate` / extending `write`) are brokered through the page's main thread, which a spinning sync caller blocks.* Those WebKit-only workarounds are:
+
+- **Dispatch-loop tweaks** — a post-response busy-poll, a starvation-timer yield, and a 5 ms-sliced response wait (defeat WebKit's lost cross-thread `Atomics.notify`).
+- **Idle/init pre-growth** — a 64 MB free-tail headroom grown at idle, so writes never have to grow *in-request* (which would deadlock against the spinning caller on WebKit).
+
+All of these are **gated behind a UA check (`IS_WEBKIT`) and run only on WebKit.** On Chromium/Gecko they are pure overhead — and on core-constrained mobile (few cores, big.LITTLE, slow flash) the pre-growth `truncate` in particular noticeably stalled the dispatch loop, so leaving it on everywhere regressed Android sync throughput badly (≈10×). Gating it restores full speed on Android while keeping Safari correct.
+
+**Override:** `forceSpin: true | false` (or the runtime global `self.__fs_force_spin` in the relay worker) forces all of the above on or off regardless of UA — purely for A/B testing on a specific device. Default (`undefined`) is auto, which is what you want.
+
+**Mode and write cost:** the OPFS **mirror** (`mode: 'hybrid'`, the default) writes every change to real OPFS files for interop; it's the main *write*-cost knob (reads are unaffected). If nothing reads the real OPFS files directly, `mode: 'vfs'` skips the mirror for the fastest writes. See [Filesystem Modes](#filesystem-modes).
 
 ## Troubleshooting
 

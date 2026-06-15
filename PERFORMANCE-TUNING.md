@@ -5,10 +5,18 @@ throughput, what each one does, and **why** it exists. It is the companion to th
 embedding app's own tuning layer (in the webcontainer: `src/shell/exec/fs-tuning.ts`)
 — keep the two in lockstep.
 
+> **Status: the Android regression is FIXED in 3.2.10.** Root cause: idle/init
+> **pre-growth** (`maybePreGrow`, added 3.1.0) — a WebKit-only deadlock workaround
+> — ran on every engine, and its forced 64 MB OPFS `truncate` stalled the dispatch
+> loop on mobile flash. 3.2.10 gates it behind the same `IS_WEBKIT` check the other
+> WebKit workarounds use, so Chromium/Firefox/Android grow on demand (fast) and
+> Safari keeps pre-growth. **No config needed — it just works out of the box.** The
+> knobs below remain as overrides / reference.
+
 Context for why this matters: sync FS was **very fast on Chrome/Android before
 3.1.0**, then regressed to slow on mobile while staying fast on every desktop
-browser. The knobs below exist so a consumer can reproduce the old behavior and
-A/B each suspect *on the device*, then settle on the best fit.
+browser (root-caused above). The knobs below let a consumer reproduce old
+behavior and A/B each suspect *on the device*.
 
 ---
 
