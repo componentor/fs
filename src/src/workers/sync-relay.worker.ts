@@ -382,9 +382,26 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
       break;
     }
 
-    case OP.OPEN:
+    case OP.OPEN: {
+      // open() mutates the VFS in two cases that must be mirrored: O_TRUNC
+      // empties an existing file, and O_CREAT of a missing path creates one
+      // (e.g. `open(p,'w')`+close as a touch, or createWriteStream opened and
+      // closed before any chunk). Neither emits a WRITE/TRUNCATE op, so without
+      // this the OPFS mirror keeps stale bytes (O_TRUNC) or lacks the file
+      // entirely (O_CREAT). A plain read-open, or O_CREAT of an already-present
+      // file (no content change), must not re-mirror — the cheap exists()
+      // pre-check (only for O_CREAT-without-O_TRUNC) avoids re-reading a large
+      // append-mode file on every open.
+      const willCreate = (flags & 64) !== 0;   // O_CREAT
+      const willTrunc = (flags & 512) !== 0;    // O_TRUNC
+      const existedBefore = willCreate && !willTrunc ? engine.exists(path).data?.[0] === 1 : false;
       result = engine.open(path, flags, reqTabId);
+      if (result.status === 0 && (willTrunc || (willCreate && !existedBefore))) {
+        syncOp = OP.WRITE;
+        syncPath = path;
+      }
       break;
+    }
 
     case OP.CLOSE: {
       const fd = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
@@ -1570,6 +1587,11 @@ function flushPathSync(path: string): void {
     } else {
       opfsSyncPort.postMessage({ op: 'write', path, data: new ArrayBuffer(0), ts });
     }
+    // Cascade: if other symlinks point AT this path (e.g. chained links
+    // L1→L2→file), re-mirror them too. Only from the success branch — a
+    // dangling/cyclic link reads non-zero and returns above, so a symlink cycle
+    // can never reach here and loop.
+    resyncSymlinksFor(path);
   } catch { /* best effort — don't crash the relay on sync failures */ }
 }
 
@@ -1577,6 +1599,19 @@ function flushPathSync(path: string): void {
 function resyncSymlinksFor(path: string): void {
   const links = symlinkTargets.get(path);
   if (links) for (const link of links) schedulePathSync(link);
+}
+
+/**
+ * Re-mirror symlinks whose target is `path` OR a descendant of it — used when a
+ * target is removed or renamed away so the dependent links flush to their new
+ * (usually dangling → empty-placeholder) state. `path` alone covers a single
+ * unlinked file; the prefix scan covers a removed/renamed directory subtree.
+ */
+function resyncSymlinksUnder(path: string): void {
+  resyncSymlinksFor(path);
+  for (const target of collectKeysUnder(symlinkTargets.keys(), path)) {
+    if (target !== path) resyncSymlinksFor(target);
+  }
 }
 
 function schedulePathSync(path: string): void {
@@ -1632,6 +1667,10 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
         deregisterLink(symlinkTargets, linkToTarget, path);
       }
       opfsSyncPort.postMessage({ op: 'delete', path, ts });
+      // If the removed path was the TARGET of other symlinks, those links are
+      // now dangling — re-mirror them so their snapshot becomes the empty
+      // placeholder instead of keeping the deleted content.
+      resyncSymlinksUnder(path);
       break;
     }
     case OP.MKDIR:
@@ -1684,6 +1723,11 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
             opfsSyncPort.postMessage(msg);
           }
         }
+        // A symlink stores a LITERAL target, so renaming a target away does not
+        // repoint the links at it — they become dangling. Re-mirror any links
+        // whose target was `path` (or under it) so their snapshot becomes the
+        // empty placeholder rather than keeping the moved content.
+        resyncSymlinksUnder(path);
       }
       break;
   }

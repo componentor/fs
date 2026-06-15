@@ -22,6 +22,7 @@ import {
   registerLink,
   deregisterLink,
   collectKeysUnder,
+  coalesceWriteIndex,
   type OpfsSyncMessage,
 } from '../src/workers/opfs-sync-plan.js';
 
@@ -242,5 +243,38 @@ describe('collectKeysUnder', () => {
 
   it('returns nothing when no key is under the dir', () => {
     expect(collectKeysUnder(['/a', '/b'], '/c')).toEqual([]);
+  });
+});
+
+describe('coalesceWriteIndex', () => {
+  const W = (path: string) => ({ op: 'write', path });
+  const D = (path: string) => ({ op: 'delete', path });
+  const R = (path: string, newPath: string) => ({ op: 'rename', path, newPath });
+
+  it('coalesces onto a queued write for the same path', () => {
+    expect(coalesceWriteIndex([W('/f')], '/f')).toBe(0);
+    expect(coalesceWriteIndex([W('/a'), W('/f')], '/f')).toBe(1);
+    expect(coalesceWriteIndex([W('/f'), W('/a')], '/f')).toBe(0);
+  });
+
+  it('does NOT coalesce across an intervening delete of the same path (the data-loss bug)', () => {
+    // queue [write /f, delete /f] + write /f must append, not merge onto index 0,
+    // else execution becomes write,delete and the re-created file is lost.
+    expect(coalesceWriteIndex([W('/f'), D('/f')], '/f')).toBe(-1);
+  });
+
+  it('does NOT coalesce across an intervening rename touching the path', () => {
+    expect(coalesceWriteIndex([W('/f'), R('/f', '/g')], '/f')).toBe(-1); // /f renamed away
+    expect(coalesceWriteIndex([W('/g'), R('/x', '/g')], '/g')).toBe(-1); // /g is a rename destination
+  });
+
+  it('skips unrelated paths while scanning', () => {
+    expect(coalesceWriteIndex([W('/f'), D('/a'), W('/b')], '/f')).toBe(0);
+  });
+
+  it('returns -1 when there is no queued write for the path', () => {
+    expect(coalesceWriteIndex([], '/f')).toBe(-1);
+    expect(coalesceWriteIndex([D('/f')], '/f')).toBe(-1);
+    expect(coalesceWriteIndex([W('/a')], '/f')).toBe(-1);
   });
 });

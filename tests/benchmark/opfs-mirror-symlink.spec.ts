@@ -100,9 +100,27 @@ test.describe('OPFS mirror — symlinks', () => {
       fs.writeFileSync('/pkg/mv-target.js', enc.encode('mv-2'));
       const mvTracksAfterRename = await waitMirror('pkg/mv-link-renamed.js', 'mv-2', 8000);
 
+      // --- 5) deleting a link's TARGET re-mirrors the link to the empty
+      //        placeholder (was left holding stale deleted content) ---
+      fs.writeFileSync('/pkg/del-target.js', enc.encode('present'));
+      fs.symlinkSync('/pkg/del-target.js', '/pkg/del-link.js');
+      const delInitial = await waitMirror('pkg/del-link.js', 'present', 8000);
+      fs.unlinkSync('/pkg/del-target.js');
+      const delLinkPlaceholder = await waitMirror('pkg/del-link.js', '', 8000); // stale 'present' before the fix
+
+      // --- 6) chained symlinks: writing the deepest target updates ALL hops ---
+      fs.writeFileSync('/pkg/c-file.js', enc.encode('c-1'));
+      fs.symlinkSync('/pkg/c-file.js', '/pkg/c-mid.js');   // mid → file
+      fs.symlinkSync('/pkg/c-mid.js', '/pkg/c-outer.js');  // outer → mid → file
+      const chainInitial = await waitMirror('pkg/c-outer.js', 'c-1', 8000);
+      fs.writeFileSync('/pkg/c-file.js', enc.encode('c-2'));
+      const chainMidUpdated = await waitMirror('pkg/c-mid.js', 'c-2', 8000);
+      const chainOuterUpdated = await waitMirror('pkg/c-outer.js', 'c-2', 8000); // stale before the cascade fix
+
       return {
         env, linkInitial, linkUpdated, relInitial, relUpdated,
         danglingPlaceholder, danglingHealed, mvInitial, mvRenamed, mvTracksAfterRename,
+        delInitial, delLinkPlaceholder, chainInitial, chainMidUpdated, chainOuterUpdated,
       };
     });
 
@@ -118,6 +136,11 @@ test.describe('OPFS mirror — symlinks', () => {
     expect(report.mvInitial.ok, `renamed link initial: ${report.mvInitial.last}`).toBe(true);
     expect(report.mvRenamed.ok, `link content present at the renamed path: ${report.mvRenamed.last}`).toBe(true);
     expect(report.mvTracksAfterRename.ok, `renamed link must still track its target: ${report.mvTracksAfterRename.last}`).toBe(true);
+    expect(report.delInitial.ok, `deleted-target link initial: ${report.delInitial.last}`).toBe(true);
+    expect(report.delLinkPlaceholder.ok, `deleting a target must re-mirror the link as empty placeholder: ${report.delLinkPlaceholder.last}`).toBe(true);
+    expect(report.chainInitial.ok, `chained link initial: ${report.chainInitial.last}`).toBe(true);
+    expect(report.chainMidUpdated.ok, `chain mid hop updated: ${report.chainMidUpdated.last}`).toBe(true);
+    expect(report.chainOuterUpdated.ok, `chain outer hop must cascade-update: ${report.chainOuterUpdated.last}`).toBe(true);
     expect(consoleErrors, `no console errors:\n${consoleErrors.join('\n')}`).toEqual([]);
   });
 });

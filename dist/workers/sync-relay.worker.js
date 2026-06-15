@@ -3251,9 +3251,17 @@ function handleRequest(reqTabId, buffer) {
       }
       break;
     }
-    case OP.OPEN:
+    case OP.OPEN: {
+      const willCreate = (flags & 64) !== 0;
+      const willTrunc = (flags & 512) !== 0;
+      const existedBefore = willCreate && !willTrunc ? engine.exists(path).data?.[0] === 1 : false;
       result = engine.open(path, flags, reqTabId);
+      if (result.status === 0 && (willTrunc || willCreate && !existedBefore)) {
+        syncOp = OP.WRITE;
+        syncPath = path;
+      }
       break;
+    }
     case OP.CLOSE: {
       const fd = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
       result = engine.close(fd);
@@ -4131,12 +4139,19 @@ function flushPathSync(path) {
     } else {
       opfsSyncPort.postMessage({ op: "write", path, data: new ArrayBuffer(0), ts });
     }
+    resyncSymlinksFor(path);
   } catch {
   }
 }
 function resyncSymlinksFor(path) {
   const links = symlinkTargets.get(path);
   if (links) for (const link of links) schedulePathSync(link);
+}
+function resyncSymlinksUnder(path) {
+  resyncSymlinksFor(path);
+  for (const target of collectKeysUnder(symlinkTargets.keys(), path)) {
+    if (target !== path) resyncSymlinksFor(target);
+  }
 }
 function schedulePathSync(path) {
   const prev = pendingPathSyncs.get(path);
@@ -4178,6 +4193,7 @@ function notifyOPFSSync(op, path, newPath) {
         deregisterLink(symlinkTargets, linkToTarget, path);
       }
       opfsSyncPort.postMessage({ op: "delete", path, ts });
+      resyncSymlinksUnder(path);
       break;
     }
     case OP.MKDIR:
@@ -4216,6 +4232,7 @@ function notifyOPFSSync(op, path, newPath) {
             opfsSyncPort.postMessage(msg);
           }
         }
+        resyncSymlinksUnder(path);
       }
       break;
   }

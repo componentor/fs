@@ -1,3 +1,32 @@
+// src/workers/opfs-sync-plan.ts
+function normalizeAbs(p) {
+  if (!p.startsWith("/")) p = "/" + p;
+  if (p.length === 1) return p;
+  const out = [];
+  for (const part of p.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      out.pop();
+      continue;
+    }
+    out.push(part);
+  }
+  return "/" + out.join("/");
+}
+function coalesceWriteIndex(queue2, path) {
+  const np = normalizeAbs(path);
+  for (let i = queue2.length - 1; i >= 0; i--) {
+    const p = queue2[i];
+    if (normalizeAbs(p.path) !== np) {
+      if (p.op === "rename" && p.newPath && normalizeAbs(p.newPath) === np) return -1;
+      continue;
+    }
+    if (p.op === "write") return i;
+    return -1;
+  }
+  return -1;
+}
+
 // src/workers/opfs-sync.worker.ts
 var serverPort;
 var mirrorRoot;
@@ -68,18 +97,37 @@ function enqueue(event) {
     trackPending(event.newPath);
   }
   if (event.op === "write") {
-    for (let i = queue.length - 1; i >= 0; i--) {
-      const pending = queue[i];
-      if (pending.op === "write" && normalizePath(pending.path) === normalizePath(event.path)) {
-        pending.data = event.data;
-        pending.ts = event.ts;
-        return;
-      }
+    const idx = coalesceWriteIndex(queue, event.path);
+    if (idx !== -1) {
+      queue[idx].data = event.data;
+      queue[idx].ts = event.ts;
+      return;
     }
   }
   queue.push(event);
   if (!processing) processNext();
 }
+async function applyEvent(event) {
+  switch (event.op) {
+    case "write":
+      if (event.data) {
+        await writeToOPFS(event.path, event.data);
+      } else {
+        await writeToOPFS(event.path, new ArrayBuffer(0));
+      }
+      break;
+    case "delete":
+      await deleteFromOPFS(event.path);
+      break;
+    case "mkdir":
+      await mkdirInOPFS(event.path);
+      break;
+    case "rename":
+      await renameInOPFS(event.path, event.newPath);
+      break;
+  }
+}
+var MIRROR_MAX_ATTEMPTS = 4;
 async function processNext() {
   if (queue.length === 0) {
     processing = false;
@@ -87,27 +135,17 @@ async function processNext() {
   }
   processing = true;
   const event = queue.shift();
-  try {
-    switch (event.op) {
-      case "write":
-        if (event.data) {
-          await writeToOPFS(event.path, event.data);
-        } else {
-          await writeToOPFS(event.path, new ArrayBuffer(0));
-        }
+  for (let attempt = 1; attempt <= MIRROR_MAX_ATTEMPTS; attempt++) {
+    try {
+      await applyEvent(event);
+      break;
+    } catch (err) {
+      if (attempt === MIRROR_MAX_ATTEMPTS) {
+        console.warn("[opfs-sync] mirror failed after retries:", event.op, event.path, err);
         break;
-      case "delete":
-        await deleteFromOPFS(event.path);
-        break;
-      case "mkdir":
-        await mkdirInOPFS(event.path);
-        break;
-      case "rename":
-        await renameInOPFS(event.path, event.newPath);
-        break;
+      }
+      await new Promise((r) => setTimeout(r, 10 * attempt));
     }
-  } catch (err) {
-    console.warn("[opfs-sync] mirror failed:", event.op, event.path, err);
   }
   untrackPending(event.path);
   trackCompleted(event.path);

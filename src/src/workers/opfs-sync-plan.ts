@@ -167,6 +167,33 @@ export function deregisterLink(
   }
 }
 
+/**
+ * Decide whether a new 'write' for `path` may coalesce onto a still-queued write
+ * in the mirror worker, returning that queue index or -1 to append in order.
+ *
+ * Scans newest→oldest: coalesce only onto a write for the SAME path that has no
+ * intervening op for that path between it and the tail. If a delete/rename/mkdir
+ * for the path (or a rename whose destination is the path) is hit first,
+ * coalescing would reorder the write to BEFORE that op (e.g. write,delete,write
+ * → write,delete, losing the file), so append instead.
+ */
+export function coalesceWriteIndex(
+  queue: ReadonlyArray<{ op: string; path: string; newPath?: string }>,
+  path: string,
+): number {
+  const np = normalizeAbs(path);
+  for (let i = queue.length - 1; i >= 0; i--) {
+    const p = queue[i];
+    if (normalizeAbs(p.path) !== np) {
+      if (p.op === 'rename' && p.newPath && normalizeAbs(p.newPath) === np) return -1;
+      continue;
+    }
+    if (p.op === 'write') return i;
+    return -1;
+  }
+  return -1;
+}
+
 /** Keys equal to `dir` or strictly under `dir + '/'` — the link paths a remove/rename of `dir` affects. */
 export function collectKeysUnder(keys: Iterable<string>, dir: string): string[] {
   const prefix = dir.endsWith('/') ? dir : dir + '/';

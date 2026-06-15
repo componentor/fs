@@ -6,6 +6,8 @@
  * Uses FileSystemObserver to detect external OPFS changes and syncs them back.
  */
 
+import { coalesceWriteIndex } from './opfs-sync-plan.js';
+
 interface SyncEvent {
   op: 'write' | 'delete' | 'mkdir' | 'rename';
   path: string;
@@ -131,19 +133,50 @@ function enqueue(event: SyncEvent): void {
   // processNext (after its `queue.shift()`), so we only scan what's
   // still queued.
   if (event.op === 'write') {
-    for (let i = queue.length - 1; i >= 0; i--) {
-      const pending = queue[i];
-      if (pending.op === 'write' && normalizePath(pending.path) === normalizePath(event.path)) {
-        pending.data = event.data;
-        pending.ts = event.ts;
-        return;
-      }
+    // Coalesce onto a still-queued write for the same path — but only if no
+    // delete/rename/mkdir for it sits in between, which would otherwise reorder
+    // this write ahead of that op and lose the file (see coalesceWriteIndex).
+    const idx = coalesceWriteIndex(queue, event.path);
+    if (idx !== -1) {
+      queue[idx].data = event.data;
+      queue[idx].ts = event.ts;
+      return;
     }
   }
 
   queue.push(event);
   if (!processing) processNext();
 }
+
+async function applyEvent(event: SyncEvent): Promise<void> {
+  switch (event.op) {
+    case 'write':
+      if (event.data) {
+        await writeToOPFS(event.path, event.data);
+      } else {
+        // No data but file should still exist (empty file like .gitkeep)
+        await writeToOPFS(event.path, new ArrayBuffer(0));
+      }
+      break;
+    case 'delete':
+      await deleteFromOPFS(event.path);
+      break;
+    case 'mkdir':
+      await mkdirInOPFS(event.path);
+      break;
+    case 'rename':
+      await renameInOPFS(event.path, event.newPath!);
+      break;
+  }
+}
+
+// Transient OPFS failures (WebKit throws NoModificationAllowedError / NotFound
+// under sync-access-handle contention where Chromium never does — see the
+// coalescing note above) must NOT silently drop a mirror op, or the OPFS file
+// diverges permanently from the authoritative VFS. Retry before giving up;
+// writeToOPFS truncates first and delete/mkdir are idempotent, so re-applying
+// is safe. (renameInOPFS swallows its own errors and has its own retries.)
+const MIRROR_MAX_ATTEMPTS = 4;
 
 async function processNext(): Promise<void> {
   if (queue.length === 0) {
@@ -154,28 +187,17 @@ async function processNext(): Promise<void> {
 
   const event = queue.shift()!;
 
-  try {
-    switch (event.op) {
-      case 'write':
-        if (event.data) {
-          await writeToOPFS(event.path, event.data);
-        } else {
-          // No data but file should still exist (empty file like .gitkeep)
-          await writeToOPFS(event.path, new ArrayBuffer(0));
-        }
+  for (let attempt = 1; attempt <= MIRROR_MAX_ATTEMPTS; attempt++) {
+    try {
+      await applyEvent(event);
+      break;
+    } catch (err) {
+      if (attempt === MIRROR_MAX_ATTEMPTS) {
+        console.warn('[opfs-sync] mirror failed after retries:', event.op, event.path, err);
         break;
-      case 'delete':
-        await deleteFromOPFS(event.path);
-        break;
-      case 'mkdir':
-        await mkdirInOPFS(event.path);
-        break;
-      case 'rename':
-        await renameInOPFS(event.path, event.newPath!);
-        break;
+      }
+      await new Promise((r) => setTimeout(r, 10 * attempt));
     }
-  } catch (err) {
-    console.warn('[opfs-sync] mirror failed:', event.op, event.path, err);
   }
 
   // Move from pending → completed (starts grace window for delayed observer events)
