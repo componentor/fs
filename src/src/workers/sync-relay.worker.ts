@@ -25,7 +25,7 @@ import { OPFSEngine } from '../opfs-engine.js';
 import { SAB_OFFSETS, SIGNAL, OP, STATUS, decodeRequest, decodeSecondPath, encodeResponse } from '../protocol/opcodes.js';
 import { FollowerForwarder } from '../protocol/follower-forward.js';
 import { waitWhile, SAB_WAIT_DEADLINE_MS } from '../protocol/sab-wait.js';
-import { planRenameMirror, planPendingReroutes } from './opfs-sync-plan.js';
+import { planRenameMirror, planPendingReroutes, resolveLinkTarget } from './opfs-sync-plan.js';
 
 // A silent worker death is the worst failure mode this architecture has —
 // the heartbeat keeps ticking while every request hangs. Surface everything.
@@ -51,7 +51,6 @@ let leaderLoopRunning = false;
 // OPFS Sync Worker (leader mode only — mirrors VFS to real OPFS files)
 let opfsSyncPort: MessagePort | null = null;
 let opfsSyncEnabled = false;
-const suppressPaths = new Set<string>(); // break external→engine→notify loop
 
 // Watch broadcast (leader mode only — fires on every VFS mutation)
 let watchBc: BroadcastChannel | null = null;
@@ -1526,12 +1525,31 @@ function broadcastWatch(op: number, path: string, newPath?: string): void {
 const pendingPathSyncs = new Map<string, ReturnType<typeof setTimeout>>();
 const SYNC_DEBOUNCE_MS = 50;
 
+// Symlink → file aliasing. OPFS has no symlinks, so a symlink is mirrored as a
+// regular file holding its TARGET's content (a snapshot via the following
+// `engine.read`). That snapshot goes stale when the target is later rewritten,
+// because a write notifies the *target's* path, not the link's. Track which
+// link paths resolve to each target path so a target write also re-mirrors its
+// links. Keyed by resolved absolute target. Entries for removed links leak
+// benignly — a stale link just triggers one extra flush that reads ENOENT.
+const symlinkTargets = new Map<string, Set<string>>();
+
 function flushPathSync(path: string): void {
   pendingPathSyncs.delete(path);
   if (!opfsSyncPort) return;
   try {
     const result = engine.read(path);
-    if (result.status !== 0) return;
+    if (result.status !== 0) {
+      // A dangling symlink (link exists, target missing) reads ENOENT here but
+      // is NOT gone — `readlink` still returns its target. Mirror an empty
+      // placeholder so the link's existence isn't silently dropped; once the
+      // target appears, the alias re-sync fills in the real content. A truly
+      // absent path (deleted file) has no readlink and is correctly skipped.
+      if (engine.readlink(path).status === 0) {
+        opfsSyncPort.postMessage({ op: 'write', path, data: new ArrayBuffer(0), ts: Date.now() });
+      }
+      return;
+    }
     const ts = Date.now();
     if (result.data && result.data.byteLength > 0) {
       const buf = result.data.buffer.byteLength === result.data.byteLength
@@ -1544,6 +1562,12 @@ function flushPathSync(path: string): void {
   } catch { /* best effort — don't crash the relay on sync failures */ }
 }
 
+/** Re-mirror any symlinks whose target is `path` (e.g. after the target is written). */
+function resyncSymlinksFor(path: string): void {
+  const links = symlinkTargets.get(path);
+  if (links) for (const link of links) schedulePathSync(link);
+}
+
 function schedulePathSync(path: string): void {
   const prev = pendingPathSyncs.get(path);
   if (prev) clearTimeout(prev);
@@ -1552,10 +1576,6 @@ function schedulePathSync(path: string): void {
 
 function notifyOPFSSync(op: number, path: string, newPath?: string): void {
   if (!opfsSyncPort) return;
-  if (suppressPaths.has(path)) {
-    suppressPaths.delete(path);
-    return;
-  }
 
   const ts = Date.now();
 
@@ -1571,6 +1591,9 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
       // short idle period so large chunked writes don't cause N
       // full-file reads that exhaust the worker's heap.
       schedulePathSync(path);
+      // If this path is a symlink target, re-mirror the links pointing at it so
+      // their snapshot content doesn't go stale.
+      resyncSymlinksFor(path);
       break;
     }
     case OP.SYMLINK: {
@@ -1578,6 +1601,13 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
       // content. Route through the same debounced flusher so this also
       // benefits from coalescing if the symlink target is being actively
       // written in the same burst.
+      const rawTarget = engine.readlink(path);
+      if (rawTarget.status === 0 && rawTarget.data) {
+        const target = resolveLinkTarget(path, new TextDecoder().decode(rawTarget.data));
+        let set = symlinkTargets.get(target);
+        if (!set) { set = new Set(); symlinkTargets.set(target, set); }
+        set.add(path);
+      }
       schedulePathSync(path);
       break;
     }
@@ -1641,14 +1671,12 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
 function handleExternalChange(msg: { op: string; path: string; newPath?: string; data?: ArrayBuffer }): void {
   switch (msg.op) {
     case 'external-write': {
-      suppressPaths.add(msg.path);
       const result = engine.write(msg.path, new Uint8Array(msg.data!), 0);
       if (result.status === 0) broadcastWatch(OP.WRITE, msg.path);
       console.log('[sync-relay] external-write:', msg.path, `${msg.data?.byteLength ?? 0}B`, `status=${result.status}`);
       break;
     }
     case 'external-delete': {
-      suppressPaths.add(msg.path);
       const result = engine.unlink(msg.path);
       if (result.status !== 0) {
         const rmdirResult = engine.rmdir(msg.path, 1);
@@ -1661,9 +1689,7 @@ function handleExternalChange(msg: { op: string; path: string; newPath?: string;
       break;
     }
     case 'external-rename':
-      suppressPaths.add(msg.path);
       if (msg.newPath) {
-        suppressPaths.add(msg.newPath);
         const result = engine.rename(msg.path, msg.newPath);
         if (result.status === 0) broadcastWatch(OP.RENAME, msg.path, msg.newPath);
         console.log('[sync-relay] external-rename:', msg.path, '→', msg.newPath, `status=${result.status}`);

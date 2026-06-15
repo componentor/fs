@@ -2878,6 +2878,26 @@ function planPendingReroutes(pendingKeys, oldDir, newDir) {
   }
   return out;
 }
+function normalizeAbs(p) {
+  if (!p.startsWith("/")) p = "/" + p;
+  if (p.length === 1) return p;
+  const out = [];
+  for (const part of p.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      out.pop();
+      continue;
+    }
+    out.push(part);
+  }
+  return "/" + out.join("/");
+}
+function resolveLinkTarget(linkPath, rawTarget) {
+  if (rawTarget.startsWith("/")) return normalizeAbs(rawTarget);
+  const slash = linkPath.lastIndexOf("/");
+  const dir = slash <= 0 ? "/" : linkPath.slice(0, slash);
+  return normalizeAbs(dir + "/" + rawTarget);
+}
 
 // src/workers/sync-relay.worker.ts
 self.addEventListener("error", (e) => {
@@ -2896,7 +2916,6 @@ var debug = false;
 var leaderLoopRunning = false;
 var opfsSyncPort = null;
 var opfsSyncEnabled = false;
-var suppressPaths = /* @__PURE__ */ new Set();
 var watchBc = null;
 var sab;
 var ctrl;
@@ -4058,12 +4077,18 @@ function broadcastWatch(op, path, newPath) {
 }
 var pendingPathSyncs = /* @__PURE__ */ new Map();
 var SYNC_DEBOUNCE_MS = 50;
+var symlinkTargets = /* @__PURE__ */ new Map();
 function flushPathSync(path) {
   pendingPathSyncs.delete(path);
   if (!opfsSyncPort) return;
   try {
     const result = engine.read(path);
-    if (result.status !== 0) return;
+    if (result.status !== 0) {
+      if (engine.readlink(path).status === 0) {
+        opfsSyncPort.postMessage({ op: "write", path, data: new ArrayBuffer(0), ts: Date.now() });
+      }
+      return;
+    }
     const ts = Date.now();
     if (result.data && result.data.byteLength > 0) {
       const buf = result.data.buffer.byteLength === result.data.byteLength ? result.data.buffer : result.data.slice().buffer;
@@ -4074,6 +4099,10 @@ function flushPathSync(path) {
   } catch {
   }
 }
+function resyncSymlinksFor(path) {
+  const links = symlinkTargets.get(path);
+  if (links) for (const link of links) schedulePathSync(link);
+}
 function schedulePathSync(path) {
   const prev = pendingPathSyncs.get(path);
   if (prev) clearTimeout(prev);
@@ -4081,10 +4110,6 @@ function schedulePathSync(path) {
 }
 function notifyOPFSSync(op, path, newPath) {
   if (!opfsSyncPort) return;
-  if (suppressPaths.has(path)) {
-    suppressPaths.delete(path);
-    return;
-  }
   const ts = Date.now();
   switch (op) {
     case OP.WRITE:
@@ -4095,9 +4120,20 @@ function notifyOPFSSync(op, path, newPath) {
     case OP.COPY:
     case OP.LINK: {
       schedulePathSync(path);
+      resyncSymlinksFor(path);
       break;
     }
     case OP.SYMLINK: {
+      const rawTarget = engine.readlink(path);
+      if (rawTarget.status === 0 && rawTarget.data) {
+        const target = resolveLinkTarget(path, new TextDecoder().decode(rawTarget.data));
+        let set = symlinkTargets.get(target);
+        if (!set) {
+          set = /* @__PURE__ */ new Set();
+          symlinkTargets.set(target, set);
+        }
+        set.add(path);
+      }
       schedulePathSync(path);
       break;
     }
@@ -4150,14 +4186,12 @@ function notifyOPFSSync(op, path, newPath) {
 function handleExternalChange(msg) {
   switch (msg.op) {
     case "external-write": {
-      suppressPaths.add(msg.path);
       const result = engine.write(msg.path, new Uint8Array(msg.data), 0);
       if (result.status === 0) broadcastWatch(OP.WRITE, msg.path);
       console.log("[sync-relay] external-write:", msg.path, `${msg.data?.byteLength ?? 0}B`, `status=${result.status}`);
       break;
     }
     case "external-delete": {
-      suppressPaths.add(msg.path);
       const result = engine.unlink(msg.path);
       if (result.status !== 0) {
         const rmdirResult = engine.rmdir(msg.path, 1);
@@ -4170,9 +4204,7 @@ function handleExternalChange(msg) {
       break;
     }
     case "external-rename":
-      suppressPaths.add(msg.path);
       if (msg.newPath) {
-        suppressPaths.add(msg.newPath);
         const result = engine.rename(msg.path, msg.newPath);
         if (result.status === 0) broadcastWatch(OP.RENAME, msg.path, msg.newPath);
         console.log("[sync-relay] external-rename:", msg.path, "\u2192", msg.newPath, `status=${result.status}`);

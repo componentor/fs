@@ -15,7 +15,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { VFSEngine } from '../src/vfs/engine.js';
-import { planRenameMirror, planPendingReroutes, type OpfsSyncMessage } from '../src/workers/opfs-sync-plan.js';
+import { planRenameMirror, planPendingReroutes, resolveLinkTarget, type OpfsSyncMessage } from '../src/workers/opfs-sync-plan.js';
 
 // Minimal in-memory sync access handle (same shape used by the other engine tests).
 class MockSyncHandle {
@@ -160,5 +160,23 @@ describe('planPendingReroutes', () => {
     const pending = ['/dir/a.tmp', '/other.txt'];
 
     expect(planPendingReroutes(pending, '/dir/a.tmp', '/dir/a.txt')).toEqual([]);
+  });
+});
+
+describe('resolveLinkTarget', () => {
+  it('resolves a relative target against the link directory', () => {
+    expect(resolveLinkTarget('/dir/link', 'target.js')).toBe('/dir/target.js');
+    expect(resolveLinkTarget('/a/b/link', './x')).toBe('/a/b/x');
+    expect(resolveLinkTarget('/dir/link', '../shared/t')).toBe('/shared/t');
+    expect(resolveLinkTarget('/a/b/c/link', '../../t')).toBe('/a/t');
+  });
+
+  it('normalizes an absolute target as-is', () => {
+    expect(resolveLinkTarget('/dir/link', '/abs/t')).toBe('/abs/t');
+    expect(resolveLinkTarget('/dir/link', '/a/./b/../t')).toBe('/a/t');
+  });
+
+  it('resolves a relative target for a link at the root', () => {
+    expect(resolveLinkTarget('/link', 't')).toBe('/t');
   });
 });

@@ -99,3 +99,32 @@ export function planPendingReroutes(
   }
   return out;
 }
+
+/** Collapse `.`/`..`/`//` to an absolute path — matches VFSEngine.normalizePath. */
+function normalizeAbs(p: string): string {
+  if (!p.startsWith('/')) p = '/' + p;
+  if (p.length === 1) return p;
+  const out: string[] = [];
+  for (const part of p.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') { out.pop(); continue; }
+    out.push(part);
+  }
+  return '/' + out.join('/');
+}
+
+/**
+ * Resolve a symlink's raw target to the absolute VFS path it points at, so the
+ * relay can key a symlink→target alias and re-mirror the link when that target
+ * is later written. Mirrors the engine's normalization so the resolved key
+ * equals the `path` the engine reports when the target is mutated.
+ *
+ * Absolute targets are normalized as-is; relative targets resolve against the
+ * link's own directory (POSIX symlink semantics).
+ */
+export function resolveLinkTarget(linkPath: string, rawTarget: string): string {
+  if (rawTarget.startsWith('/')) return normalizeAbs(rawTarget);
+  const slash = linkPath.lastIndexOf('/');
+  const dir = slash <= 0 ? '/' : linkPath.slice(0, slash);
+  return normalizeAbs(dir + '/' + rawTarget);
+}
