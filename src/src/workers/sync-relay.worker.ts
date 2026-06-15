@@ -937,6 +937,16 @@ const PREGROW_QUIET_MS = 25;
 let lastRequestAt = 0;
 
 function preGrowIfQuiet(): void {
+  // Pre-growth exists ONLY to dodge WebKit's in-request growth deadlock: on
+  // WebKit a size-changing OPFS call (truncate / extending write) blocks until
+  // the page main thread returns to its event loop, which a spinning sync caller
+  // prevents — so growth must be done proactively at idle. On Chromium/Gecko
+  // there is NO such deadlock; in-request growth (allocateBlocks) is safe, so
+  // this proactive 64MB OPFS truncate is pure overhead — and on a core-
+  // constrained device (Android flash) it actively stalls the dispatch loop
+  // between ops. Gate it to the WebKit case, exactly like the three dispatch-loop
+  // workarounds (3.2.8). `forceSpin` / `self.__fs_force_spin` override.
+  if (!spinningNeeded()) return;
   try {
     if (Date.now() - lastRequestAt < PREGROW_QUIET_MS) return;
     if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST) return;
@@ -1485,10 +1495,14 @@ async function initEngine(config: {
   // thread is provably awaiting init (not spinning), so the size-changing
   // OPFS call is safe and fast. On WebKit, growth while a sync caller spins
   // deadlocks until the caller's stall guard aborts — see maybePreGrow.
-  try {
-    engine.maybePreGrow(true);
-  } catch (err) {
-    console.error('[sync-relay] init pre-grow failed:', (err as Error)?.message);
+  // WebKit-only: on Chromium/Gecko in-request growth is safe, so skip the
+  // one-time 64MB OPFS truncate (slow on mobile flash) and grow on demand.
+  if (spinningNeeded()) {
+    try {
+      engine.maybePreGrow(true);
+    } catch (err) {
+      console.error('[sync-relay] init pre-grow failed:', (err as Error)?.message);
+    }
   }
 
   // Watch broadcast channel — fires on every VFS mutation for fs.watch() support

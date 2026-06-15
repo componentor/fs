@@ -3732,6 +3732,7 @@ function writeResponse(targetSab, targetCtrl, responseData) {
 var PREGROW_QUIET_MS = 25;
 var lastRequestAt = 0;
 function preGrowIfQuiet() {
+  if (!spinningNeeded()) return;
   try {
     if (Date.now() - lastRequestAt < PREGROW_QUIET_MS) return;
     if (Atomics.load(ctrl, 0) === SIGNAL.REQUEST) return;
@@ -4073,10 +4074,12 @@ async function initEngine(config) {
       [mc.port2]
     );
   }
-  try {
-    engine.maybePreGrow(true);
-  } catch (err) {
-    console.error("[sync-relay] init pre-grow failed:", err?.message);
+  if (spinningNeeded()) {
+    try {
+      engine.maybePreGrow(true);
+    } catch (err) {
+      console.error("[sync-relay] init pre-grow failed:", err?.message);
+    }
   }
   watchBc = new BroadcastChannel(`${config.ns}-watch`);
 }
