@@ -15,7 +15,7 @@
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { VFSEngine } from '../src/vfs/engine.js';
-import { planRenameMirror, type OpfsSyncMessage } from '../src/workers/opfs-sync-plan.js';
+import { planRenameMirror, planPendingReroutes, type OpfsSyncMessage } from '../src/workers/opfs-sync-plan.js';
 
 // Minimal in-memory sync access handle (same shape used by the other engine tests).
 class MockSyncHandle {
@@ -124,5 +124,41 @@ describe('planRenameMirror', () => {
     expect(plan.messages).toEqual([
       { op: 'rename', path: '/gone', newPath: '/also-gone', ts: TS },
     ]);
+  });
+});
+
+describe('planPendingReroutes', () => {
+  it('re-keys pending child syncs from the old dir prefix to the new one', () => {
+    // The Vite case: deps_temp_X is populated then renamed to deps; recently
+    // written children are still pending when the directory rename fires.
+    const pending = [
+      '/app/.vite/deps_temp_abc/vue.js',
+      '/app/.vite/deps_temp_abc/sub/chunk.js',
+    ];
+
+    const reroutes = planPendingReroutes(pending, '/app/.vite/deps_temp_abc', '/app/.vite/deps');
+
+    expect(reroutes).toEqual([
+      { from: '/app/.vite/deps_temp_abc/vue.js', to: '/app/.vite/deps/vue.js' },
+      { from: '/app/.vite/deps_temp_abc/sub/chunk.js', to: '/app/.vite/deps/sub/chunk.js' },
+    ]);
+  });
+
+  it('only matches strict descendants — not the dir itself or sibling prefixes', () => {
+    const pending = [
+      '/d',            // the renamed dir's own key (never debounced, but guard anyway)
+      '/d2/x.js',      // sibling sharing a name prefix — must NOT match
+      '/d/a.js',       // genuine descendant
+    ];
+
+    const reroutes = planPendingReroutes(pending, '/d', '/e');
+
+    expect(reroutes).toEqual([{ from: '/d/a.js', to: '/e/a.js' }]);
+  });
+
+  it('returns nothing for a file rename (no descendants under path + "/")', () => {
+    const pending = ['/dir/a.tmp', '/other.txt'];
+
+    expect(planPendingReroutes(pending, '/dir/a.tmp', '/dir/a.txt')).toEqual([]);
   });
 });

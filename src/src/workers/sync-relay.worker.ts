@@ -25,7 +25,7 @@ import { OPFSEngine } from '../opfs-engine.js';
 import { SAB_OFFSETS, SIGNAL, OP, STATUS, decodeRequest, decodeSecondPath, encodeResponse } from '../protocol/opcodes.js';
 import { FollowerForwarder } from '../protocol/follower-forward.js';
 import { waitWhile, SAB_WAIT_DEADLINE_MS } from '../protocol/sab-wait.js';
-import { planRenameMirror } from './opfs-sync-plan.js';
+import { planRenameMirror, planPendingReroutes } from './opfs-sync-plan.js';
 
 // A silent worker death is the worst failure mode this architecture has —
 // the heartbeat keeps ticking while every request hangs. Surface everything.
@@ -1603,6 +1603,17 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
         if (pendingOld) { clearTimeout(pendingOld); pendingPathSyncs.delete(path); }
         const pendingNew = pendingPathSyncs.get(newPath);
         if (pendingNew) { clearTimeout(pendingNew); pendingPathSyncs.delete(newPath); }
+        // Directory rename: re-key any pending child syncs to the new location.
+        // `engine.rename` moves the whole subtree in one op, so a child written
+        // inside the debounce window now lives under `newPath` — a sync still
+        // keyed under the old prefix would read a vanished path and drop the
+        // child from the mirror. Reschedule under the new prefix so it flushes
+        // against its real location, landing after the rename op below.
+        for (const { from, to } of planPendingReroutes(pendingPathSyncs.keys(), path, newPath)) {
+          const t = pendingPathSyncs.get(from);
+          if (t) { clearTimeout(t); pendingPathSyncs.delete(from); }
+          schedulePathSync(to);
+        }
         // Atomic-write pattern: apps write a temp file then rename(temp → final).
         // The temp is frequently created AND renamed within the write-debounce
         // window (SYNC_DEBOUNCE_MS), so it was NEVER mirrored to OPFS —

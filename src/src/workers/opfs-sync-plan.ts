@@ -66,3 +66,36 @@ export function planRenameMirror(
   }
   return { messages: [{ op: 'rename', path, newPath, ts }], transfers: [] };
 }
+
+/**
+ * For a rename(oldDir → newDir), compute which pending debounced child syncs
+ * must be re-keyed to the new location.
+ *
+ * Pending syncs are keyed by absolute path. `engine.rename` of a directory
+ * moves every descendant to the new prefix in a single op, so a child sync
+ * still keyed under `oldDir` would, when it flushes, `engine.read` a path that
+ * no longer exists → silently drop the child's content from the OPFS mirror.
+ * (The directory itself is mirrored via `renameDirInOPFS`, which only moves
+ * files ALREADY in the mirror — a child written inside the debounce window
+ * isn't mirrored yet, so without rerouting it is lost entirely.)
+ *
+ * Only STRICT descendants are returned: a file rename (no `oldDir/` children)
+ * yields nothing, and the directory's own key is never scheduled (directories
+ * are never debounced). Rerouting to the new path lets the child flush against
+ * its real post-rename location, landing after the rename op in the mirror.
+ */
+export function planPendingReroutes(
+  pendingKeys: Iterable<string>,
+  oldDir: string,
+  newDir: string,
+): Array<{ from: string; to: string }> {
+  const prefix = oldDir.endsWith('/') ? oldDir : oldDir + '/';
+  const newPrefix = newDir.endsWith('/') ? newDir : newDir + '/';
+  const out: Array<{ from: string; to: string }> = [];
+  for (const key of pendingKeys) {
+    if (key.startsWith(prefix)) {
+      out.push({ from: key, to: newPrefix + key.slice(prefix.length) });
+    }
+  }
+  return out;
+}

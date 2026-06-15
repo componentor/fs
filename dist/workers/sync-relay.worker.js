@@ -2867,6 +2867,17 @@ function planRenameMirror(engine2, path, newPath, ts) {
   }
   return { messages: [{ op: "rename", path, newPath, ts }], transfers: [] };
 }
+function planPendingReroutes(pendingKeys, oldDir, newDir) {
+  const prefix = oldDir.endsWith("/") ? oldDir : oldDir + "/";
+  const newPrefix = newDir.endsWith("/") ? newDir : newDir + "/";
+  const out = [];
+  for (const key of pendingKeys) {
+    if (key.startsWith(prefix)) {
+      out.push({ from: key, to: newPrefix + key.slice(prefix.length) });
+    }
+  }
+  return out;
+}
 
 // src/workers/sync-relay.worker.ts
 self.addEventListener("error", (e) => {
@@ -4115,6 +4126,14 @@ function notifyOPFSSync(op, path, newPath) {
         if (pendingNew) {
           clearTimeout(pendingNew);
           pendingPathSyncs.delete(newPath);
+        }
+        for (const { from, to } of planPendingReroutes(pendingPathSyncs.keys(), path, newPath)) {
+          const t = pendingPathSyncs.get(from);
+          if (t) {
+            clearTimeout(t);
+            pendingPathSyncs.delete(from);
+          }
+          schedulePathSync(to);
         }
         const plan = planRenameMirror(engine, path, newPath, ts);
         for (const msg of plan.messages) {
