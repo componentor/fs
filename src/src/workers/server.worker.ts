@@ -319,7 +319,15 @@ function setupClientPort(tabId: string, port: MessagePort): void {
     const { buffer, id } = e.data;
 
     if (buffer instanceof ArrayBuffer) {
-      const response = handleRequest(tabId, buffer);
+      let response: ArrayBuffer;
+      try {
+        response = handleRequest(tabId, buffer);
+      } catch (err) {
+        // An engine op threw (e.g. ENOSPC when the volume is full). Degrade to
+        // an EIO response rather than rejecting and hanging the awaiting client.
+        console.error('[server.worker] handleRequest threw:', (err as Error)?.message);
+        response = encodeResponse(11, undefined); // EIO
+      }
       port.postMessage({ id, buffer: response }, [response]);
     }
   };

@@ -571,14 +571,16 @@ var S_IFMT = 61440;
 var MAX_SYMLINK_DEPTH = 40;
 var INITIAL_PATH_TABLE_SIZE = 256 * 1024;
 var INITIAL_DATA_BLOCKS = 1024;
-function calculateLayout(inodeCount = DEFAULT_INODE_COUNT, blockSize = DEFAULT_BLOCK_SIZE, totalBlocks = INITIAL_DATA_BLOCKS) {
+var MAX_DATA_BLOCKS = 4e6;
+function calculateLayout(inodeCount = DEFAULT_INODE_COUNT, blockSize = DEFAULT_BLOCK_SIZE, totalBlocks = INITIAL_DATA_BLOCKS, maxBlocks = MAX_DATA_BLOCKS) {
   const inodeTableOffset = SUPERBLOCK.SIZE;
   const inodeTableSize = inodeCount * INODE_SIZE;
   const pathTableOffset = inodeTableOffset + inodeTableSize;
   const pathTableSize = INITIAL_PATH_TABLE_SIZE;
   const bitmapOffset = pathTableOffset + pathTableSize;
+  const bitmapRegionSize = Math.ceil(maxBlocks / 8);
   const bitmapSize = Math.ceil(totalBlocks / 8);
-  const dataOffset = Math.ceil((bitmapOffset + bitmapSize) / blockSize) * blockSize;
+  const dataOffset = Math.ceil((bitmapOffset + bitmapRegionSize) / blockSize) * blockSize;
   const totalSize = dataOffset + totalBlocks * blockSize;
   return {
     inodeTableOffset,
@@ -587,6 +589,7 @@ function calculateLayout(inodeCount = DEFAULT_INODE_COUNT, blockSize = DEFAULT_B
     pathTableSize,
     bitmapOffset,
     bitmapSize,
+    bitmapRegionSize,
     dataOffset,
     totalSize,
     totalBlocks
@@ -4452,7 +4455,11 @@ var VFSEngine = class {
   childIndexGen = 0;
   // Configurable upper bounds
   maxInodes = 4e6;
-  maxBlocks = 4e6;
+  // Default ceiling on data blocks. The on-disk bitmap region is reserved for
+  // this many blocks at format time (see calculateLayout), so the effective
+  // limit and the reserved bitmap capacity stay in lock-step. Sourced from the
+  // shared layout constant so both agree.
+  maxBlocks = MAX_DATA_BLOCKS;
   maxPathTable = 256 * 1024 * 1024;
   // 256MB
   maxVFSSize = 100 * 1024 * 1024 * 1024;
@@ -4492,7 +4499,7 @@ var VFSEngine = class {
   }
   /** Format a fresh VFS */
   format() {
-    const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
+    const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS, this.maxBlocks);
     this.inodeCount = DEFAULT_INODE_COUNT;
     this.blockSize = DEFAULT_BLOCK_SIZE;
     this.totalBlocks = layout.totalBlocks;
@@ -4580,6 +4587,9 @@ var VFSEngine = class {
     }
     if (dataOffset <= bitmapOffset) {
       throw new Error(`Corrupt VFS: data offset ${dataOffset} must be after bitmap ${bitmapOffset}`);
+    }
+    if (totalBlocks > (dataOffset - bitmapOffset) * 8) {
+      throw new Error(`Corrupt VFS: total blocks (${totalBlocks}) exceed bitmap region capacity (${(dataOffset - bitmapOffset) * 8})`);
     }
     const pathTableSize = bitmapOffset - pathTableOffset;
     if (pathUsed > pathTableSize) {
@@ -4710,8 +4720,9 @@ var VFSEngine = class {
     this.lastPreGrowCheck = now;
     const trailingFree = this.totalBlocks - (this.findLastUsedBlock() + 1);
     if (trailingFree >= PREGROW_HEADROOM_BLOCKS) return false;
+    const hardCap = Math.min(this.maxBlocks, this.bitmapCapacityBlocks());
     const wanted = Math.ceil((PREGROW_HEADROOM_BLOCKS - trailingFree) / 8) * 8;
-    const addedBlocks = Math.min(wanted, this.maxBlocks - this.totalBlocks);
+    const addedBlocks = Math.min(wanted, hardCap - this.totalBlocks);
     if (addedBlocks <= 0) return false;
     const newTotal = this.totalBlocks + addedBlocks;
     this.handle.truncate(this.dataOffset + newTotal * this.blockSize);
@@ -4934,9 +4945,22 @@ var VFSEngine = class {
     }
     return this.growAndAllocate(count);
   }
+  /** Highest block count the reserved on-disk bitmap region can represent.
+   *  The bitmap lives in [bitmapOffset, dataOffset); each byte covers 8 blocks.
+   *  Growing past this would write bitmap bytes into the data region (silent
+   *  corruption) — the bug fixed by reserving the region for maxBlocks at
+   *  format. This is the authoritative ceiling for any layout, new or legacy. */
+  bitmapCapacityBlocks() {
+    return (this.dataOffset - this.bitmapOffset) * 8;
+  }
   growAndAllocate(count) {
     const oldTotal = this.totalBlocks;
-    const newTotal = Math.max(oldTotal * 2, oldTotal + count);
+    const hardCap = Math.min(this.maxBlocks, this.bitmapCapacityBlocks());
+    let newTotal = Math.max(oldTotal * 2, oldTotal + count);
+    if (newTotal > hardCap) newTotal = hardCap;
+    if (newTotal < oldTotal + count) {
+      throw new Error(`ENOSPC: cannot allocate ${count} blocks (total ${oldTotal}, ceiling ${hardCap})`);
+    }
     const addedBlocks = newTotal - oldTotal;
     const newFileSize = this.dataOffset + newTotal * this.blockSize;
     this.handle.truncate(newFileSize);

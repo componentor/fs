@@ -10,7 +10,7 @@ import {
   VFS_MAGIC, VFS_VERSION, SUPERBLOCK, INODE, INODE_SIZE, INODE_TYPE,
   DEFAULT_BLOCK_SIZE, DEFAULT_INODE_COUNT, DEFAULT_FILE_MODE, DEFAULT_DIR_MODE,
   DEFAULT_SYMLINK_MODE, DEFAULT_UMASK, S_IFMT, S_IFREG, S_IFDIR, S_IFLNK,
-  MAX_SYMLINK_DEPTH, INITIAL_DATA_BLOCKS, INITIAL_PATH_TABLE_SIZE,
+  MAX_SYMLINK_DEPTH, INITIAL_DATA_BLOCKS, INITIAL_PATH_TABLE_SIZE, MAX_DATA_BLOCKS,
   calculateLayout,
 } from './layout.js';
 import { crc32 } from './crc32.js';
@@ -139,7 +139,11 @@ export class VFSEngine {
 
   // Configurable upper bounds
   private maxInodes = 4_000_000;
-  private maxBlocks = 4_000_000;
+  // Default ceiling on data blocks. The on-disk bitmap region is reserved for
+  // this many blocks at format time (see calculateLayout), so the effective
+  // limit and the reserved bitmap capacity stay in lock-step. Sourced from the
+  // shared layout constant so both agree.
+  private maxBlocks = MAX_DATA_BLOCKS;
   private maxPathTable = 256 * 1024 * 1024; // 256MB
   private maxVFSSize = 100 * 1024 * 1024 * 1024; // 100GB
 
@@ -192,7 +196,9 @@ export class VFSEngine {
 
   /** Format a fresh VFS */
   private format(): void {
-    const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS);
+    // Reserve the bitmap region for `this.maxBlocks` (honors opts.limits.maxBlocks)
+    // so the bitmap never overflows into the data region as the FS grows.
+    const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS, this.maxBlocks);
 
     this.inodeCount = DEFAULT_INODE_COUNT;
     this.blockSize = DEFAULT_BLOCK_SIZE;
@@ -318,6 +324,13 @@ export class VFSEngine {
     }
     if (dataOffset <= bitmapOffset) {
       throw new Error(`Corrupt VFS: data offset ${dataOffset} must be after bitmap ${bitmapOffset}`);
+    }
+    // The bitmap [bitmapOffset, dataOffset) must be able to represent every
+    // block. If totalBlocks exceeds the region's capacity the on-disk bitmap
+    // overlaps file data (the pre-fix overflow bug) — the bitmap we're about to
+    // read is partly garbage, so fail the mount rather than trust it.
+    if (totalBlocks > (dataOffset - bitmapOffset) * 8) {
+      throw new Error(`Corrupt VFS: total blocks (${totalBlocks}) exceed bitmap region capacity (${(dataOffset - bitmapOffset) * 8})`);
     }
     const pathTableSize = bitmapOffset - pathTableOffset;
     if (pathUsed > pathTableSize) {
@@ -479,9 +492,11 @@ export class VFSEngine {
     const trailingFree = this.totalBlocks - (this.findLastUsedBlock() + 1);
     if (trailingFree >= PREGROW_HEADROOM_BLOCKS) return false;
 
-    // Round to whole bitmap bytes; respect the configured block ceiling.
+    // Round to whole bitmap bytes; respect both the configured block ceiling
+    // and the reserved bitmap-region capacity (never grow the bitmap into data).
+    const hardCap = Math.min(this.maxBlocks, this.bitmapCapacityBlocks());
     const wanted = Math.ceil((PREGROW_HEADROOM_BLOCKS - trailingFree) / 8) * 8;
-    const addedBlocks = Math.min(wanted, this.maxBlocks - this.totalBlocks);
+    const addedBlocks = Math.min(wanted, hardCap - this.totalBlocks);
     if (addedBlocks <= 0) return false;
 
     const newTotal = this.totalBlocks + addedBlocks;
@@ -774,10 +789,26 @@ export class VFSEngine {
     return this.growAndAllocate(count);
   }
 
+  /** Highest block count the reserved on-disk bitmap region can represent.
+   *  The bitmap lives in [bitmapOffset, dataOffset); each byte covers 8 blocks.
+   *  Growing past this would write bitmap bytes into the data region (silent
+   *  corruption) — the bug fixed by reserving the region for maxBlocks at
+   *  format. This is the authoritative ceiling for any layout, new or legacy. */
+  private bitmapCapacityBlocks(): number {
+    return (this.dataOffset - this.bitmapOffset) * 8;
+  }
+
   private growAndAllocate(count: number): number {
     const oldTotal = this.totalBlocks;
-    // Grow by at least doubling or enough for the request
-    const newTotal = Math.max(oldTotal * 2, oldTotal + count);
+    // Never grow past the reserved bitmap region or the configured ceiling —
+    // either would push the bitmap into file data. If even the clamped total
+    // can't fit the request, the volume is genuinely full.
+    const hardCap = Math.min(this.maxBlocks, this.bitmapCapacityBlocks());
+    let newTotal = Math.max(oldTotal * 2, oldTotal + count);
+    if (newTotal > hardCap) newTotal = hardCap;
+    if (newTotal < oldTotal + count) {
+      throw new Error(`ENOSPC: cannot allocate ${count} blocks (total ${oldTotal}, ceiling ${hardCap})`);
+    }
     const addedBlocks = newTotal - oldTotal;
 
     // Grow the file

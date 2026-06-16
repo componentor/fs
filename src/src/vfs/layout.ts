@@ -83,18 +83,39 @@ export const INITIAL_PATH_TABLE_SIZE = 256 * 1024;
 // Initial data blocks (1024 blocks = 4MB with 4KB blocks)
 export const INITIAL_DATA_BLOCKS = 1024;
 
+// Maximum data blocks the VFS can ever grow to. The free-block bitmap region is
+// reserved for THIS many blocks at format time so the bitmap can never overflow
+// into the data region as `totalBlocks` grows (4_000_000 blocks ≈ 16 GB with 4 KB
+// blocks; the reserved bitmap is ceil(4_000_000 / 8) = 500 KB). Must match the
+// engine's default `maxBlocks`.
+export const MAX_DATA_BLOCKS = 4_000_000;
+
 /**
  * Calculate section offsets for a fresh VFS.
+ *
+ * `maxBlocks` sizes the *reserved* bitmap region (so the bitmap never grows past
+ * `dataOffset` and collides with file data), while `totalBlocks` sizes the
+ * initial in-memory bitmap and the initial file length. They are intentionally
+ * decoupled: the region is reserved for the maximum, the file starts small.
  */
-export function calculateLayout(inodeCount: number = DEFAULT_INODE_COUNT, blockSize: number = DEFAULT_BLOCK_SIZE, totalBlocks: number = INITIAL_DATA_BLOCKS) {
+export function calculateLayout(
+  inodeCount: number = DEFAULT_INODE_COUNT,
+  blockSize: number = DEFAULT_BLOCK_SIZE,
+  totalBlocks: number = INITIAL_DATA_BLOCKS,
+  maxBlocks: number = MAX_DATA_BLOCKS,
+) {
   const inodeTableOffset = SUPERBLOCK.SIZE;
   const inodeTableSize = inodeCount * INODE_SIZE;
   const pathTableOffset = inodeTableOffset + inodeTableSize;
   const pathTableSize = INITIAL_PATH_TABLE_SIZE;
   const bitmapOffset = pathTableOffset + pathTableSize;
-  const bitmapSize = Math.ceil(totalBlocks / 8);
-  // Align data region to block boundary
-  const dataOffset = Math.ceil((bitmapOffset + bitmapSize) / blockSize) * blockSize;
+  // Reserve the bitmap region for the MAXIMUM block count, not the initial one.
+  // The data region begins after the full reservation, so growing `totalBlocks`
+  // (allocateBlocks / maybePreGrow) never pushes the bitmap into file data.
+  const bitmapRegionSize = Math.ceil(maxBlocks / 8);
+  const bitmapSize = Math.ceil(totalBlocks / 8); // currently-used portion
+  // Align data region to block boundary, after the full reserved bitmap region.
+  const dataOffset = Math.ceil((bitmapOffset + bitmapRegionSize) / blockSize) * blockSize;
   const totalSize = dataOffset + totalBlocks * blockSize;
 
   return {
@@ -104,6 +125,7 @@ export function calculateLayout(inodeCount: number = DEFAULT_INODE_COUNT, blockS
     pathTableSize,
     bitmapOffset,
     bitmapSize,
+    bitmapRegionSize,
     dataOffset,
     totalSize,
     totalBlocks,
