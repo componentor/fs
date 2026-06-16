@@ -4993,13 +4993,31 @@ var VFSEngine = class {
     const newCount = oldCount * 2;
     const growth = (newCount - oldCount) * INODE_SIZE;
     const afterInodeOffset = this.inodeTableOffset + oldCount * INODE_SIZE;
-    const afterSize = this.handle.getSize() - afterInodeOffset;
-    const afterBuf = new Uint8Array(afterSize);
-    this.handle.read(afterBuf, { at: afterInodeOffset });
-    this.handle.truncate(this.handle.getSize() + growth);
-    this.handle.write(afterBuf, { at: afterInodeOffset + growth });
-    const zeroes = new Uint8Array(growth);
-    this.handle.write(zeroes, { at: afterInodeOffset });
+    const totalSize = this.handle.getSize();
+    const afterSize = totalSize - afterInodeOffset;
+    this.handle.truncate(totalSize + growth);
+    const SHIFT_CHUNK = 8 * 1024 * 1024;
+    if (afterSize > 0) {
+      const buf = new Uint8Array(Math.min(SHIFT_CHUNK, afterSize));
+      let remaining = afterSize;
+      while (remaining > 0) {
+        const n = Math.min(SHIFT_CHUNK, remaining);
+        const srcAt = afterInodeOffset + remaining - n;
+        const view = n === buf.length ? buf : buf.subarray(0, n);
+        this.handle.read(view, { at: srcAt });
+        this.handle.write(view, { at: srcAt + growth });
+        remaining -= n;
+      }
+    }
+    const zChunk = new Uint8Array(Math.min(SHIFT_CHUNK, growth));
+    let zRemaining = growth;
+    let zOffset = afterInodeOffset;
+    while (zRemaining > 0) {
+      const n = Math.min(SHIFT_CHUNK, zRemaining);
+      this.handle.write(n === zChunk.length ? zChunk : zChunk.subarray(0, n), { at: zOffset });
+      zOffset += n;
+      zRemaining -= n;
+    }
     this.pathTableOffset += growth;
     this.bitmapOffset += growth;
     this.dataOffset += growth;

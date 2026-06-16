@@ -855,21 +855,46 @@ export class VFSEngine {
     const newCount = oldCount * 2;
     const growth = (newCount - oldCount) * INODE_SIZE;
 
-    // Read everything after inode table
     const afterInodeOffset = this.inodeTableOffset + oldCount * INODE_SIZE;
-    const afterSize = this.handle.getSize() - afterInodeOffset;
-    const afterBuf = new Uint8Array(afterSize);
-    this.handle.read(afterBuf, { at: afterInodeOffset });
+    const totalSize = this.handle.getSize();
+    const afterSize = totalSize - afterInodeOffset;
 
-    // Grow file
-    this.handle.truncate(this.handle.getSize() + growth);
+    // Grow the file first.
+    this.handle.truncate(totalSize + growth);
 
-    // Write back shifted content
-    this.handle.write(afterBuf, { at: afterInodeOffset + growth });
+    // Shift the region after the inode table (path table + bitmap + ALL DATA)
+    // RIGHT by `growth`, in CHUNKS scanned from the END backward. A single
+    // `new Uint8Array(afterSize)` buffers the entire data region — hundreds of MB
+    // for a large bundle (e.g. the Telegram AppDir) — and throws "Array buffer
+    // allocation failed". Chunking caps the transient allocation; end→start order
+    // guarantees a chunk's source bytes are never overwritten by an earlier
+    // (lower-offset) chunk's destination, since every write lands `growth` bytes
+    // HIGHER than its read and we always move the highest-offset chunk first.
+    const SHIFT_CHUNK = 8 * 1024 * 1024;
+    if (afterSize > 0) {
+      const buf = new Uint8Array(Math.min(SHIFT_CHUNK, afterSize));
+      let remaining = afterSize;
+      while (remaining > 0) {
+        const n = Math.min(SHIFT_CHUNK, remaining);
+        const srcAt = afterInodeOffset + remaining - n;
+        const view = n === buf.length ? buf : buf.subarray(0, n);
+        this.handle.read(view, { at: srcAt });
+        this.handle.write(view, { at: srcAt + growth });
+        remaining -= n;
+      }
+    }
 
-    // Zero out new inode entries
-    const zeroes = new Uint8Array(growth);
-    this.handle.write(zeroes, { at: afterInodeOffset });
+    // Zero out the new inode entries (also chunked — `growth` doubles each grow
+    // and can itself exceed a comfortable single allocation on a large table).
+    const zChunk = new Uint8Array(Math.min(SHIFT_CHUNK, growth));
+    let zRemaining = growth;
+    let zOffset = afterInodeOffset;
+    while (zRemaining > 0) {
+      const n = Math.min(SHIFT_CHUNK, zRemaining);
+      this.handle.write(n === zChunk.length ? zChunk : zChunk.subarray(0, n), { at: zOffset });
+      zOffset += n;
+      zRemaining -= n;
+    }
 
     // Update offsets
     this.pathTableOffset += growth;
