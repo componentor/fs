@@ -360,8 +360,21 @@ var OP = {
   FUTIMES: 33
 };
 var SAB_OFFSETS = {
+  CONTROL: 0,
+  // Int32 - signal (0=idle, 1=request, 2=response, 3=chunk, 4=ack)
+  TICKET_NEXT: 4,
+  // Int32 - fairness lock: next ticket to hand out (fetch-add)
+  TICKET_SERVING: 8,
+  // Int32 - fairness lock: ticket currently allowed to use the SAB
+  OPCODE: 4,
+  // (alias of TICKET_NEXT) — op code is carried in the payload
+  STATUS: 8,
+  // (alias of TICKET_SERVING) — status is carried in the payload
+  CHUNK_LEN: 12,
   // Int32 - bytes in this chunk
   TOTAL_LEN: 16,
+  // BigUint64 - full data size across all chunks
+  CHUNK_IDX: 24,
   // Int32 - 0-based chunk index
   HEARTBEAT: 28,
   // Int32 - liveness counter; the relay worker bumps this ~1×/s
@@ -411,6 +424,58 @@ function encodeTwoPathRequest(op, path1, path2, flags = 0) {
   pv.setUint32(0, path2Bytes.byteLength, true);
   payload.set(path2Bytes, 4);
   return encodeRequest(op, path1, flags, payload);
+}
+
+// src/protocol/fs-lock.ts
+var NEXT_INDEX = SAB_OFFSETS.TICKET_NEXT >> 2;
+var SERVING_INDEX = SAB_OFFSETS.TICKET_SERVING >> 2;
+var SIGNAL_INDEX = SAB_OFFSETS.CONTROL >> 2;
+var CAN_WAIT = typeof globalThis.WorkerGlobalScope !== "undefined";
+var WAIT_SLICE_MS = 50;
+var HOLDER_STUCK_MS = 3e4;
+function now() {
+  return performance.now();
+}
+function acquireFsLock(ctrl) {
+  const ticket = Atomics.add(ctrl, NEXT_INDEX, 1);
+  if (Atomics.load(ctrl, SERVING_INDEX) === ticket) return ticket;
+  waitForTurn(ctrl, ticket);
+  return ticket;
+}
+function releaseFsLock(ctrl) {
+  Atomics.add(ctrl, SERVING_INDEX, 1);
+  Atomics.notify(ctrl, SERVING_INDEX);
+}
+function waitForTurn(ctrl, ticket) {
+  let serving = Atomics.load(ctrl, SERVING_INDEX);
+  let sig = Atomics.load(ctrl, SIGNAL_INDEX);
+  let progressAt = now();
+  while (serving !== ticket) {
+    if (CAN_WAIT) {
+      Atomics.wait(ctrl, SERVING_INDEX, serving, WAIT_SLICE_MS);
+    } else {
+      const spinStart = now();
+      while (now() - spinStart < WAIT_SLICE_MS && Atomics.load(ctrl, SERVING_INDEX) === serving) {
+      }
+    }
+    const curServing = Atomics.load(ctrl, SERVING_INDEX);
+    const curSig = Atomics.load(ctrl, SIGNAL_INDEX);
+    if (curServing !== serving || curSig !== sig) {
+      serving = curServing;
+      sig = curSig;
+      progressAt = now();
+      continue;
+    }
+    if (now() - progressAt > HOLDER_STUCK_MS) {
+      if (Atomics.compareExchange(ctrl, SERVING_INDEX, serving, serving + 1) === serving) {
+        Atomics.store(ctrl, SIGNAL_INDEX, SIGNAL.IDLE);
+        Atomics.notify(ctrl, SERVING_INDEX);
+      }
+      serving = Atomics.load(ctrl, SERVING_INDEX);
+      sig = Atomics.load(ctrl, SIGNAL_INDEX);
+      progressAt = now();
+    }
+  }
 }
 
 // src/errors.ts
@@ -3111,6 +3176,15 @@ var VFSFileSystem = class {
   /** Send a sync request via SAB and wait for response */
   syncRequest(requestBuf) {
     this.ensureReady();
+    const lockCtrl = this.ctrl;
+    acquireFsLock(lockCtrl);
+    try {
+      return this.syncRequestLocked(requestBuf);
+    } finally {
+      releaseFsLock(lockCtrl);
+    }
+  }
+  syncRequestLocked(requestBuf) {
     const t0 = this.config.debug ? performance.now() : 0;
     const maxChunk = this.sab.byteLength - HEADER_SIZE;
     const requestBytes = new Uint8Array(requestBuf);
@@ -4715,9 +4789,9 @@ var VFSEngine = class {
    */
   maybePreGrow(force = false) {
     if (!this.bitmap) return false;
-    const now = Date.now();
-    if (!force && now - this.lastPreGrowCheck < 250) return false;
-    this.lastPreGrowCheck = now;
+    const now2 = Date.now();
+    if (!force && now2 - this.lastPreGrowCheck < 250) return false;
+    this.lastPreGrowCheck = now2;
     const trailingFree = this.totalBlocks - (this.findLastUsedBlock() + 1);
     if (trailingFree >= PREGROW_HEADROOM_BLOCKS) return false;
     const hardCap = Math.min(this.maxBlocks, this.bitmapCapacityBlocks());
@@ -5129,7 +5203,7 @@ var VFSEngine = class {
   createInode(path, type, mode, size, data) {
     const idx = this.findFreeInode();
     const { offset: pathOff, length: pathLen } = this.appendPath(path);
-    const now = Date.now();
+    const now2 = Date.now();
     let firstBlock = 0;
     let blockCount = 0;
     if (data && data.byteLength > 0) {
@@ -5146,9 +5220,9 @@ var VFSEngine = class {
       size,
       firstBlock,
       blockCount,
-      mtime: now,
-      ctime: now,
-      atime: now,
+      mtime: now2,
+      ctime: now2,
+      atime: now2,
       uid: this.processUid,
       gid: this.processGid
     };
@@ -6044,7 +6118,7 @@ var VFSEngine = class {
    */
   rebuildImplicitDirs() {
     if (this.implicitDirsGen === this.pathIndexGen) return;
-    const now = Date.now();
+    const now2 = Date.now();
     const prev = this.implicitDirs;
     this.implicitDirs = /* @__PURE__ */ new Map();
     for (const filePath of this.pathIndex.keys()) {
@@ -6055,7 +6129,7 @@ var VFSEngine = class {
         const ancestor = filePath.substring(0, pos);
         if (this.implicitDirs.has(ancestor)) break;
         if (!this.pathIndex.has(ancestor)) {
-          this.implicitDirs.set(ancestor, prev.get(ancestor) ?? now);
+          this.implicitDirs.set(ancestor, prev.get(ancestor) ?? now2);
         }
       }
     }
@@ -6635,6 +6709,6 @@ function init() {
   return getDefaultFS().init();
 }
 
-export { FSError, NodeReadable, NodeWritable, NodeReadable as ReadStream, SimpleEventEmitter, VFSFileSystem, NodeWritable as WriteStream, constants, createError, createFS, createServiceWorkerBridge, getDefaultFS, init, loadFromOPFS, path_exports as path, repairVFS, statusToError, unpackToOPFS };
+export { FSError, NodeReadable, NodeWritable, NodeReadable as ReadStream, SAB_OFFSETS, SIGNAL, SimpleEventEmitter, VFSFileSystem, NodeWritable as WriteStream, acquireFsLock, constants, createError, createFS, createServiceWorkerBridge, getDefaultFS, init, loadFromOPFS, path_exports as path, releaseFsLock, repairVFS, statusToError, unpackToOPFS };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map

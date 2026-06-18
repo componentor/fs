@@ -19,6 +19,7 @@ import type {
 import { NodeReadable, NodeWritable } from './node-streams.js';
 import type { SyncRequestFn, AsyncRequestFn } from './methods/context.js';
 import { SAB_OFFSETS, SIGNAL, OP, encodeRequest, decodeResponse } from './protocol/opcodes.js';
+import { acquireFsLock, releaseFsLock } from './protocol/fs-lock.js';
 
 // ---- Method imports ----
 import { readFileSync as _readFileSync, readFile as _readFile } from './methods/readFile.js';
@@ -778,6 +779,21 @@ export class VFSFileSystem {
   private syncRequest(requestBuf: ArrayBuffer): { status: number; data: Uint8Array | null } {
     this.ensureReady();
 
+    // Take a turn on the shared control SAB. Uncontended (a single client driving
+    // this SAB) this is a couple of atomics and never blocks; when several sync
+    // clients share ONE SAB it serializes them in fair arrival order so their
+    // request frames never interleave. Captured once so a leader handoff that
+    // swaps `this.ctrl` mid-op can't release a different SAB than we acquired.
+    const lockCtrl = this.ctrl;
+    acquireFsLock(lockCtrl);
+    try {
+      return this.syncRequestLocked(requestBuf);
+    } finally {
+      releaseFsLock(lockCtrl);
+    }
+  }
+
+  private syncRequestLocked(requestBuf: ArrayBuffer): { status: number; data: Uint8Array | null } {
     const t0 = this.config.debug ? performance.now() : 0;
     const maxChunk = this.sab.byteLength - HEADER_SIZE;
     const requestBytes = new Uint8Array(requestBuf);

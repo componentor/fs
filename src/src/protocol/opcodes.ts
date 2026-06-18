@@ -63,10 +63,21 @@ export const STATUS = {
 } as const;
 
 // SAB layout offsets
+//
+// NOTE on idx1 (byte 4) and idx2 (byte 8): the operation code and response
+// status travel inside the *payload* (see encodeRequest / decodeResponse), NOT
+// in these control-header slots — neither `syncRequest` nor the sync-relay
+// worker ever reads or writes byte 4 / byte 8 of the header. They are therefore
+// free, and are now used by the fairness ticket lock (see protocol/fs-lock.ts)
+// that serializes multiple sync clients sharing ONE control SAB (e.g. several
+// exec workers + the main thread all driving a single relay). The `OPCODE` /
+// `STATUS` names are kept as aliases for backwards compatibility.
 export const SAB_OFFSETS = {
   CONTROL: 0,       // Int32 - signal (0=idle, 1=request, 2=response, 3=chunk, 4=ack)
-  OPCODE: 4,        // Int32 - operation code
-  STATUS: 8,        // Int32 - response status / error
+  TICKET_NEXT: 4,   // Int32 - fairness lock: next ticket to hand out (fetch-add)
+  TICKET_SERVING: 8,// Int32 - fairness lock: ticket currently allowed to use the SAB
+  OPCODE: 4,        // (alias of TICKET_NEXT) — op code is carried in the payload
+  STATUS: 8,        // (alias of TICKET_SERVING) — status is carried in the payload
   CHUNK_LEN: 12,    // Int32 - bytes in this chunk
   TOTAL_LEN: 16,    // BigUint64 - full data size across all chunks
   CHUNK_IDX: 24,    // Int32 - 0-based chunk index

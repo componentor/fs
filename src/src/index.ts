@@ -18,6 +18,11 @@
  */
 
 export { VFSFileSystem } from './filesystem.js';
+// Fairness ticket lock over the control SAB — exported so a host that shares one
+// control SAB across several raw sync clients (e.g. multiple Web Workers) can
+// serialize them with the SAME lock the library's own `syncRequest` uses.
+export { acquireFsLock, releaseFsLock } from './protocol/fs-lock.js';
+export { SAB_OFFSETS, SIGNAL } from './protocol/opcodes.js';
 export { createServiceWorkerBridge } from './sw-bridge.js';
 export type { ServiceWorkerBridgeOptions } from './sw-bridge.js';
 export { NodeReadable, NodeWritable, SimpleEventEmitter } from './node-streams.js';

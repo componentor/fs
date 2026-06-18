@@ -55,10 +55,14 @@ var STATUS = {
 var SAB_OFFSETS = {
   CONTROL: 0,
   // Int32 - signal (0=idle, 1=request, 2=response, 3=chunk, 4=ack)
+  TICKET_NEXT: 4,
+  // Int32 - fairness lock: next ticket to hand out (fetch-add)
+  TICKET_SERVING: 8,
+  // Int32 - fairness lock: ticket currently allowed to use the SAB
   OPCODE: 4,
-  // Int32 - operation code
+  // (alias of TICKET_NEXT) — op code is carried in the payload
   STATUS: 8,
-  // Int32 - response status / error
+  // (alias of TICKET_SERVING) — status is carried in the payload
   CHUNK_LEN: 12,
   // Int32 - bytes in this chunk
   TOTAL_LEN: 16,

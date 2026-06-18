@@ -463,6 +463,7 @@ declare class VFSFileSystem {
     private ensureReady;
     /** Send a sync request via SAB and wait for response */
     private syncRequest;
+    private syncRequestLocked;
     private asyncRequest;
     readFileSync(filePath: PathLike, options?: ReadOptions | Encoding | null): string | Uint8Array;
     writeFileSync(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): void;
@@ -755,6 +756,92 @@ declare class VFSPromises {
     flush(): Promise<void>;
     purge(): Promise<void>;
 }
+
+/**
+ * Fairness ticket lock for a shared control SAB.
+ *
+ * ## Why this exists
+ *
+ * The sync FS protocol uses ONE control SAB (one request/response slot) serviced
+ * by ONE sync-relay worker against ONE OPFS sync access handle. When a single
+ * client drives that SAB this is fine. But a host can deliberately share one SAB
+ * across MANY sync clients — e.g. a browser dev container that runs several exec
+ * Web Workers plus the main thread, all issuing sync FS ops to a single relay so
+ * there is only ever one open OPFS handle. Those clients must take turns: if two
+ * stage a request into the single slot at once, the relay reads a torn frame and
+ * everyone downstream sees truncated/garbage data.
+ *
+ * A plain CAS spinlock (`compareExchange(lock, 0, 1)`) provides mutual exclusion
+ * but is **unfair**: under contention one client can lose the race indefinitely
+ * (starve). Hosts that "self-heal" a starved client by force-stealing the lock
+ * after a timeout then create the exact double-holder corruption the lock was
+ * meant to prevent — the timeout fires on a *live* holder simply because the
+ * waiter was starved, not because anyone died.
+ *
+ * This is a **ticket (bakery) lock**: each client atomically draws a ticket and
+ * is served in strict arrival order. No starvation, so the only reason a waiter
+ * ever waits "too long" is a genuinely dead/wedged holder — which is recovered
+ * conservatively (see below), not on mere contention.
+ *
+ * ## Protocol (two Int32 slots in the control header)
+ *
+ *   TICKET_NEXT     — next ticket to hand out; `Atomics.add(.,1)` draws one.
+ *   TICKET_SERVING  — ticket currently permitted to touch the SAB.
+ *
+ * Both start at 0 (zeroed SAB). Acquire draws `t = fetch_add(NEXT)`, then waits
+ * until `SERVING === t`. Release does `add(SERVING, 1)` + notify. Uncontended,
+ * NEXT and SERVING march in lockstep and every acquire is satisfied immediately
+ * — so the single-client case pays only a couple of atomics and never blocks
+ * (in particular it never calls `Atomics.wait`, which is illegal on the browser
+ * main thread).
+ *
+ * ## Liveness / recovery
+ *
+ * A holder runs exactly ONE sync op between acquire and release. A live holder
+ * therefore always makes observable progress quickly: either SERVING advances
+ * (it finished and released) or the protocol signal changes (it is mid multi-
+ * chunk transfer, handing frames back and forth with the relay). The ONE state
+ * that can legitimately sit frozen for a long stretch is a single slow op the
+ * relay is servicing (e.g. a WebKit OPFS truncate that blocks the relay — and
+ * thus its heartbeat — for up to ~20s). So: if neither SERVING nor the signal
+ * changes for `HOLDER_STUCK_MS` (30s, matching the relay-heartbeat stall ceiling
+ * the rest of the library already tolerates), the current holder — or the relay
+ * itself — is wedged/dead. Exactly one waiter then advances SERVING past the
+ * dead ticket via CAS so the queue drains. If it was the relay that died, the
+ * recovered holder's own op surfaces that error through its normal spin-wait;
+ * recovery here never throws and never leaks a ticket.
+ *
+ * 30s is far longer than any single live op, so a healthy holder is never
+ * stolen from — the corruption mode of the old force-steal cannot occur.
+ */
+/**
+ * Acquire the SAB. Returns the drawn ticket (pass it to nothing — release takes
+ * no argument; the ticket is returned only for debugging/inspection). MUST be
+ * paired with exactly one {@link releaseFsLock} in a `finally`.
+ */
+declare function acquireFsLock(ctrl: Int32Array): number;
+/** Release the SAB, admitting the next ticket in line. */
+declare function releaseFsLock(ctrl: Int32Array): void;
+
+declare const SAB_OFFSETS: {
+    readonly CONTROL: 0;
+    readonly TICKET_NEXT: 4;
+    readonly TICKET_SERVING: 8;
+    readonly OPCODE: 4;
+    readonly STATUS: 8;
+    readonly CHUNK_LEN: 12;
+    readonly TOTAL_LEN: 16;
+    readonly CHUNK_IDX: 24;
+    readonly HEARTBEAT: 28;
+    readonly HEADER_SIZE: 32;
+};
+declare const SIGNAL: {
+    readonly IDLE: 0;
+    readonly REQUEST: 1;
+    readonly RESPONSE: 2;
+    readonly CHUNK: 3;
+    readonly CHUNK_ACK: 4;
+};
 
 /**
  * Main-thread service-worker bridge for worker-hosted VFS instances.
@@ -1087,4 +1174,4 @@ declare function getDefaultFS(): VFSFileSystem;
 /** Async init helper — avoids blocking main thread */
 declare function init(): Promise<void>;
 
-export { type BigIntStats, type CpOptions, type Dir, type Dirent, type Encoding, FSError, type FSMode, type FSReadStream, type FSWatcher, type FSWriteStream, type FileHandle, type LoadResult, type MkdirOptions, NodeReadable, NodeWritable, type OpenAsBlobOptions, type PathLike, type ReadOptions, NodeReadable as ReadStream, type ReadStreamOptions, type ReaddirOptions, type RepairResult, type RmOptions, type RmdirOptions, type ServiceWorkerBridgeOptions, SimpleEventEmitter, type StatFs, type StatOptions, type Stats, type UnpackResult, type VFSConfig, VFSFileSystem, type VFSLimits, type WatchEventType, type WatchFileListener, type WatchListener, type WatchOptions, type WriteOptions, NodeWritable as WriteStream, type WriteStreamOptions, constants, createError, createFS, createServiceWorkerBridge, getDefaultFS, init, loadFromOPFS, path, repairVFS, statusToError, unpackToOPFS };
+export { type BigIntStats, type CpOptions, type Dir, type Dirent, type Encoding, FSError, type FSMode, type FSReadStream, type FSWatcher, type FSWriteStream, type FileHandle, type LoadResult, type MkdirOptions, NodeReadable, NodeWritable, type OpenAsBlobOptions, type PathLike, type ReadOptions, NodeReadable as ReadStream, type ReadStreamOptions, type ReaddirOptions, type RepairResult, type RmOptions, type RmdirOptions, SAB_OFFSETS, SIGNAL, type ServiceWorkerBridgeOptions, SimpleEventEmitter, type StatFs, type StatOptions, type Stats, type UnpackResult, type VFSConfig, VFSFileSystem, type VFSLimits, type WatchEventType, type WatchFileListener, type WatchListener, type WatchOptions, type WriteOptions, NodeWritable as WriteStream, type WriteStreamOptions, acquireFsLock, constants, createError, createFS, createServiceWorkerBridge, getDefaultFS, init, loadFromOPFS, path, releaseFsLock, repairVFS, statusToError, unpackToOPFS };
