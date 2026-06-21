@@ -4,7 +4,7 @@ const jsExtension = () => ({ js: '.js' });
 
 export default defineConfig([
   {
-    entry: ['src/index.ts'],
+    entry: ['src/index.ts', 'src/drives-entry.ts'],
     outDir: '../dist',
     format: ['esm'],
     outExtension: jsExtension,

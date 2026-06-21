@@ -632,8 +632,15 @@ Dropbox / OneDrive, or a local/USB folder. Every drive implements the same
 [`Drive`](src/src/drives/types.ts) interface, so the UI, cross-drive copy/move,
 and sync all work against one abstraction with no per-backend code.
 
+> **Engine-free import.** The drive layer is also exported from
+> `@componentor/fs/drives`, which omits `VfsDrive` (the only drive that wraps the
+> VFS engine) so a host that brings its own OPFS layer can tree-shake the engine
+> out of its bundle. Import `VfsDrive` from the root `@componentor/fs` when you do
+> want to wrap the engine. Both entries are otherwise identical.
+
 ```typescript
 import { DriveManager, MemoryDrive } from '@componentor/fs';
+// …or, engine-free: import { DriveManager, MemoryDrive } from '@componentor/fs/drives';
 
 const manager = new DriveManager();
 

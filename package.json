@@ -1,6 +1,6 @@
 {
   "name": "@componentor/fs",
-  "version": "3.3.0",
+  "version": "3.3.1",
   "description": "High-performance OPFS-based Node.js fs polyfill with true sync API, VFS binary format, and bidirectional OPFS mirroring",
   "license": "MIT",
   "author": "Componentor",
@@ -15,10 +15,19 @@
   "type": "module",
   "module": "./dist/index.js",
   "types": "./dist/index.d.mts",
+  "//sideEffects": "All modules are side-effect-free so bundlers can tree-shake (e.g. importing only the drive classes drops the VFS engine). The worker entry files DO have side effects (self.onmessage) — they're loaded as separate worker bundles, never imported for their side effects, but listed here defensively.",
+  "sideEffects": [
+    "**/*.worker.js",
+    "**/workers/*.js"
+  ],
   "exports": {
     ".": {
       "types": "./dist/index.d.mts",
       "import": "./dist/index.js"
+    },
+    "./drives": {
+      "types": "./dist/drives-entry.d.mts",
+      "import": "./dist/drives-entry.js"
     },
     "./sw": "./dist/workers/service.worker.js"
   },
