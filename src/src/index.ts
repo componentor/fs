@@ -64,6 +64,9 @@ export type {
   OpenAsBlobOptions,
 } from './types.js';
 
+// Multi-drive abstraction (additive; the single-OPFS API above is unchanged). See drives/DESIGN.md.
+export * from './drives/index.js';
+
 import { VFSFileSystem } from './filesystem.js';
 
 /** Create a configured VFS instance */
