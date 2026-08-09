@@ -113,6 +113,26 @@ const fs = new VFSFileSystem({
 });
 ```
 
+### Text Encodings
+
+Encodings follow Node: the same names, matched **case-insensitively**, with the same aliases —
+`utf8`/`utf-8`, `utf16le`/`utf-16le`/`ucs2`/`ucs-2`, `latin1`/`binary`, `base64`, `base64url`,
+`ascii`, `hex`. An unrecognised name throws Node's `ERR_INVALID_ARG_VALUE` rather than silently
+falling back to UTF-8, so a typo surfaces at the call instead of as corrupted bytes later.
+
+```js
+fs.writeFileSync('/a.bin', '4142', 'hex');       // writes the two bytes 41 42
+fs.readFileSync('/a.bin', 'latin1');             // 'AB'
+fs.readdirSync('/dir', 'buffer');                // raw name bytes
+fs.writeFileSync('/b', 'x', 'utf9');             // throws ERR_INVALID_ARG_VALUE
+```
+
+The `base64` and `hex` parsers reproduce Node's leniency exactly: base64 skips characters outside
+the alphabet, stops at `=`, tolerates missing padding, and accepts the url-safe alphabet under
+either name; hex stops at the first pair that is not two hex digits and ignores a trailing odd
+character. Note the `ascii` asymmetry, which is Node's, not ours — encoding truncates to the low
+byte (identical to `latin1`), while decoding masks to 7 bits.
+
 ### File Permissions
 
 Modes behave as they do in Node. `mkdir` takes the mode you give it, the engine subtracts the

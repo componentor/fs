@@ -1205,89 +1205,162 @@ function createFileHandle(fd, asyncRequest) {
 }
 
 // src/encoding.ts
+var ALIASES = {
+  "utf8": "utf8",
+  "utf-8": "utf8",
+  "utf16le": "utf16le",
+  "utf-16le": "utf16le",
+  "ucs2": "utf16le",
+  "ucs-2": "utf16le",
+  "latin1": "latin1",
+  "binary": "latin1",
+  "base64": "base64",
+  "base64url": "base64url",
+  "ascii": "ascii",
+  "hex": "hex"
+};
+var utf8Decoder = new TextDecoder("utf-8");
+var utf16Decoder = new TextDecoder("utf-16le");
+var utf8Encoder = new TextEncoder();
+function normalizeEncoding(encoding) {
+  if (encoding === "utf8" || encoding === "utf-8") return "utf8";
+  if (typeof encoding !== "string") return void 0;
+  return ALIASES[encoding.toLowerCase()];
+}
+function assertEncoding(encoding, name = "encoding") {
+  const normalized = normalizeEncoding(encoding);
+  if (normalized === void 0) throw invalidArgValue(name, encoding, "is invalid encoding");
+  return normalized;
+}
+var B64_VALUES = /* @__PURE__ */ (() => {
+  const table = new Int8Array(256).fill(-1);
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  for (let i = 0; i < alphabet.length; i++) table[alphabet.charCodeAt(i)] = i;
+  table["-".charCodeAt(0)] = 62;
+  table["_".charCodeAt(0)] = 63;
+  return table;
+})();
+var B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+var B64URL_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+function base64ToBytes(str) {
+  const sextets = new Uint8Array(str.length);
+  let n = 0;
+  for (let i = 0; i < str.length; i++) {
+    const code = str.charCodeAt(i);
+    if (code === 61) break;
+    const value = code < 256 ? B64_VALUES[code] : -1;
+    if (value >= 0) sextets[n++] = value;
+  }
+  const groups = n >> 2;
+  const rem = n & 3;
+  const out = new Uint8Array(groups * 3 + (rem === 0 ? 0 : rem - 1));
+  let o = 0;
+  for (let g = 0; g < groups; g++) {
+    const i = g * 4;
+    out[o++] = sextets[i] << 2 | sextets[i + 1] >> 4;
+    out[o++] = (sextets[i + 1] & 15) << 4 | sextets[i + 2] >> 2;
+    out[o++] = (sextets[i + 2] & 3) << 6 | sextets[i + 3];
+  }
+  const tail = groups * 4;
+  if (rem === 2) {
+    out[o] = sextets[tail] << 2 | sextets[tail + 1] >> 4;
+  } else if (rem === 3) {
+    out[o++] = sextets[tail] << 2 | sextets[tail + 1] >> 4;
+    out[o] = (sextets[tail + 1] & 15) << 4 | sextets[tail + 2] >> 2;
+  }
+  return out;
+}
+function bytesToBase64(data, urlSafe) {
+  const chars = urlSafe ? B64URL_CHARS : B64_CHARS;
+  const full = Math.floor(data.length / 3);
+  let out = "";
+  let i = 0;
+  for (let g = 0; g < full; g++, i += 3) {
+    const n = data[i] << 16 | data[i + 1] << 8 | data[i + 2];
+    out += chars[n >> 18 & 63] + chars[n >> 12 & 63] + chars[n >> 6 & 63] + chars[n & 63];
+  }
+  const rem = data.length - i;
+  if (rem === 1) {
+    const n = data[i] << 16;
+    out += chars[n >> 18 & 63] + chars[n >> 12 & 63];
+    if (!urlSafe) out += "==";
+  } else if (rem === 2) {
+    const n = data[i] << 16 | data[i + 1] << 8;
+    out += chars[n >> 18 & 63] + chars[n >> 12 & 63] + chars[n >> 6 & 63];
+    if (!urlSafe) out += "=";
+  }
+  return out;
+}
+function hexValue(code) {
+  if (code >= 48 && code <= 57) return code - 48;
+  if (code >= 97 && code <= 102) return code - 87;
+  if (code >= 65 && code <= 70) return code - 55;
+  return -1;
+}
+function hexToBytes(str) {
+  const max = str.length >>> 1;
+  const out = new Uint8Array(max);
+  let n = 0;
+  for (; n < max; n++) {
+    const hi = hexValue(str.charCodeAt(n * 2));
+    const lo = hexValue(str.charCodeAt(n * 2 + 1));
+    if (hi < 0 || lo < 0) break;
+    out[n] = hi << 4 | lo;
+  }
+  return n === max ? out : out.subarray(0, n);
+}
+function bytesToBinaryString(data, mask) {
+  const CHUNK = 8192;
+  let out = "";
+  for (let i = 0; i < data.length; i += CHUNK) {
+    const slice = data.subarray(i, i + CHUNK);
+    if (mask === 255) {
+      out += String.fromCharCode.apply(null, slice);
+    } else {
+      const masked = new Uint8Array(slice.length);
+      for (let j = 0; j < slice.length; j++) masked[j] = slice[j] & mask;
+      out += String.fromCharCode.apply(null, masked);
+    }
+  }
+  return out;
+}
 function decodeBuffer(data, encoding) {
-  switch (encoding) {
+  switch (assertEncoding(encoding)) {
     case "utf8":
-    case "utf-8":
-      return new TextDecoder("utf-8").decode(data);
+      return utf8Decoder.decode(data);
     case "latin1":
-    case "binary": {
-      let result = "";
-      for (let i = 0; i < data.length; i++) {
-        result += String.fromCharCode(data[i]);
-      }
-      return result;
-    }
-    case "ascii": {
-      let result = "";
-      for (let i = 0; i < data.length; i++) {
-        result += String.fromCharCode(data[i] & 127);
-      }
-      return result;
-    }
-    case "base64": {
-      let binary = "";
-      for (let i = 0; i < data.length; i++) {
-        binary += String.fromCharCode(data[i]);
-      }
-      return btoa(binary);
-    }
+      return bytesToBinaryString(data, 255);
+    case "ascii":
+      return bytesToBinaryString(data, 127);
+    case "base64":
+      return bytesToBase64(data, false);
+    case "base64url":
+      return bytesToBase64(data, true);
     case "hex": {
       let hex = "";
-      for (let i = 0; i < data.length; i++) {
-        hex += data[i].toString(16).padStart(2, "0");
-      }
+      for (let i = 0; i < data.length; i++) hex += data[i].toString(16).padStart(2, "0");
       return hex;
     }
-    case "ucs2":
-    case "ucs-2":
     case "utf16le":
-    case "utf-16le":
-      return new TextDecoder("utf-16le").decode(data);
-    default:
-      return new TextDecoder("utf-8").decode(data);
+      return utf16Decoder.decode(data.length & 1 ? data.subarray(0, data.length - 1) : data);
   }
 }
 function encodeString(str, encoding) {
-  switch (encoding) {
+  switch (assertEncoding(encoding)) {
     case "utf8":
-    case "utf-8":
-      return new TextEncoder().encode(str);
+      return utf8Encoder.encode(str);
     case "latin1":
-    case "binary": {
-      const buf = new Uint8Array(str.length);
-      for (let i = 0; i < str.length; i++) {
-        buf[i] = str.charCodeAt(i) & 255;
-      }
-      return buf;
-    }
     case "ascii": {
       const buf = new Uint8Array(str.length);
-      for (let i = 0; i < str.length; i++) {
-        buf[i] = str.charCodeAt(i) & 127;
-      }
+      for (let i = 0; i < str.length; i++) buf[i] = str.charCodeAt(i);
       return buf;
     }
-    case "base64": {
-      const binary = atob(str);
-      const buf = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) {
-        buf[i] = binary.charCodeAt(i);
-      }
-      return buf;
-    }
-    case "hex": {
-      const len = str.length >>> 1;
-      const buf = new Uint8Array(len);
-      for (let i = 0; i < len; i++) {
-        buf[i] = parseInt(str.slice(i * 2, i * 2 + 2), 16);
-      }
-      return buf;
-    }
-    case "ucs2":
-    case "ucs-2":
-    case "utf16le":
-    case "utf-16le": {
+    case "base64":
+    case "base64url":
+      return base64ToBytes(str);
+    case "hex":
+      return hexToBytes(str);
+    case "utf16le": {
       const buf = new Uint8Array(str.length * 2);
       for (let i = 0; i < str.length; i++) {
         const code = str.charCodeAt(i);
@@ -1296,8 +1369,6 @@ function encodeString(str, encoding) {
       }
       return buf;
     }
-    default:
-      return new TextEncoder().encode(str);
   }
 }
 
@@ -1715,47 +1786,41 @@ async function readdirRecursiveAsync(asyncRequest, basePath, prefix, withFileTyp
   }
   return results;
 }
+function resolveNameEncoding(encoding) {
+  if (encoding === void 0 || encoding === null || encoding === "buffer") {
+    return encoding === "buffer" ? "buffer" : null;
+  }
+  const canonical = assertEncoding(encoding);
+  return canonical === "utf8" ? null : canonical;
+}
+function recodeNames(names, encoding) {
+  return names.map((n) => decodeBuffer(encodeString(n, "utf8"), encoding));
+}
 function readdirSync(syncRequest, filePath, options) {
   const opts = typeof options === "string" ? { encoding: options } : options;
-  const asBuffer = opts?.encoding === "buffer";
+  const nameEncoding = resolveNameEncoding(opts?.encoding);
+  const recode = (names) => {
+    if (opts?.withFileTypes || nameEncoding === null) return names;
+    if (nameEncoding === "buffer") return namesToBuffers(names);
+    return recodeNames(names, nameEncoding);
+  };
   if (opts?.recursive) {
-    const result2 = readdirRecursiveSync(
-      syncRequest,
-      filePath,
-      "",
-      !!opts?.withFileTypes
-    );
-    if (asBuffer && !opts?.withFileTypes) {
-      return namesToBuffers(result2);
-    }
-    return result2;
+    return recode(readdirRecursiveSync(syncRequest, filePath, "", !!opts?.withFileTypes));
   }
-  const result = readdirBaseSync(syncRequest, filePath, !!opts?.withFileTypes);
-  if (asBuffer && !opts?.withFileTypes) {
-    return namesToBuffers(result);
-  }
-  return result;
+  return recode(readdirBaseSync(syncRequest, filePath, !!opts?.withFileTypes));
 }
 async function readdir(asyncRequest, filePath, options) {
   const opts = typeof options === "string" ? { encoding: options } : options;
-  const asBuffer = opts?.encoding === "buffer";
+  const nameEncoding = resolveNameEncoding(opts?.encoding);
+  const recode = (names) => {
+    if (opts?.withFileTypes || nameEncoding === null) return names;
+    if (nameEncoding === "buffer") return namesToBuffers(names);
+    return recodeNames(names, nameEncoding);
+  };
   if (opts?.recursive) {
-    const result2 = await readdirRecursiveAsync(
-      asyncRequest,
-      filePath,
-      "",
-      !!opts?.withFileTypes
-    );
-    if (asBuffer && !opts?.withFileTypes) {
-      return namesToBuffers(result2);
-    }
-    return result2;
+    return recode(await readdirRecursiveAsync(asyncRequest, filePath, "", !!opts?.withFileTypes));
   }
-  const result = await readdirBaseAsync(asyncRequest, filePath, !!opts?.withFileTypes);
-  if (asBuffer && !opts?.withFileTypes) {
-    return namesToBuffers(result);
-  }
-  return result;
+  return recode(await readdirBaseAsync(asyncRequest, filePath, !!opts?.withFileTypes));
 }
 
 // src/methods/stat.ts
@@ -1974,13 +2039,17 @@ function symlinkSync(syncRequest, target, linkPath, type) {
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "symlink", linkPath);
 }
+function decodeLink(data, options) {
+  const encoding = typeof options === "string" ? options : options?.encoding;
+  if (encoding === "buffer") return new Uint8Array(data);
+  if (encoding === void 0 || encoding === null) return decoder6.decode(data);
+  return decodeBuffer(data, assertEncoding(encoding));
+}
 function readlinkSync(syncRequest, filePath, options) {
   const buf = encodeRequest(OP.READLINK, filePath);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "readlink", filePath);
-  const encoding = typeof options === "string" ? options : options?.encoding;
-  if (encoding === "buffer") return new Uint8Array(data);
-  return decoder6.decode(data);
+  return decodeLink(data, options);
 }
 async function symlink(asyncRequest, target, linkPath, type) {
   const targetBytes = encoder7.encode(target);
@@ -1990,9 +2059,7 @@ async function symlink(asyncRequest, target, linkPath, type) {
 async function readlink(asyncRequest, filePath, options) {
   const { status, data } = await asyncRequest(OP.READLINK, filePath);
   if (status !== 0) throw statusToError(status, "readlink", filePath);
-  const encoding = typeof options === "string" ? options : options?.encoding;
-  if (encoding === "buffer") return new Uint8Array(data);
-  return decoder6.decode(data);
+  return decodeLink(data, options);
 }
 
 // src/methods/link.ts

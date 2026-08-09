@@ -66,10 +66,12 @@ describe('encoding', () => {
       expect(encodeString(str, 'binary')).toEqual(encodeString(str, 'latin1'));
     });
 
-    it('should encode ascii (mask to 7 bits)', () => {
+    it('should encode ascii by truncating to a byte, exactly like latin1', () => {
+      // Node masks to 7 bits when DECODING ascii, but not when encoding it:
+      // Buffer.from('é', 'ascii') is [0xE9], identical to latin1. Verified against node:fs.
       const result = encodeString('Hello\u00e9', 'ascii');
-      // 0xe9 & 0x7f = 0x69 = 'i'
-      expect(result).toEqual(new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x69]));
+      expect(result).toEqual(new Uint8Array([0x48, 0x65, 0x6c, 0x6c, 0x6f, 0xe9]));
+      expect(result).toEqual(encodeString('Hello\u00e9', 'latin1'));
     });
 
     it('should encode hex', () => {

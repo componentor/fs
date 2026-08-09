@@ -5,7 +5,7 @@ export { CloudDrive, CloudDriveOptions, CloudProvider, DirNode, DriveEvent, Driv
  * Type definitions for the VFS-based filesystem.
  * Mirrors Node.js fs module interfaces.
  */
-type Encoding = 'utf8' | 'utf-8' | 'ascii' | 'base64' | 'hex' | 'binary' | 'latin1' | 'ucs2' | 'ucs-2' | 'utf16le' | 'utf-16le' | 'buffer';
+type Encoding = 'utf8' | 'utf-8' | 'ascii' | 'base64' | 'base64url' | 'hex' | 'binary' | 'latin1' | 'ucs2' | 'ucs-2' | 'utf16le' | 'utf-16le' | 'buffer';
 interface ReadOptions {
     encoding?: Encoding | null;
     flag?: string;
