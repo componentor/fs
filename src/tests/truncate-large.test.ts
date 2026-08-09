@@ -1,38 +1,39 @@
 /**
- * Truncate Large File Tests
+ * Truncate length encoding — lengths beyond the uint32 ceiling.
  *
- * Tests that truncate and ftruncate correctly encode/decode lengths
- * beyond the uint32 limit (4GB), using float64 encoding.
+ * `truncate` and `ftruncate` carry their length as a float64 so a file larger than 4 GiB can be
+ * shortened. This file used to verify that with its *own* encode/decode helpers: it wrote a
+ * float64 and read a float64, so it agreed with itself no matter what the product did — and the
+ * shipped server worker was meanwhile reading the field as a uint32, which zeroed every file it
+ * was asked to truncate. See CHANGELOG 3.3.6.
+ *
+ * It now runs the real encoders from [payloads.ts](../src/protocol/payloads.ts) through the real
+ * decoder in [dispatch.ts](../src/protocol/dispatch.ts), so a disagreement between them fails
+ * here. The large-value coverage that motivated the file is kept.
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import { encodeTruncatePayload, encodeFtruncatePayload } from '../src/protocol/payloads.js';
+import { dispatchOp } from '../src/protocol/dispatch.js';
+import { OP } from '../src/protocol/opcodes.js';
+import type { VFSEngine } from '../src/vfs/engine.js';
+
+/** Round-trip a truncate length through the real encoder and the real dispatch decoder. */
+function roundtripTruncateLength(len: number): number {
+  const truncate = vi.fn(() => ({ status: 0, data: null }));
+  dispatchOp({ truncate } as unknown as VFSEngine, 't', OP.TRUNCATE, 0, '/p', encodeTruncatePayload(len));
+  return (truncate.mock.calls[0] as unknown as [string, number])[1];
+}
+
+/** Same for ftruncate, which also carries the fd. */
+function roundtripFtruncate(fd: number, len: number): { fd: number; len: number } {
+  const ftruncate = vi.fn(() => ({ status: 0, data: null }));
+  dispatchOp({ ftruncate } as unknown as VFSEngine, 't', OP.FTRUNCATE, 0, '', encodeFtruncatePayload(fd, len));
+  const call = ftruncate.mock.calls[0] as unknown as [number, number];
+  return { fd: call[0], len: call[1] };
+}
 
 describe('truncate length encoding', () => {
-  /**
-   * Helper: encode a truncate length the same way truncateSync does,
-   * then decode it the same way the worker does.
-   */
-  function roundtripTruncateLength(len: number): number {
-    const buf = new Uint8Array(8);
-    new DataView(buf.buffer).setFloat64(0, len, true);
-    return new DataView(buf.buffer).getFloat64(0, true);
-  }
-
-  /**
-   * Helper: encode an ftruncate (fd + length) the same way ftruncateSync does,
-   * then decode it the same way the worker does.
-   */
-  function roundtripFtruncate(fd: number, len: number): { fd: number; len: number } {
-    const buf = new Uint8Array(12);
-    const dv = new DataView(buf.buffer);
-    dv.setUint32(0, fd, true);
-    dv.setFloat64(4, len, true);
-    return {
-      fd: new DataView(buf.buffer).getUint32(0, true),
-      len: new DataView(buf.buffer).getFloat64(4, true),
-    };
-  }
-
   describe('truncateSync encoding', () => {
     it('should roundtrip normal lengths correctly', () => {
       expect(roundtripTruncateLength(0)).toBe(0);

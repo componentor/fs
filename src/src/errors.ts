@@ -33,6 +33,7 @@ export const ErrorCodes = {
   ENOSYS: -38,
   ELOOP: -40,
   EIO: -5,
+  ENOTSUP: -45,
 } as const;
 
 /** Binary protocol status codes → error code mapping */
@@ -49,6 +50,7 @@ export const STATUS_TO_CODE: Record<number, string> = {
   9: 'ELOOP',
   10: 'ENOSPC',
   11: 'EIO',
+  12: 'ENOTSUP',
 };
 
 /** Error code → binary protocol status mapping */
@@ -65,6 +67,7 @@ export const CODE_TO_STATUS: Record<string, number> = {
   ELOOP: 9,
   ENOSPC: 10,
   EIO: 11,
+  ENOTSUP: 12,
 };
 
 export function createError(code: string, syscall: string, path: string): FSError {
@@ -81,6 +84,7 @@ export function createError(code: string, syscall: string, path: string): FSErro
     ELOOP: 'too many symbolic links encountered',
     ENOSPC: 'no space left on device',
     EIO: 'i/o error',
+    ENOTSUP: 'operation not supported',
   };
   const msg = messages[code] ?? 'unknown error';
   return new FSError(code, errno, `${code}: ${msg}, ${syscall} '${path}'`, syscall, path);
@@ -131,6 +135,73 @@ export function invalidArgType(name: string, expected: string, actual: unknown):
 export function invalidArgValue(name: string, value: unknown, reason: string): TypeError {
   const err = new TypeError(`The ${kind(name)} '${name}' ${reason}. Received ${inspectArg(value)}`);
   (err as TypeError & { code: string }).code = 'ERR_INVALID_ARG_VALUE';
+  return err;
+}
+
+/** Attach Node's `ERR_*` shape to an argument-level filesystem error. */
+function fsError(code: string, message: string, path: string, syscall: string): Error {
+  const err = new Error(message) as Error & { code: string; path: string; syscall: string };
+  err.code = code;
+  err.path = path;
+  err.syscall = syscall;
+  return err;
+}
+
+/**
+ * `ERR_FS_EISDIR` — `rm` was pointed at a directory without `recursive: true`.
+ *
+ * Not an errno error: Node raises this in JS before deciding what syscall to make, and unlike
+ * ENOENT it is *not* suppressed by `force`. Empty or not, a directory needs `recursive`.
+ */
+export function eisdirNotRecursive(path: string, syscall = 'rm'): Error {
+  return fsError('ERR_FS_EISDIR', `Path is a directory: ${syscall} returned EISDIR (is a directory) ${path}`, path, syscall);
+}
+
+/**
+ * `ERR_FS_EISDIR` as `cp` raises it — same code, different wording.
+ *
+ * Node words this one after the option the caller forgot rather than after the syscall, and
+ * code that branches on `err.code` sees `ERR_FS_EISDIR` from both. Reporting a bare `EISDIR`
+ * here (as this used to) makes a Node-targeted `catch (e) { if (e.code === 'ERR_FS_EISDIR') }`
+ * miss entirely.
+ */
+export function cpEisdirNotRecursive(path: string): Error {
+  return fsError('ERR_FS_EISDIR', `Recursive option not enabled, cannot copy a directory: ${path}`, path, 'cp');
+}
+
+/**
+ * `ERR_FS_CP_EINVAL` — `cp` was asked to copy something onto itself.
+ *
+ * Node rejects both `src === dest` and a `dest` inside `src`. The second is not a nicety: a
+ * recursive copy into its own subtree recreates the destination inside itself on every pass and
+ * never terminates, filling storage and hanging the tab. The drives layer guarded this in 3.3.0;
+ * `VFSFileSystem.cpSync` did not, until 3.3.16.
+ */
+export function cpSameSource(path: string): Error {
+  return fsError('ERR_FS_CP_EINVAL', `src and dest cannot be the same ${path}`, path, 'cp');
+}
+
+/** `ERR_FS_CP_EINVAL` — the destination lives inside the source directory. */
+export function cpIntoSubdirectory(src: string, dest: string): Error {
+  return fsError('ERR_FS_CP_EINVAL', `Cannot copy ${src}/ to a subdirectory of self ${dest}`, dest, 'cp');
+}
+
+/** `ERR_FS_CP_EEXIST` — `cp` with `errorOnExist` found the destination already present. */
+export function cpTargetExists(path: string): Error {
+  return fsError('ERR_FS_CP_EEXIST', `Target already exists: cp returned EEXIST (${path})`, path, 'cp');
+}
+
+/**
+ * `ERR_STREAM_WRITE_AFTER_END` — `write()` on a stream whose `end()` has already been called.
+ *
+ * A stream error rather than a filesystem one, so it carries no `path`/`syscall`. Node raises it
+ * the moment `end()` has been seen, not when the close completes; deferring it makes the outcome
+ * depend on whether the queued writes happened to drain first, which is a race the caller has no
+ * way to observe or control.
+ */
+export function streamWriteAfterEnd(): Error {
+  const err = new Error('write after end') as Error & { code: string };
+  err.code = 'ERR_STREAM_WRITE_AFTER_END';
   return err;
 }
 

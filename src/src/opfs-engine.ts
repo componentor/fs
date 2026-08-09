@@ -15,6 +15,10 @@
 
 const encoder = new TextEncoder();
 
+/** Filesystem type reported by statfs — matches VFS_MAGIC ('VFS!'), kept literal so this
+ *  module stays import-free like the rest of it. */
+const VFS_TYPE_MAGIC = 0x56465321;
+
 // Match VFS inode types for stat encoding
 const TYPE_FILE = 1;
 const TYPE_DIRECTORY = 2;
@@ -179,8 +183,22 @@ export class OPFSEngine {
     if (!nav) return { status: ENOENT, data: null };
     try {
       const fh = await nav.dir.getFileHandle(nav.name);
-      const file = await fh.getFile();
-      return { status: OK, data: new Uint8Array(await file.arrayBuffer()) };
+      // Read through a sync access handle rather than getFile()/arrayBuffer().
+      //
+      // The Blob path stalls on Firefox when the caller is a page main thread spinning on the
+      // SharedArrayBuffer: `File`/`Blob` reads appear to need main-thread involvement, so the
+      // continuation never runs and the sync caller waits forever. `createSyncAccessHandle` is
+      // worker-local — the same primitive `write` already used, which is why writes worked there
+      // and reads did not. Also avoids materialising the file twice (Blob, then ArrayBuffer).
+      const sh = await (fh as any).createSyncAccessHandle();
+      try {
+        const size: number = sh.getSize();
+        const buf = new Uint8Array(size);
+        if (size > 0) sh.read(buf, { at: 0 });
+        return { status: OK, data: buf };
+      } finally {
+        sh.close();
+      }
     } catch {
       return { status: ENOENT, data: null };
     }
@@ -663,6 +681,43 @@ export class OPFSEngine {
     entry.handle.truncate(len);
     entry.handle.flush();
     return { status: OK, data: null };
+  }
+
+  /**
+   * Volume statistics for OPFS mode, from the Storage API rather than a VFS superblock.
+   *
+   * There is no block allocator here to ask, but `navigator.storage.estimate()` reports the
+   * origin's real quota and usage, which is the honest answer to "how much space is there".
+   * Reported in the same 4 KB blocks the VFS uses so callers see one unit across both modes.
+   *
+   * Inode counts have no meaning in OPFS — there is no fixed table — so `files`/`ffree` are 0.
+   * Node always returns numbers here, and 0 is the least misleading one available: any other
+   * value would be invented, which is exactly what this method used to do in both modes.
+   *
+   * Payload matches VFSEngine.statfs: [type u32][bsize u32][blocks u32][bfree u32][files u32][ffree u32].
+   */
+  async statfs(): Promise<OPFSResult> {
+    const BSIZE = 4096;
+    let quota = 0;
+    let usage = 0;
+    try {
+      const est = await navigator.storage.estimate();
+      quota = est.quota ?? 0;
+      usage = est.usage ?? 0;
+    } catch { /* Storage API unavailable — report zeros rather than invent a capacity */ }
+
+    const blocks = Math.floor(quota / BSIZE);
+    const free = Math.max(0, Math.floor((quota - usage) / BSIZE));
+
+    const buf = new Uint8Array(24);
+    const dv = new DataView(buf.buffer);
+    dv.setUint32(0, VFS_TYPE_MAGIC, true);
+    dv.setUint32(4, BSIZE, true);
+    dv.setUint32(8, Math.min(blocks, 0xffffffff), true);
+    dv.setUint32(12, Math.min(free, 0xffffffff), true);
+    dv.setUint32(16, 0, true);
+    dv.setUint32(20, 0, true);
+    return { status: 0, data: buf };
   }
 
   async fsync(): Promise<OPFSResult> {

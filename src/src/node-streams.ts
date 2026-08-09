@@ -9,6 +9,9 @@
 // SimpleEventEmitter — shared base for Node-style event emitters
 // ---------------------------------------------------------------------------
 
+import { createStringDecoder, encodeString, type StringDecoder } from './encoding.js';
+import { streamWriteAfterEnd } from './errors.js';
+
 type Listener = (...args: unknown[]) => void;
 
 export class SimpleEventEmitter {
@@ -118,6 +121,13 @@ export class NodeReadable extends SimpleEventEmitter {
   private _reading = false;
   private _readBuffer: Uint8Array | null = null;
   private _encoding: string | null = null;
+  /**
+   * Carries partial characters between chunks — see {@link createStringDecoder}.
+   *
+   * Decoding each chunk on its own turned every multi-byte character that straddled a 64 KB
+   * chunk boundary into two U+FFFDs.
+   */
+  private _decoder: StringDecoder | null = null;
 
   /** Whether the stream is still readable (not ended or destroyed). */
   readable = true;
@@ -168,6 +178,7 @@ export class NodeReadable extends SimpleEventEmitter {
    */
   setEncoding(encoding: string): this {
     this._encoding = encoding;
+    this._decoder = createStringDecoder(encoding);
     return this;
   }
 
@@ -241,6 +252,63 @@ export class NodeReadable extends SimpleEventEmitter {
 
   // ---- Internal ----
 
+  /**
+   * `for await (const chunk of stream)`.
+   *
+   * Node's readables are async iterable, and this one was not — so the ordinary way to consume a
+   * read stream threw "stream is not async iterable". Implemented over the event interface with
+   * `pause()` between chunks so a slow consumer applies backpressure instead of buffering the
+   * whole file.
+   *
+   * Leaving the loop early (`break`, `return`, or a throw in the body) destroys the stream, which
+   * closes the underlying handle — node does the same, and here it matters more: in the browser
+   * these are OPFS sync access handles holding an *exclusive* lock, so a leaked one blocks every
+   * later open of that file for the lifetime of the page.
+   */
+  async *[Symbol.asyncIterator](): AsyncIterableIterator<Uint8Array | string> {
+    const queue: (Uint8Array | string)[] = [];
+    let ended = false;
+    let failure: Error | null = null;
+    let wake: (() => void) | null = null;
+    const notify = () => { const w = wake; wake = null; w?.(); };
+
+    const onData = ((chunk: Uint8Array | string) => {
+      queue.push(chunk);
+      this.pause();      // one chunk at a time; resumed once the consumer takes it
+      notify();
+    }) as Listener;
+    const onEnd = (() => { ended = true; notify(); }) as Listener;
+    const onError = ((err: Error) => { failure = err; notify(); }) as Listener;
+
+    this.on('data', onData);
+    this.on('end', onEnd);
+    this.on('error', onError);
+
+    this.resume();
+
+    try {
+      for (;;) {
+        if (queue.length > 0) {
+          const chunk = queue.shift()!;
+          yield chunk;
+          this.resume();
+          continue;
+        }
+        if (failure) throw failure;
+        if (ended || this._ended) return;
+        await new Promise<void>((resolve) => { wake = resolve; });
+      }
+    } finally {
+      // Detach first, so `destroy()` cannot re-enter the handlers above.
+      this.off('data', onData);
+      this.off('end', onEnd);
+      this.off('error', onError);
+      // Only on early exit: a stream that ran to completion has already released its handle,
+      // and destroying it again would emit a second 'close'.
+      if (!this._ended && !this._destroyed) this.destroy();
+    }
+  }
+
   private async _drain(): Promise<void> {
     if (this._reading || this._destroyed || this._ended) return;
     this._reading = true;
@@ -254,6 +322,12 @@ export class NodeReadable extends SimpleEventEmitter {
         if (result.done || !result.value || result.value.byteLength === 0) {
           this._ended = true;
           this.readable = false;
+          // Flush any bytes the decoder was holding for a character that never completed. Node
+          // emits this as a final 'data' before 'end' rather than dropping it.
+          if (this._decoder) {
+            const tail = this._decoder.end();
+            if (tail !== '') this.emit('data', tail);
+          }
           this.emit('end');
           this.emit('close');
           break;
@@ -261,8 +335,10 @@ export class NodeReadable extends SimpleEventEmitter {
 
         this.bytesRead += result.value.byteLength;
         this._readBuffer = result.value;
-        if (this._encoding) {
-          this.emit('data', new TextDecoder(this._encoding).decode(result.value));
+        if (this._decoder) {
+          // A chunk may end mid-character; the decoder holds the remainder for the next one.
+          const text = this._decoder.write(result.value);
+          if (text !== '') this.emit('data', text);
         } else {
           this.emit('data', result.value);
         }
@@ -295,11 +371,33 @@ export class NodeWritable extends SimpleEventEmitter {
   private _finished = false;
   private _writing = false;
   private _corked = false;
+  /**
+   * Set synchronously by `end()`, where `_finished` is only set once the queue has drained.
+   *
+   * Node rejects a write the moment `end()` has been called. Testing `_finished` instead let a
+   * late write be accepted and queued, and whether it landed in the file, hit `EBADF`, or wrote
+   * past a closed handle depended purely on whether close won the race.
+   */
+  private _ending = false;
+
+  /**
+   * Serialises queued writes.
+   *
+   * `_writeFn` reads the stream's current file offset when it runs and advances it by however
+   * much it wrote. Firing writes concurrently therefore loses data: two synchronous `write()`
+   * calls both started at the same offset, and the second overwrote the first — a plain
+   * `ws.write('abc'); ws.write('def')` produced `'def'`. Chaining keeps each write starting
+   * where the previous one finished, and lets `end()` wait for the queue to drain before
+   * closing the handle, which was the same race one step later.
+   */
+  private _chain: Promise<void> = Promise.resolve();
 
   constructor(
     path: string,
     private _writeFn: (chunk: Uint8Array) => Promise<void>,
     private _closeFn: () => Promise<void>,
+    /** Encoding for string chunks written without one — the stream's `encoding` option. */
+    private _defaultEncoding: string = 'utf8',
   ) {
     super();
     this.path = path;
@@ -329,31 +427,43 @@ export class NodeWritable extends SimpleEventEmitter {
     cb?: (...args: unknown[]) => void,
   ): boolean {
     const callback = typeof encodingOrCb === 'function' ? encodingOrCb : cb;
+    const encoding = typeof encodingOrCb === 'string' ? encodingOrCb : this._defaultEncoding;
 
-    if (this._destroyed || this._finished) {
-      const err = new Error('write after end');
+    if (this._destroyed || this._finished || this._ending) {
+      const err = streamWriteAfterEnd();
+      // Node reports it to the callback *and* emits 'error'; without the emit a stream with no
+      // per-write callback loses the failure entirely.
       if (callback) callback(err);
+      this.emit('error', err);
       return false;
     }
 
+    // A string chunk is encoded with the write's own encoding, falling back to the stream's.
+    // This used to be an unconditional `new TextEncoder()`, so `write(s, 'latin1')` wrote UTF-8:
+    // 'é' went out as [195,169] where node writes [233].
     const data =
       typeof chunk === 'string'
-        ? new TextEncoder().encode(chunk)
+        ? encodeString(chunk, encoding)
         : chunk;
 
     this._writing = true;
-    this._writeFn(data)
-      .then(() => {
-        this.bytesWritten += data.byteLength;
-        this._writing = false;
-        if (callback) callback();
-        this.emit('drain');
-      })
-      .catch((err: unknown) => {
-        this._writing = false;
-        if (callback) callback(err);
-        this.emit('error', err);
-      });
+    this._chain = this._chain
+      .then(() => this._writeFn(data))
+      .then(
+        () => {
+          this.bytesWritten += data.byteLength;
+          this._writing = false;
+          if (callback) callback();
+          this.emit('drain');
+        },
+        (err: unknown) => {
+          this._writing = false;
+          if (callback) callback(err);
+          this.emit('error', err);
+          // Settle rather than rethrow: a rejected chain would strand every later write and
+          // leave `end()` waiting forever on a promise nobody resolves.
+        },
+      );
 
     // Always return true — we don't implement back-pressure
     return true;
@@ -367,6 +477,7 @@ export class NodeWritable extends SimpleEventEmitter {
     // Normalise arguments — Node allows several overloads
     let callback: ((...args: unknown[]) => void) | undefined;
     let finalChunk: string | Uint8Array | undefined;
+    let finalEncoding: string | undefined;
 
     if (typeof chunk === 'function') {
       callback = chunk;
@@ -376,11 +487,12 @@ export class NodeWritable extends SimpleEventEmitter {
       if (typeof encodingOrCb === 'function') {
         callback = encodingOrCb;
       } else {
+        finalEncoding = encodingOrCb;
         callback = cb;
       }
     }
 
-    if (this._finished) {
+    if (this._finished || this._ending) {
       if (callback) callback();
       return this;
     }
@@ -388,7 +500,9 @@ export class NodeWritable extends SimpleEventEmitter {
     this.writable = false;
 
     const finish = () => {
-      this._closeFn()
+      // Drain queued writes first — closing the handle with writes still in flight loses them.
+      this._chain
+        .then(() => this._closeFn())
         .then(() => {
           this._finished = true;
           this.emit('finish');
@@ -402,10 +516,15 @@ export class NodeWritable extends SimpleEventEmitter {
     };
 
     if (finalChunk !== undefined && finalChunk !== null) {
-      this.write(finalChunk, undefined, () => finish());
-    } else {
-      finish();
+      // Enqueue it; `finish` waits on the same chain, so no completion callback is needed.
+      // This runs before `_ending` is set, or `write()` would reject the stream's own last chunk.
+      this.write(finalChunk, finalEncoding);
     }
+    // From here `write()` reports ERR_STREAM_WRITE_AFTER_END. Setting it now — rather than when
+    // the queue drains — also freezes `_chain`, so nothing can be appended after `finish()` has
+    // captured it and slip in behind the close.
+    this._ending = true;
+    finish();
 
     return this;
   }

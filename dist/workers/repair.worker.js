@@ -137,14 +137,15 @@ var CODE_TO_STATUS = {
   EBADF: 8,
   ELOOP: 9,
   ENOSPC: 10,
-  EIO: 11
+  EIO: 11,
+  ENOTSUP: 12
 };
 
 // src/vfs/engine.ts
 var encoder = new TextEncoder();
 var PREGROW_HEADROOM_BLOCKS = 16384;
 var decoder = new TextDecoder();
-var VFSEngine = class {
+var VFSEngine = class _VFSEngine {
   handle;
   pathIndex = /* @__PURE__ */ new Map();
   // path → inode index
@@ -167,6 +168,22 @@ var VFSEngine = class {
   fdTable = /* @__PURE__ */ new Map();
   nextFd = 3;
   // 0=stdin, 1=stdout, 2=stderr reserved
+  /**
+   * Whether an fd's open flags permit reading / writing.
+   *
+   * The low two bits of the flags are the access mode (O_RDONLY=0, O_WRONLY=1, O_RDWR=2). These
+   * were not enforced: reading from a descriptor opened `'w'` returned 0 bytes instead of EBADF,
+   * and writing through one opened `'r'` succeeded. Both are errors in Node, and code that
+   * relies on the error to detect a mis-opened file saw silence instead. Found by the fd fuzzer.
+   */
+  static isReadable(flags) {
+    const mode = flags & 3;
+    return mode === 0 || mode === 2;
+  }
+  static isWritable(flags) {
+    const mode = flags & 3;
+    return mode === 1 || mode === 2;
+  }
   // Reusable buffers to avoid allocations
   inodeBuf = new Uint8Array(INODE_SIZE);
   inodeView = new DataView(this.inodeBuf.buffer);
@@ -220,6 +237,21 @@ var VFSEngine = class {
   // scaffolding mutates pathIndex directly.
   childIndex = /* @__PURE__ */ new Map();
   childIndexGen = 0;
+  /** Where the next block search resumes — see allocateBlocks. Reset on mount/format. */
+  allocCursor = 0;
+  /**
+   * Set when path resolution gave up because a symlink chain exceeded MAX_SYMLINK_DEPTH.
+   *
+   * The resolvers return `undefined` for both "not there" and "went in circles", which every
+   * caller then reported as ENOENT — so a symlink pointing at itself looked like a missing file
+   * instead of the ELOOP Node reports. Reset at the start of every top-level resolve and read
+   * immediately after, via `resolveFailureStatus`.
+   */
+  symlinkLoopDetected = false;
+  /** ENOENT, or ELOOP when the last resolve gave up on a symlink cycle. */
+  resolveFailureStatus() {
+    return this.symlinkLoopDetected ? CODE_TO_STATUS.ELOOP : CODE_TO_STATUS.ENOENT;
+  }
   // Configurable upper bounds
   maxInodes = 4e6;
   // Default ceiling on data blocks. The on-disk bitmap region is reserved for
@@ -683,34 +715,60 @@ var VFSEngine = class {
       written += n;
     }
   }
+  /**
+   * Find and reserve `count` contiguous free blocks.
+   *
+   * Next-fit: the search resumes where the last allocation ended and wraps once, rather than
+   * restarting at block 0 every time. Restarting meant each allocation first walked past every
+   * block already in use, so creating files into a filling volume cost O(allocated) each and
+   * O(n²) overall — measured at 8 µs per create on an empty volume rising to 16 µs by 16k files.
+   * With a cursor, sequential allocation is O(count).
+   *
+   * Wrapping preserves the old guarantee that the volume only grows when no contiguous run
+   * exists anywhere: the second pass covers everything below the cursor, extended by `count - 1`
+   * so a run straddling the cursor is still found.
+   */
   allocateBlocks(count) {
     if (count === 0) return 0;
+    let start = this.scanForRun(this.allocCursor, this.totalBlocks, count);
+    if (start < 0 && this.allocCursor > 0) {
+      const wrapEnd = Math.min(this.allocCursor + count - 1, this.totalBlocks);
+      start = this.scanForRun(0, wrapEnd, count);
+    }
+    if (start < 0) return this.growAndAllocate(count);
+    const end = start + count - 1;
+    const bitmap = this.bitmap;
+    for (let j = start; j <= end; j++) bitmap[j >>> 3] |= 1 << (j & 7);
+    this.markBitmapDirty(start >>> 3, end >>> 3);
+    this.freeBlocks -= count;
+    this.superblockDirty = true;
+    this.allocCursor = end + 1 >= this.totalBlocks ? 0 : end + 1;
+    return start;
+  }
+  /**
+   * First index in [from, to) starting a run of `count` free blocks, or -1.
+   *
+   * Fully-allocated bytes are skipped eight blocks at a time. That matters on a filling volume,
+   * where the overwhelming majority of the bitmap the scan crosses is solid 0xFF.
+   */
+  scanForRun(from, to, count) {
     const bitmap = this.bitmap;
     let run = 0;
-    let start = 0;
-    for (let i = 0; i < this.totalBlocks; i++) {
-      const byteIdx = i >>> 3;
-      const bitIdx = i & 7;
-      const used = bitmap[byteIdx] >>> bitIdx & 1;
-      if (used) {
+    let start = from;
+    for (let i = from; i < to; i++) {
+      if (run === 0 && (i & 7) === 0 && bitmap[i >>> 3] === 255) {
+        i += 7;
+        start = i + 1;
+        continue;
+      }
+      if (bitmap[i >>> 3] >>> (i & 7) & 1) {
         run = 0;
         start = i + 1;
-      } else {
-        run++;
-        if (run === count) {
-          for (let j = start; j <= i; j++) {
-            const bj = j >>> 3;
-            const bi = j & 7;
-            bitmap[bj] |= 1 << bi;
-          }
-          this.markBitmapDirty(start >>> 3, i >>> 3);
-          this.freeBlocks -= count;
-          this.superblockDirty = true;
-          return start;
-        }
+      } else if (++run === count) {
+        return start;
       }
     }
-    return this.growAndAllocate(count);
+    return -1;
   }
   /** Highest block count the reserved on-disk bitmap region can represent.
    *  The bitmap lives in [bitmapOffset, dataOffset); each byte covers 8 blocks.
@@ -829,7 +887,11 @@ var VFSEngine = class {
   }
   // ========== Path resolution ==========
   resolvePath(path, depth = 0) {
-    if (depth > MAX_SYMLINK_DEPTH) return void 0;
+    if (depth === 0) this.symlinkLoopDetected = false;
+    if (depth > MAX_SYMLINK_DEPTH) {
+      this.symlinkLoopDetected = true;
+      return void 0;
+    }
     const idx = this.pathIndex.get(path);
     if (idx === void 0) {
       return this.resolvePathComponents(path, true, depth);
@@ -854,7 +916,11 @@ var VFSEngine = class {
    * (where files actually exist in pathIndex), not under the symlink path.
    */
   resolvePathFull(path, followLast = true, depth = 0) {
-    if (depth > MAX_SYMLINK_DEPTH) return void 0;
+    if (depth === 0) this.symlinkLoopDetected = false;
+    if (depth > MAX_SYMLINK_DEPTH) {
+      this.symlinkLoopDetected = true;
+      return void 0;
+    }
     const parts = path.split("/").filter(Boolean);
     let current = "/";
     for (let i = 0; i < parts.length; i++) {
@@ -877,6 +943,28 @@ var VFSEngine = class {
     const finalIdx = this.pathIndex.get(current);
     if (finalIdx === void 0) return void 0;
     return { idx: finalIdx, resolvedPath: current };
+  }
+  /**
+   * Follow a symlink chain to the path a *create* should land on.
+   *
+   * `resolvePathFull` gives up when the final target does not exist, which is exactly the
+   * dangling-link case: `writeFileSync('/link', …)` where `/link` → `t3` and `t3` is absent.
+   * Callers then created a file at `/link` itself, destroying the symlink — Node follows the
+   * link and creates `/t3`, leaving the link intact.
+   *
+   * Returns `path` unchanged when it is not a symlink, so callers on the common path pay a
+   * single Map lookup, and `null` when the chain exceeds MAX_SYMLINK_DEPTH — a cycle, which
+   * callers must report as ELOOP rather than writing to wherever the walk happened to stop.
+   */
+  resolveDanglingLink(path, depth = 0) {
+    if (depth > MAX_SYMLINK_DEPTH) return null;
+    const idx = this.pathIndex.get(path);
+    if (idx === void 0) return path;
+    const inode = this.readInode(idx);
+    if (inode.type !== INODE_TYPE.SYMLINK) return path;
+    const target = decoder.decode(this.readData(inode.firstBlock, inode.blockCount, inode.size));
+    const resolved = target.startsWith("/") ? target : this.resolveRelative(path, target);
+    return this.resolveDanglingLink(resolved, depth + 1);
   }
   resolveRelative(from, target) {
     const dir = from.substring(0, from.lastIndexOf("/")) || "/";
@@ -967,7 +1055,7 @@ var VFSEngine = class {
       }
     }
     if (idx === void 0) idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    if (idx === void 0) return { status: this.resolveFailureStatus(), data: null };
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR, data: null };
     const data = inode.size > 0 ? this.readData(inode.firstBlock, inode.blockCount, inode.size) : new Uint8Array(0);
@@ -985,7 +1073,17 @@ var VFSEngine = class {
     const parentStatus = this.ensureParent(path);
     if (parentStatus !== 0) return { status: parentStatus };
     const t2 = this.debug ? performance.now() : 0;
-    const existingIdx = this.resolvePathComponents(path, true);
+    let existingIdx = this.resolvePathComponents(path, true);
+    if (existingIdx === void 0) {
+      const linkTarget = this.resolveDanglingLink(path);
+      if (linkTarget === null) return { status: CODE_TO_STATUS.ELOOP };
+      if (linkTarget !== path) {
+        path = linkTarget;
+        const targetParentStatus = this.ensureParent(path);
+        if (targetParentStatus !== 0) return { status: targetParentStatus };
+        existingIdx = this.resolvePathComponents(path, true);
+      }
+    }
     const t3 = this.debug ? performance.now() : 0;
     let tAlloc = t3, tData = t3, tInode = t3;
     if (existingIdx !== void 0) {
@@ -1042,6 +1140,14 @@ var VFSEngine = class {
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
     const combinedSize = inode.size + data.byteLength;
     const neededBlocks = Math.ceil(combinedSize / this.blockSize);
+    if (neededBlocks <= inode.blockCount) {
+      this.handle.write(data, { at: this.dataOffset + inode.firstBlock * this.blockSize + inode.size });
+      inode.size = combinedSize;
+      inode.mtime = Date.now();
+      this.writeInode(existingIdx, inode);
+      this.commitPending();
+      return { status: 0 };
+    }
     const newFirst = this.allocateBlocks(neededBlocks);
     const newBase = this.dataOffset + newFirst * this.blockSize;
     if (inode.size > 0) {
@@ -1089,10 +1195,11 @@ var VFSEngine = class {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
     if (idx === void 0) {
+      const failure = this.resolveFailureStatus();
       if (this.isImplicitDirectory(path)) {
         return this.encodeImplicitDirStatResponse(path);
       }
-      return { status: CODE_TO_STATUS.ENOENT, data: null };
+      return { status: failure, data: null };
     }
     return this.encodeStatResponse(idx);
   }
@@ -1239,6 +1346,11 @@ var VFSEngine = class {
         this.deletePathIndex(child);
       }
     }
+    if (path === "/") {
+      this.pathIndexGen++;
+      this.commitPending();
+      return { status: 0 };
+    }
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
     this.deletePathIndex(path);
@@ -1262,56 +1374,43 @@ var VFSEngine = class {
       return { status: CODE_TO_STATUS.ENOENT, data: null };
     }
     const withFileTypes = (flags & 1) !== 0;
-    const children = this.getDirectChildrenWithImplicit(effectiveDirPath);
     if (withFileTypes) {
-      let totalSize2 = 4;
-      const entries = [];
-      for (const child of children) {
-        const name = child.path.substring(child.path.lastIndexOf("/") + 1);
-        const nameBytes = encoder.encode(name);
-        let type;
-        if (child.type === "implicit") {
-          type = INODE_TYPE.DIRECTORY;
-        } else {
-          const childIdx = this.pathIndex.get(child.path);
-          const childInode = this.readInode(childIdx);
-          type = childInode.type;
-        }
-        entries.push({ name: nameBytes, type });
-        totalSize2 += 2 + nameBytes.byteLength + 1;
-      }
-      const buf2 = new Uint8Array(totalSize2);
+      this.ensureChildIndex();
+      const typedNames = this.childIndex.get(effectiveDirPath);
+      if (!typedNames) return { status: 0, data: new Uint8Array([0, 0, 0, 0]) };
+      const names2 = [...typedNames.keys()].sort();
+      const prefix = effectiveDirPath === "/" ? "/" : effectiveDirPath + "/";
+      let capacity2 = 4;
+      for (const name of names2) capacity2 += 3 + name.length * 3;
+      const buf2 = new Uint8Array(capacity2);
       const view2 = new DataView(buf2.buffer);
-      view2.setUint32(0, entries.length, true);
+      view2.setUint32(0, names2.length, true);
       let offset2 = 4;
-      for (const entry of entries) {
-        view2.setUint16(offset2, entry.name.byteLength, true);
-        offset2 += 2;
-        buf2.set(entry.name, offset2);
-        offset2 += entry.name.byteLength;
-        buf2[offset2++] = entry.type;
+      for (const name of names2) {
+        const { written } = encoder.encodeInto(name, buf2.subarray(offset2 + 2));
+        view2.setUint16(offset2, written, true);
+        offset2 += 2 + written;
+        const childIdx = this.pathIndex.get(prefix + name);
+        buf2[offset2++] = childIdx === void 0 ? INODE_TYPE.DIRECTORY : this.readInode(childIdx).type;
       }
-      return { status: 0, data: buf2 };
+      return { status: 0, data: buf2.subarray(0, offset2) };
     }
-    let totalSize = 4;
-    const nameEntries = [];
-    for (const child of children) {
-      const name = child.path.substring(child.path.lastIndexOf("/") + 1);
-      const nameBytes = encoder.encode(name);
-      nameEntries.push(nameBytes);
-      totalSize += 2 + nameBytes.byteLength;
-    }
-    const buf = new Uint8Array(totalSize);
+    this.ensureChildIndex();
+    const childNames = this.childIndex.get(effectiveDirPath);
+    if (!childNames) return { status: 0, data: new Uint8Array([0, 0, 0, 0]) };
+    const names = [...childNames.keys()].sort();
+    let capacity = 4;
+    for (const name of names) capacity += 2 + name.length * 3;
+    const buf = new Uint8Array(capacity);
     const view = new DataView(buf.buffer);
-    view.setUint32(0, nameEntries.length, true);
+    view.setUint32(0, names.length, true);
     let offset = 4;
-    for (const nameBytes of nameEntries) {
-      view.setUint16(offset, nameBytes.byteLength, true);
-      offset += 2;
-      buf.set(nameBytes, offset);
-      offset += nameBytes.byteLength;
+    for (const name of names) {
+      const { written } = encoder.encodeInto(name, buf.subarray(offset + 2));
+      view.setUint16(offset, written, true);
+      offset += 2 + written;
     }
-    return { status: 0, data: buf };
+    return { status: 0, data: buf.subarray(0, offset) };
   }
   // ---- RENAME ----
   rename(oldPath, newPath) {
@@ -1397,7 +1496,7 @@ var VFSEngine = class {
   truncate(path, len = 0) {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === void 0) return { status: this.resolveFailureStatus() };
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
     if (len === 0) {
@@ -1452,18 +1551,28 @@ var VFSEngine = class {
     srcPath = this.normalizePath(srcPath);
     destPath = this.normalizePath(destPath);
     const srcIdx = this.resolvePathComponents(srcPath, true);
-    if (srcIdx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (srcIdx === void 0) return { status: this.resolveFailureStatus() };
     const srcInode = this.readInode(srcIdx);
-    if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
+    if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTSUP };
     if (flags & 1 && (this.pathIndex.has(destPath) || this.isImplicitDirectory(destPath))) {
       return { status: CODE_TO_STATUS.EEXIST };
     }
     if (srcPath === destPath) return { status: 0 };
     const srcSize = srcInode.size;
     const srcFirstBlock = srcInode.firstBlock;
+    const srcMode = srcInode.mode;
     const emptyStatus = this.write(destPath, new Uint8Array(0));
     if (emptyStatus.status !== 0) return emptyStatus;
-    if (srcSize === 0) return { status: 0 };
+    if (srcSize === 0) {
+      const emptyIdx = this.resolvePathComponents(destPath, true);
+      if (emptyIdx !== void 0) {
+        const emptyInode = this.readInode(emptyIdx);
+        emptyInode.mode = emptyInode.mode & ~4095 | srcMode & 4095;
+        this.writeInode(emptyIdx, emptyInode);
+        this.commitPending();
+      }
+      return { status: 0 };
+    }
     const destIdx = this.resolvePathComponents(destPath, true);
     if (destIdx === void 0) return { status: CODE_TO_STATUS.EIO };
     const destInode = this.readInode(destIdx);
@@ -1485,6 +1594,7 @@ var VFSEngine = class {
     destInode.blockCount = neededBlocks;
     destInode.size = srcSize;
     destInode.mtime = Date.now();
+    destInode.mode = destInode.mode & ~4095 | srcMode & 4095;
     this.writeInode(destIdx, destInode);
     this.commitPending();
     return { status: 0 };
@@ -1494,8 +1604,9 @@ var VFSEngine = class {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
     if (idx === void 0) {
+      const failure = this.resolveFailureStatus();
       if (this.isImplicitDirectory(path)) return { status: 0 };
-      return { status: CODE_TO_STATUS.ENOENT };
+      return { status: failure };
     }
     if (mode === 0) return { status: 0 };
     if (!this.strictPermissions) return { status: 0 };
@@ -1517,10 +1628,11 @@ var VFSEngine = class {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
     if (idx === void 0) {
+      const failure = this.resolveFailureStatus();
       if (this.isImplicitDirectory(path)) {
         return { status: 0, data: encoder.encode(path) };
       }
-      return { status: CODE_TO_STATUS.ENOENT, data: null };
+      return { status: failure, data: null };
     }
     const inode = this.readInode(idx);
     const resolvedPath = this.readPath(inode.pathOffset, inode.pathLength);
@@ -1530,7 +1642,7 @@ var VFSEngine = class {
   chmod(path, mode) {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === void 0) return { status: this.resolveFailureStatus() };
     const inode = this.readInode(idx);
     inode.mode = inode.mode & S_IFMT | mode & 4095;
     inode.ctime = Date.now();
@@ -1541,7 +1653,7 @@ var VFSEngine = class {
   chown(path, uid, gid) {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === void 0) return { status: this.resolveFailureStatus() };
     const inode = this.readInode(idx);
     inode.uid = uid;
     inode.gid = gid;
@@ -1553,7 +1665,7 @@ var VFSEngine = class {
   utimes(path, atime, mtime) {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === void 0) return { status: this.resolveFailureStatus() };
     const inode = this.readInode(idx);
     inode.atime = atime;
     inode.mtime = mtime;
@@ -1589,7 +1701,7 @@ var VFSEngine = class {
     existingPath = this.normalizePath(existingPath);
     newPath = this.normalizePath(newPath);
     const srcIdx = this.resolvePathComponents(existingPath, true);
-    if (srcIdx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (srcIdx === void 0) return { status: this.resolveFailureStatus() };
     const srcInode = this.readInode(srcIdx);
     if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EPERM };
     if (this.pathIndex.has(newPath) || this.isImplicitDirectory(newPath)) {
@@ -1623,7 +1735,17 @@ var VFSEngine = class {
     const hasExcl = (flags & 128) !== 0;
     let idx = this.resolvePathComponents(path, true);
     if (idx === void 0) {
-      if (!hasCreate) return { status: CODE_TO_STATUS.ENOENT, data: null };
+      const linkTarget = this.resolveDanglingLink(path);
+      if (linkTarget === null) return { status: CODE_TO_STATUS.ELOOP, data: null };
+      if (linkTarget !== path) {
+        path = linkTarget;
+        idx = this.resolvePathComponents(path, true);
+      }
+    }
+    if (idx === void 0) {
+      if (!hasCreate) return { status: this.resolveFailureStatus(), data: null };
+      const parentStatus = this.ensureParent(path);
+      if (parentStatus !== 0) return { status: parentStatus, data: null };
       idx = this.createInode(path, INODE_TYPE.FILE, this.fileModeFor(reqMode), 0);
     } else if (hasExcl && hasCreate) {
       return { status: CODE_TO_STATUS.EEXIST, data: null };
@@ -1647,7 +1769,9 @@ var VFSEngine = class {
   fread(fd, length, position) {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF, data: null };
+    if (!_VFSEngine.isReadable(entry.flags)) return { status: CODE_TO_STATUS.EBADF, data: null };
     const inode = this.readInode(entry.inodeIdx);
+    if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR, data: null };
     const pos = position ?? entry.position;
     const readLen = Math.min(length, inode.size - pos);
     if (readLen <= 0) return { status: 0, data: new Uint8Array(0) };
@@ -1663,6 +1787,7 @@ var VFSEngine = class {
   fwrite(fd, data, position) {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF, data: null };
+    if (!_VFSEngine.isWritable(entry.flags)) return { status: CODE_TO_STATUS.EBADF, data: null };
     const inode = this.readInode(entry.inodeIdx);
     const isAppend = (entry.flags & 1024) !== 0;
     const pos = isAppend ? inode.size : position ?? entry.position;
@@ -1728,11 +1853,38 @@ var VFSEngine = class {
   ftruncate(fd, len = 0) {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    if (!_VFSEngine.isWritable(entry.flags)) return { status: CODE_TO_STATUS.EINVAL };
     const inode = this.readInode(entry.inodeIdx);
     const path = this.readPath(inode.pathOffset, inode.pathLength);
     return this.truncate(path, len);
   }
   // ---- FSYNC ----
+  /**
+   * Real volume statistics.
+   *
+   * `statfs` used to be answered by the filesystem layer with fixed constants — always ~4 GB
+   * capacity and ~2 GB free, whatever the volume actually held — so anything checking free space
+   * before a large write got a number unrelated to reality. These come from the superblock the
+   * allocator maintains.
+   *
+   * Payload: [type u32][bsize u32][blocks u32][bfree u32][files u32][ffree u32].
+   */
+  statfs(path = "/") {
+    path = this.normalizePath(path);
+    if (this.resolvePathComponents(path, true) === void 0 && !this.isImplicitDirectory(path)) {
+      return { status: this.resolveFailureStatus(), data: null };
+    }
+    const usedInodes = new Set(this.pathIndex.values()).size;
+    const buf = new Uint8Array(24);
+    const dv = new DataView(buf.buffer);
+    dv.setUint32(0, VFS_MAGIC, true);
+    dv.setUint32(4, this.blockSize, true);
+    dv.setUint32(8, this.totalBlocks, true);
+    dv.setUint32(12, this.freeBlocks, true);
+    dv.setUint32(16, this.inodeCount, true);
+    dv.setUint32(20, Math.max(0, this.inodeCount - usedInodes), true);
+    return { status: 0, data: buf };
+  }
   fsync() {
     this.commitPending();
     this.handle.flush();
@@ -2044,7 +2196,7 @@ var VFSEngine = class {
     const prefix = dirPath === "/" ? "/" : dirPath + "/";
     const descendants = [];
     for (const path of this.pathIndex.keys()) {
-      if (path.startsWith(prefix)) descendants.push(path);
+      if (path !== dirPath && path.startsWith(prefix)) descendants.push(path);
     }
     return descendants.sort((a, b) => {
       const da = a.split("/").length;

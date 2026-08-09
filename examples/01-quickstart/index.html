@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>@componentor/fs — quickstart</title>
+  <style>
+    body { font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.1rem; }
+    pre { background: #f5f5f5; padding: 1rem; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; }
+    .bad { color: #b00; }
+  </style>
+
+  <!--
+    Maps the bare specifier to this repo's built output so the example runs with no install.
+    In your own project: `npm install @componentor/fs`, then DELETE this import map — the
+    `import ... from '@componentor/fs'` line below is already what you want.
+  -->
+  <script type="importmap">
+    { "imports": { "@componentor/fs": "/vendor/index.js" } }
+  </script>
+</head>
+<body>
+  <h1>@componentor/fs — quickstart</h1>
+  <pre id="out">running…</pre>
+
+  <script type="module">
+    import { VFSFileSystem } from '@componentor/fs';
+
+    const out = document.getElementById('out');
+    const lines = [];
+    const log = (...a) => { lines.push(a.join(' ')); out.textContent = lines.join('\n'); };
+
+    // The sync API needs SharedArrayBuffer, which needs a cross-origin-isolated page.
+    // Say so plainly rather than failing later with a confusing error.
+    if (!crossOriginIsolated) {
+      out.innerHTML = '<span class="bad">Not cross-origin isolated — serve this page with '
+        + 'COOP/COEP headers (examples/serve.js does).\nThe async API would still work.</span>';
+      throw new Error('not crossOriginIsolated');
+    }
+
+    // One instance per `root`. `init()` resolves when the volume is mounted and ready.
+    const fs = new VFSFileSystem({ root: '/quickstart' });
+    await fs.init();
+
+    // Start from a clean slate so re-running the page is idempotent.
+    await fs.promises.rm('/', { recursive: true, force: true });
+
+    // ---- synchronous API: the point of the library --------------------------
+    fs.mkdirSync('/notes', { recursive: true });
+    fs.writeFileSync('/notes/hello.txt', 'Hello, OPFS!');
+
+    log('readFileSync      ', JSON.stringify(fs.readFileSync('/notes/hello.txt', 'utf8')));
+    log('existsSync        ', fs.existsSync('/notes/hello.txt'));
+    log('readdirSync       ', JSON.stringify(fs.readdirSync('/notes')));
+
+    const st = fs.statSync('/notes/hello.txt');
+    log('statSync          ', `size=${st.size} isFile=${st.isFile()} mode=0o${(st.mode & 0o777).toString(8)}`);
+
+    fs.appendFileSync('/notes/hello.txt', '\nAppended line.');
+    log('after append      ', JSON.stringify(fs.readFileSync('/notes/hello.txt', 'utf8')));
+
+    // ---- the same operations, promise-flavoured -----------------------------
+    // Identical semantics to node's `fs.promises`; use these when you cannot be
+    // cross-origin isolated, since they do not need SharedArrayBuffer.
+    await fs.promises.writeFile('/notes/async.txt', 'written with await');
+    log('promises.readFile ', JSON.stringify(await fs.promises.readFile('/notes/async.txt', 'utf8')));
+
+    // ---- directories, recursion, and Dirent ---------------------------------
+    fs.mkdirSync('/notes/deep/nested', { recursive: true });
+    fs.writeFileSync('/notes/deep/nested/leaf.txt', 'leaf');
+
+    const entries = fs.readdirSync('/notes', { recursive: true, withFileTypes: true });
+    log('recursive readdir ', entries.map((e) => `${e.parentPath}/${e.name}${e.isDirectory() ? '/' : ''}`).join(', '));
+
+    // Data survives a reload — it is in OPFS, not memory. Refresh the page and the
+    // rm() above is what clears it, not the browser.
+    log('');
+    log('Done. Everything above persisted to OPFS under /quickstart.');
+  </script>
+</body>
+</html>

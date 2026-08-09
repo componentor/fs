@@ -125,9 +125,13 @@ describe('Validation', () => {
       expect(() => {
         toPathString(null as any);
       }).toThrow(TypeError);
+      // The code, not the wording — callers branch on this, and node sets it here too.
       expect(() => {
         toPathString(null as any);
-      }).toThrow(/must be of type string, Uint8Array, or URL/);
+      }).toThrow(expect.objectContaining({ code: 'ERR_INVALID_ARG_TYPE' }));
+      expect(() => {
+        toPathString(null as any);
+      }).toThrow(/must be of type string or an instance of Uint8Array or URL/);
     });
 
     it('undefined path throws TypeError', () => {
@@ -136,7 +140,11 @@ describe('Validation', () => {
       }).toThrow(TypeError);
       expect(() => {
         toPathString(undefined as any);
-      }).toThrow(/must be of type string, Uint8Array, or URL/);
+      }).toThrow(expect.objectContaining({ code: 'ERR_INVALID_ARG_TYPE' }));
+      // node prints null/undefined bare, without a `type` prefix.
+      expect(() => {
+        toPathString(undefined as any);
+      }).toThrow(/Received undefined/);
     });
 
     it('number path throws TypeError', () => {
@@ -145,7 +153,11 @@ describe('Validation', () => {
       }).toThrow(TypeError);
       expect(() => {
         toPathString(42 as any);
-      }).toThrow(/Received number/);
+      }).toThrow(expect.objectContaining({ code: 'ERR_INVALID_ARG_TYPE' }));
+      // node's shape for primitives: `type <typeof> (<value>)`.
+      expect(() => {
+        toPathString(42 as any);
+      }).toThrow(/Received type number \(42\)/);
     });
   });
 

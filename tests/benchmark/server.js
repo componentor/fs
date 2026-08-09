@@ -10,6 +10,7 @@ import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const distDir = path.join(__dirname, '../../dist');
 const benchDir = __dirname;
+const examplesDir = path.join(__dirname, '../../examples');
 const noCoep = process.argv.includes('--no-coep');
 
 const MIME_TYPES = {
@@ -34,6 +35,15 @@ const server = http.createServer((req, res) => {
 
   if (url === '/' || url === '/index.html') {
     filePath = path.join(benchDir, 'index.html');
+  } else if (url.startsWith('/examples/')) {
+    // Serve the examples so examples.spec.ts can prove they still run. Directory URLs get
+    // index.html, matching how examples/serve.js and any static host behave.
+    const rel = url.slice('/examples/'.length);
+    const candidate = path.join(examplesDir, rel);
+    filePath = rel === '' || rel.endsWith('/') ? path.join(candidate, 'index.html') : candidate;
+  } else if (url.startsWith('/vendor/')) {
+    // The examples' import map points here; it is the built library.
+    filePath = path.join(distDir, url.slice('/vendor/'.length));
   } else if (url.startsWith('/dist/') || url === '/index.js' || url === '/kernel.js') {
     // Map shorthand URLs to dist files
     const fileName = url === '/index.js' ? 'index.js'

@@ -1,6 +1,7 @@
 import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { OP, encodeRequest } from '../protocol/opcodes.js';
 import { statusToError } from '../errors.js';
+import { toEpochMs } from '../protocol/payloads.js';
 
 export function utimesSync(
   syncRequest: SyncRequestFn,
@@ -10,8 +11,8 @@ export function utimesSync(
 ): void {
   const timesBuf = new Uint8Array(16);
   const dv = new DataView(timesBuf.buffer);
-  dv.setFloat64(0, typeof atime === 'number' ? atime : atime.getTime(), true);
-  dv.setFloat64(8, typeof mtime === 'number' ? mtime : mtime.getTime(), true);
+  dv.setFloat64(0, toEpochMs(atime, 'atime'), true);
+  dv.setFloat64(8, toEpochMs(mtime, 'mtime'), true);
   const buf = encodeRequest(OP.UTIMES, filePath, 0, timesBuf);
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'utimes', filePath);
@@ -25,8 +26,8 @@ export async function utimes(
 ): Promise<void> {
   const buf = new Uint8Array(16);
   const dv = new DataView(buf.buffer);
-  dv.setFloat64(0, typeof atime === 'number' ? atime : atime.getTime(), true);
-  dv.setFloat64(8, typeof mtime === 'number' ? mtime : mtime.getTime(), true);
+  dv.setFloat64(0, toEpochMs(atime, 'atime'), true);
+  dv.setFloat64(8, toEpochMs(mtime, 'mtime'), true);
   const { status } = await asyncRequest(OP.UTIMES, filePath, 0, buf);
   if (status !== 0) throw statusToError(status, 'utimes', filePath);
 }
@@ -46,8 +47,8 @@ export function futimesSync(
   const payload = new Uint8Array(24);
   const dv = new DataView(payload.buffer);
   dv.setUint32(0, fd, true);
-  dv.setFloat64(8, typeof atime === 'number' ? atime : atime.getTime(), true);
-  dv.setFloat64(16, typeof mtime === 'number' ? mtime : mtime.getTime(), true);
+  dv.setFloat64(8, toEpochMs(atime, 'atime'), true);
+  dv.setFloat64(16, toEpochMs(mtime, 'mtime'), true);
   const buf = encodeRequest(OP.FUTIMES, '', 0, payload);
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'futimes', String(fd));
@@ -62,8 +63,8 @@ export async function futimes(
   const payload = new Uint8Array(24);
   const dv = new DataView(payload.buffer);
   dv.setUint32(0, fd, true);
-  dv.setFloat64(8, typeof atime === 'number' ? atime : atime.getTime(), true);
-  dv.setFloat64(16, typeof mtime === 'number' ? mtime : mtime.getTime(), true);
+  dv.setFloat64(8, toEpochMs(atime, 'atime'), true);
+  dv.setFloat64(16, toEpochMs(mtime, 'mtime'), true);
   const { status } = await asyncRequest(OP.FUTIMES, '', 0, payload);
   if (status !== 0) throw statusToError(status, 'futimes', String(fd));
 }

@@ -64,21 +64,28 @@ function createMockAsync(opts?: { fileSize?: number }) {
 }
 
 describe('FileHandle.appendFile', () => {
-  it('appends string data at end of file', async () => {
+  // In node, `filehandle.appendFile` is a documented **alias of `writeFile`**: it writes at the
+  // descriptor's current position, and the appending comes from having opened with 'a'
+  // (O_APPEND), which the engine honours regardless of the position sent.
+  //
+  // These cases previously asserted an fstat-then-write-at-size sequence, which put the write
+  // past the cursor on an 'r+' handle — `appendFile('B')` over 'AAA' produced 'AAAB' where node
+  // produces 'BAA'. The observable behaviour is compared against real node:fs in
+  // [fd-arg-parity.test.ts](./fd-arg-parity.test.ts); what is pinned here is the wire traffic.
+  it('writes string data at the cursor', async () => {
     const { asyncRequest, calls } = createMockAsync({ fileSize: 10 });
     const handle = await open(asyncRequest, '/test.txt', 'a');
 
     await handle.appendFile('hello');
 
-    // Should have: OPEN, FSTAT (to get size), FWRITE
     const writeCalls = calls.filter(c => c.op === OP.FWRITE);
     expect(writeCalls).toHaveLength(1);
     const writeArgs = writeCalls[0].fdArgs!;
-    expect(writeArgs.position).toBe(10); // file size was 10
+    expect(writeArgs.position).toBe(-1); // -1 = "use the cursor"
     expect(writeArgs.data).toEqual(encoder.encode('hello'));
   });
 
-  it('appends Uint8Array data at end of file', async () => {
+  it('writes Uint8Array data at the cursor', async () => {
     const { asyncRequest, calls } = createMockAsync({ fileSize: 5 });
     const handle = await open(asyncRequest, '/test.bin', 'a');
     const data = new Uint8Array([1, 2, 3, 4]);
@@ -88,19 +95,28 @@ describe('FileHandle.appendFile', () => {
     const writeCalls = calls.filter(c => c.op === OP.FWRITE);
     expect(writeCalls).toHaveLength(1);
     const writeArgs = writeCalls[0].fdArgs!;
-    expect(writeArgs.position).toBe(5);
+    expect(writeArgs.position).toBe(-1);
     expect(writeArgs.data).toEqual(new Uint8Array([1, 2, 3, 4]));
   });
 
-  it('appends to an empty file (position 0)', async () => {
+  it('costs one round trip — it no longer fstats to find the end', async () => {
     const { asyncRequest, calls } = createMockAsync({ fileSize: 0 });
     const handle = await open(asyncRequest, '/empty.txt', 'a');
 
     await handle.appendFile('first');
 
-    const writeCalls = calls.filter(c => c.op === OP.FWRITE);
-    expect(writeCalls).toHaveLength(1);
-    expect(writeCalls[0].fdArgs!.position).toBe(0);
+    expect(calls.filter(c => c.op === OP.FSTAT)).toHaveLength(0);
+    expect(calls.filter(c => c.op === OP.FWRITE)).toHaveLength(1);
+  });
+
+  it('honours a string encoding, which it used to ignore', async () => {
+    const { asyncRequest, calls } = createMockAsync({ fileSize: 0 });
+    const handle = await open(asyncRequest, '/enc.txt', 'a');
+
+    await handle.appendFile('é', 'latin1');
+
+    const writeArgs = calls.filter(c => c.op === OP.FWRITE)[0].fdArgs!;
+    expect(writeArgs.data).toEqual(new Uint8Array([0xe9])); // one byte, not UTF-8's two
   });
 });
 

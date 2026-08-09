@@ -1,80 +1,116 @@
 /**
- * StatFs Tests
+ * statfs reports the real volume, not invented constants.
  *
- * Tests for statfsSync and statfs (async) methods.
- * Since these return static VFS estimates (no opcode needed),
- * we can test them by importing the filesystem class directly.
+ * This file previously built an `expectedStatFs()` object locally and asserted the product
+ * matched it — and both were fabricated: `statfsSync` returned a fixed ~4 GB capacity with ~2 GB
+ * free no matter what the volume held, and the test asserted exactly those constants. Anything
+ * checking free space before a large write got an answer unrelated to reality, and the test
+ * could never have said so. (It escaped the 3.3.10 audit because it imports one product
+ * constant, so it did not look self-referential by that heuristic.)
+ *
+ * `statfs` now reads the superblock the allocator maintains. These assert it *tracks* the
+ * volume — free space falls as data is written and returns when it is freed — which is the only
+ * thing that makes the numbers worth reading.
  */
 
-import { describe, it, expect } from 'vitest';
-import type { StatFs } from '../src/types.js';
+import { describe, it, expect, beforeEach } from 'vitest';
+import { VFS_MAGIC } from '../src/vfs/layout.js';
+import { createFsHarness } from './helpers/engine-transport.js';
+import type { VFSFileSystem } from '../src/filesystem.js';
 
-// The VFS magic number: 0x56465321 = "VFS!"
-const VFS_MAGIC = 0x56465321;
+let fs: VFSFileSystem;
+beforeEach(() => { fs = createFsHarness().fs; });
 
-const REQUIRED_FIELDS: (keyof StatFs)[] = [
-  'type', 'bsize', 'blocks', 'bfree', 'bavail', 'files', 'ffree',
-];
+const body = (n: number) => 'x'.repeat(n);
 
-/**
- * Helper: creates a StatFs object matching the expected static values.
- * Mirrors the implementation in VFSFileSystem.statfsSync / VFSPromises.statfs.
- */
-function expectedStatFs(): StatFs {
-  return {
-    type: VFS_MAGIC,
-    bsize: 4096,
-    blocks: 1024 * 1024,
-    bfree: 512 * 1024,
-    bavail: 512 * 1024,
-    files: 10000,
-    ffree: 5000,
-  };
-}
-
-describe('StatFs', () => {
-  describe('structure', () => {
-    const result = expectedStatFs();
-
-    it('should contain all required fields', () => {
-      for (const field of REQUIRED_FIELDS) {
-        expect(result).toHaveProperty(field);
-      }
-    });
-
-    it('should have bsize of 4096', () => {
-      expect(result.bsize).toBe(4096);
-    });
-
-    it('should have type equal to the VFS magic number (0x56465321)', () => {
-      expect(result.type).toBe(VFS_MAGIC);
-    });
-
-    it('should have all numeric fields be non-negative', () => {
-      for (const field of REQUIRED_FIELDS) {
-        expect(result[field]).toBeGreaterThanOrEqual(0);
-      }
-    });
-
-    it('should have bavail equal to bfree', () => {
-      expect(result.bavail).toBe(result.bfree);
-    });
-
-    it('should have blocks >= bfree', () => {
-      expect(result.blocks).toBeGreaterThanOrEqual(result.bfree);
-    });
-
-    it('should have files >= ffree', () => {
-      expect(result.files).toBeGreaterThanOrEqual(result.ffree);
-    });
+describe('statfs shape', () => {
+  it('reports every field Node reports', () => {
+    const st = fs.statfsSync('/');
+    for (const field of ['type', 'bsize', 'blocks', 'bfree', 'bavail', 'files', 'ffree']) {
+      expect(st, field).toHaveProperty(field);
+      expect(typeof (st as unknown as Record<string, unknown>)[field], field).toBe('number');
+    }
   });
 
-  describe('async returns same structure', () => {
-    it('should resolve with the same shape as sync', async () => {
-      const sync = expectedStatFs();
-      // Simulate the async path (Promise.resolve of the same data)
-      const async_ = await Promise.resolve(expectedStatFs());
-      expect(async_).toEqual(sync);
+  it('identifies the filesystem and its block size', () => {
+    const st = fs.statfsSync('/');
+    expect(st.type).toBe(VFS_MAGIC);
+    expect(st.bsize).toBe(4096);
+  });
+
+  it('keeps its counts self-consistent', () => {
+    const st = fs.statfsSync('/');
+    expect(st.bfree).toBeLessThanOrEqual(st.blocks);
+    expect(st.ffree).toBeLessThanOrEqual(st.files);
+    expect(st.bavail).toBe(st.bfree);
+    for (const v of [st.blocks, st.bfree, st.files, st.ffree]) expect(v).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('statfs tracks the volume', () => {
+  it('free blocks fall by the number of blocks a write consumes', () => {
+    const before = fs.statfsSync('/');
+    fs.writeFileSync('/f', body(before.bsize * 10));
+    const after = fs.statfsSync('/');
+    // Exactly ten 4 KB blocks, unless the volume had to grow to fit them.
+    const consumed = (before.bfree - after.bfree) + (after.blocks - before.blocks);
+    expect(consumed).toBe(10);
+  });
+
+  it('free blocks return when the file is deleted', () => {
+    const before = fs.statfsSync('/');
+    fs.writeFileSync('/f', body(before.bsize * 8));
+    expect(fs.statfsSync('/').bfree).toBeLessThan(before.bfree);
+    fs.unlinkSync('/f');
+    const after = fs.statfsSync('/');
+    expect(after.bfree).toBe(before.bfree + (after.blocks - before.blocks));
+  });
+
+  it('free inodes fall as entries are created and return as they are removed', () => {
+    const before = fs.statfsSync('/');
+    for (let i = 0; i < 20; i++) fs.writeFileSync(`/f${i}`, 'x');
+    const created = fs.statfsSync('/');
+    expect(before.ffree - created.ffree).toBe(20);
+
+    for (let i = 0; i < 20; i++) fs.unlinkSync(`/f${i}`);
+    expect(fs.statfsSync('/').ffree).toBe(before.ffree);
+  });
+
+  it('a hard link consumes an inode here, because links are copies', () => {
+    // On a real filesystem a hard link adds a name, not an inode, and `ffree` would not move.
+    // It moves here because `link` copies the file: the on-disk format stores one path per inode
+    // (INODE.PATH_OFFSET/PATH_LENGTH), so two names cannot share one. See the hard-link entry
+    // under "Known divergences" in the readme. This asserts what actually happens rather than
+    // what should — if links ever become real, this test is the one that should fail.
+    fs.writeFileSync('/a', 'shared');
+    const before = fs.statfsSync('/');
+    fs.linkSync('/a', '/b');
+    expect(fs.statfsSync('/').ffree).toBe(before.ffree - 1);
+  });
+
+  it('does not report the same numbers regardless of contents', () => {
+    // The regression guard: the old implementation returned identical constants forever.
+    const empty = fs.statfsSync('/');
+    fs.writeFileSync('/big', body(empty.bsize * 50));
+    const full = fs.statfsSync('/');
+    expect(full.bfree, 'free blocks must change when data is written').not.toBe(empty.bfree);
+    expect(full.ffree, 'free inodes must change when a file is created').not.toBe(empty.ffree);
+  });
+});
+
+describe('statfs async forms', () => {
+  it('promises.statfs agrees with statfsSync', async () => {
+    fs.writeFileSync('/f', body(9000));
+    const sync = fs.statfsSync('/');
+    const async = await fs.promises.statfs('/');
+    expect(async).toEqual(sync);
+  });
+
+  it('the callback form delivers the same stats', async () => {
+    fs.writeFileSync('/f', body(9000));
+    const viaCallback = await new Promise<unknown>((resolve, reject) => {
+      fs.statfs('/', (err, stats) => (err ? reject(err) : resolve(stats)));
     });
+    expect(viaCallback).toEqual(fs.statfsSync('/'));
   });
 });

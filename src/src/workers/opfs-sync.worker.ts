@@ -525,6 +525,17 @@ async function navigateToParent(path: string): Promise<FileSystemDirectoryHandle
 
 // ========== FileSystemObserver for external changes ==========
 
+/**
+ * The live observer, kept so it can be disconnected again.
+ *
+ * It used to be a local in `setupObserver`, which meant nothing could ever stop it: a recursive
+ * `FileSystemObserver` stayed registered on the origin's OPFS for as long as the worker lived,
+ * and nothing terminated the worker either. Chromium detects a dangling `raw_ptr` and **aborts
+ * the whole browser process** when a page is torn down with observers still attached, which is
+ * how a leak with no visible symptom turned into a crash partway through a long test run.
+ */
+let observer: FileSystemObserver | null = null;
+
 function setupObserver(): void {
   if (typeof FileSystemObserver === 'undefined') {
     console.warn('[opfs-sync] FileSystemObserver not available — external changes will not be detected');
@@ -533,7 +544,7 @@ function setupObserver(): void {
 
   console.log('[opfs-sync] Setting up FileSystemObserver on mirrorRoot:', mirrorRoot.name || '(opfs-root)');
 
-  const observer = new FileSystemObserver((records) => {
+  observer = new FileSystemObserver((records) => {
     //console.log(`[opfs-sync] observer fired: ${records.length} record(s), pending=${pendingPaths.size}, completed=${completedPaths.size}`);
     for (const record of records) {
       const path = normalizePath('/' + record.relativePathComponents.join('/'));
@@ -566,6 +577,13 @@ function setupObserver(): void {
   });
 
   observer.observe(mirrorRoot, { recursive: true });
+}
+
+/** Detach the observer. Safe to call more than once, and safe if none was ever created. */
+function teardownObserver(): void {
+  if (!observer) return;
+  try { observer.disconnect(); } catch { /* already gone */ }
+  observer = null;
 }
 
 async function syncExternalChange(path: string, handle: FileSystemHandle | null): Promise<void> {
@@ -651,6 +669,17 @@ self.onmessage = async (e: MessageEvent) => {
     serverPort.start();
 
     (self as unknown as Worker).postMessage({ type: 'ready' });
+    return;
+  }
+
+  // Sent by the sync relay when the filesystem is closing. Disconnecting before the worker goes
+  // away is the point: terminating a worker that still holds a recursive observer is exactly the
+  // shape Chromium aborts on.
+  if (msg.type === 'shutdown') {
+    teardownObserver();
+    try { serverPort?.close(); } catch { /* already closed */ }
+    (self as unknown as Worker).postMessage({ type: 'shutdown-done' });
+    self.close();
     return;
   }
 };

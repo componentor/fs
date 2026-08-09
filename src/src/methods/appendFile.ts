@@ -3,6 +3,7 @@ import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { OP, encodeRequest } from '../protocol/opcodes.js';
 import { statusToError } from '../errors.js';
 import { openSync, closeSync, writeSyncFd, fdatasyncSync, open } from './open.js';
+import { writeFileFdSync, writeFileFd } from './writeFile.js';
 import { encodeString } from '../encoding.js';
 
 const encoder = new TextEncoder();
@@ -32,6 +33,17 @@ function encodeData(data: string | Uint8Array, encoding?: Encoding): Uint8Array 
   if (typeof data !== 'string') return data;
   return encoding ? encodeString(data, encoding) : encoder.encode(data);
 }
+
+/**
+ * `fs.appendFileSync(fd, data)` — **not** an append. Node writes at the descriptor's current
+ * position, exactly as `writeFile(fd, …)` does; the appending comes from having opened with
+ * `'a'`. Verified against `node:fs`: on an `'r+'` descriptor, appending `'B'` to `'AAA'`
+ * produces `'BAA'`. See [fd-arg.ts](./fd-arg.ts).
+ */
+export const appendFileFdSync = writeFileFdSync;
+
+/** `fs.appendFile(fd, data, cb)` — the callback form. Same semantics as {@link appendFileFdSync}. */
+export const appendFileFd = writeFileFd;
 
 export function appendFileSync(
   syncRequest: SyncRequestFn,

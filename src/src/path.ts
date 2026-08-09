@@ -4,6 +4,7 @@
  */
 
 import type { PathLike } from './types.js';
+import { invalidArgType } from './errors.js';
 
 /**
  * Normalize a PathLike value (string, Uint8Array, or URL) to a plain string.
@@ -19,7 +20,23 @@ export function toPathString(p: PathLike): string {
     }
     return decodeURIComponent(p.pathname);
   }
-  throw new TypeError('The "path" argument must be of type string, Uint8Array, or URL. Received ' + typeof p);
+  // Carries `ERR_INVALID_ARG_TYPE`, as node's does — callers branch on the code, not the text.
+  throw invalidArgType('path', 'string or an instance of Uint8Array or URL', p);
+}
+
+/**
+ * `realpath`'s path coercion, which is **not** the one every other method uses.
+ *
+ * Node validates the path argument everywhere except here: `fs.statSync({})` is an
+ * `ERR_INVALID_ARG_TYPE`, but `fs.realpathSync({ toString: () => '/tmp' })` resolves, and
+ * `fs.realpathSync(123)` is an `ENOENT` on the relative path `'123'`. Rejecting those would
+ * make working node code fail against this library, so realpath keeps the loose form.
+ */
+export function toRealpathString(p: PathLike): string {
+  if (typeof p === 'string') return p;
+  if (p instanceof Uint8Array) return new TextDecoder().decode(p);
+  if (typeof URL !== 'undefined' && p instanceof URL) return toPathString(p);
+  return String(p);
 }
 
 export const sep = '/';

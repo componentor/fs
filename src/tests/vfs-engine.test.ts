@@ -529,7 +529,11 @@ describe('VFSEngine', () => {
 
   describe('file descriptors', () => {
     it('should open, write, read, close a file', () => {
-      const openResult = engine.open('/fd.txt', 64 | 512, 'tab1'); // O_CREAT | O_TRUNC
+      // O_RDWR is required to write through the descriptor: the low two bits of the flags are
+      // the access mode, and O_CREAT|O_TRUNC alone leaves it O_RDONLY. This used to pass without
+      // O_RDWR because the access mode was not enforced — verified against node:fs, which
+      // rejects a write on such a descriptor with EBADF.
+      const openResult = engine.open('/fd.txt', 2 | 64 | 512, 'tab1'); // O_RDWR | O_CREAT | O_TRUNC
       expect(openResult.status).toBe(0);
       const fd = new DataView(openResult.data!.buffer, openResult.data!.byteOffset).getUint32(0, true);
 

@@ -1,6 +1,6 @@
 {
   "name": "@componentor/fs",
-  "version": "3.3.5",
+  "version": "3.3.29",
   "description": "High-performance OPFS-based Node.js fs polyfill with true sync API, VFS binary format, and bidirectional OPFS mirroring",
   "license": "MIT",
   "author": "Componentor",
@@ -38,6 +38,7 @@
     "build": "cd src && npx tsup",
     "dev": "cd src && npx tsup --watch",
     "test": "cd src && npx vitest run",
+    "example": "node examples/serve.js",
     "benchmark": "npm run build && playwright test",
     "benchmark:server": "node tests/benchmark/server.js",
     "benchmark:open": "npm run build && PORT=3030 node tests/benchmark/server.js",
@@ -59,11 +60,18 @@
   },
   "keywords": [
     "opfs",
+    "origin-private-file-system",
+    "web-worker",
     "filesystem",
     "fs",
     "polyfill",
-    "browser",
+    "browser-storage",
+    "file-api",
+    "shim",
     "sync",
-    "async"
+    "async",
+    "typescript",
+    "shared-array-buffer",
+    "vfs"
   ]
 }

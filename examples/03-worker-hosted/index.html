@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>@componentor/fs — worker-hosted instance</title>
+  <style>
+    body { font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.1rem; }
+    pre { background: #f5f5f5; padding: 1rem; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; }
+    .bad { color: #b00; }
+    button { font: inherit; padding: .3rem .8rem; }
+  </style>
+</head>
+<body>
+  <h1>@componentor/fs — running the filesystem inside a worker</h1>
+  <p>
+    Open this page in <strong>two tabs</strong> and write from each. Both see the same volume.
+  </p>
+  <p><button id="write">write a line from this tab</button></p>
+  <pre id="out">starting…</pre>
+
+  <script type="module">
+    // A real URL rather than a bare specifier + import map: import maps are not inherited by
+    // module workers, so fs-worker.js could not use one anyway. Keeping both sides on the same
+    // URL is the honest version. With a bundler, both files just import '@componentor/fs'.
+    import { createServiceWorkerBridge } from '/vendor/index.js';
+
+    const out = document.getElementById('out');
+    const lines = [];
+    const log = (...a) => { lines.push(a.join(' ')); out.textContent = lines.join('\n'); };
+
+    if (!crossOriginIsolated) {
+      out.innerHTML = '<span class="bad">Serve with COOP/COEP (examples/serve.js).</span>';
+      throw new Error('not crossOriginIsolated');
+    }
+
+    // Resolved relative to this module, so the example works wherever it is mounted.
+    const worker = new Worker(new URL('./fs-worker.js', import.meta.url), { type: 'module' });
+
+    // Why the bridge: in a follower tab a synchronous call has to wait for the leader tab to
+    // answer. Doing that on the main thread deadlocks on Safari, so the instance is put in a
+    // worker, where the wait is a real Atomics.wait. But `navigator.serviceWorker` does not
+    // exist in worker scope on Safari/Firefox, so the main thread brokers it across a
+    // MessageChannel. `ns` is `vfs-${root}` with non-alphanumerics replaced by underscores.
+    const channel = new MessageChannel();
+    createServiceWorkerBridge(channel.port1, { ns: 'vfs-_worker_demo' });
+    worker.postMessage({ swBridge: channel.port2 }, [channel.port2]);
+
+    worker.onmessage = (e) => {
+      if (e.data.ready) log('worker ready — filesystem mounted at /worker-demo');
+      if (e.data.log) log(e.data.log);
+    };
+
+    document.getElementById('write').onclick = () => worker.postMessage({ write: true });
+  </script>
+</body>
+</html>

@@ -1,19 +1,21 @@
 /**
  * File Descriptor Callback API Tests
  *
- * Tests for fd-based callback methods: fstat, ftruncate, read, write, close.
- * Since VFSFileSystem requires browser workers, we test by creating a
- * minimal mock that mirrors the callback wiring pattern from filesystem.ts.
+ * The fd-based callback methods — `fstat`, `ftruncate`, `read`, `write`, `close` — which wrap
+ * their `*Sync` counterparts in try/catch and defer the callback with `setTimeout(…, 0)`.
+ *
+ * These drive the **real** methods: the object under test is built with
+ * `Object.create(VFSFileSystem.prototype)` (the constructor needs workers and a
+ * SharedArrayBuffer) and only the `*Sync` methods they delegate to are shadowed with mocks. The
+ * previous version re-implemented the wrapping and asserted against the copy, so it could not
+ * fail if the real error handling or scheduling changed.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { VFSFileSystem } from '../src/filesystem.js';
 
-/**
- * Creates a mock fs object that mirrors VFSFileSystem fd callback methods.
- * Each callback method wraps the corresponding sync mock in try/catch with
- * setTimeout, matching the real implementation pattern.
- */
-function createMockFS() {
+/** Build an fs whose fd callback methods are the shipped ones, over mocked *Sync methods. */
+function createRealFS() {
   const mockStats = {
     isFile: () => true,
     isDirectory: () => false,
@@ -32,82 +34,26 @@ function createMockFS() {
   const writeSyncMock = vi.fn().mockReturnValue(11);
   const closeSyncMock = vi.fn();
 
-  const fs = {
+  // Real prototype for the callback methods under test; the *Sync methods they delegate to are
+  // shadowed with mocks as own properties. Object.create skips the constructor, which would
+  // otherwise need workers and a SharedArrayBuffer.
+  const fs = Object.create(VFSFileSystem.prototype) as VFSFileSystem;
+  Object.assign(fs, {
     fstatSync: fstatSyncMock,
     ftruncateSync: ftruncateSyncMock,
     readSync: readSyncMock,
     writeSync: writeSyncMock,
     closeSync: closeSyncMock,
-
-    fstat(fd: number, optionsOrCallback: any, callback?: any): void {
-      const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-      try {
-        const result = this.fstatSync(fd);
-        setTimeout(() => cb(null, result), 0);
-      } catch (err) {
-        setTimeout(() => cb(err), 0);
-      }
-    },
-
-    ftruncate(fd: number, lenOrCallback?: any, callback?: any): void {
-      const cb = typeof lenOrCallback === 'function' ? lenOrCallback : callback;
-      const len = typeof lenOrCallback === 'function' ? 0 : lenOrCallback;
-      try {
-        this.ftruncateSync(fd, len);
-        setTimeout(() => cb(null), 0);
-      } catch (err) {
-        setTimeout(() => cb(err), 0);
-      }
-    },
-
-    read(fd: number, buffer: Uint8Array, offset: number, length: number, position: number | null, callback: (err: Error | null, bytesRead?: number, buffer?: Uint8Array) => void): void {
-      try {
-        const bytesRead = this.readSync(fd, buffer, offset, length, position);
-        setTimeout(() => callback(null, bytesRead, buffer), 0);
-      } catch (err) {
-        setTimeout(() => callback(err as Error), 0);
-      }
-    },
-
-    write(fd: number, bufferOrString: Uint8Array | string, offsetOrPosition?: any, lengthOrEncoding?: any, position?: any, callback?: any): void {
-      const cb = [offsetOrPosition, lengthOrEncoding, position, callback].find(a => typeof a === 'function');
-      try {
-        let bytesWritten: number;
-        if (typeof bufferOrString === 'string') {
-          const pos = typeof offsetOrPosition === 'function' ? undefined : offsetOrPosition;
-          const enc = typeof lengthOrEncoding === 'function' ? undefined : lengthOrEncoding;
-          bytesWritten = this.writeSync(fd, bufferOrString, pos, enc);
-        } else {
-          const off = typeof offsetOrPosition === 'function' ? undefined : offsetOrPosition;
-          const len = typeof lengthOrEncoding === 'function' ? undefined : lengthOrEncoding;
-          const pos2 = typeof position === 'function' ? undefined : position;
-          bytesWritten = this.writeSync(fd, bufferOrString, off, len, pos2);
-        }
-        setTimeout(() => cb(null, bytesWritten, bufferOrString), 0);
-      } catch (err) {
-        setTimeout(() => cb(err), 0);
-      }
-    },
-
-    close(fd: number, callback?: (err: Error | null) => void): void {
-      try {
-        this.closeSync(fd);
-        if (callback) setTimeout(() => callback(null), 0);
-      } catch (err) {
-        if (callback) setTimeout(() => callback(err as Error), 0);
-        else throw err;
-      }
-    },
-  };
+  });
 
   return { fs, mockStats, fstatSyncMock, ftruncateSyncMock, readSyncMock, writeSyncMock, closeSyncMock };
 }
 
 describe('fd callback API', () => {
-  let mock: ReturnType<typeof createMockFS>;
+  let mock: ReturnType<typeof createRealFS>;
 
   beforeEach(() => {
-    mock = createMockFS();
+    mock = createRealFS();
   });
 
   it('fstat callback receives Stats', async () => {
@@ -121,7 +67,9 @@ describe('fd callback API', () => {
     expect(stats.isFile()).toBe(true);
     expect(stats.isDirectory()).toBe(false);
     expect(stats.size).toBe(256);
-    expect(mock.fstatSyncMock).toHaveBeenCalledWith(3);
+    // The real fstat forwards its (possibly undefined) options through to fstatSync; the
+    // re-implemented model this test used to run against passed the fd alone.
+    expect(mock.fstatSyncMock).toHaveBeenCalledWith(3, undefined);
   });
 
   it('fstat with options still calls callback', async () => {

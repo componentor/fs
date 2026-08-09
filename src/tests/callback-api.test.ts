@@ -1,25 +1,26 @@
 /**
  * Callback API Tests
  *
- * Tests for Node.js-style callback overloads on VFSFileSystem.
- * Since VFSFileSystem requires browser workers, we test the callback
- * wiring by creating a minimal mock that exercises the same pattern:
- * callback detection, option extraction, and promise-to-callback bridging.
+ * Node.js-style callback overloads on `VFSFileSystem`: callback detection, option extraction,
+ * and promise-to-callback bridging.
+ *
+ * These drive the **real** methods. `VFSFileSystem` cannot be constructed in Node (it spawns
+ * workers and allocates a SharedArrayBuffer), so the object under test is built with
+ * `Object.create(VFSFileSystem.prototype)` — every method is the shipped one, and only
+ * `this.promises` is stubbed. The previous version of this file re-implemented the callback
+ * wiring and asserted against the copy, which could not fail when the product changed. It was
+ * also already wrong: the copy resolved callbacks straight out of `.then()`, while the real
+ * `_cb` schedules them with `setTimeout(…, 0)` to honour Node's guarantee that a callback never
+ * fires in the same microtask turn.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { VFSFileSystem } from '../src/filesystem.js';
 
-// We cannot instantiate VFSFileSystem in Node (needs workers/SAB),
-// so we replicate the callback wiring pattern used in filesystem.ts
-// and verify correctness of the overload logic. This ensures the
-// callback plumbing works without needing a full browser environment.
+/** Let queued macrotask callbacks run — the real `_cb` defers with setTimeout(…, 0). */
+const flush = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 
-/**
- * Creates a mock fs object that mirrors VFSFileSystem callback methods.
- * Each method delegates to a mock promises object, applying the same
- * overload resolution logic as the real implementation.
- */
-function createMockFS() {
+function createRealFS() {
   const mockPromises = {
     readFile: vi.fn().mockResolvedValue(new Uint8Array([72, 101, 108, 108, 111])),
     writeFile: vi.fn().mockResolvedValue(undefined),
@@ -63,63 +64,21 @@ function createMockFS() {
     cp: vi.fn().mockResolvedValue(undefined),
   };
 
-  // Mirror the exact callback wiring from VFSFileSystem
-  const fs = {
-    promises: mockPromises,
-
-    readFile(filePath: string, optionsOrCallback?: any, callback?: any) {
-      const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-      const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
-      this.promises.readFile(filePath, opts).then(
-        (result: any) => cb(null, result),
-        (err: any) => cb(err),
-      );
-    },
-
-    writeFile(filePath: string, data: string | Uint8Array, optionsOrCallback?: any, callback?: any) {
-      const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-      const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
-      this.promises.writeFile(filePath, data, opts).then(
-        () => cb(null),
-        (err: any) => cb(err),
-      );
-    },
-
-    stat(filePath: string, optionsOrCallback?: any, callback?: any) {
-      const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-      const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
-      this.promises.stat(filePath, opts).then(
-        (result: any) => cb(null, result),
-        (err: any) => cb(err),
-      );
-    },
-
-    mkdir(filePath: string, optionsOrCallback?: any, callback?: any) {
-      const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-      const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
-      this.promises.mkdir(filePath, opts).then(
-        (result: any) => cb(null, result),
-        (err: any) => cb(err),
-      );
-    },
-
-    exists(filePath: string, callback: (exists: boolean) => void) {
-      this.promises.exists(filePath).then(
-        (result: boolean) => callback(result),
-        () => callback(false),
-      );
-    },
-  };
+  // The real prototype: every callback method under test is the shipped implementation,
+  // including the private _cb/_cbVoid bridges. Object.create skips the constructor, which is
+  // what would otherwise demand workers and a SharedArrayBuffer.
+  const fs = Object.create(VFSFileSystem.prototype) as VFSFileSystem;
+  (fs as unknown as { promises: unknown }).promises = mockPromises;
 
   return { fs, mockPromises };
 }
 
 describe('Callback API', () => {
-  let fs: ReturnType<typeof createMockFS>['fs'];
-  let mockPromises: ReturnType<typeof createMockFS>['mockPromises'];
+  let fs: ReturnType<typeof createRealFS>['fs'];
+  let mockPromises: ReturnType<typeof createRealFS>['mockPromises'];
 
   beforeEach(() => {
-    const mock = createMockFS();
+    const mock = createRealFS();
     fs = mock.fs;
     mockPromises = mock.mockPromises;
   });

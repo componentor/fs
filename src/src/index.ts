@@ -28,16 +28,17 @@ export type { ServiceWorkerBridgeOptions } from './sw-bridge.js';
 export { NodeReadable, NodeWritable, SimpleEventEmitter } from './node-streams.js';
 export { NodeReadable as ReadStream, NodeWritable as WriteStream } from './node-streams.js';
 export { constants } from './constants.js';
+// The result classes, exported as node exports them so `instanceof` type-tests work.
+export { Stats, BigIntStats, Dirent } from './stats-classes.js';
+export { Dir } from './dir.js';
 export { FSError, createError, statusToError } from './errors.js';
 export { unpackToOPFS, loadFromOPFS, repairVFS } from './helpers.js';
 export type { UnpackResult, LoadResult, RepairResult } from './helpers.js';
 export * as path from './path.js';
 export type {
-  Stats,
+  OpendirOptions,
   StatFs,
-  BigIntStats,
   StatOptions,
-  Dirent,
   ReadOptions,
   WriteOptions,
   MkdirOptions,
@@ -48,7 +49,6 @@ export type {
   Encoding,
   PathLike,
   FileHandle,
-  Dir,
   VFSConfig,
   VFSLimits,
   FSMode,

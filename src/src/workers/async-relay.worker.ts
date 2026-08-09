@@ -22,6 +22,9 @@ import {
   encodeRequest, encodeTwoPathRequest, decodeResponse,
   OP,
 } from '../protocol/opcodes.js';
+import {
+  encodeFdPayload, encodeFreadPayload, encodeFwritePayload, encodeFtruncatePayload,
+} from '../protocol/payloads.js';
 import { waitWhile, waitUntil, SabWaitTimeoutError, SAB_WAIT_DEADLINE_MS } from '../protocol/sab-wait.js';
 
 const encoder = new TextEncoder();
@@ -287,38 +290,25 @@ function encodeData(data: unknown): Uint8Array | null {
   return null;
 }
 
+/**
+ * Encode a file-descriptor request.
+ *
+ * The layouts come from the shared payload encoders, so this cannot drift from what the workers
+ * decode. It did before: FTRUNCATE was written here as `[fd: u32][len: u32]` (8 bytes) while the
+ * sync side and every decoder use `[fd: u32][len: f64]` (12), so the relay's length guard
+ * rejected `await fileHandle.truncate(n)` outright with EINVAL.
+ */
 function encodeFdRequest(op: number, args: { fd: number; length?: number; position?: number; data?: Uint8Array }): ArrayBuffer {
   switch (op) {
-    case OP.FREAD: {
-      const buf = new Uint8Array(16);
-      const view = new DataView(buf.buffer);
-      view.setUint32(0, args.fd, true);
-      view.setUint32(4, args.length ?? 0, true);
-      view.setFloat64(8, args.position ?? -1, true);
-      return encodeRequest(op, '', 0, buf);
-    }
-    case OP.FWRITE: {
-      const writeData = args.data ?? new Uint8Array(0);
-      const buf = new Uint8Array(12 + writeData.byteLength);
-      const view = new DataView(buf.buffer);
-      view.setUint32(0, args.fd, true);
-      view.setFloat64(4, args.position ?? -1, true);
-      buf.set(writeData, 12);
-      return encodeRequest(op, '', 0, buf);
-    }
+    case OP.FREAD:
+      return encodeRequest(op, '', 0, encodeFreadPayload(args.fd, args.length ?? 0, args.position ?? -1));
+    case OP.FWRITE:
+      return encodeRequest(op, '', 0, encodeFwritePayload(args.fd, args.position ?? -1, args.data ?? new Uint8Array(0)));
     case OP.FSTAT:
-    case OP.CLOSE: {
-      const buf = new Uint8Array(4);
-      new DataView(buf.buffer).setUint32(0, args.fd, true);
-      return encodeRequest(op, '', 0, buf);
-    }
-    case OP.FTRUNCATE: {
-      const buf = new Uint8Array(8);
-      const view = new DataView(buf.buffer);
-      view.setUint32(0, args.fd, true);
-      view.setUint32(4, args.length ?? 0, true);
-      return encodeRequest(op, '', 0, buf);
-    }
+    case OP.CLOSE:
+      return encodeRequest(op, '', 0, encodeFdPayload(args.fd));
+    case OP.FTRUNCATE:
+      return encodeRequest(op, '', 0, encodeFtruncatePayload(args.fd, args.length ?? 0));
     case OP.FSYNC:
       return encodeRequest(op, '', 0);
     default:

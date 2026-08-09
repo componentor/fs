@@ -206,6 +206,95 @@ export function decodeBuffer(data: Uint8Array, encoding: string): string {
 }
 
 /**
+ * A resumable decoder, for turning a *stream* of byte chunks into text.
+ *
+ * Node's `string_decoder.StringDecoder`, and the reason it exists: decoding each chunk
+ * independently splits any multi-byte character that happens to straddle a chunk boundary into
+ * two invalid fragments, and both decode to U+FFFD. With the 64 KB chunks a read stream uses,
+ * `createReadStream(p, 'utf8')` over a file with any non-ASCII text past the first 64 KB
+ * corrupted exactly one character per boundary — silently, since the surrounding text is fine.
+ *
+ * Three of the seven encodings need to carry bytes across a chunk:
+ *   • `utf8` — a code point is 1–4 bytes; `TextDecoder`'s own `{ stream: true }` handles it;
+ *   • `utf16le` — 2 bytes per unit, so an odd-length chunk holds half of one;
+ *   • `base64`/`base64url` — 3 bytes map to 4 characters, so only whole triples may be emitted.
+ * The rest (`latin1`, `ascii`, `hex`) are byte-aligned and pass straight through.
+ *
+ * `end()` flushes whatever is left, matching Node: a truncated sequence at EOF yields the
+ * replacement character rather than being dropped.
+ */
+export interface StringDecoder {
+  /** Decode a chunk, holding back any bytes that belong to a character still to come. */
+  write(bytes: Uint8Array): string;
+  /** Flush the held-back bytes at end of stream. */
+  end(): string;
+}
+
+/**
+ * Build a {@link StringDecoder} for `encoding`.
+ *
+ * @throws `ERR_INVALID_ARG_VALUE` if the encoding is not one Node accepts.
+ */
+export function createStringDecoder(encoding: string): StringDecoder {
+  const canonical = assertEncoding(encoding);
+
+  if (canonical === 'utf8') {
+    // A dedicated instance, not the shared `utf8Decoder`: streaming state is per-decoder, so
+    // sharing one across concurrent streams would interleave their partial characters.
+    const decoder = new TextDecoder('utf-8');
+    return {
+      write: (bytes) => decoder.decode(bytes, { stream: true }),
+      end: () => decoder.decode(),
+    };
+  }
+
+  if (canonical === 'utf16le' || canonical === 'base64' || canonical === 'base64url') {
+    // Emit only whole units; hold the remainder for the next chunk.
+    const unit = canonical === 'utf16le' ? 2 : 3;
+    const isUtf16 = canonical === 'utf16le';
+    let carry = new Uint8Array(0);
+    return {
+      write(bytes) {
+        const joined = carry.length === 0 ? bytes : concatBytes(carry, bytes);
+        let whole = joined.length - (joined.length % unit);
+        // A UTF-16 astral character is two units, and splitting it emits two lone surrogates
+        // instead of the character. Node holds a trailing lead surrogate back for the next
+        // chunk; verified against `string_decoder`, which yields '' then the whole emoji.
+        if (isUtf16 && whole >= 2) {
+          const lastUnit = joined[whole - 2] | (joined[whole - 1] << 8);
+          if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) whole -= 2;
+        }
+        // Copied, not a subarray view: chunks here may be backed by a SharedArrayBuffer, whose
+        // bytes the relay is free to overwrite once the read returns. At most three bytes.
+        carry = new Uint8Array(joined.subarray(whole));
+        return whole === 0 ? '' : decodeBuffer(joined.subarray(0, whole), canonical);
+      },
+      end() {
+        if (carry.length === 0) return '';
+        // A lead surrogate still held at EOF is emitted alone, as node does; a stray odd byte is
+        // dropped, which `decodeBuffer` already does for utf16le.
+        const rest = decodeBuffer(carry, canonical);
+        carry = new Uint8Array(0);
+        return rest;
+      },
+    };
+  }
+
+  // latin1, ascii, hex — one byte in, a fixed amount of text out. Nothing can straddle.
+  return {
+    write: (bytes) => (bytes.length === 0 ? '' : decodeBuffer(bytes, canonical)),
+    end: () => '',
+  };
+}
+
+function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+
+/**
  * Encode a string to a Uint8Array using the specified encoding.
  *
  * @throws `ERR_INVALID_ARG_VALUE` if the encoding is not one Node accepts.

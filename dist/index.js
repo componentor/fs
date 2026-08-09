@@ -4,493 +4,6 @@ var __export = (target, all) => {
     __defProp(target, name, { get: all[name], enumerable: true });
 };
 
-// src/node-streams.ts
-var SimpleEventEmitter = class {
-  _listeners = /* @__PURE__ */ new Map();
-  _onceSet = /* @__PURE__ */ new WeakSet();
-  on(event, fn) {
-    let arr = this._listeners.get(event);
-    if (!arr) {
-      arr = [];
-      this._listeners.set(event, arr);
-    }
-    arr.push(fn);
-    return this;
-  }
-  addListener(event, fn) {
-    return this.on(event, fn);
-  }
-  once(event, fn) {
-    this._onceSet.add(fn);
-    return this.on(event, fn);
-  }
-  off(event, fn) {
-    const arr = this._listeners.get(event);
-    if (arr) {
-      const idx = arr.indexOf(fn);
-      if (idx !== -1) arr.splice(idx, 1);
-    }
-    return this;
-  }
-  removeListener(event, fn) {
-    return this.off(event, fn);
-  }
-  removeAllListeners(event) {
-    if (event !== void 0) {
-      this._listeners.delete(event);
-    } else {
-      this._listeners.clear();
-    }
-    return this;
-  }
-  emit(event, ...args) {
-    const arr = this._listeners.get(event);
-    if (!arr || arr.length === 0) return false;
-    const copy = arr.slice();
-    for (const fn of copy) {
-      if (this._onceSet.has(fn)) {
-        this._onceSet.delete(fn);
-        this.off(event, fn);
-      }
-      fn(...args);
-    }
-    return true;
-  }
-  listenerCount(event) {
-    return this._listeners.get(event)?.length ?? 0;
-  }
-  rawListeners(event) {
-    return [...this._listeners.get(event) ?? []];
-  }
-  prependListener(event, fn) {
-    const arr = this._listeners.get(event) ?? [];
-    arr.unshift(fn);
-    this._listeners.set(event, arr);
-    return this;
-  }
-  prependOnceListener(event, fn) {
-    const wrapper = (...args) => {
-      this.off(event, wrapper);
-      fn(...args);
-    };
-    return this.prependListener(event, wrapper);
-  }
-  eventNames() {
-    return [...this._listeners.keys()].filter((k) => (this._listeners.get(k)?.length ?? 0) > 0);
-  }
-};
-var NodeReadable = class extends SimpleEventEmitter {
-  constructor(_readFn, destroyFn) {
-    super();
-    this._readFn = _readFn;
-    if (destroyFn) this._destroyFn = destroyFn;
-  }
-  _paused = true;
-  _destroyed = false;
-  _ended = false;
-  _reading = false;
-  _readBuffer = null;
-  _encoding = null;
-  /** Whether the stream is still readable (not ended or destroyed). */
-  readable = true;
-  /** The file path this stream reads from (set externally). */
-  path = "";
-  /** Total bytes read so far. */
-  bytesRead = 0;
-  /** Optional cleanup callback invoked on destroy (e.g. close file handle). */
-  _destroyFn = null;
-  // ---- Flow control (override on to auto-resume) ----
-  on(event, fn) {
-    super.on(event, fn);
-    if (event === "data" && this._paused) {
-      this.resume();
-    }
-    return this;
-  }
-  pause() {
-    this._paused = true;
-    return this;
-  }
-  resume() {
-    if (this._destroyed || this._ended) return this;
-    this._paused = false;
-    this._drain();
-    return this;
-  }
-  /**
-   * Set the character encoding for data read from this stream.
-   * When set, 'data' events emit strings instead of Uint8Array.
-   */
-  setEncoding(encoding) {
-    this._encoding = encoding;
-    return this;
-  }
-  /**
-   * Non-flowing read — returns the last buffered chunk or null.
-   * Node.js has a complex buffer system; we keep it simple here.
-   */
-  read(_size) {
-    const buf = this._readBuffer;
-    this._readBuffer = null;
-    return buf;
-  }
-  /** Destroy the stream, optionally with an error. */
-  destroy(err) {
-    if (this._destroyed) return this;
-    this._destroyed = true;
-    this.readable = false;
-    if (err) {
-      this.emit("error", err);
-    }
-    if (this._destroyFn) {
-      this._destroyFn().then(
-        () => this.emit("close"),
-        () => this.emit("close")
-      );
-    } else {
-      this.emit("close");
-    }
-    return this;
-  }
-  // ---- pipe ----
-  pipe(dest) {
-    if (isNodeWritableInstance(dest)) {
-      this.on("data", (chunk) => {
-        dest.write(chunk);
-      });
-      this.on("end", () => {
-        if (typeof dest.end === "function") {
-          dest.end();
-        }
-      });
-      this.on("error", (err) => {
-        if (typeof dest.destroy === "function") {
-          dest.destroy(err);
-        }
-      });
-    } else {
-      const writer = dest.getWriter();
-      this.on("data", (chunk) => {
-        writer.write(chunk);
-      });
-      this.on("end", () => {
-        writer.close();
-      });
-      this.on("error", (err) => {
-        writer.abort(err);
-      });
-    }
-    if (this._paused) {
-      this.resume();
-    }
-    return dest;
-  }
-  // ---- Internal ----
-  async _drain() {
-    if (this._reading || this._destroyed || this._ended) return;
-    this._reading = true;
-    try {
-      while (!this._paused && !this._destroyed && !this._ended) {
-        const result = await this._readFn();
-        if (this._destroyed) break;
-        if (result.done || !result.value || result.value.byteLength === 0) {
-          this._ended = true;
-          this.readable = false;
-          this.emit("end");
-          this.emit("close");
-          break;
-        }
-        this.bytesRead += result.value.byteLength;
-        this._readBuffer = result.value;
-        if (this._encoding) {
-          this.emit("data", new TextDecoder(this._encoding).decode(result.value));
-        } else {
-          this.emit("data", result.value);
-        }
-      }
-    } catch (err) {
-      if (!this._destroyed) {
-        this.destroy(err);
-      }
-    } finally {
-      this._reading = false;
-    }
-  }
-};
-var NodeWritable = class extends SimpleEventEmitter {
-  constructor(path, _writeFn, _closeFn) {
-    super();
-    this._writeFn = _writeFn;
-    this._closeFn = _closeFn;
-    this.path = path;
-  }
-  /** Total bytes written so far. */
-  bytesWritten = 0;
-  /** The file path this stream was created for. */
-  path;
-  /** Whether this stream is still writable. */
-  writable = true;
-  _destroyed = false;
-  _finished = false;
-  _writing = false;
-  _corked = false;
-  // -- public API -----------------------------------------------------------
-  /**
-   * Buffer all writes until `uncork()` is called.
-   * In this minimal implementation we only track the flag for compatibility.
-   */
-  cork() {
-    this._corked = true;
-  }
-  /**
-   * Flush buffered writes (clears the cork flag).
-   * In this minimal implementation we only track the flag for compatibility.
-   */
-  uncork() {
-    this._corked = false;
-  }
-  write(chunk, encodingOrCb, cb) {
-    const callback = typeof encodingOrCb === "function" ? encodingOrCb : cb;
-    if (this._destroyed || this._finished) {
-      const err = new Error("write after end");
-      if (callback) callback(err);
-      return false;
-    }
-    const data = typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk;
-    this._writing = true;
-    this._writeFn(data).then(() => {
-      this.bytesWritten += data.byteLength;
-      this._writing = false;
-      if (callback) callback();
-      this.emit("drain");
-    }).catch((err) => {
-      this._writing = false;
-      if (callback) callback(err);
-      this.emit("error", err);
-    });
-    return true;
-  }
-  end(chunk, encodingOrCb, cb) {
-    let callback;
-    let finalChunk;
-    if (typeof chunk === "function") {
-      callback = chunk;
-      finalChunk = void 0;
-    } else {
-      finalChunk = chunk;
-      if (typeof encodingOrCb === "function") {
-        callback = encodingOrCb;
-      } else {
-        callback = cb;
-      }
-    }
-    if (this._finished) {
-      if (callback) callback();
-      return this;
-    }
-    this.writable = false;
-    const finish = () => {
-      this._closeFn().then(() => {
-        this._finished = true;
-        this.emit("finish");
-        this.emit("close");
-        if (callback) callback();
-      }).catch((err) => {
-        this.emit("error", err);
-        if (callback) callback(err);
-      });
-    };
-    if (finalChunk !== void 0 && finalChunk !== null) {
-      this.write(finalChunk, void 0, () => finish());
-    } else {
-      finish();
-    }
-    return this;
-  }
-  destroy(err) {
-    if (this._destroyed) return this;
-    this._destroyed = true;
-    this.writable = false;
-    this._closeFn().catch(() => {
-    }).finally(() => {
-      if (err) this.emit("error", err);
-      this.emit("close");
-    });
-    return this;
-  }
-};
-function isNodeWritableInstance(obj) {
-  return obj !== null && typeof obj === "object" && typeof obj.write === "function" && !("getWriter" in obj);
-}
-
-// src/protocol/opcodes.ts
-var OP = {
-  READ: 1,
-  WRITE: 2,
-  UNLINK: 3,
-  STAT: 4,
-  LSTAT: 5,
-  MKDIR: 6,
-  RMDIR: 7,
-  READDIR: 8,
-  RENAME: 9,
-  EXISTS: 10,
-  TRUNCATE: 11,
-  APPEND: 12,
-  COPY: 13,
-  ACCESS: 14,
-  REALPATH: 15,
-  CHMOD: 16,
-  CHOWN: 17,
-  UTIMES: 18,
-  SYMLINK: 19,
-  READLINK: 20,
-  LINK: 21,
-  OPEN: 22,
-  CLOSE: 23,
-  FREAD: 24,
-  FWRITE: 25,
-  FSTAT: 26,
-  FTRUNCATE: 27,
-  FSYNC: 28,
-  OPENDIR: 29,
-  MKDTEMP: 30,
-  FCHMOD: 31,
-  FCHOWN: 32,
-  FUTIMES: 33
-};
-var SAB_OFFSETS = {
-  CONTROL: 0,
-  // Int32 - signal (0=idle, 1=request, 2=response, 3=chunk, 4=ack)
-  TICKET_NEXT: 4,
-  // Int32 - fairness lock: next ticket to hand out (fetch-add)
-  TICKET_SERVING: 8,
-  // Int32 - fairness lock: ticket currently allowed to use the SAB
-  OPCODE: 4,
-  // (alias of TICKET_NEXT) — op code is carried in the payload
-  STATUS: 8,
-  // (alias of TICKET_SERVING) — status is carried in the payload
-  CHUNK_LEN: 12,
-  // Int32 - bytes in this chunk
-  TOTAL_LEN: 16,
-  // BigUint64 - full data size across all chunks
-  CHUNK_IDX: 24,
-  // Int32 - 0-based chunk index
-  HEARTBEAT: 28,
-  // Int32 - liveness counter; the relay worker bumps this ~1×/s
-  //         while its event loop is alive (incl. mid-await of a
-  //         long op) so a spin-waiting main thread can tell
-  //         "slow" from "dead". Never written by the main thread.
-  HEADER_SIZE: 32
-  // Data payload starts here
-};
-var SIGNAL = {
-  IDLE: 0,
-  REQUEST: 1,
-  RESPONSE: 2,
-  CHUNK: 3,
-  CHUNK_ACK: 4
-};
-var encoder = new TextEncoder();
-new TextDecoder();
-function encodeRequest(op, path, flags = 0, data) {
-  const pathBytes = encoder.encode(path);
-  const dataLen = data ? data.byteLength : 0;
-  const totalLen = 16 + pathBytes.byteLength + dataLen;
-  const buf = new ArrayBuffer(totalLen);
-  const view = new DataView(buf);
-  view.setUint32(0, op, true);
-  view.setUint32(4, flags, true);
-  view.setUint32(8, pathBytes.byteLength, true);
-  view.setUint32(12, dataLen, true);
-  const bytes = new Uint8Array(buf);
-  bytes.set(pathBytes, 16);
-  if (data) {
-    bytes.set(data, 16 + pathBytes.byteLength);
-  }
-  return buf;
-}
-function encodeRequestU32(op, path, flags, value) {
-  const pathBytes = encoder.encode(path);
-  const payloadOffset = 16 + pathBytes.byteLength;
-  const buf = new ArrayBuffer(payloadOffset + 4);
-  const view = new DataView(buf);
-  view.setUint32(0, op, true);
-  view.setUint32(4, flags, true);
-  view.setUint32(8, pathBytes.byteLength, true);
-  view.setUint32(12, 4, true);
-  new Uint8Array(buf).set(pathBytes, 16);
-  view.setUint32(payloadOffset, value >>> 0, true);
-  return buf;
-}
-function decodeResponse(buf) {
-  const view = new DataView(buf);
-  const status = view.getUint32(0, true);
-  const dataLen = view.getUint32(4, true);
-  const data = dataLen > 0 ? new Uint8Array(buf, 8, dataLen) : null;
-  return { status, data };
-}
-function encodeTwoPathRequest(op, path1, path2, flags = 0) {
-  const path2Bytes = encoder.encode(path2);
-  const payload = new Uint8Array(4 + path2Bytes.byteLength);
-  const pv = new DataView(payload.buffer);
-  pv.setUint32(0, path2Bytes.byteLength, true);
-  payload.set(path2Bytes, 4);
-  return encodeRequest(op, path1, flags, payload);
-}
-
-// src/protocol/fs-lock.ts
-var NEXT_INDEX = SAB_OFFSETS.TICKET_NEXT >> 2;
-var SERVING_INDEX = SAB_OFFSETS.TICKET_SERVING >> 2;
-var SIGNAL_INDEX = SAB_OFFSETS.CONTROL >> 2;
-var CAN_WAIT = typeof globalThis.WorkerGlobalScope !== "undefined";
-var WAIT_SLICE_MS = 50;
-var HOLDER_STUCK_MS = 3e4;
-function now() {
-  return performance.now();
-}
-function acquireFsLock(ctrl) {
-  const ticket = Atomics.add(ctrl, NEXT_INDEX, 1);
-  if (Atomics.load(ctrl, SERVING_INDEX) === ticket) return ticket;
-  waitForTurn(ctrl, ticket);
-  return ticket;
-}
-function releaseFsLock(ctrl) {
-  Atomics.add(ctrl, SERVING_INDEX, 1);
-  Atomics.notify(ctrl, SERVING_INDEX);
-}
-function waitForTurn(ctrl, ticket) {
-  let serving = Atomics.load(ctrl, SERVING_INDEX);
-  let sig = Atomics.load(ctrl, SIGNAL_INDEX);
-  let progressAt = now();
-  while (serving !== ticket) {
-    if (CAN_WAIT) {
-      Atomics.wait(ctrl, SERVING_INDEX, serving, WAIT_SLICE_MS);
-    } else {
-      const spinStart = now();
-      while (now() - spinStart < WAIT_SLICE_MS && Atomics.load(ctrl, SERVING_INDEX) === serving) {
-      }
-    }
-    const curServing = Atomics.load(ctrl, SERVING_INDEX);
-    const curSig = Atomics.load(ctrl, SIGNAL_INDEX);
-    if (curServing !== serving || curSig !== sig) {
-      serving = curServing;
-      sig = curSig;
-      progressAt = now();
-      continue;
-    }
-    if (now() - progressAt > HOLDER_STUCK_MS) {
-      if (Atomics.compareExchange(ctrl, SERVING_INDEX, serving, serving + 1) === serving) {
-        Atomics.store(ctrl, SIGNAL_INDEX, SIGNAL.IDLE);
-        Atomics.notify(ctrl, SERVING_INDEX);
-      }
-      serving = Atomics.load(ctrl, SERVING_INDEX);
-      sig = Atomics.load(ctrl, SIGNAL_INDEX);
-      progressAt = now();
-    }
-  }
-}
-
 // src/errors.ts
 var FSError = class extends Error {
   code;
@@ -520,7 +33,8 @@ var ErrorCodes = {
   EPERM: -1,
   ENOSYS: -38,
   ELOOP: -40,
-  EIO: -5
+  EIO: -5,
+  ENOTSUP: -45
 };
 var STATUS_TO_CODE = {
   0: "OK",
@@ -534,7 +48,8 @@ var STATUS_TO_CODE = {
   8: "EBADF",
   9: "ELOOP",
   10: "ENOSPC",
-  11: "EIO"
+  11: "EIO",
+  12: "ENOTSUP"
 };
 var CODE_TO_STATUS = {
   ENOENT: 1,
@@ -545,7 +60,9 @@ var CODE_TO_STATUS = {
   EACCES: 6,
   EINVAL: 7,
   EBADF: 8,
-  EIO: 11
+  ELOOP: 9,
+  EIO: 11,
+  ENOTSUP: 12
 };
 function createError(code, syscall, path) {
   const errno = ErrorCodes[code] ?? -1;
@@ -560,7 +77,8 @@ function createError(code, syscall, path) {
     EBADF: "bad file descriptor",
     ELOOP: "too many symbolic links encountered",
     ENOSPC: "no space left on device",
-    EIO: "i/o error"
+    EIO: "i/o error",
+    ENOTSUP: "operation not supported"
   };
   const msg = messages[code] ?? "unknown error";
   return new FSError(code, errno, `${code}: ${msg}, ${syscall} '${path}'`, syscall, path);
@@ -590,618 +108,39 @@ function invalidArgValue(name, value, reason) {
   err.code = "ERR_INVALID_ARG_VALUE";
   return err;
 }
+function fsError(code, message, path, syscall) {
+  const err = new Error(message);
+  err.code = code;
+  err.path = path;
+  err.syscall = syscall;
+  return err;
+}
+function eisdirNotRecursive(path, syscall = "rm") {
+  return fsError("ERR_FS_EISDIR", `Path is a directory: ${syscall} returned EISDIR (is a directory) ${path}`, path, syscall);
+}
+function cpEisdirNotRecursive(path) {
+  return fsError("ERR_FS_EISDIR", `Recursive option not enabled, cannot copy a directory: ${path}`, path, "cp");
+}
+function cpSameSource(path) {
+  return fsError("ERR_FS_CP_EINVAL", `src and dest cannot be the same ${path}`, path, "cp");
+}
+function cpIntoSubdirectory(src, dest) {
+  return fsError("ERR_FS_CP_EINVAL", `Cannot copy ${src}/ to a subdirectory of self ${dest}`, dest, "cp");
+}
+function cpTargetExists(path) {
+  return fsError("ERR_FS_CP_EEXIST", `Target already exists: cp returned EEXIST (${path})`, path, "cp");
+}
+function streamWriteAfterEnd() {
+  const err = new Error("write after end");
+  err.code = "ERR_STREAM_WRITE_AFTER_END";
+  return err;
+}
 function outOfRange(name, range, value) {
   const err = new RangeError(
     `The value of "${name}" is out of range. It must be ${range}. Received ${inspectArg(value)}`
   );
   err.code = "ERR_OUT_OF_RANGE";
   return err;
-}
-
-// src/methods/mode.ts
-var OCTAL_STRING = /^[0-7]+$/;
-function parseFileMode(mode, name, def) {
-  mode ??= def;
-  if (typeof mode === "string") {
-    if (!OCTAL_STRING.test(mode)) {
-      throw invalidArgValue(name, mode, "must be a 32-bit unsigned integer or an octal string");
-    }
-    return parseInt(mode, 8);
-  }
-  if (typeof mode !== "number") throw invalidArgType(name, "number", mode);
-  if (!Number.isInteger(mode)) throw outOfRange(name, "an integer", mode);
-  if (mode < 0 || mode > 4294967295) throw outOfRange(name, ">= 0 && <= 4294967295", mode);
-  return mode;
-}
-function encodeMode(mode) {
-  const buf = new Uint8Array(4);
-  buf[0] = mode;
-  buf[1] = mode >>> 8;
-  buf[2] = mode >>> 16;
-  buf[3] = mode >>> 24;
-  return buf;
-}
-
-// src/vfs/layout.ts
-var VFS_MAGIC = 1447449377;
-var VFS_VERSION = 1;
-var DEFAULT_BLOCK_SIZE = 4096;
-var DEFAULT_INODE_COUNT = 1e5;
-var INODE_SIZE = 64;
-var SUPERBLOCK = {
-  SIZE: 64,
-  MAGIC: 0,
-  // uint32 - 0x56465321
-  VERSION: 4,
-  // uint32
-  INODE_COUNT: 8,
-  // uint32 - total inodes allocated
-  BLOCK_SIZE: 12,
-  // uint32 - data block size (default 4096)
-  TOTAL_BLOCKS: 16,
-  // uint32 - total data blocks
-  FREE_BLOCKS: 20,
-  // uint32 - available data blocks
-  INODE_OFFSET: 24,
-  // float64 - byte offset to inode table
-  PATH_OFFSET: 32,
-  // float64 - byte offset to path table
-  DATA_OFFSET: 40,
-  // float64 - byte offset to data region
-  BITMAP_OFFSET: 48,
-  // float64 - byte offset to free block bitmap
-  PATH_USED: 56,
-  // uint32 - bytes used in path table
-  CRC32: 60
-  // uint32 - CRC-32 of superblock bytes 0..59.
-  //   0 = legacy file written before checksumming existed
-  //   (validation skipped; upgraded on next superblock write).
-};
-var INODE = {
-  TYPE: 0,
-  // uint8 - 0=free, 1=file, 2=directory, 3=symlink
-  FLAGS: 1,
-  // uint8[3] - reserved
-  PATH_OFFSET: 4,
-  // uint32 - byte offset into path table
-  PATH_LENGTH: 8,
-  // uint16 - length of path string
-  NLINK: 10,
-  // uint16 - hard link count
-  MODE: 12,
-  // uint32 - permissions (e.g. 0o100644)
-  SIZE: 16,
-  // float64 - file content size in bytes (using f64 for >4GB)
-  FIRST_BLOCK: 24,
-  // uint32 - index of first data block
-  BLOCK_COUNT: 28,
-  // uint32 - number of contiguous data blocks
-  MTIME: 32,
-  // float64 - last modification time (ms since epoch)
-  CTIME: 40,
-  // float64 - creation/change time (ms since epoch)
-  ATIME: 48,
-  // float64 - last access time (ms since epoch)
-  UID: 56,
-  // uint32 - owner
-  GID: 60
-  // uint32 - group
-};
-var INODE_TYPE = {
-  FREE: 0,
-  FILE: 1,
-  DIRECTORY: 2,
-  SYMLINK: 3
-};
-var DEFAULT_FILE_MODE = 33188;
-var DEFAULT_DIR_MODE = 16877;
-var DEFAULT_SYMLINK_MODE = 41471;
-var DEFAULT_UMASK = 18;
-var S_IFMT = 61440;
-var S_IFREG = 32768;
-var S_IFDIR = 16384;
-var MAX_SYMLINK_DEPTH = 40;
-var INITIAL_PATH_TABLE_SIZE = 256 * 1024;
-var INITIAL_DATA_BLOCKS = 1024;
-var MAX_DATA_BLOCKS = 4e6;
-function calculateLayout(inodeCount = DEFAULT_INODE_COUNT, blockSize = DEFAULT_BLOCK_SIZE, totalBlocks = INITIAL_DATA_BLOCKS, maxBlocks = MAX_DATA_BLOCKS) {
-  const inodeTableOffset = SUPERBLOCK.SIZE;
-  const inodeTableSize = inodeCount * INODE_SIZE;
-  const pathTableOffset = inodeTableOffset + inodeTableSize;
-  const pathTableSize = INITIAL_PATH_TABLE_SIZE;
-  const bitmapOffset = pathTableOffset + pathTableSize;
-  const bitmapRegionSize = Math.ceil(maxBlocks / 8);
-  const bitmapSize = Math.ceil(totalBlocks / 8);
-  const dataOffset = Math.ceil((bitmapOffset + bitmapRegionSize) / blockSize) * blockSize;
-  const totalSize = dataOffset + totalBlocks * blockSize;
-  return {
-    inodeTableOffset,
-    inodeTableSize,
-    pathTableOffset,
-    pathTableSize,
-    bitmapOffset,
-    bitmapSize,
-    bitmapRegionSize,
-    dataOffset,
-    totalSize,
-    totalBlocks
-  };
-}
-
-// src/stats.ts
-function decodeStats(data) {
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const type = view.getUint8(0);
-  const mode = view.getUint32(1, true);
-  const size = view.getFloat64(5, true);
-  const mtimeMs = view.getFloat64(13, true);
-  const ctimeMs = view.getFloat64(21, true);
-  const atimeMs = view.getFloat64(29, true);
-  const uid = view.getUint32(37, true);
-  const gid = view.getUint32(41, true);
-  const ino = view.getUint32(45, true);
-  const nlink = data.byteLength >= 53 ? view.getUint32(49, true) : 1;
-  const isFile = type === INODE_TYPE.FILE;
-  const isDirectory = type === INODE_TYPE.DIRECTORY;
-  const isSymlink = type === INODE_TYPE.SYMLINK;
-  return {
-    isFile: () => isFile,
-    isDirectory: () => isDirectory,
-    isBlockDevice: () => false,
-    isCharacterDevice: () => false,
-    isSymbolicLink: () => isSymlink,
-    isFIFO: () => false,
-    isSocket: () => false,
-    dev: 1,
-    ino,
-    mode,
-    nlink,
-    uid,
-    gid,
-    rdev: 0,
-    size,
-    blksize: 4096,
-    blocks: Math.ceil(size / 512),
-    atimeMs,
-    mtimeMs,
-    ctimeMs,
-    birthtimeMs: ctimeMs,
-    atime: new Date(atimeMs),
-    mtime: new Date(mtimeMs),
-    ctime: new Date(ctimeMs),
-    birthtime: new Date(ctimeMs),
-    atimeNs: atimeMs * 1e6,
-    mtimeNs: mtimeMs * 1e6,
-    ctimeNs: ctimeMs * 1e6,
-    birthtimeNs: ctimeMs * 1e6
-  };
-}
-function decodeStatsBigInt(data) {
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const type = view.getUint8(0);
-  const mode = view.getUint32(1, true);
-  const size = view.getFloat64(5, true);
-  const mtimeMs = view.getFloat64(13, true);
-  const ctimeMs = view.getFloat64(21, true);
-  const atimeMs = view.getFloat64(29, true);
-  const uid = view.getUint32(37, true);
-  const gid = view.getUint32(41, true);
-  const ino = view.getUint32(45, true);
-  const nlink = data.byteLength >= 53 ? view.getUint32(49, true) : 1;
-  const isFile = type === INODE_TYPE.FILE;
-  const isDirectory = type === INODE_TYPE.DIRECTORY;
-  const isSymlink = type === INODE_TYPE.SYMLINK;
-  const atimeMsBigInt = BigInt(Math.trunc(atimeMs));
-  const mtimeMsBigInt = BigInt(Math.trunc(mtimeMs));
-  const ctimeMsBigInt = BigInt(Math.trunc(ctimeMs));
-  return {
-    isFile: () => isFile,
-    isDirectory: () => isDirectory,
-    isBlockDevice: () => false,
-    isCharacterDevice: () => false,
-    isSymbolicLink: () => isSymlink,
-    isFIFO: () => false,
-    isSocket: () => false,
-    dev: 1n,
-    ino: BigInt(ino),
-    mode: BigInt(mode),
-    nlink: BigInt(nlink),
-    uid: BigInt(uid),
-    gid: BigInt(gid),
-    rdev: 0n,
-    size: BigInt(Math.trunc(size)),
-    blksize: 4096n,
-    blocks: BigInt(Math.ceil(size / 512)),
-    atimeMs: atimeMsBigInt,
-    mtimeMs: mtimeMsBigInt,
-    ctimeMs: ctimeMsBigInt,
-    birthtimeMs: ctimeMsBigInt,
-    atime: new Date(atimeMs),
-    mtime: new Date(mtimeMs),
-    ctime: new Date(ctimeMs),
-    birthtime: new Date(ctimeMs),
-    atimeNs: atimeMsBigInt * 1000000n,
-    mtimeNs: mtimeMsBigInt * 1000000n,
-    ctimeNs: ctimeMsBigInt * 1000000n,
-    birthtimeNs: ctimeMsBigInt * 1000000n
-  };
-}
-function decodeDirents(data, parentPath = "") {
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const count = view.getUint32(0, true);
-  const decoder9 = new TextDecoder();
-  const entries = [];
-  let offset = 4;
-  for (let i = 0; i < count; i++) {
-    const nameLen = view.getUint16(offset, true);
-    offset += 2;
-    const name = decoder9.decode(data.subarray(offset, offset + nameLen));
-    offset += nameLen;
-    const type = data[offset++];
-    const isFile = type === INODE_TYPE.FILE;
-    const isDirectory = type === INODE_TYPE.DIRECTORY;
-    const isSymlink = type === INODE_TYPE.SYMLINK;
-    entries.push({
-      name,
-      parentPath,
-      path: parentPath,
-      isFile: () => isFile,
-      isDirectory: () => isDirectory,
-      isBlockDevice: () => false,
-      isCharacterDevice: () => false,
-      isSymbolicLink: () => isSymlink,
-      isFIFO: () => false,
-      isSocket: () => false
-    });
-  }
-  return entries;
-}
-function decodeNames(data) {
-  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-  const count = view.getUint32(0, true);
-  const decoder9 = new TextDecoder();
-  const names = [];
-  let offset = 4;
-  for (let i = 0; i < count; i++) {
-    const nameLen = view.getUint16(offset, true);
-    offset += 2;
-    names.push(decoder9.decode(data.subarray(offset, offset + nameLen)));
-    offset += nameLen;
-  }
-  return names;
-}
-
-// src/constants.ts
-var constants = {
-  // File access constants
-  F_OK: 0,
-  R_OK: 4,
-  W_OK: 2,
-  X_OK: 1,
-  // File copy constants
-  COPYFILE_EXCL: 1,
-  COPYFILE_FICLONE: 2,
-  COPYFILE_FICLONE_FORCE: 4,
-  // File open constants
-  O_RDONLY: 0,
-  O_WRONLY: 1,
-  O_RDWR: 2,
-  O_CREAT: 64,
-  O_EXCL: 128,
-  O_TRUNC: 512,
-  O_APPEND: 1024,
-  O_NOCTTY: 256,
-  O_NONBLOCK: 2048,
-  O_SYNC: 4096,
-  O_DSYNC: 4096,
-  O_DIRECTORY: 65536,
-  O_NOFOLLOW: 131072,
-  O_NOATIME: 262144,
-  // File type constants
-  S_IFMT: 61440,
-  S_IFREG: 32768,
-  S_IFDIR: 16384,
-  S_IFCHR: 8192,
-  S_IFBLK: 24576,
-  S_IFIFO: 4096,
-  S_IFLNK: 40960,
-  S_IFSOCK: 49152,
-  // File mode constants
-  S_IRWXU: 448,
-  S_IRUSR: 256,
-  S_IWUSR: 128,
-  S_IXUSR: 64,
-  S_IRWXG: 56,
-  S_IRGRP: 32,
-  S_IWGRP: 16,
-  S_IXGRP: 8,
-  S_IRWXO: 7,
-  S_IROTH: 4,
-  S_IWOTH: 2,
-  S_IXOTH: 1
-};
-
-// src/methods/open.ts
-var encoder2 = new TextEncoder();
-var decoder2 = new TextDecoder();
-function parseFlags(flags) {
-  switch (flags) {
-    case "r":
-      return constants.O_RDONLY;
-    case "r+":
-      return constants.O_RDWR;
-    case "w":
-      return constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC;
-    case "w+":
-      return constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC;
-    case "a":
-      return constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND;
-    case "a+":
-      return constants.O_RDWR | constants.O_CREAT | constants.O_APPEND;
-    case "wx":
-      return constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_EXCL;
-    case "wx+":
-      return constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC | constants.O_EXCL;
-    case "ax":
-      return constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_EXCL;
-    case "ax+":
-      return constants.O_RDWR | constants.O_CREAT | constants.O_APPEND | constants.O_EXCL;
-    default:
-      return constants.O_RDONLY;
-  }
-}
-var DEFAULT_OPEN_MODE = 438;
-function resolveOpenMode(mode) {
-  return mode === void 0 ? DEFAULT_OPEN_MODE : parseFileMode(mode, "mode");
-}
-function openSync(syncRequest, filePath, flags = "r", mode) {
-  const numFlags = typeof flags === "string" ? parseFlags(flags) : flags;
-  const buf = encodeRequestU32(OP.OPEN, filePath, numFlags, resolveOpenMode(mode));
-  const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "open", filePath);
-  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
-}
-function closeSync(syncRequest, fd) {
-  const fdBuf = new Uint8Array(4);
-  new DataView(fdBuf.buffer).setUint32(0, fd, true);
-  const buf = encodeRequest(OP.CLOSE, "", 0, fdBuf);
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "close", String(fd));
-}
-function readSync(syncRequest, fd, bufferOrOptions, offsetOrOptions, length, position) {
-  let buffer;
-  let off, len, pos;
-  if (bufferOrOptions instanceof Uint8Array) {
-    buffer = bufferOrOptions;
-    if (offsetOrOptions != null && typeof offsetOrOptions === "object") {
-      off = offsetOrOptions.offset ?? 0;
-      len = offsetOrOptions.length ?? buffer.byteLength;
-      pos = offsetOrOptions.position ?? null;
-    } else {
-      off = offsetOrOptions ?? 0;
-      len = length ?? buffer.byteLength;
-      pos = position ?? null;
-    }
-  } else {
-    buffer = bufferOrOptions.buffer;
-    off = bufferOrOptions.offset ?? 0;
-    len = bufferOrOptions.length ?? buffer.byteLength;
-    pos = bufferOrOptions.position ?? null;
-  }
-  const fdBuf = new Uint8Array(16);
-  const dv = new DataView(fdBuf.buffer);
-  dv.setUint32(0, fd, true);
-  dv.setUint32(4, len, true);
-  dv.setFloat64(8, pos ?? -1, true);
-  const buf = encodeRequest(OP.FREAD, "", 0, fdBuf);
-  const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "read", String(fd));
-  if (data) {
-    buffer.set(data.subarray(0, Math.min(data.byteLength, len)), off);
-    return data.byteLength;
-  }
-  return 0;
-}
-function writeSyncFd(syncRequest, fd, bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position) {
-  let writeData;
-  let pos;
-  if (typeof bufferOrString === "string") {
-    writeData = encoder2.encode(bufferOrString);
-    pos = offsetOrPositionOrOptions != null && typeof offsetOrPositionOrOptions === "number" ? offsetOrPositionOrOptions : null;
-  } else if (offsetOrPositionOrOptions != null && typeof offsetOrPositionOrOptions === "object") {
-    const offset = offsetOrPositionOrOptions.offset ?? 0;
-    const length = offsetOrPositionOrOptions.length ?? bufferOrString.byteLength;
-    pos = offsetOrPositionOrOptions.position ?? null;
-    writeData = bufferOrString.subarray(offset, offset + length);
-  } else {
-    const offset = offsetOrPositionOrOptions ?? 0;
-    const length = lengthOrEncoding != null ? lengthOrEncoding : bufferOrString.byteLength;
-    pos = position ?? null;
-    writeData = bufferOrString.subarray(offset, offset + length);
-  }
-  const fdBuf = new Uint8Array(12 + writeData.byteLength);
-  const dv = new DataView(fdBuf.buffer);
-  dv.setUint32(0, fd, true);
-  dv.setFloat64(4, pos ?? -1, true);
-  fdBuf.set(writeData, 12);
-  const buf = encodeRequest(OP.FWRITE, "", 0, fdBuf);
-  const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "write", String(fd));
-  return data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-}
-function fstatSync(syncRequest, fd, options) {
-  const fdBuf = new Uint8Array(4);
-  new DataView(fdBuf.buffer).setUint32(0, fd, true);
-  const buf = encodeRequest(OP.FSTAT, "", 0, fdBuf);
-  const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "fstat", String(fd));
-  return options?.bigint ? decodeStatsBigInt(data) : decodeStats(data);
-}
-function ftruncateSync(syncRequest, fd, len = 0) {
-  const fdBuf = new Uint8Array(12);
-  const dv = new DataView(fdBuf.buffer);
-  dv.setUint32(0, fd, true);
-  dv.setFloat64(4, len, true);
-  const buf = encodeRequest(OP.FTRUNCATE, "", 0, fdBuf);
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "ftruncate", String(fd));
-}
-function fdatasyncSync(syncRequest, fd) {
-  const buf = encodeRequest(OP.FSYNC, "");
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "fdatasync", String(fd));
-}
-async function open(asyncRequest, filePath, flags, mode) {
-  const numFlags = typeof flags === "string" ? parseFlags(flags ?? "r") : flags ?? 0;
-  const { status, data } = await asyncRequest(OP.OPEN, filePath, numFlags, encodeMode(resolveOpenMode(mode)));
-  if (status !== 0) throw statusToError(status, "open", filePath);
-  const fd = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
-  return createFileHandle(fd, asyncRequest);
-}
-function createFileHandle(fd, asyncRequest) {
-  return {
-    fd,
-    async read(bufferOrOptions, offsetOrOptions, length, position) {
-      let buffer;
-      let off, len, pos;
-      if (bufferOrOptions instanceof Uint8Array) {
-        buffer = bufferOrOptions;
-        if (offsetOrOptions != null && typeof offsetOrOptions === "object") {
-          off = offsetOrOptions.offset ?? 0;
-          len = offsetOrOptions.length ?? buffer.byteLength;
-          pos = offsetOrOptions.position ?? null;
-        } else {
-          off = offsetOrOptions ?? 0;
-          len = length ?? buffer.byteLength;
-          pos = position ?? null;
-        }
-      } else {
-        buffer = bufferOrOptions.buffer;
-        off = bufferOrOptions.offset ?? 0;
-        len = bufferOrOptions.length ?? buffer.byteLength;
-        pos = bufferOrOptions.position ?? null;
-      }
-      const { status, data } = await asyncRequest(OP.FREAD, "", 0, null, void 0, { fd, length: len, position: pos ?? -1 });
-      if (status !== 0) throw statusToError(status, "read", String(fd));
-      const bytesRead = data ? data.byteLength : 0;
-      if (data) buffer.set(data.subarray(0, Math.min(bytesRead, len)), off);
-      return { bytesRead, buffer };
-    },
-    async write(bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position) {
-      let writeData;
-      let pos;
-      let resultBuffer;
-      if (typeof bufferOrString === "string") {
-        resultBuffer = encoder2.encode(bufferOrString);
-        writeData = resultBuffer;
-        pos = offsetOrPositionOrOptions != null && typeof offsetOrPositionOrOptions === "number" ? offsetOrPositionOrOptions : -1;
-      } else if (offsetOrPositionOrOptions != null && typeof offsetOrPositionOrOptions === "object") {
-        resultBuffer = bufferOrString;
-        const offset = offsetOrPositionOrOptions.offset ?? 0;
-        const length = offsetOrPositionOrOptions.length ?? bufferOrString.byteLength;
-        pos = offsetOrPositionOrOptions.position != null ? offsetOrPositionOrOptions.position : -1;
-        writeData = bufferOrString.subarray(offset, offset + length);
-      } else {
-        resultBuffer = bufferOrString;
-        const offset = offsetOrPositionOrOptions ?? 0;
-        const length = lengthOrEncoding != null ? lengthOrEncoding : bufferOrString.byteLength;
-        pos = position != null ? position : -1;
-        writeData = bufferOrString.subarray(offset, offset + length);
-      }
-      const { status, data } = await asyncRequest(OP.FWRITE, "", 0, null, void 0, { fd, data: writeData, position: pos });
-      if (status !== 0) throw statusToError(status, "write", String(fd));
-      const bytesWritten = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      return { bytesWritten, buffer: resultBuffer };
-    },
-    async readv(buffers, position) {
-      let totalRead = 0;
-      let pos = position ?? null;
-      for (const buf of buffers) {
-        const { bytesRead } = await this.read(buf, 0, buf.byteLength, pos);
-        totalRead += bytesRead;
-        if (pos !== null) pos += bytesRead;
-        if (bytesRead < buf.byteLength) break;
-      }
-      return { bytesRead: totalRead, buffers };
-    },
-    async writev(buffers, position) {
-      let totalWritten = 0;
-      let pos = position ?? null;
-      for (const buf of buffers) {
-        const { bytesWritten } = await this.write(buf, 0, buf.byteLength, pos);
-        totalWritten += bytesWritten;
-        if (pos !== null) pos += bytesWritten;
-      }
-      return { bytesWritten: totalWritten, buffers };
-    },
-    async readFile(options) {
-      const encoding = typeof options === "string" ? options : options?.encoding;
-      const { status, data } = await asyncRequest(OP.FREAD, "", 0, null, void 0, { fd, length: Number.MAX_SAFE_INTEGER, position: 0 });
-      if (status !== 0) throw statusToError(status, "read", String(fd));
-      const result = data ?? new Uint8Array(0);
-      if (encoding) return decoder2.decode(result);
-      return result;
-    },
-    async writeFile(data, _options) {
-      const encoded = typeof data === "string" ? encoder2.encode(data) : data;
-      const { status } = await asyncRequest(OP.FWRITE, "", 0, null, void 0, { fd, data: encoded, position: 0 });
-      if (status !== 0) throw statusToError(status, "write", String(fd));
-    },
-    async truncate(len = 0) {
-      const { status } = await asyncRequest(OP.FTRUNCATE, "", 0, null, void 0, { fd, length: len });
-      if (status !== 0) throw statusToError(status, "ftruncate", String(fd));
-    },
-    async stat() {
-      const { status, data } = await asyncRequest(OP.FSTAT, "", 0, null, void 0, { fd });
-      if (status !== 0) throw statusToError(status, "fstat", String(fd));
-      return decodeStats(data);
-    },
-    async appendFile(data, _options) {
-      const encoded = typeof data === "string" ? encoder2.encode(data) : data;
-      const st = await this.stat();
-      const { status } = await asyncRequest(OP.FWRITE, "", 0, null, void 0, { fd, data: encoded, position: st.size });
-      if (status !== 0) throw statusToError(status, "write", String(fd));
-    },
-    async chmod(mode) {
-      const payload = new Uint8Array(8);
-      const dv = new DataView(payload.buffer);
-      dv.setUint32(0, fd, true);
-      dv.setUint32(4, mode, true);
-      const { status } = await asyncRequest(OP.FCHMOD, "", 0, payload);
-      if (status !== 0) throw statusToError(status, "fchmod", String(fd));
-    },
-    async chown(uid, gid) {
-      const payload = new Uint8Array(12);
-      const dv = new DataView(payload.buffer);
-      dv.setUint32(0, fd, true);
-      dv.setUint32(4, uid, true);
-      dv.setUint32(8, gid, true);
-      const { status } = await asyncRequest(OP.FCHOWN, "", 0, payload);
-      if (status !== 0) throw statusToError(status, "fchown", String(fd));
-    },
-    async utimes(atime, mtime) {
-      const payload = new Uint8Array(24);
-      const dv = new DataView(payload.buffer);
-      dv.setUint32(0, fd, true);
-      dv.setFloat64(8, typeof atime === "number" ? atime : atime.getTime(), true);
-      dv.setFloat64(16, typeof mtime === "number" ? mtime : mtime.getTime(), true);
-      const { status } = await asyncRequest(OP.FUTIMES, "", 0, payload);
-      if (status !== 0) throw statusToError(status, "futimes", String(fd));
-    },
-    async sync() {
-      await asyncRequest(OP.FSYNC, "");
-    },
-    async datasync() {
-      await asyncRequest(OP.FSYNC, "");
-    },
-    async close() {
-      const { status } = await asyncRequest(OP.CLOSE, "", 0, null, void 0, { fd });
-      if (status !== 0) throw statusToError(status, "close", String(fd));
-    },
-    [Symbol.asyncDispose]() {
-      return this.close();
-    }
-  };
 }
 
 // src/encoding.ts
@@ -1345,6 +284,49 @@ function decodeBuffer(data, encoding) {
       return utf16Decoder.decode(data.length & 1 ? data.subarray(0, data.length - 1) : data);
   }
 }
+function createStringDecoder(encoding) {
+  const canonical = assertEncoding(encoding);
+  if (canonical === "utf8") {
+    const decoder9 = new TextDecoder("utf-8");
+    return {
+      write: (bytes) => decoder9.decode(bytes, { stream: true }),
+      end: () => decoder9.decode()
+    };
+  }
+  if (canonical === "utf16le" || canonical === "base64" || canonical === "base64url") {
+    const unit = canonical === "utf16le" ? 2 : 3;
+    const isUtf16 = canonical === "utf16le";
+    let carry = new Uint8Array(0);
+    return {
+      write(bytes) {
+        const joined = carry.length === 0 ? bytes : concatBytes(carry, bytes);
+        let whole = joined.length - joined.length % unit;
+        if (isUtf16 && whole >= 2) {
+          const lastUnit = joined[whole - 2] | joined[whole - 1] << 8;
+          if (lastUnit >= 55296 && lastUnit <= 56319) whole -= 2;
+        }
+        carry = new Uint8Array(joined.subarray(whole));
+        return whole === 0 ? "" : decodeBuffer(joined.subarray(0, whole), canonical);
+      },
+      end() {
+        if (carry.length === 0) return "";
+        const rest = decodeBuffer(carry, canonical);
+        carry = new Uint8Array(0);
+        return rest;
+      }
+    };
+  }
+  return {
+    write: (bytes) => bytes.length === 0 ? "" : decodeBuffer(bytes, canonical),
+    end: () => ""
+  };
+}
+function concatBytes(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
 function encodeString(str, encoding) {
   switch (assertEncoding(encoding)) {
     case "utf8":
@@ -1372,8 +354,1628 @@ function encodeString(str, encoding) {
   }
 }
 
+// src/node-streams.ts
+var SimpleEventEmitter = class {
+  _listeners = /* @__PURE__ */ new Map();
+  _onceSet = /* @__PURE__ */ new WeakSet();
+  on(event, fn) {
+    let arr = this._listeners.get(event);
+    if (!arr) {
+      arr = [];
+      this._listeners.set(event, arr);
+    }
+    arr.push(fn);
+    return this;
+  }
+  addListener(event, fn) {
+    return this.on(event, fn);
+  }
+  once(event, fn) {
+    this._onceSet.add(fn);
+    return this.on(event, fn);
+  }
+  off(event, fn) {
+    const arr = this._listeners.get(event);
+    if (arr) {
+      const idx = arr.indexOf(fn);
+      if (idx !== -1) arr.splice(idx, 1);
+    }
+    return this;
+  }
+  removeListener(event, fn) {
+    return this.off(event, fn);
+  }
+  removeAllListeners(event) {
+    if (event !== void 0) {
+      this._listeners.delete(event);
+    } else {
+      this._listeners.clear();
+    }
+    return this;
+  }
+  emit(event, ...args) {
+    const arr = this._listeners.get(event);
+    if (!arr || arr.length === 0) return false;
+    const copy = arr.slice();
+    for (const fn of copy) {
+      if (this._onceSet.has(fn)) {
+        this._onceSet.delete(fn);
+        this.off(event, fn);
+      }
+      fn(...args);
+    }
+    return true;
+  }
+  listenerCount(event) {
+    return this._listeners.get(event)?.length ?? 0;
+  }
+  rawListeners(event) {
+    return [...this._listeners.get(event) ?? []];
+  }
+  prependListener(event, fn) {
+    const arr = this._listeners.get(event) ?? [];
+    arr.unshift(fn);
+    this._listeners.set(event, arr);
+    return this;
+  }
+  prependOnceListener(event, fn) {
+    const wrapper = (...args) => {
+      this.off(event, wrapper);
+      fn(...args);
+    };
+    return this.prependListener(event, wrapper);
+  }
+  eventNames() {
+    return [...this._listeners.keys()].filter((k) => (this._listeners.get(k)?.length ?? 0) > 0);
+  }
+};
+var NodeReadable = class extends SimpleEventEmitter {
+  constructor(_readFn, destroyFn) {
+    super();
+    this._readFn = _readFn;
+    if (destroyFn) this._destroyFn = destroyFn;
+  }
+  _paused = true;
+  _destroyed = false;
+  _ended = false;
+  _reading = false;
+  _readBuffer = null;
+  _encoding = null;
+  /**
+   * Carries partial characters between chunks — see {@link createStringDecoder}.
+   *
+   * Decoding each chunk on its own turned every multi-byte character that straddled a 64 KB
+   * chunk boundary into two U+FFFDs.
+   */
+  _decoder = null;
+  /** Whether the stream is still readable (not ended or destroyed). */
+  readable = true;
+  /** The file path this stream reads from (set externally). */
+  path = "";
+  /** Total bytes read so far. */
+  bytesRead = 0;
+  /** Optional cleanup callback invoked on destroy (e.g. close file handle). */
+  _destroyFn = null;
+  // ---- Flow control (override on to auto-resume) ----
+  on(event, fn) {
+    super.on(event, fn);
+    if (event === "data" && this._paused) {
+      this.resume();
+    }
+    return this;
+  }
+  pause() {
+    this._paused = true;
+    return this;
+  }
+  resume() {
+    if (this._destroyed || this._ended) return this;
+    this._paused = false;
+    this._drain();
+    return this;
+  }
+  /**
+   * Set the character encoding for data read from this stream.
+   * When set, 'data' events emit strings instead of Uint8Array.
+   */
+  setEncoding(encoding) {
+    this._encoding = encoding;
+    this._decoder = createStringDecoder(encoding);
+    return this;
+  }
+  /**
+   * Non-flowing read — returns the last buffered chunk or null.
+   * Node.js has a complex buffer system; we keep it simple here.
+   */
+  read(_size) {
+    const buf = this._readBuffer;
+    this._readBuffer = null;
+    return buf;
+  }
+  /** Destroy the stream, optionally with an error. */
+  destroy(err) {
+    if (this._destroyed) return this;
+    this._destroyed = true;
+    this.readable = false;
+    if (err) {
+      this.emit("error", err);
+    }
+    if (this._destroyFn) {
+      this._destroyFn().then(
+        () => this.emit("close"),
+        () => this.emit("close")
+      );
+    } else {
+      this.emit("close");
+    }
+    return this;
+  }
+  // ---- pipe ----
+  pipe(dest) {
+    if (isNodeWritableInstance(dest)) {
+      this.on("data", (chunk) => {
+        dest.write(chunk);
+      });
+      this.on("end", () => {
+        if (typeof dest.end === "function") {
+          dest.end();
+        }
+      });
+      this.on("error", (err) => {
+        if (typeof dest.destroy === "function") {
+          dest.destroy(err);
+        }
+      });
+    } else {
+      const writer = dest.getWriter();
+      this.on("data", (chunk) => {
+        writer.write(chunk);
+      });
+      this.on("end", () => {
+        writer.close();
+      });
+      this.on("error", (err) => {
+        writer.abort(err);
+      });
+    }
+    if (this._paused) {
+      this.resume();
+    }
+    return dest;
+  }
+  // ---- Internal ----
+  /**
+   * `for await (const chunk of stream)`.
+   *
+   * Node's readables are async iterable, and this one was not — so the ordinary way to consume a
+   * read stream threw "stream is not async iterable". Implemented over the event interface with
+   * `pause()` between chunks so a slow consumer applies backpressure instead of buffering the
+   * whole file.
+   *
+   * Leaving the loop early (`break`, `return`, or a throw in the body) destroys the stream, which
+   * closes the underlying handle — node does the same, and here it matters more: in the browser
+   * these are OPFS sync access handles holding an *exclusive* lock, so a leaked one blocks every
+   * later open of that file for the lifetime of the page.
+   */
+  async *[Symbol.asyncIterator]() {
+    const queue = [];
+    let ended = false;
+    let failure = null;
+    let wake = null;
+    const notify = () => {
+      const w = wake;
+      wake = null;
+      w?.();
+    };
+    const onData = ((chunk) => {
+      queue.push(chunk);
+      this.pause();
+      notify();
+    });
+    const onEnd = (() => {
+      ended = true;
+      notify();
+    });
+    const onError = ((err) => {
+      failure = err;
+      notify();
+    });
+    this.on("data", onData);
+    this.on("end", onEnd);
+    this.on("error", onError);
+    this.resume();
+    try {
+      for (; ; ) {
+        if (queue.length > 0) {
+          const chunk = queue.shift();
+          yield chunk;
+          this.resume();
+          continue;
+        }
+        if (failure) throw failure;
+        if (ended || this._ended) return;
+        await new Promise((resolve2) => {
+          wake = resolve2;
+        });
+      }
+    } finally {
+      this.off("data", onData);
+      this.off("end", onEnd);
+      this.off("error", onError);
+      if (!this._ended && !this._destroyed) this.destroy();
+    }
+  }
+  async _drain() {
+    if (this._reading || this._destroyed || this._ended) return;
+    this._reading = true;
+    try {
+      while (!this._paused && !this._destroyed && !this._ended) {
+        const result = await this._readFn();
+        if (this._destroyed) break;
+        if (result.done || !result.value || result.value.byteLength === 0) {
+          this._ended = true;
+          this.readable = false;
+          if (this._decoder) {
+            const tail = this._decoder.end();
+            if (tail !== "") this.emit("data", tail);
+          }
+          this.emit("end");
+          this.emit("close");
+          break;
+        }
+        this.bytesRead += result.value.byteLength;
+        this._readBuffer = result.value;
+        if (this._decoder) {
+          const text = this._decoder.write(result.value);
+          if (text !== "") this.emit("data", text);
+        } else {
+          this.emit("data", result.value);
+        }
+      }
+    } catch (err) {
+      if (!this._destroyed) {
+        this.destroy(err);
+      }
+    } finally {
+      this._reading = false;
+    }
+  }
+};
+var NodeWritable = class extends SimpleEventEmitter {
+  constructor(path, _writeFn, _closeFn, _defaultEncoding = "utf8") {
+    super();
+    this._writeFn = _writeFn;
+    this._closeFn = _closeFn;
+    this._defaultEncoding = _defaultEncoding;
+    this.path = path;
+  }
+  /** Total bytes written so far. */
+  bytesWritten = 0;
+  /** The file path this stream was created for. */
+  path;
+  /** Whether this stream is still writable. */
+  writable = true;
+  _destroyed = false;
+  _finished = false;
+  _writing = false;
+  _corked = false;
+  /**
+   * Set synchronously by `end()`, where `_finished` is only set once the queue has drained.
+   *
+   * Node rejects a write the moment `end()` has been called. Testing `_finished` instead let a
+   * late write be accepted and queued, and whether it landed in the file, hit `EBADF`, or wrote
+   * past a closed handle depended purely on whether close won the race.
+   */
+  _ending = false;
+  /**
+   * Serialises queued writes.
+   *
+   * `_writeFn` reads the stream's current file offset when it runs and advances it by however
+   * much it wrote. Firing writes concurrently therefore loses data: two synchronous `write()`
+   * calls both started at the same offset, and the second overwrote the first — a plain
+   * `ws.write('abc'); ws.write('def')` produced `'def'`. Chaining keeps each write starting
+   * where the previous one finished, and lets `end()` wait for the queue to drain before
+   * closing the handle, which was the same race one step later.
+   */
+  _chain = Promise.resolve();
+  // -- public API -----------------------------------------------------------
+  /**
+   * Buffer all writes until `uncork()` is called.
+   * In this minimal implementation we only track the flag for compatibility.
+   */
+  cork() {
+    this._corked = true;
+  }
+  /**
+   * Flush buffered writes (clears the cork flag).
+   * In this minimal implementation we only track the flag for compatibility.
+   */
+  uncork() {
+    this._corked = false;
+  }
+  write(chunk, encodingOrCb, cb) {
+    const callback = typeof encodingOrCb === "function" ? encodingOrCb : cb;
+    const encoding = typeof encodingOrCb === "string" ? encodingOrCb : this._defaultEncoding;
+    if (this._destroyed || this._finished || this._ending) {
+      const err = streamWriteAfterEnd();
+      if (callback) callback(err);
+      this.emit("error", err);
+      return false;
+    }
+    const data = typeof chunk === "string" ? encodeString(chunk, encoding) : chunk;
+    this._writing = true;
+    this._chain = this._chain.then(() => this._writeFn(data)).then(
+      () => {
+        this.bytesWritten += data.byteLength;
+        this._writing = false;
+        if (callback) callback();
+        this.emit("drain");
+      },
+      (err) => {
+        this._writing = false;
+        if (callback) callback(err);
+        this.emit("error", err);
+      }
+    );
+    return true;
+  }
+  end(chunk, encodingOrCb, cb) {
+    let callback;
+    let finalChunk;
+    let finalEncoding;
+    if (typeof chunk === "function") {
+      callback = chunk;
+      finalChunk = void 0;
+    } else {
+      finalChunk = chunk;
+      if (typeof encodingOrCb === "function") {
+        callback = encodingOrCb;
+      } else {
+        finalEncoding = encodingOrCb;
+        callback = cb;
+      }
+    }
+    if (this._finished || this._ending) {
+      if (callback) callback();
+      return this;
+    }
+    this.writable = false;
+    const finish = () => {
+      this._chain.then(() => this._closeFn()).then(() => {
+        this._finished = true;
+        this.emit("finish");
+        this.emit("close");
+        if (callback) callback();
+      }).catch((err) => {
+        this.emit("error", err);
+        if (callback) callback(err);
+      });
+    };
+    if (finalChunk !== void 0 && finalChunk !== null) {
+      this.write(finalChunk, finalEncoding);
+    }
+    this._ending = true;
+    finish();
+    return this;
+  }
+  destroy(err) {
+    if (this._destroyed) return this;
+    this._destroyed = true;
+    this.writable = false;
+    this._closeFn().catch(() => {
+    }).finally(() => {
+      if (err) this.emit("error", err);
+      this.emit("close");
+    });
+    return this;
+  }
+};
+function isNodeWritableInstance(obj) {
+  return obj !== null && typeof obj === "object" && typeof obj.write === "function" && !("getWriter" in obj);
+}
+
+// src/protocol/opcodes.ts
+var OP = {
+  READ: 1,
+  WRITE: 2,
+  UNLINK: 3,
+  STAT: 4,
+  LSTAT: 5,
+  MKDIR: 6,
+  RMDIR: 7,
+  READDIR: 8,
+  RENAME: 9,
+  EXISTS: 10,
+  TRUNCATE: 11,
+  APPEND: 12,
+  COPY: 13,
+  ACCESS: 14,
+  REALPATH: 15,
+  CHMOD: 16,
+  CHOWN: 17,
+  UTIMES: 18,
+  SYMLINK: 19,
+  READLINK: 20,
+  LINK: 21,
+  OPEN: 22,
+  CLOSE: 23,
+  FREAD: 24,
+  FWRITE: 25,
+  FSTAT: 26,
+  FTRUNCATE: 27,
+  FSYNC: 28,
+  OPENDIR: 29,
+  MKDTEMP: 30,
+  FCHMOD: 31,
+  FCHOWN: 32,
+  FUTIMES: 33,
+  STATFS: 34
+};
+var SAB_OFFSETS = {
+  CONTROL: 0,
+  // Int32 - signal (0=idle, 1=request, 2=response, 3=chunk, 4=ack)
+  TICKET_NEXT: 4,
+  // Int32 - fairness lock: next ticket to hand out (fetch-add)
+  TICKET_SERVING: 8,
+  // Int32 - fairness lock: ticket currently allowed to use the SAB
+  OPCODE: 4,
+  // (alias of TICKET_NEXT) — op code is carried in the payload
+  STATUS: 8,
+  // (alias of TICKET_SERVING) — status is carried in the payload
+  CHUNK_LEN: 12,
+  // Int32 - bytes in this chunk
+  TOTAL_LEN: 16,
+  // BigUint64 - full data size across all chunks
+  CHUNK_IDX: 24,
+  // Int32 - 0-based chunk index
+  HEARTBEAT: 28,
+  // Int32 - liveness counter; the relay worker bumps this ~1×/s
+  //         while its event loop is alive (incl. mid-await of a
+  //         long op) so a spin-waiting main thread can tell
+  //         "slow" from "dead". Never written by the main thread.
+  HEADER_SIZE: 32
+  // Data payload starts here
+};
+var SIGNAL = {
+  IDLE: 0,
+  REQUEST: 1,
+  RESPONSE: 2,
+  CHUNK: 3,
+  CHUNK_ACK: 4
+};
+var encoder = new TextEncoder();
+new TextDecoder();
+function encodeRequest(op, path, flags = 0, data) {
+  const pathBytes = encoder.encode(path);
+  const dataLen = data ? data.byteLength : 0;
+  const totalLen = 16 + pathBytes.byteLength + dataLen;
+  const buf = new ArrayBuffer(totalLen);
+  const view = new DataView(buf);
+  view.setUint32(0, op, true);
+  view.setUint32(4, flags, true);
+  view.setUint32(8, pathBytes.byteLength, true);
+  view.setUint32(12, dataLen, true);
+  const bytes = new Uint8Array(buf);
+  bytes.set(pathBytes, 16);
+  if (data) {
+    bytes.set(data, 16 + pathBytes.byteLength);
+  }
+  return buf;
+}
+function encodeRequestU32(op, path, flags, value) {
+  const pathBytes = encoder.encode(path);
+  const payloadOffset = 16 + pathBytes.byteLength;
+  const buf = new ArrayBuffer(payloadOffset + 4);
+  const view = new DataView(buf);
+  view.setUint32(0, op, true);
+  view.setUint32(4, flags, true);
+  view.setUint32(8, pathBytes.byteLength, true);
+  view.setUint32(12, 4, true);
+  new Uint8Array(buf).set(pathBytes, 16);
+  view.setUint32(payloadOffset, value >>> 0, true);
+  return buf;
+}
+function decodeResponse(buf) {
+  const view = new DataView(buf);
+  const status = view.getUint32(0, true);
+  const dataLen = view.getUint32(4, true);
+  const data = dataLen > 0 ? new Uint8Array(buf, 8, dataLen) : null;
+  return { status, data };
+}
+function encodeTwoPathRequest(op, path1, path2, flags = 0) {
+  const path2Bytes = encoder.encode(path2);
+  const payload = new Uint8Array(4 + path2Bytes.byteLength);
+  const pv = new DataView(payload.buffer);
+  pv.setUint32(0, path2Bytes.byteLength, true);
+  payload.set(path2Bytes, 4);
+  return encodeRequest(op, path1, flags, payload);
+}
+
+// src/protocol/fs-lock.ts
+var NEXT_INDEX = SAB_OFFSETS.TICKET_NEXT >> 2;
+var SERVING_INDEX = SAB_OFFSETS.TICKET_SERVING >> 2;
+var SIGNAL_INDEX = SAB_OFFSETS.CONTROL >> 2;
+var CAN_WAIT = typeof globalThis.WorkerGlobalScope !== "undefined";
+var WAIT_SLICE_MS = 50;
+var HOLDER_STUCK_MS = 3e4;
+function now() {
+  return performance.now();
+}
+function acquireFsLock(ctrl) {
+  const ticket = Atomics.add(ctrl, NEXT_INDEX, 1);
+  if (Atomics.load(ctrl, SERVING_INDEX) === ticket) return ticket;
+  waitForTurn(ctrl, ticket);
+  return ticket;
+}
+function releaseFsLock(ctrl) {
+  Atomics.add(ctrl, SERVING_INDEX, 1);
+  Atomics.notify(ctrl, SERVING_INDEX);
+}
+function waitForTurn(ctrl, ticket) {
+  let serving = Atomics.load(ctrl, SERVING_INDEX);
+  let sig = Atomics.load(ctrl, SIGNAL_INDEX);
+  let progressAt = now();
+  while (serving !== ticket) {
+    if (CAN_WAIT) {
+      Atomics.wait(ctrl, SERVING_INDEX, serving, WAIT_SLICE_MS);
+    } else {
+      const spinStart = now();
+      while (now() - spinStart < WAIT_SLICE_MS && Atomics.load(ctrl, SERVING_INDEX) === serving) {
+      }
+    }
+    const curServing = Atomics.load(ctrl, SERVING_INDEX);
+    const curSig = Atomics.load(ctrl, SIGNAL_INDEX);
+    if (curServing !== serving || curSig !== sig) {
+      serving = curServing;
+      sig = curSig;
+      progressAt = now();
+      continue;
+    }
+    if (now() - progressAt > HOLDER_STUCK_MS) {
+      if (Atomics.compareExchange(ctrl, SERVING_INDEX, serving, serving + 1) === serving) {
+        Atomics.store(ctrl, SIGNAL_INDEX, SIGNAL.IDLE);
+        Atomics.notify(ctrl, SERVING_INDEX);
+      }
+      serving = Atomics.load(ctrl, SERVING_INDEX);
+      sig = Atomics.load(ctrl, SIGNAL_INDEX);
+      progressAt = now();
+    }
+  }
+}
+
+// src/protocol/payloads.ts
+function encodeTruncatePayload(len) {
+  const buf = new Uint8Array(8);
+  new DataView(buf.buffer).setFloat64(0, len, true);
+  return buf;
+}
+function encodeFdPayload(fd) {
+  const buf = new Uint8Array(4);
+  writeU32(buf, 0, fd);
+  return buf;
+}
+function encodeFreadPayload(fd, length, position) {
+  const buf = new Uint8Array(16);
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setUint32(4, length, true);
+  dv.setFloat64(8, position ?? -1, true);
+  return buf;
+}
+function encodeFwritePayload(fd, position, data) {
+  const buf = new Uint8Array(12 + data.byteLength);
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setFloat64(4, position ?? -1, true);
+  buf.set(data, 12);
+  return buf;
+}
+function encodeFtruncatePayload(fd, len) {
+  const buf = new Uint8Array(12);
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setFloat64(4, len, true);
+  return buf;
+}
+function writeU32(buf, at, value) {
+  buf[at] = value;
+  buf[at + 1] = value >>> 8;
+  buf[at + 2] = value >>> 16;
+  buf[at + 3] = value >>> 24;
+}
+function toEpochMs(time, name = "time") {
+  if (time instanceof Date) return time.getTime();
+  const seconds = typeof time === "string" ? Number(time) : time;
+  if (typeof seconds !== "number" || !Number.isFinite(seconds)) {
+    throw invalidArgType(name, "number | string | Date", time);
+  }
+  return seconds * 1e3;
+}
+
+// src/methods/mode.ts
+var OCTAL_STRING = /^[0-7]+$/;
+function parseFileMode(mode, name, def) {
+  mode ??= def;
+  if (typeof mode === "string") {
+    if (!OCTAL_STRING.test(mode)) {
+      throw invalidArgValue(name, mode, "must be a 32-bit unsigned integer or an octal string");
+    }
+    return parseInt(mode, 8);
+  }
+  if (typeof mode !== "number") throw invalidArgType(name, "number", mode);
+  if (!Number.isInteger(mode)) throw outOfRange(name, "an integer", mode);
+  if (mode < 0 || mode > 4294967295) throw outOfRange(name, ">= 0 && <= 4294967295", mode);
+  return mode;
+}
+function encodeMode(mode) {
+  const buf = new Uint8Array(4);
+  buf[0] = mode;
+  buf[1] = mode >>> 8;
+  buf[2] = mode >>> 16;
+  buf[3] = mode >>> 24;
+  return buf;
+}
+
+// src/vfs/layout.ts
+var VFS_MAGIC = 1447449377;
+var VFS_VERSION = 1;
+var DEFAULT_BLOCK_SIZE = 4096;
+var DEFAULT_INODE_COUNT = 1e5;
+var INODE_SIZE = 64;
+var SUPERBLOCK = {
+  SIZE: 64,
+  MAGIC: 0,
+  // uint32 - 0x56465321
+  VERSION: 4,
+  // uint32
+  INODE_COUNT: 8,
+  // uint32 - total inodes allocated
+  BLOCK_SIZE: 12,
+  // uint32 - data block size (default 4096)
+  TOTAL_BLOCKS: 16,
+  // uint32 - total data blocks
+  FREE_BLOCKS: 20,
+  // uint32 - available data blocks
+  INODE_OFFSET: 24,
+  // float64 - byte offset to inode table
+  PATH_OFFSET: 32,
+  // float64 - byte offset to path table
+  DATA_OFFSET: 40,
+  // float64 - byte offset to data region
+  BITMAP_OFFSET: 48,
+  // float64 - byte offset to free block bitmap
+  PATH_USED: 56,
+  // uint32 - bytes used in path table
+  CRC32: 60
+  // uint32 - CRC-32 of superblock bytes 0..59.
+  //   0 = legacy file written before checksumming existed
+  //   (validation skipped; upgraded on next superblock write).
+};
+var INODE = {
+  TYPE: 0,
+  // uint8 - 0=free, 1=file, 2=directory, 3=symlink
+  FLAGS: 1,
+  // uint8[3] - reserved
+  PATH_OFFSET: 4,
+  // uint32 - byte offset into path table
+  PATH_LENGTH: 8,
+  // uint16 - length of path string
+  NLINK: 10,
+  // uint16 - hard link count
+  MODE: 12,
+  // uint32 - permissions (e.g. 0o100644)
+  SIZE: 16,
+  // float64 - file content size in bytes (using f64 for >4GB)
+  FIRST_BLOCK: 24,
+  // uint32 - index of first data block
+  BLOCK_COUNT: 28,
+  // uint32 - number of contiguous data blocks
+  MTIME: 32,
+  // float64 - last modification time (ms since epoch)
+  CTIME: 40,
+  // float64 - creation/change time (ms since epoch)
+  ATIME: 48,
+  // float64 - last access time (ms since epoch)
+  UID: 56,
+  // uint32 - owner
+  GID: 60
+  // uint32 - group
+};
+var INODE_TYPE = {
+  FREE: 0,
+  FILE: 1,
+  DIRECTORY: 2,
+  SYMLINK: 3
+};
+var DEFAULT_FILE_MODE = 33188;
+var DEFAULT_DIR_MODE = 16877;
+var DEFAULT_SYMLINK_MODE = 41471;
+var DEFAULT_UMASK = 18;
+var S_IFMT = 61440;
+var S_IFREG = 32768;
+var S_IFDIR = 16384;
+var MAX_SYMLINK_DEPTH = 40;
+var INITIAL_PATH_TABLE_SIZE = 256 * 1024;
+var INITIAL_DATA_BLOCKS = 1024;
+var MAX_DATA_BLOCKS = 4e6;
+function calculateLayout(inodeCount = DEFAULT_INODE_COUNT, blockSize = DEFAULT_BLOCK_SIZE, totalBlocks = INITIAL_DATA_BLOCKS, maxBlocks = MAX_DATA_BLOCKS) {
+  const inodeTableOffset = SUPERBLOCK.SIZE;
+  const inodeTableSize = inodeCount * INODE_SIZE;
+  const pathTableOffset = inodeTableOffset + inodeTableSize;
+  const pathTableSize = INITIAL_PATH_TABLE_SIZE;
+  const bitmapOffset = pathTableOffset + pathTableSize;
+  const bitmapRegionSize = Math.ceil(maxBlocks / 8);
+  const bitmapSize = Math.ceil(totalBlocks / 8);
+  const dataOffset = Math.ceil((bitmapOffset + bitmapRegionSize) / blockSize) * blockSize;
+  const totalSize = dataOffset + totalBlocks * blockSize;
+  return {
+    inodeTableOffset,
+    inodeTableSize,
+    pathTableOffset,
+    pathTableSize,
+    bitmapOffset,
+    bitmapSize,
+    bitmapRegionSize,
+    dataOffset,
+    totalSize,
+    totalBlocks
+  };
+}
+
+// src/stats-classes.ts
+var S_IFMT2 = 61440;
+var S_IFREG2 = 32768;
+var S_IFDIR2 = 16384;
+var S_IFLNK = 40960;
+var S_IFBLK = 24576;
+var S_IFCHR = 8192;
+var S_IFIFO = 4096;
+var S_IFSOCK = 49152;
+var Stats = class {
+  dev;
+  mode;
+  nlink;
+  uid;
+  gid;
+  rdev;
+  blksize;
+  ino;
+  size;
+  blocks;
+  atimeMs;
+  mtimeMs;
+  ctimeMs;
+  birthtimeMs;
+  constructor(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks, atimeMs, mtimeMs, ctimeMs, birthtimeMs) {
+    this.dev = dev;
+    this.mode = mode;
+    this.nlink = nlink;
+    this.uid = uid;
+    this.gid = gid;
+    this.rdev = rdev;
+    this.blksize = blksize;
+    this.ino = ino;
+    this.size = size;
+    this.blocks = blocks;
+    this.atimeMs = atimeMs;
+    this.mtimeMs = mtimeMs;
+    this.ctimeMs = ctimeMs;
+    this.birthtimeMs = birthtimeMs;
+  }
+  /** node's own helper name, kept so code that pokes at it behaves the same. */
+  _checkModeProperty(type) {
+    return (this.mode & S_IFMT2) === type;
+  }
+  isFile() {
+    return this._checkModeProperty(S_IFREG2);
+  }
+  isDirectory() {
+    return this._checkModeProperty(S_IFDIR2);
+  }
+  isSymbolicLink() {
+    return this._checkModeProperty(S_IFLNK);
+  }
+  isBlockDevice() {
+    return this._checkModeProperty(S_IFBLK);
+  }
+  isCharacterDevice() {
+    return this._checkModeProperty(S_IFCHR);
+  }
+  isFIFO() {
+    return this._checkModeProperty(S_IFIFO);
+  }
+  isSocket() {
+    return this._checkModeProperty(S_IFSOCK);
+  }
+  // Built on first read, then cached — most callers never touch them. Native private fields
+  // rather than symbol-keyed properties: a symbol write pushes the object into dictionary mode,
+  // which measured slower than the closures it was meant to replace.
+  #atime;
+  #mtime;
+  #ctime;
+  #birthtime;
+  get atime() {
+    return this.#atime ??= new Date(this.atimeMs);
+  }
+  get mtime() {
+    return this.#mtime ??= new Date(this.mtimeMs);
+  }
+  get ctime() {
+    return this.#ctime ??= new Date(this.ctimeMs);
+  }
+  get birthtime() {
+    return this.#birthtime ??= new Date(this.birthtimeMs);
+  }
+  // Not node's — see the file comment. Kept readable for backward compatibility.
+  get atimeNs() {
+    return this.atimeMs * 1e6;
+  }
+  get mtimeNs() {
+    return this.mtimeMs * 1e6;
+  }
+  get ctimeNs() {
+    return this.ctimeMs * 1e6;
+  }
+  get birthtimeNs() {
+    return this.birthtimeMs * 1e6;
+  }
+};
+var BigIntStats = class {
+  dev;
+  mode;
+  nlink;
+  uid;
+  gid;
+  rdev;
+  blksize;
+  ino;
+  size;
+  blocks;
+  atimeMs;
+  mtimeMs;
+  ctimeMs;
+  birthtimeMs;
+  atimeNs;
+  mtimeNs;
+  ctimeNs;
+  birthtimeNs;
+  constructor(dev, mode, nlink, uid, gid, rdev, blksize, ino, size, blocks, atimeMs, mtimeMs, ctimeMs, birthtimeMs) {
+    this.dev = dev;
+    this.mode = mode;
+    this.nlink = nlink;
+    this.uid = uid;
+    this.gid = gid;
+    this.rdev = rdev;
+    this.blksize = blksize;
+    this.ino = ino;
+    this.size = size;
+    this.blocks = blocks;
+    this.atimeMs = atimeMs;
+    this.mtimeMs = mtimeMs;
+    this.ctimeMs = ctimeMs;
+    this.birthtimeMs = birthtimeMs;
+    this.atimeNs = atimeMs * 1000000n;
+    this.mtimeNs = mtimeMs * 1000000n;
+    this.ctimeNs = ctimeMs * 1000000n;
+    this.birthtimeNs = birthtimeMs * 1000000n;
+  }
+  _checkModeProperty(type) {
+    return (this.mode & BigInt(S_IFMT2)) === BigInt(type);
+  }
+  isFile() {
+    return this._checkModeProperty(S_IFREG2);
+  }
+  isDirectory() {
+    return this._checkModeProperty(S_IFDIR2);
+  }
+  isSymbolicLink() {
+    return this._checkModeProperty(S_IFLNK);
+  }
+  isBlockDevice() {
+    return this._checkModeProperty(S_IFBLK);
+  }
+  isCharacterDevice() {
+    return this._checkModeProperty(S_IFCHR);
+  }
+  isFIFO() {
+    return this._checkModeProperty(S_IFIFO);
+  }
+  isSocket() {
+    return this._checkModeProperty(S_IFSOCK);
+  }
+  #atime;
+  #mtime;
+  #ctime;
+  #birthtime;
+  get atime() {
+    return this.#atime ??= new Date(Number(this.atimeMs));
+  }
+  get mtime() {
+    return this.#mtime ??= new Date(Number(this.mtimeMs));
+  }
+  get ctime() {
+    return this.#ctime ??= new Date(Number(this.ctimeMs));
+  }
+  get birthtime() {
+    return this.#birthtime ??= new Date(Number(this.birthtimeMs));
+  }
+};
+var Dirent = class _Dirent {
+  name;
+  parentPath;
+  /**
+   * A native private field, not a symbol-keyed property: it stays out of `Object.keys`,
+   * `JSON.stringify` and spreads exactly like node's internal type slot, and unlike a symbol it
+   * does not push the object into dictionary mode — measured, a symbol here made `Dirent`
+   * construction *slower* than the object literal it replaced.
+   */
+  #type;
+  constructor(name, type, parentPath) {
+    this.name = name;
+    this.parentPath = parentPath;
+    this.#type = type;
+  }
+  /** @deprecated Alias of `parentPath`. Node removed this in v24; kept here for compatibility. */
+  get path() {
+    return this.parentPath;
+  }
+  /**
+   * The same entry reported under a different parent directory — what recursive `readdir` needs.
+   *
+   * Copying `isFile`/`isDirectory`/… off the source entry into a new object literal (which is
+   * what the recursive walk used to do) only worked while those were per-instance closures. With
+   * the predicates on the prototype they read the entry type through `this`, so a bare function
+   * reference lands on an object that has no type and reports false for everything.
+   */
+  withParentPath(parentPath) {
+    return new _Dirent(this.name, this.#type, parentPath);
+  }
+  isFile() {
+    return this.#type === INODE_TYPE.FILE;
+  }
+  isDirectory() {
+    return this.#type === INODE_TYPE.DIRECTORY;
+  }
+  isSymbolicLink() {
+    return this.#type === INODE_TYPE.SYMLINK;
+  }
+  isBlockDevice() {
+    return false;
+  }
+  isCharacterDevice() {
+    return false;
+  }
+  isFIFO() {
+    return false;
+  }
+  isSocket() {
+    return false;
+  }
+};
+
+// src/stats.ts
+function decodeStats(data) {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  view.getUint8(0);
+  const mode = view.getUint32(1, true);
+  const size = view.getFloat64(5, true);
+  const mtimeMs = view.getFloat64(13, true);
+  const ctimeMs = view.getFloat64(21, true);
+  const atimeMs = view.getFloat64(29, true);
+  const uid = view.getUint32(37, true);
+  const gid = view.getUint32(41, true);
+  const ino = view.getUint32(45, true);
+  const nlink = data.byteLength >= 53 ? view.getUint32(49, true) : 1;
+  return new Stats(
+    1,
+    mode,
+    nlink,
+    uid,
+    gid,
+    0,
+    4096,
+    ino,
+    size,
+    Math.ceil(size / 512),
+    atimeMs,
+    mtimeMs,
+    ctimeMs,
+    ctimeMs
+  );
+}
+function decodeStatsBigInt(data) {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  view.getUint8(0);
+  const mode = view.getUint32(1, true);
+  const size = view.getFloat64(5, true);
+  const mtimeMs = view.getFloat64(13, true);
+  const ctimeMs = view.getFloat64(21, true);
+  const atimeMs = view.getFloat64(29, true);
+  const uid = view.getUint32(37, true);
+  const gid = view.getUint32(41, true);
+  const ino = view.getUint32(45, true);
+  const nlink = data.byteLength >= 53 ? view.getUint32(49, true) : 1;
+  return new BigIntStats(
+    1n,
+    BigInt(mode),
+    BigInt(nlink),
+    BigInt(uid),
+    BigInt(gid),
+    0n,
+    4096n,
+    BigInt(ino),
+    BigInt(Math.trunc(size)),
+    BigInt(Math.ceil(size / 512)),
+    BigInt(Math.trunc(atimeMs)),
+    BigInt(Math.trunc(mtimeMs)),
+    BigInt(Math.trunc(ctimeMs)),
+    BigInt(Math.trunc(ctimeMs))
+  );
+}
+function decodeDirents(data, parentPath = "") {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const count = view.getUint32(0, true);
+  const decoder9 = new TextDecoder();
+  const entries = [];
+  let offset = 4;
+  for (let i = 0; i < count; i++) {
+    const nameLen = view.getUint16(offset, true);
+    offset += 2;
+    const name = decoder9.decode(data.subarray(offset, offset + nameLen));
+    offset += nameLen;
+    const type = data[offset++];
+    entries.push(new Dirent(name, type, parentPath));
+  }
+  return entries;
+}
+function decodeNames(data) {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const count = view.getUint32(0, true);
+  const decoder9 = new TextDecoder();
+  const names = [];
+  let offset = 4;
+  for (let i = 0; i < count; i++) {
+    const nameLen = view.getUint16(offset, true);
+    offset += 2;
+    names.push(decoder9.decode(data.subarray(offset, offset + nameLen)));
+    offset += nameLen;
+  }
+  return names;
+}
+
+// src/handle-streams.ts
+function byteBudget(start, end) {
+  return end === void 0 ? Infinity : end - (start ?? 0) + 1;
+}
+function readStreamFromHandle(source, options) {
+  const opts = typeof options === "string" ? { encoding: options } : options;
+  const start = opts?.start;
+  const highWaterMark = opts?.highWaterMark ?? 64 * 1024;
+  let position = start ?? (source.followCursor ? void 0 : 0);
+  let remaining = byteBudget(start, opts?.end);
+  let handle = null;
+  let finished = false;
+  const cleanup = async () => {
+    if (handle && source.autoClose) {
+      try {
+        await handle.close();
+      } catch {
+      }
+    }
+    handle = null;
+  };
+  const readFn = async () => {
+    if (finished) return { done: true };
+    if (!handle) handle = await source.acquire();
+    const readLen = Math.min(highWaterMark, remaining);
+    if (readLen <= 0) {
+      finished = true;
+      await cleanup();
+      return { done: true };
+    }
+    const buffer = new Uint8Array(readLen);
+    const { bytesRead } = await handle.read(buffer, 0, readLen, position ?? null);
+    if (bytesRead === 0) {
+      finished = true;
+      await cleanup();
+      return { done: true };
+    }
+    if (position !== void 0) position += bytesRead;
+    remaining -= bytesRead;
+    if (remaining <= 0) {
+      finished = true;
+      await cleanup();
+    }
+    return { done: false, value: buffer.subarray(0, bytesRead) };
+  };
+  const stream = new NodeReadable(readFn, cleanup);
+  stream.path = source.path;
+  if (opts?.encoding) stream.setEncoding(opts.encoding);
+  return stream;
+}
+function writeStreamFromHandle(source, options) {
+  const opts = typeof options === "string" ? { encoding: options } : options;
+  let position = opts?.start ?? (source.followCursor ? void 0 : 0);
+  let handle = null;
+  const writeFn = async (chunk) => {
+    if (!handle) handle = await source.acquire();
+    const { bytesWritten } = await handle.write(chunk, 0, chunk.byteLength, position ?? null);
+    if (position !== void 0) position += bytesWritten;
+  };
+  const closeFn = async () => {
+    if (!handle) return;
+    if (opts?.flush) await handle.sync();
+    if (source.autoClose) await handle.close();
+    handle = null;
+  };
+  return new NodeWritable(source.path, writeFn, closeFn, opts?.encoding ?? "utf8");
+}
+async function* linesFromStream(stream) {
+  const decoder9 = new TextDecoder();
+  let carry = "";
+  for await (const chunk of stream) {
+    carry += typeof chunk === "string" ? chunk : decoder9.decode(chunk, { stream: true });
+    let nl = carry.indexOf("\n");
+    while (nl !== -1) {
+      const line = carry.slice(0, nl);
+      yield line.endsWith("\r") ? line.slice(0, -1) : line;
+      carry = carry.slice(nl + 1);
+      nl = carry.indexOf("\n");
+    }
+  }
+  carry += decoder9.decode();
+  if (carry.length > 0) yield carry.endsWith("\r") ? carry.slice(0, -1) : carry;
+}
+function webStreamFromHandle(source, highWaterMark = 64 * 1024) {
+  let handle = null;
+  let position = source.followCursor ? void 0 : 0;
+  return new ReadableStream({
+    async pull(controller) {
+      if (!handle) handle = await source.acquire();
+      const buffer = new Uint8Array(highWaterMark);
+      const { bytesRead } = await handle.read(buffer, 0, highWaterMark, position ?? null);
+      if (bytesRead === 0) {
+        controller.close();
+        if (source.autoClose) {
+          try {
+            await handle.close();
+          } catch {
+          }
+        }
+        handle = null;
+        return;
+      }
+      if (position !== void 0) position += bytesRead;
+      controller.enqueue(buffer.subarray(0, bytesRead));
+    },
+    async cancel() {
+      if (handle && source.autoClose) {
+        try {
+          await handle.close();
+        } catch {
+        }
+      }
+      handle = null;
+    }
+  });
+}
+
+// src/constants.ts
+var constants = {
+  // File access constants
+  F_OK: 0,
+  R_OK: 4,
+  W_OK: 2,
+  X_OK: 1,
+  // File copy constants
+  COPYFILE_EXCL: 1,
+  COPYFILE_FICLONE: 2,
+  COPYFILE_FICLONE_FORCE: 4,
+  // File open constants
+  O_RDONLY: 0,
+  O_WRONLY: 1,
+  O_RDWR: 2,
+  O_CREAT: 64,
+  O_EXCL: 128,
+  O_TRUNC: 512,
+  O_APPEND: 1024,
+  O_NOCTTY: 256,
+  O_NONBLOCK: 2048,
+  O_SYNC: 4096,
+  O_DSYNC: 4096,
+  O_DIRECTORY: 65536,
+  O_NOFOLLOW: 131072,
+  O_NOATIME: 262144,
+  // File type constants
+  S_IFMT: 61440,
+  S_IFREG: 32768,
+  S_IFDIR: 16384,
+  S_IFCHR: 8192,
+  S_IFBLK: 24576,
+  S_IFIFO: 4096,
+  S_IFLNK: 40960,
+  S_IFSOCK: 49152,
+  // File mode constants
+  S_IRWXU: 448,
+  S_IRUSR: 256,
+  S_IWUSR: 128,
+  S_IXUSR: 64,
+  S_IRWXG: 56,
+  S_IRGRP: 32,
+  S_IWGRP: 16,
+  S_IXGRP: 8,
+  S_IRWXO: 7,
+  S_IROTH: 4,
+  S_IWOTH: 2,
+  S_IXOTH: 1
+};
+
+// src/methods/open.ts
+var encoder2 = new TextEncoder();
+new TextDecoder();
+function parseFlags(flags) {
+  const { O_RDONLY, O_RDWR, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND, O_EXCL } = constants;
+  switch (flags) {
+    case "r":
+      return O_RDONLY;
+    case "rs":
+      return O_RDONLY;
+    // O_SYNC — see above
+    case "r+":
+      return O_RDWR;
+    case "rs+":
+      return O_RDWR;
+    case "w":
+      return O_WRONLY | O_CREAT | O_TRUNC;
+    case "wx":
+      return O_WRONLY | O_CREAT | O_TRUNC | O_EXCL;
+    case "w+":
+      return O_RDWR | O_CREAT | O_TRUNC;
+    case "wx+":
+      return O_RDWR | O_CREAT | O_TRUNC | O_EXCL;
+    case "a":
+      return O_WRONLY | O_CREAT | O_APPEND;
+    case "ax":
+      return O_WRONLY | O_CREAT | O_APPEND | O_EXCL;
+    case "as":
+      return O_WRONLY | O_CREAT | O_APPEND;
+    case "a+":
+      return O_RDWR | O_CREAT | O_APPEND;
+    case "ax+":
+      return O_RDWR | O_CREAT | O_APPEND | O_EXCL;
+    case "as+":
+      return O_RDWR | O_CREAT | O_APPEND;
+    default:
+      throw invalidArgValue("flags", flags, "is invalid");
+  }
+}
+var DEFAULT_OPEN_MODE = 438;
+function resolveOpenMode(mode) {
+  return mode === void 0 ? DEFAULT_OPEN_MODE : parseFileMode(mode, "mode");
+}
+function openSync(syncRequest, filePath, flags = "r", mode) {
+  const numFlags = typeof flags === "string" ? parseFlags(flags) : flags;
+  const buf = encodeRequestU32(OP.OPEN, filePath, numFlags, resolveOpenMode(mode));
+  const { status, data } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "open", filePath);
+  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
+}
+function closeSync(syncRequest, fd) {
+  const buf = encodeRequest(OP.CLOSE, "", 0, encodeFdPayload(fd));
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "close", String(fd));
+}
+function readSync(syncRequest, fd, bufferOrOptions, offsetOrOptions, length, position) {
+  let buffer;
+  let off, len, pos;
+  if (bufferOrOptions instanceof Uint8Array) {
+    buffer = bufferOrOptions;
+    if (offsetOrOptions != null && typeof offsetOrOptions === "object") {
+      off = offsetOrOptions.offset ?? 0;
+      len = offsetOrOptions.length ?? buffer.byteLength;
+      pos = offsetOrOptions.position ?? null;
+    } else {
+      off = offsetOrOptions ?? 0;
+      len = length ?? buffer.byteLength;
+      pos = position ?? null;
+    }
+  } else {
+    buffer = bufferOrOptions.buffer;
+    off = bufferOrOptions.offset ?? 0;
+    len = bufferOrOptions.length ?? buffer.byteLength;
+    pos = bufferOrOptions.position ?? null;
+  }
+  const buf = encodeRequest(OP.FREAD, "", 0, encodeFreadPayload(fd, len, pos));
+  const { status, data } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "read", String(fd));
+  if (data) {
+    buffer.set(data.subarray(0, Math.min(data.byteLength, len)), off);
+    return data.byteLength;
+  }
+  return 0;
+}
+function writeSyncFd(syncRequest, fd, bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position) {
+  let writeData;
+  let pos;
+  if (typeof bufferOrString === "string") {
+    writeData = encoder2.encode(bufferOrString);
+    pos = offsetOrPositionOrOptions != null && typeof offsetOrPositionOrOptions === "number" ? offsetOrPositionOrOptions : null;
+  } else if (offsetOrPositionOrOptions != null && typeof offsetOrPositionOrOptions === "object") {
+    const offset = offsetOrPositionOrOptions.offset ?? 0;
+    const length = offsetOrPositionOrOptions.length ?? bufferOrString.byteLength;
+    pos = offsetOrPositionOrOptions.position ?? null;
+    writeData = bufferOrString.subarray(offset, offset + length);
+  } else {
+    const offset = offsetOrPositionOrOptions ?? 0;
+    const length = lengthOrEncoding != null ? lengthOrEncoding : bufferOrString.byteLength;
+    pos = position ?? null;
+    writeData = bufferOrString.subarray(offset, offset + length);
+  }
+  const buf = encodeRequest(OP.FWRITE, "", 0, encodeFwritePayload(fd, pos, writeData));
+  const { status, data } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "write", String(fd));
+  return data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
+}
+function fstatSync(syncRequest, fd, options) {
+  const buf = encodeRequest(OP.FSTAT, "", 0, encodeFdPayload(fd));
+  const { status, data } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "fstat", String(fd));
+  return options?.bigint ? decodeStatsBigInt(data) : decodeStats(data);
+}
+function ftruncateSync(syncRequest, fd, len = 0) {
+  const buf = encodeRequest(OP.FTRUNCATE, "", 0, encodeFtruncatePayload(fd, len));
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "ftruncate", String(fd));
+}
+function fdatasyncSync(syncRequest, fd) {
+  const buf = encodeRequest(OP.FSYNC, "");
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "fdatasync", String(fd));
+}
+async function open(asyncRequest, filePath, flags, mode) {
+  const numFlags = typeof flags === "string" ? parseFlags(flags ?? "r") : flags ?? 0;
+  const { status, data } = await asyncRequest(OP.OPEN, filePath, numFlags, encodeMode(resolveOpenMode(mode)));
+  if (status !== 0) throw statusToError(status, "open", filePath);
+  const fd = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
+  return createFileHandle(fd, asyncRequest);
+}
+function createFileHandle(fd, asyncRequest) {
+  const events = new SimpleEventEmitter();
+  const handle = {
+    fd,
+    async read(bufferOrOptions, offsetOrOptions, length, position) {
+      let buffer;
+      let off, len, pos;
+      if (bufferOrOptions instanceof Uint8Array) {
+        buffer = bufferOrOptions;
+        if (offsetOrOptions != null && typeof offsetOrOptions === "object") {
+          off = offsetOrOptions.offset ?? 0;
+          len = offsetOrOptions.length ?? buffer.byteLength;
+          pos = offsetOrOptions.position ?? null;
+        } else {
+          off = offsetOrOptions ?? 0;
+          len = length ?? buffer.byteLength;
+          pos = position ?? null;
+        }
+      } else {
+        buffer = bufferOrOptions.buffer;
+        off = bufferOrOptions.offset ?? 0;
+        len = bufferOrOptions.length ?? buffer.byteLength;
+        pos = bufferOrOptions.position ?? null;
+      }
+      const { status, data } = await asyncRequest(OP.FREAD, "", 0, null, void 0, { fd, length: len, position: pos ?? -1 });
+      if (status !== 0) throw statusToError(status, "read", String(fd));
+      const bytesRead = data ? data.byteLength : 0;
+      if (data) buffer.set(data.subarray(0, Math.min(bytesRead, len)), off);
+      return { bytesRead, buffer };
+    },
+    async write(bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position) {
+      let writeData;
+      let pos;
+      let resultBuffer;
+      if (typeof bufferOrString === "string") {
+        resultBuffer = encoder2.encode(bufferOrString);
+        writeData = resultBuffer;
+        pos = offsetOrPositionOrOptions != null && typeof offsetOrPositionOrOptions === "number" ? offsetOrPositionOrOptions : -1;
+      } else if (offsetOrPositionOrOptions != null && typeof offsetOrPositionOrOptions === "object") {
+        resultBuffer = bufferOrString;
+        const offset = offsetOrPositionOrOptions.offset ?? 0;
+        const length = offsetOrPositionOrOptions.length ?? bufferOrString.byteLength;
+        pos = offsetOrPositionOrOptions.position != null ? offsetOrPositionOrOptions.position : -1;
+        writeData = bufferOrString.subarray(offset, offset + length);
+      } else {
+        resultBuffer = bufferOrString;
+        const offset = offsetOrPositionOrOptions ?? 0;
+        const length = lengthOrEncoding != null ? lengthOrEncoding : bufferOrString.byteLength;
+        pos = position != null ? position : -1;
+        writeData = bufferOrString.subarray(offset, offset + length);
+      }
+      const { status, data } = await asyncRequest(OP.FWRITE, "", 0, null, void 0, { fd, data: writeData, position: pos });
+      if (status !== 0) throw statusToError(status, "write", String(fd));
+      const bytesWritten = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
+      return { bytesWritten, buffer: resultBuffer };
+    },
+    async readv(buffers, position) {
+      let totalRead = 0;
+      let pos = position ?? null;
+      for (const buf of buffers) {
+        const { bytesRead } = await this.read(buf, 0, buf.byteLength, pos);
+        totalRead += bytesRead;
+        if (pos !== null) pos += bytesRead;
+        if (bytesRead < buf.byteLength) break;
+      }
+      return { bytesRead: totalRead, buffers };
+    },
+    async writev(buffers, position) {
+      let totalWritten = 0;
+      let pos = position ?? null;
+      for (const buf of buffers) {
+        const { bytesWritten } = await this.write(buf, 0, buf.byteLength, pos);
+        totalWritten += bytesWritten;
+        if (pos !== null) pos += bytesWritten;
+      }
+      return { bytesWritten: totalWritten, buffers };
+    },
+    async readFile(options) {
+      const encoding = typeof options === "string" ? options : options?.encoding;
+      const { status, data } = await asyncRequest(OP.FREAD, "", 0, null, void 0, { fd, length: Number.MAX_SAFE_INTEGER, position: -1 });
+      if (status !== 0) throw statusToError(status, "read", String(fd));
+      const result = data ?? new Uint8Array(0);
+      if (encoding) return decodeBuffer(result, encoding);
+      return result;
+    },
+    async writeFile(data, options) {
+      const encoding = typeof options === "string" ? options : options?.encoding;
+      const encoded = typeof data === "string" ? encoding ? encodeString(data, encoding) : encoder2.encode(data) : data;
+      const { status } = await asyncRequest(OP.FWRITE, "", 0, null, void 0, { fd, data: encoded, position: -1 });
+      if (status !== 0) throw statusToError(status, "write", String(fd));
+    },
+    async truncate(len = 0) {
+      const { status } = await asyncRequest(OP.FTRUNCATE, "", 0, null, void 0, { fd, length: len });
+      if (status !== 0) throw statusToError(status, "ftruncate", String(fd));
+    },
+    async stat() {
+      const { status, data } = await asyncRequest(OP.FSTAT, "", 0, null, void 0, { fd });
+      if (status !== 0) throw statusToError(status, "fstat", String(fd));
+      return decodeStats(data);
+    },
+    /**
+     * In Node this is a documented **alias of `writeFile`** — the appending comes from opening
+     * with `'a'` (O_APPEND), not from the method. Seeking to end-of-file here made
+     * `handle.appendFile()` on an `'r+'` handle write past the cursor, where Node overwrites at
+     * it, and cost an extra `fstat` round-trip per call.
+     */
+    async appendFile(data, options) {
+      return this.writeFile(data, options);
+    },
+    async chmod(mode) {
+      const payload = new Uint8Array(8);
+      const dv = new DataView(payload.buffer);
+      dv.setUint32(0, fd, true);
+      dv.setUint32(4, mode, true);
+      const { status } = await asyncRequest(OP.FCHMOD, "", 0, payload);
+      if (status !== 0) throw statusToError(status, "fchmod", String(fd));
+    },
+    async chown(uid, gid) {
+      const payload = new Uint8Array(12);
+      const dv = new DataView(payload.buffer);
+      dv.setUint32(0, fd, true);
+      dv.setUint32(4, uid, true);
+      dv.setUint32(8, gid, true);
+      const { status } = await asyncRequest(OP.FCHOWN, "", 0, payload);
+      if (status !== 0) throw statusToError(status, "fchown", String(fd));
+    },
+    async utimes(atime, mtime) {
+      const payload = new Uint8Array(24);
+      const dv = new DataView(payload.buffer);
+      dv.setUint32(0, fd, true);
+      dv.setFloat64(8, toEpochMs(atime, "atime"), true);
+      dv.setFloat64(16, toEpochMs(mtime, "mtime"), true);
+      const { status } = await asyncRequest(OP.FUTIMES, "", 0, payload);
+      if (status !== 0) throw statusToError(status, "futimes", String(fd));
+    },
+    async sync() {
+      await asyncRequest(OP.FSYNC, "");
+    },
+    async datasync() {
+      await asyncRequest(OP.FSYNC, "");
+    },
+    async close() {
+      const { status } = await asyncRequest(OP.CLOSE, "", 0, null, void 0, { fd });
+      if (status !== 0) throw statusToError(status, "close", String(fd));
+      events.emit("close");
+    },
+    [Symbol.asyncDispose]() {
+      return this.close();
+    },
+    // ---- Streams over this handle ----
+    //
+    // All four were missing. A stream built from a handle **owns** it: node closes the handle
+    // when the stream ends, so `handle.stat()` afterwards is EBADF. `autoClose: false` opts out.
+    // The machinery is shared with `fs.createReadStream`/`createWriteStream` so the two cannot
+    // drift — see [handle-streams.ts](../handle-streams.ts).
+    createReadStream(options) {
+      return readStreamFromHandle(handleSource(options), options);
+    },
+    createWriteStream(options) {
+      return writeStreamFromHandle(handleSource(options), options);
+    },
+    readLines(options) {
+      return linesFromStream(readStreamFromHandle(handleSource(options), options));
+    },
+    readableWebStream(_options) {
+      return webStreamFromHandle(handleSource(void 0));
+    },
+    // ---- EventEmitter surface ----
+    on(event, listener) {
+      events.on(event, listener);
+      return this;
+    },
+    once(event, listener) {
+      events.once(event, listener);
+      return this;
+    },
+    off(event, listener) {
+      events.off(event, listener);
+      return this;
+    },
+    removeListener(event, listener) {
+      events.off(event, listener);
+      return this;
+    },
+    emit(event, ...args) {
+      return events.emit(event, ...args);
+    }
+  };
+  function handleSource(options) {
+    const opts = typeof options === "string" ? void 0 : options;
+    return {
+      acquire: async () => handle,
+      autoClose: opts?.autoClose !== false,
+      path: "",
+      // node reports no path for a handle-backed stream
+      followCursor: true
+    };
+  }
+  return handle;
+}
+
+// src/methods/fd-arg.ts
+var INT32_MIN = -2147483648;
+var INT32_MAX = 2147483647;
+function isFdArg(p) {
+  return typeof p === "number" && Number.isInteger(p) && p >= INT32_MIN && p <= INT32_MAX;
+}
+function validateFdArg(fd) {
+  if (fd < 0) throw outOfRange("fd", `>= 0 && <= ${INT32_MAX}`, fd);
+  return fd;
+}
+function isFileHandle(p) {
+  return typeof p === "object" && p !== null && typeof p.fd === "number" && typeof p.readFile === "function" && typeof p.writeFile === "function";
+}
+
 // src/methods/readFile.ts
 new TextDecoder();
+var TO_EOF = 4294967295;
+function readFileFdSync(syncRequest, fd, options) {
+  validateFdArg(fd);
+  const encoding = typeof options === "string" ? options : options?.encoding;
+  const signal = typeof options === "string" ? void 0 : options?.signal;
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  const buf = encodeRequest(OP.FREAD, "", 0, encodeFreadPayload(fd, TO_EOF, null));
+  const { status, data } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "read", String(fd));
+  const result = data ?? new Uint8Array(0);
+  return encoding ? decodeBuffer(result, encoding) : result;
+}
+async function readFileFd(asyncRequest, fd, options) {
+  validateFdArg(fd);
+  const signal = typeof options === "string" ? void 0 : options?.signal;
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  const result = await createFileHandle(fd, asyncRequest).readFile(options);
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  return result;
+}
 function readFileSync(syncRequest, filePath, options) {
   const encoding = typeof options === "string" ? options : options?.encoding;
   const flag = typeof options === "string" ? void 0 : options?.flag;
@@ -1448,6 +2050,28 @@ async function readFile(asyncRequest, filePath, options) {
 
 // src/methods/writeFile.ts
 var encoder3 = new TextEncoder();
+function encodeData(data, encoding) {
+  if (typeof data !== "string") return data;
+  return encoding ? encodeString(data, encoding) : encoder3.encode(data);
+}
+function writeFileFdSync(syncRequest, fd, data, options) {
+  validateFdArg(fd);
+  const opts = typeof options === "string" ? { encoding: options } : options;
+  if (opts?.signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  const encoded = encodeData(data, opts?.encoding);
+  writeSyncFd(syncRequest, fd, encoded, 0, encoded.byteLength, null);
+  if (opts?.flush === true) fdatasyncSync(syncRequest, fd);
+}
+async function writeFileFd(asyncRequest, fd, data, options) {
+  validateFdArg(fd);
+  const opts = typeof options === "string" ? { encoding: options } : options;
+  const signal = opts?.signal;
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  const handle = createFileHandle(fd, asyncRequest);
+  await handle.writeFile(encodeData(data, opts?.encoding));
+  if (opts?.flush === true) await handle.datasync();
+  if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+}
 function writeFileSync(syncRequest, filePath, data, options) {
   const opts = typeof options === "string" ? { encoding: options } : options;
   const encoded = typeof data === "string" ? opts?.encoding ? encodeString(data, opts.encoding) : encoder3.encode(data) : data;
@@ -1508,13 +2132,15 @@ function resolveOptions(options) {
     fastPath: (!flag || flag === "a") && opts?.mode === void 0 && opts?.flush !== true
   };
 }
-function encodeData(data, encoding) {
+function encodeData2(data, encoding) {
   if (typeof data !== "string") return data;
   return encoding ? encodeString(data, encoding) : encoder4.encode(data);
 }
+var appendFileFdSync = writeFileFdSync;
+var appendFileFd = writeFileFd;
 function appendFileSync(syncRequest, filePath, data, options) {
   const { opts, flag, fastPath } = resolveOptions(options);
-  const encoded = encodeData(data, opts?.encoding);
+  const encoded = encodeData2(data, opts?.encoding);
   if (opts?.signal?.aborted) {
     throw new DOMException("The operation was aborted", "AbortError");
   }
@@ -1534,7 +2160,7 @@ function appendFileSync(syncRequest, filePath, data, options) {
 }
 async function appendFile(asyncRequest, filePath, data, options) {
   const { opts, flag, fastPath } = resolveOptions(options);
-  const encoded = encodeData(data, opts?.encoding);
+  const encoded = encodeData2(data, opts?.encoding);
   const signal = opts?.signal;
   if (signal?.aborted) {
     throw new DOMException("The operation was aborted", "AbortError");
@@ -1617,6 +2243,7 @@ function rmSyncCore(syncRequest, filePath, options) {
   const buf = encodeRequest(OP.UNLINK, filePath, flags);
   const { status } = syncRequest(buf);
   if (status === 3) {
+    if (!options?.recursive) throw eisdirNotRecursive(filePath);
     const rmdirBuf = encodeRequest(OP.RMDIR, filePath, flags);
     const rmdirResult = syncRequest(rmdirBuf);
     if (rmdirResult.status !== 0) {
@@ -1651,6 +2278,7 @@ async function rmAsyncCore(asyncRequest, filePath, options) {
   const flags = (options?.recursive ? 1 : 0) | (options?.force ? 2 : 0);
   const { status } = await asyncRequest(OP.UNLINK, filePath, flags);
   if (status === 3) {
+    if (!options?.recursive) throw eisdirNotRecursive(filePath);
     const { status: s2 } = await asyncRequest(OP.RMDIR, filePath, flags);
     if (s2 !== 0) {
       if (options?.force && s2 === 1) return;
@@ -1724,19 +2352,8 @@ function readdirRecursiveSync(syncRequest, basePath, prefix, withFileTypes, root
   for (const entry of entries) {
     const relativePath = prefix ? prefix + "/" + entry.name : entry.name;
     if (withFileTypes) {
-      const parentPath = prefix || effectiveRoot;
-      results.push({
-        name: relativePath,
-        parentPath,
-        path: parentPath,
-        isFile: entry.isFile,
-        isDirectory: entry.isDirectory,
-        isBlockDevice: entry.isBlockDevice,
-        isCharacterDevice: entry.isCharacterDevice,
-        isSymbolicLink: entry.isSymbolicLink,
-        isFIFO: entry.isFIFO,
-        isSocket: entry.isSocket
-      });
+      const parentPath = prefix ? effectiveRoot + "/" + prefix : effectiveRoot;
+      results.push(entry.withParentPath(parentPath));
     } else {
       results.push(relativePath);
     }
@@ -1756,19 +2373,8 @@ async function readdirRecursiveAsync(asyncRequest, basePath, prefix, withFileTyp
   for (const entry of entries) {
     const relativePath = prefix ? prefix + "/" + entry.name : entry.name;
     if (withFileTypes) {
-      const parentPath = prefix || effectiveRoot;
-      results.push({
-        name: relativePath,
-        parentPath,
-        path: parentPath,
-        isFile: entry.isFile,
-        isDirectory: entry.isDirectory,
-        isBlockDevice: entry.isBlockDevice,
-        isCharacterDevice: entry.isCharacterDevice,
-        isSymbolicLink: entry.isSymbolicLink,
-        isFIFO: entry.isFIFO,
-        isSocket: entry.isSocket
-      });
+      const parentPath = prefix ? effectiveRoot + "/" + prefix : effectiveRoot;
+      results.push(entry.withParentPath(parentPath));
     } else {
       results.push(relativePath);
     }
@@ -1824,26 +2430,41 @@ async function readdir(asyncRequest, filePath, options) {
 }
 
 // src/methods/stat.ts
+function suppressesMissing(options, status) {
+  return options?.throwIfNoEntry === false && status === CODE_TO_STATUS.ENOENT;
+}
 function statSync(syncRequest, filePath, options) {
   const buf = encodeRequest(OP.STAT, filePath);
   const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "stat", filePath);
+  if (status !== 0) {
+    if (suppressesMissing(options, status)) return void 0;
+    throw statusToError(status, "stat", filePath);
+  }
   return options?.bigint ? decodeStatsBigInt(data) : decodeStats(data);
 }
 function lstatSync(syncRequest, filePath, options) {
   const buf = encodeRequest(OP.LSTAT, filePath);
   const { status, data } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "lstat", filePath);
+  if (status !== 0) {
+    if (suppressesMissing(options, status)) return void 0;
+    throw statusToError(status, "lstat", filePath);
+  }
   return options?.bigint ? decodeStatsBigInt(data) : decodeStats(data);
 }
 async function stat(asyncRequest, filePath, options) {
   const { status, data } = await asyncRequest(OP.STAT, filePath);
-  if (status !== 0) throw statusToError(status, "stat", filePath);
+  if (status !== 0) {
+    if (suppressesMissing(options, status)) return void 0;
+    throw statusToError(status, "stat", filePath);
+  }
   return options?.bigint ? decodeStatsBigInt(data) : decodeStats(data);
 }
 async function lstat(asyncRequest, filePath, options) {
   const { status, data } = await asyncRequest(OP.LSTAT, filePath);
-  if (status !== 0) throw statusToError(status, "lstat", filePath);
+  if (status !== 0) {
+    if (suppressesMissing(options, status)) return void 0;
+    throw statusToError(status, "lstat", filePath);
+  }
   return options?.bigint ? decodeStatsBigInt(data) : decodeStats(data);
 }
 
@@ -1881,16 +2502,12 @@ async function copyFile(asyncRequest, src, dest, mode) {
 
 // src/methods/truncate.ts
 function truncateSync(syncRequest, filePath, len = 0) {
-  const lenBuf = new Uint8Array(8);
-  new DataView(lenBuf.buffer).setFloat64(0, len, true);
-  const buf = encodeRequest(OP.TRUNCATE, filePath, 0, lenBuf);
+  const buf = encodeRequest(OP.TRUNCATE, filePath, 0, encodeTruncatePayload(len));
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "truncate", filePath);
 }
 async function truncate(asyncRequest, filePath, len) {
-  const lenBuf = new Uint8Array(8);
-  new DataView(lenBuf.buffer).setFloat64(0, len ?? 0, true);
-  const { status } = await asyncRequest(OP.TRUNCATE, filePath, 0, lenBuf);
+  const { status } = await asyncRequest(OP.TRUNCATE, filePath, 0, encodeTruncatePayload(len ?? 0));
   if (status !== 0) throw statusToError(status, "truncate", filePath);
 }
 
@@ -1906,17 +2523,23 @@ async function access(asyncRequest, filePath, mode = constants.F_OK) {
 }
 
 // src/methods/realpath.ts
+function decodePath(data, options) {
+  const encoding = typeof options === "string" ? options : options?.encoding;
+  if (encoding === "buffer") return new Uint8Array(data);
+  if (encoding === void 0 || encoding === null) return decoder5.decode(data);
+  return decodeBuffer(data, assertEncoding(encoding));
+}
 var decoder5 = new TextDecoder();
-function realpathSync(syncRequest, filePath) {
+function realpathSync(syncRequest, filePath, options) {
   const buf = encodeRequest(OP.REALPATH, filePath);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "realpath", filePath);
-  return decoder5.decode(data);
+  return decodePath(data, options);
 }
-async function realpath(asyncRequest, filePath) {
+async function realpath(asyncRequest, filePath, options) {
   const { status, data } = await asyncRequest(OP.REALPATH, filePath);
   if (status !== 0) throw statusToError(status, "realpath", filePath);
-  return decoder5.decode(data);
+  return decodePath(data, options);
 }
 
 // src/methods/chmod.ts
@@ -1996,8 +2619,8 @@ async function fchown(asyncRequest, fd, uid, gid) {
 function utimesSync(syncRequest, filePath, atime, mtime) {
   const timesBuf = new Uint8Array(16);
   const dv = new DataView(timesBuf.buffer);
-  dv.setFloat64(0, typeof atime === "number" ? atime : atime.getTime(), true);
-  dv.setFloat64(8, typeof mtime === "number" ? mtime : mtime.getTime(), true);
+  dv.setFloat64(0, toEpochMs(atime, "atime"), true);
+  dv.setFloat64(8, toEpochMs(mtime, "mtime"), true);
   const buf = encodeRequest(OP.UTIMES, filePath, 0, timesBuf);
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "utimes", filePath);
@@ -2005,8 +2628,8 @@ function utimesSync(syncRequest, filePath, atime, mtime) {
 async function utimes(asyncRequest, filePath, atime, mtime) {
   const buf = new Uint8Array(16);
   const dv = new DataView(buf.buffer);
-  dv.setFloat64(0, typeof atime === "number" ? atime : atime.getTime(), true);
-  dv.setFloat64(8, typeof mtime === "number" ? mtime : mtime.getTime(), true);
+  dv.setFloat64(0, toEpochMs(atime, "atime"), true);
+  dv.setFloat64(8, toEpochMs(mtime, "mtime"), true);
   const { status } = await asyncRequest(OP.UTIMES, filePath, 0, buf);
   if (status !== 0) throw statusToError(status, "utimes", filePath);
 }
@@ -2014,8 +2637,8 @@ function futimesSync(syncRequest, fd, atime, mtime) {
   const payload = new Uint8Array(24);
   const dv = new DataView(payload.buffer);
   dv.setUint32(0, fd, true);
-  dv.setFloat64(8, typeof atime === "number" ? atime : atime.getTime(), true);
-  dv.setFloat64(16, typeof mtime === "number" ? mtime : mtime.getTime(), true);
+  dv.setFloat64(8, toEpochMs(atime, "atime"), true);
+  dv.setFloat64(16, toEpochMs(mtime, "mtime"), true);
   const buf = encodeRequest(OP.FUTIMES, "", 0, payload);
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "futimes", String(fd));
@@ -2024,8 +2647,8 @@ async function futimes(asyncRequest, fd, atime, mtime) {
   const payload = new Uint8Array(24);
   const dv = new DataView(payload.buffer);
   dv.setUint32(0, fd, true);
-  dv.setFloat64(8, typeof atime === "number" ? atime : atime.getTime(), true);
-  dv.setFloat64(16, typeof mtime === "number" ? mtime : mtime.getTime(), true);
+  dv.setFloat64(8, toEpochMs(atime, "atime"), true);
+  dv.setFloat64(16, toEpochMs(mtime, "mtime"), true);
   const { status } = await asyncRequest(OP.FUTIMES, "", 0, payload);
   if (status !== 0) throw statusToError(status, "futimes", String(fd));
 }
@@ -2079,49 +2702,115 @@ async function link(asyncRequest, existingPath, newPath) {
 }
 
 // src/methods/mkdtemp.ts
+function decodePath2(data, options) {
+  const encoding = typeof options === "string" ? options : options?.encoding;
+  if (encoding === "buffer") return new Uint8Array(data);
+  if (encoding === void 0 || encoding === null) return decoder7.decode(data);
+  return decodeBuffer(data, assertEncoding(encoding));
+}
 var decoder7 = new TextDecoder();
-function mkdtempSync(syncRequest, prefix) {
+function mkdtempSync(syncRequest, prefix, options) {
   const buf = encodeRequest(OP.MKDTEMP, prefix);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "mkdtemp", prefix);
-  return decoder7.decode(data);
+  return decodePath2(data, options);
 }
-async function mkdtemp(asyncRequest, prefix) {
+async function mkdtemp(asyncRequest, prefix, options) {
   const { status, data } = await asyncRequest(OP.MKDTEMP, prefix);
   if (status !== 0) throw statusToError(status, "mkdtemp", prefix);
-  return decoder7.decode(data);
+  return decodePath2(data, options);
 }
 
+// src/methods/statfs.ts
+function decodeStatFs(data) {
+  const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const bfree = dv.getUint32(12, true);
+  return {
+    type: dv.getUint32(0, true),
+    bsize: dv.getUint32(4, true),
+    blocks: dv.getUint32(8, true),
+    bfree,
+    bavail: bfree,
+    files: dv.getUint32(16, true),
+    ffree: dv.getUint32(20, true)
+  };
+}
+function statfsSync(syncRequest, path = "/") {
+  const { status, data } = syncRequest(encodeRequest(OP.STATFS, path));
+  if (status !== 0) throw statusToError(status, "statfs", path);
+  return decodeStatFs(data);
+}
+async function statfs(asyncRequest, path = "/") {
+  const { status, data } = await asyncRequest(OP.STATFS, path);
+  if (status !== 0) throw statusToError(status, "statfs", path);
+  return decodeStatFs(data);
+}
+
+// src/dir.ts
+var Dir = class {
+  path;
+  _entries;
+  _index = 0;
+  _closed = false;
+  _onClose;
+  constructor(path, entries, onClose = null) {
+    this.path = path;
+    this._entries = entries;
+    this._onClose = onClose;
+  }
+  _assertOpen() {
+    if (this._closed) {
+      const err = new Error("Directory handle was closed");
+      err.code = "ERR_DIR_CLOSED";
+      throw err;
+    }
+  }
+  /** The next entry, or `null` once the directory is exhausted. */
+  async read() {
+    this._assertOpen();
+    return this._index >= this._entries.length ? null : this._entries[this._index++];
+  }
+  /** The synchronous form. Was missing entirely. */
+  readSync() {
+    this._assertOpen();
+    return this._index >= this._entries.length ? null : this._entries[this._index++];
+  }
+  async close() {
+    if (this._closed) return;
+    this._closed = true;
+    if (this._onClose) await this._onClose();
+  }
+  /** The synchronous form. Was missing entirely. */
+  closeSync() {
+    if (this._closed) return;
+    this._closed = true;
+    if (this._onClose) void this._onClose().catch(() => {
+    });
+  }
+  async *[Symbol.asyncIterator]() {
+    try {
+      for (let entry = await this.read(); entry !== null; entry = await this.read()) {
+        yield entry;
+      }
+    } finally {
+      await this.close();
+    }
+  }
+};
+
 // src/methods/opendir.ts
-async function opendir(asyncRequest, filePath) {
+async function opendir(asyncRequest, filePath, options) {
   const { status, data } = await asyncRequest(OP.OPENDIR, filePath);
   if (status !== 0) throw statusToError(status, "opendir", filePath);
   const fd = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
-  let entries = null;
-  let index = 0;
-  const loadEntries = async () => {
-    if (entries === null) {
-      entries = await readdir(asyncRequest, filePath, { withFileTypes: true });
-    }
-  };
-  return {
-    path: filePath,
-    async read() {
-      await loadEntries();
-      if (index >= entries.length) return null;
-      return entries[index++];
-    },
-    async close() {
-      const { status: status2 } = await asyncRequest(OP.CLOSE, "", 0, null, void 0, { fd });
-      if (status2 !== 0) throw statusToError(status2, "close", String(fd));
-    },
-    async *[Symbol.asyncIterator]() {
-      await loadEntries();
-      for (const entry of entries) {
-        yield entry;
-      }
-    }
-  };
+  const entries = await readdir(asyncRequest, filePath, {
+    withFileTypes: true,
+    recursive: options?.recursive
+  });
+  return new Dir(filePath, entries, async () => {
+    const { status: closeStatus } = await asyncRequest(OP.CLOSE, "", 0, null, void 0, { fd });
+    if (closeStatus !== 0) throw statusToError(closeStatus, "close", String(fd));
+  });
 }
 
 // src/path.ts
@@ -2139,7 +2828,8 @@ __export(path_exports, {
   relative: () => relative,
   resolve: () => resolve,
   sep: () => sep,
-  toPathString: () => toPathString
+  toPathString: () => toPathString,
+  toRealpathString: () => toRealpathString
 });
 function toPathString(p) {
   if (typeof p === "string") return p;
@@ -2150,7 +2840,13 @@ function toPathString(p) {
     }
     return decodeURIComponent(p.pathname);
   }
-  throw new TypeError('The "path" argument must be of type string, Uint8Array, or URL. Received ' + typeof p);
+  throw invalidArgType("path", "string or an instance of Uint8Array or URL", p);
+}
+function toRealpathString(p) {
+  if (typeof p === "string") return p;
+  if (p instanceof Uint8Array) return new TextDecoder().decode(p);
+  if (typeof URL !== "undefined" && p instanceof URL) return toPathString(p);
+  return String(p);
 }
 var sep = "/";
 var delimiter = ":";
@@ -2311,9 +3007,10 @@ function matchWatcher(entry, mutatedPath) {
   return relativePath.indexOf("/") === -1 ? relativePath : null;
 }
 function watch(ns, filePath, options, listener) {
-  const opts = typeof options === "string" ? { encoding: options } : options ?? {};
-  const cb = listener ?? (() => {
+  const listenerInOptions = typeof options === "function";
+  const cb = (listenerInOptions ? options : listener) ?? (() => {
   });
+  const opts = typeof options === "string" ? { encoding: options } : listenerInOptions || options == null ? {} : options;
   const absPath = resolve(filePath);
   const signal = opts.signal;
   const asBuffer = opts.encoding === "buffer";
@@ -2429,38 +3126,7 @@ function triggerWatchFile(entry) {
   }
 }
 function emptyStats() {
-  const zero = /* @__PURE__ */ new Date(0);
-  return {
-    isFile: () => false,
-    isDirectory: () => false,
-    isBlockDevice: () => false,
-    isCharacterDevice: () => false,
-    isSymbolicLink: () => false,
-    isFIFO: () => false,
-    isSocket: () => false,
-    dev: 0,
-    ino: 0,
-    mode: 0,
-    nlink: 0,
-    uid: 0,
-    gid: 0,
-    rdev: 0,
-    size: 0,
-    blksize: 4096,
-    blocks: 0,
-    atimeMs: 0,
-    mtimeMs: 0,
-    ctimeMs: 0,
-    birthtimeMs: 0,
-    atime: zero,
-    mtime: zero,
-    ctime: zero,
-    birthtime: zero,
-    atimeNs: 0,
-    mtimeNs: 0,
-    ctimeNs: 0,
-    birthtimeNs: 0
-  };
+  return new Stats(0, 0, 0, 0, 0, 0, 4096, 0, 0, 0, 0, 0, 0, 0);
 }
 async function* watchAsync(ns, _asyncRequest, filePath, options) {
   const absPath = resolve(filePath);
@@ -2628,17 +3294,8 @@ function normalizeCwd(cwd) {
   return cwd.pathname || "/";
 }
 function makeDirent(parentPath, name, isDir, isSymlink) {
-  return {
-    name,
-    parentPath,
-    isFile: () => !isDir && !isSymlink,
-    isDirectory: () => isDir,
-    isBlockDevice: () => false,
-    isCharacterDevice: () => false,
-    isSymbolicLink: () => isSymlink,
-    isFIFO: () => false,
-    isSocket: () => false
-  };
+  const type = isDir ? INODE_TYPE.DIRECTORY : INODE_TYPE.FILE;
+  return new Dirent(name, type, parentPath);
 }
 function globSync(syncRequest, pattern, options) {
   const patterns = Array.isArray(pattern) ? pattern : [pattern];
@@ -2651,7 +3308,7 @@ function globSync(syncRequest, pattern, options) {
     if (withFileTypes) {
       if (!resultsSet.has(fullPath)) {
         resultsSet.add(fullPath);
-        let isDir = false, isSymlink = false;
+        let isDir = false;
         try {
           const s = statSync(syncRequest, fullPath);
           isDir = s.isDirectory();
@@ -2660,7 +3317,7 @@ function globSync(syncRequest, pattern, options) {
         const slash = fullPath.lastIndexOf("/");
         const parent = slash <= 0 ? "/" : fullPath.slice(0, slash);
         const name = fullPath.slice(slash + 1);
-        const dirent = makeDirent(parent, name, isDir, isSymlink);
+        const dirent = makeDirent(parent, name, isDir);
         if (exclude && exclude(dirent)) {
           resultsSet.delete(fullPath);
           return;
@@ -2745,7 +3402,7 @@ async function glob(asyncRequest, pattern, options) {
     if (withFileTypes) {
       if (resultsSet.has(fullPath)) return;
       resultsSet.add(fullPath);
-      let isDir = false, isSymlink = false;
+      let isDir = false;
       try {
         const s = await stat(asyncRequest, fullPath);
         isDir = s.isDirectory();
@@ -2754,7 +3411,7 @@ async function glob(asyncRequest, pattern, options) {
       const slash = fullPath.lastIndexOf("/");
       const parent = slash <= 0 ? "/" : fullPath.slice(0, slash);
       const name = fullPath.slice(slash + 1);
-      const dirent = makeDirent(parent, name, isDir, isSymlink);
+      const dirent = makeDirent(parent, name, isDir);
       if (exclude && exclude(dirent)) {
         resultsSet.delete(fullPath);
         return;
@@ -2835,14 +3492,23 @@ var _canAtomicsWait = typeof globalThis.WorkerGlobalScope !== "undefined";
 var SAB_HEARTBEAT_INDEX = SAB_OFFSETS.HEARTBEAT >> 2;
 var SPIN_STALL_TIMEOUT_MS = 3e4;
 var SPIN_NO_HEARTBEAT_TIMEOUT_MS = 3e4;
-function spinWait(arr, index, value, heartbeatArr) {
+var OPFS_MAIN_THREAD_SPIN_TIMEOUT_MS = 1e4;
+var OPFS_SYNC_STALL_MESSAGE = "VFS sync operation stalled in opfs mode. Sync calls from a page main thread are only reliable on Chromium here: every operation is async underneath, and the spin-wait this thread must use (Atomics.wait is illegal on the main thread) starves the relay worker on Firefox and WebKit. Use fs.promises.* instead, or host the filesystem inside a Worker, where the sync API works on every engine.";
+function spinWait(arr, index, value, heartbeatArr, absoluteDeadlineMs, deadlineMessage) {
   if (_canAtomicsWait) {
     Atomics.wait(arr, index, value);
     return;
   }
+  const deadlineAt = absoluteDeadlineMs !== void 0 ? performance.now() + absoluteDeadlineMs : Infinity;
+  const checkDeadline = () => {
+    if (performance.now() > deadlineAt) {
+      throw new Error(deadlineMessage ?? `VFS sync operation timed out after ${absoluteDeadlineMs}ms`);
+    }
+  };
   if (!heartbeatArr) {
     const start = performance.now();
     while (Atomics.load(arr, index) === value) {
+      checkDeadline();
       if (performance.now() - start > SPIN_NO_HEARTBEAT_TIMEOUT_MS) {
         throw new Error(
           `VFS sync operation timed out after ${SPIN_NO_HEARTBEAT_TIMEOUT_MS / 1e3}s \u2014 relay worker did not respond`
@@ -2854,6 +3520,7 @@ function spinWait(arr, index, value, heartbeatArr) {
   let lastBeat = Atomics.load(heartbeatArr, SAB_HEARTBEAT_INDEX);
   let lastProgress = performance.now();
   while (Atomics.load(arr, index) === value) {
+    checkDeadline();
     const beat = Atomics.load(heartbeatArr, SAB_HEARTBEAT_INDEX);
     if (beat !== lastBeat) {
       lastBeat = beat;
@@ -2865,7 +3532,32 @@ function spinWait(arr, index, value, heartbeatArr) {
     }
   }
 }
+function assertCopyable(srcPath, destPath) {
+  if (srcPath === destPath) throw cpSameSource(srcPath);
+  const srcPrefix = srcPath.endsWith("/") ? srcPath : srcPath + "/";
+  if (destPath.startsWith(srcPrefix)) throw cpIntoSubdirectory(srcPath, destPath);
+}
 var VFSFileSystem = class {
+  /**
+   * `fs.constants` — the flag/mode constants (`F_OK`, `O_CREAT`, `COPYFILE_EXCL`, …).
+   *
+   * This existed on `fs.promises.constants` but not on the instance, so the single most common
+   * form — `fs.access(p, fs.constants.F_OK)` — read a property of `undefined`.
+   */
+  get constants() {
+    return constants;
+  }
+  // The classes behind `stat`, `readdir({ withFileTypes: true })` and `opendir` results, exposed
+  // as node exposes them so `x instanceof fs.Stats` / `fs.Dirent` / `fs.Dir` type-tests work.
+  get Stats() {
+    return Stats;
+  }
+  get Dirent() {
+    return Dirent;
+  }
+  get Dir() {
+    return Dir;
+  }
   // SAB for sync communication with sync relay worker (null when SAB unavailable)
   sab;
   ctrl;
@@ -2887,6 +3579,10 @@ var VFSFileSystem = class {
   rejectReady;
   initError = null;
   isReady = false;
+  /** Set by {@link dispose}; makes disposal idempotent. */
+  closed = false;
+  /** The `pagehide` handler, kept so {@link dispose} can unregister it. */
+  onPageHide = null;
   /** True while a leader transition is in flight (promotion to leader, etc.).
    *  Cleared the moment the new sync-relay signals `ready`. Consumers can
    *  combine this with `isReady` to know when sync FS ops are safe again. */
@@ -2911,6 +3607,15 @@ var VFSFileSystem = class {
   leaderChangeBc = null;
   // Bound request functions for method delegation
   _sync = (buf) => this.syncRequest(buf);
+  /**
+   * Spin cap for the current mode: bounded in `opfs` mode, unbounded otherwise.
+   *
+   * `undefined` keeps hybrid/vfs behaviour exactly as it was — those service sync requests
+   * synchronously in the relay, so a long spin there means a genuinely slow op, not a stall.
+   */
+  _opfsSpinCap() {
+    return this._mode === "opfs" ? OPFS_MAIN_THREAD_SPIN_TIMEOUT_MS : void 0;
+  }
   _async = (op, p, flags, data, path2, fdArgs) => this.asyncRequest(op, p, flags, data, path2, fdArgs);
   // Promises API namespace
   promises;
@@ -2966,6 +3671,7 @@ var VFSFileSystem = class {
     }
     this.syncWorker = this.spawnWorker("sync-relay");
     this.asyncWorker = this.spawnWorker("async-relay");
+    this.installUnloadTeardown();
     this.syncWorker.onmessage = (e) => {
       const msg = e.data;
       if (msg.type === "ready") {
@@ -3406,11 +4112,11 @@ var VFSFileSystem = class {
         Atomics.notify(this.ctrl, 0);
         sent += chunkSize;
         if (sent < requestBytes.byteLength) {
-          spinWait(this.ctrl, 0, sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK, this.ctrl);
+          spinWait(this.ctrl, 0, sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK, this.ctrl, this._opfsSpinCap(), OPFS_SYNC_STALL_MESSAGE);
         }
       }
     }
-    spinWait(this.ctrl, 0, multiChunkRequest ? SIGNAL.CHUNK : SIGNAL.REQUEST, this.ctrl);
+    spinWait(this.ctrl, 0, multiChunkRequest ? SIGNAL.CHUNK : SIGNAL.REQUEST, this.ctrl, this._opfsSpinCap(), OPFS_SYNC_STALL_MESSAGE);
     const signal = Atomics.load(this.ctrl, 0);
     const respChunkLen = Atomics.load(this.ctrl, 3);
     const respTotalLen = Number(Atomics.load(totalLenView, 0));
@@ -3426,7 +4132,7 @@ var VFSFileSystem = class {
       while (received < respTotalLen) {
         Atomics.store(this.ctrl, 0, SIGNAL.CHUNK_ACK);
         Atomics.notify(this.ctrl, 0);
-        spinWait(this.ctrl, 0, SIGNAL.CHUNK_ACK, this.ctrl);
+        spinWait(this.ctrl, 0, SIGNAL.CHUNK_ACK, this.ctrl, this._opfsSpinCap(), OPFS_SYNC_STALL_MESSAGE);
         const nextLen = Atomics.load(this.ctrl, 3);
         responseBytes.set(new Uint8Array(this.sab, HEADER_SIZE, nextLen), received);
         received += nextLen;
@@ -3461,12 +4167,15 @@ var VFSFileSystem = class {
   }
   // ========== Sync API ==========
   readFileSync(filePath, options) {
+    if (isFdArg(filePath)) return readFileFdSync(this._sync, filePath, options);
     return readFileSync(this._sync, toPathString(filePath), options);
   }
   writeFileSync(filePath, data, options) {
+    if (isFdArg(filePath)) return writeFileFdSync(this._sync, filePath, data, options);
     writeFileSync(this._sync, toPathString(filePath), data, options);
   }
   appendFileSync(filePath, data, options) {
+    if (isFdArg(filePath)) return appendFileFdSync(this._sync, filePath, data, options);
     appendFileSync(this._sync, toPathString(filePath), data, options);
   }
   existsSync(filePath) {
@@ -3490,24 +4199,13 @@ var VFSFileSystem = class {
   globSync(pattern, options) {
     return globSync(this._sync, pattern, options);
   }
-  opendirSync(filePath) {
+  opendirSync(filePath, options) {
     const dirPath = toPathString(filePath);
-    const entries = this.readdirSync(dirPath, { withFileTypes: true });
-    let index = 0;
-    return {
-      path: dirPath,
-      async read() {
-        if (index >= entries.length) return null;
-        return entries[index++];
-      },
-      async close() {
-      },
-      async *[Symbol.asyncIterator]() {
-        for (const entry of entries) {
-          yield entry;
-        }
-      }
-    };
+    const entries = this.readdirSync(dirPath, {
+      withFileTypes: true,
+      recursive: options?.recursive
+    });
+    return new Dir(dirPath, entries);
   }
   statSync(filePath, options) {
     return statSync(this._sync, toPathString(filePath), options);
@@ -3521,7 +4219,25 @@ var VFSFileSystem = class {
   copyFileSync(src, dest, mode) {
     copyFileSync(this._sync, toPathString(src), toPathString(dest), mode);
   }
+  /**
+   * Reject a copy whose destination is the source, or lives inside it.
+   *
+   * The subtree case is the dangerous one: a recursive copy into its own subtree recreates the
+   * destination inside itself on every pass and never terminates — an unbounded loop that hangs
+   * the tab and fills storage. Node rejects both with ERR_FS_CP_EINVAL before copying anything.
+   *
+   * Called once per public `cp` entry point rather than inside the recursion, so the recursive
+   * calls (whose dest is legitimately inside the destination tree) are unaffected.
+   */
+  _assertCopyable(srcPath, destPath) {
+    assertCopyable(srcPath, destPath);
+  }
   cpSync(src, dest, options) {
+    this._assertCopyable(toPathString(src), toPathString(dest));
+    this._cpSyncInner(src, dest, options);
+  }
+  /** The recursive worker. Its destinations are legitimately inside the destination tree. */
+  _cpSyncInner(src, dest, options) {
     const srcPath = toPathString(src);
     const destPath = toPathString(dest);
     const force = options?.force !== false;
@@ -3531,7 +4247,7 @@ var VFSFileSystem = class {
     const srcStat = dereference ? this.statSync(srcPath) : this.lstatSync(srcPath);
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
-        throw createError("EISDIR", "cp", srcPath);
+        throw cpEisdirNotRecursive(srcPath);
       }
       try {
         this.mkdirSync(destPath, { recursive: true });
@@ -3542,7 +4258,7 @@ var VFSFileSystem = class {
       for (const entry of entries) {
         const srcChild = join(srcPath, entry.name);
         const destChild = join(destPath, entry.name);
-        this.cpSync(srcChild, destChild, options);
+        this._cpSyncInner(srcChild, destChild, options);
       }
     } else if (srcStat.isSymbolicLink() && !dereference) {
       const target = this.readlinkSync(srcPath);
@@ -3553,7 +4269,7 @@ var VFSFileSystem = class {
       } catch {
       }
       if (destExists) {
-        if (errorOnExist) throw createError("EEXIST", "cp", destPath);
+        if (errorOnExist) throw cpTargetExists(destPath);
         if (!force) return;
         this.unlinkSync(destPath);
       }
@@ -3566,7 +4282,7 @@ var VFSFileSystem = class {
       } catch {
       }
       if (destExists) {
-        if (errorOnExist) throw createError("EEXIST", "cp", destPath);
+        if (errorOnExist) throw cpTargetExists(destPath);
         if (!force) return;
       }
       this.copyFileSync(srcPath, destPath, errorOnExist ? constants.COPYFILE_EXCL : 0);
@@ -3584,7 +4300,7 @@ var VFSFileSystem = class {
     const srcStat = dereference ? await this.promises.stat(src) : await this.promises.lstat(src);
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
-        throw createError("EISDIR", "cp", src);
+        throw cpEisdirNotRecursive(src);
       }
       try {
         await this.promises.mkdir(dest, { recursive: true });
@@ -3606,7 +4322,7 @@ var VFSFileSystem = class {
       } catch {
       }
       if (destExists) {
-        if (errorOnExist) throw createError("EEXIST", "cp", dest);
+        if (errorOnExist) throw cpTargetExists(dest);
         if (!force) return;
         await this.promises.unlink(dest);
       }
@@ -3619,7 +4335,7 @@ var VFSFileSystem = class {
       } catch {
       }
       if (destExists) {
-        if (errorOnExist) throw createError("EEXIST", "cp", dest);
+        if (errorOnExist) throw cpTargetExists(dest);
         if (!force) return;
       }
       await this.promises.copyFile(src, dest, errorOnExist ? constants.COPYFILE_EXCL : 0);
@@ -3635,15 +4351,15 @@ var VFSFileSystem = class {
   accessSync(filePath, mode) {
     accessSync(this._sync, toPathString(filePath), mode);
   }
-  realpathSync(filePath) {
-    return realpathSync(this._sync, toPathString(filePath));
+  realpathSync(filePath, options) {
+    return realpathSync(this._sync, toRealpathString(filePath), options);
   }
   chmodSync(filePath, mode) {
     chmodSync(this._sync, toPathString(filePath), mode);
   }
   /** Like chmodSync but operates on the symlink itself. In this VFS, delegates to chmodSync. */
   lchmodSync(filePath, mode) {
-    chmodSync(this._sync, filePath, mode);
+    chmodSync(this._sync, toPathString(filePath), mode);
   }
   /** chmod on an open file descriptor. Resolves the fd to its inode on the
    *  server side and mutates the inode's mode bits directly, matching what
@@ -3656,7 +4372,7 @@ var VFSFileSystem = class {
   }
   /** Like chownSync but operates on the symlink itself. In this VFS, delegates to chownSync. */
   lchownSync(filePath, uid, gid) {
-    chownSync(this._sync, filePath, uid, gid);
+    chownSync(this._sync, toPathString(filePath), uid, gid);
   }
   /** chown on an open file descriptor. Mutates the underlying inode's uid/gid. */
   fchownSync(fd, uid, gid) {
@@ -3671,7 +4387,7 @@ var VFSFileSystem = class {
   }
   /** Like utimesSync but operates on the symlink itself. In this VFS, delegates to utimesSync. */
   lutimesSync(filePath, atime, mtime) {
-    utimesSync(this._sync, filePath, atime, mtime);
+    utimesSync(this._sync, toPathString(filePath), atime, mtime);
   }
   symlinkSync(target, linkPath, type) {
     symlinkSync(this._sync, toPathString(target), toPathString(linkPath));
@@ -3682,8 +4398,44 @@ var VFSFileSystem = class {
   linkSync(existingPath, newPath) {
     linkSync(this._sync, toPathString(existingPath), toPathString(newPath));
   }
-  mkdtempSync(prefix) {
-    return mkdtempSync(this._sync, prefix);
+  mkdtempSync(prefix, options) {
+    return mkdtempSync(this._sync, toPathString(prefix), options);
+  }
+  /**
+   * The stream constructors, exposed as properties the way `node:fs` exposes them, so
+   * `x instanceof fs.ReadStream` and `fs.FileReadStream` resolve for code written against Node.
+   * `Stats`, `Dirent` and `Dir` are deliberately absent: they are structural interfaces here,
+   * not runtime classes, and a fake constructor would make `instanceof` lie.
+   */
+  get ReadStream() {
+    return NodeReadable;
+  }
+  get WriteStream() {
+    return NodeWritable;
+  }
+  /** Node's legacy aliases for the same two constructors. */
+  get FileReadStream() {
+    return NodeReadable;
+  }
+  get FileWriteStream() {
+    return NodeWritable;
+  }
+  /**
+   * `mkdtempSync` whose result cleans itself up — Node 24's explicit-resource-management form.
+   *
+   * ```js
+   * using dir = fs.mkdtempDisposableSync('/tmp/build-');
+   * // dir.path is removed when the block exits, however it exits
+   * ```
+   * `remove()` is idempotent so an explicit call followed by the implicit `Symbol.dispose`
+   * does not throw ENOENT.
+   */
+  mkdtempDisposableSync(prefix) {
+    const path = mkdtempSync(this._sync, prefix);
+    const remove = () => {
+      this.rmSync(path, { recursive: true, force: true });
+    };
+    return { path, remove, [Symbol.dispose]: remove };
   }
   // ---- File descriptor sync methods ----
   openSync(filePath, flags = "r", mode) {
@@ -3771,30 +4523,23 @@ var VFSFileSystem = class {
     }
   }
   // ---- statfs methods ----
-  statfsSync(_path) {
-    return {
-      type: 1447449377,
-      // "VFS!"
-      bsize: 4096,
-      blocks: 1024 * 1024,
-      // ~4GB virtual capacity
-      bfree: 512 * 1024,
-      // ~2GB free (estimate)
-      bavail: 512 * 1024,
-      files: 1e4,
-      // default max inodes
-      ffree: 5e3
-      // estimate half free
-    };
+  /**
+   * Real volume statistics, read from the VFS superblock.
+   *
+   * This used to return fixed constants — always ~4 GB capacity with ~2 GB free, whatever the
+   * volume actually held — so code checking free space before a large write got an answer
+   * unrelated to reality, and never saw a full disk coming.
+   */
+  statfsSync(path = "/") {
+    return statfsSync(this._sync, toPathString(path));
   }
-  statfs(path, callback) {
-    const result = this.statfsSync(path);
+  statfs(path = "/", callback) {
+    const promise = statfs(this._async, path);
     if (callback) {
       this._validateCb(callback);
-      setTimeout(() => callback(null, result), 0);
-      return;
+      return this._cb(promise, callback);
     }
-    return Promise.resolve(result);
+    return promise;
   }
   // ---- Watch methods ----
   watch(filePath, options, listener) {
@@ -3814,87 +4559,30 @@ var VFSFileSystem = class {
   }
   // ---- Stream methods ----
   createReadStream(filePath, options) {
-    const opts = typeof options === "string" ? { } : options;
-    const start = opts?.start ?? 0;
-    const end = opts?.end;
-    const highWaterMark = opts?.highWaterMark ?? 64 * 1024;
-    let position = start;
-    let handle = null;
-    let finished = false;
-    const cleanup = async () => {
-      if (handle && ownsHandle) {
-        try {
-          await handle.close();
-        } catch {
-        }
-      }
-      handle = null;
-    };
+    const opts = typeof options === "string" ? void 0 : options;
     const providedFd = opts?.fd;
-    let ownsHandle = providedFd == null;
-    const readFn = async () => {
-      if (finished) return { done: true };
-      if (!handle) {
-        if (providedFd != null) {
-          handle = createFileHandle(providedFd, this._async);
-        } else {
-          handle = await this.promises.open(toPathString(filePath), opts?.flags ?? "r");
-        }
-      }
-      const readLen = end !== void 0 ? Math.min(highWaterMark, end - position + 1) : highWaterMark;
-      if (readLen <= 0) {
-        finished = true;
-        await cleanup();
-        return { done: true };
-      }
-      const buffer = new Uint8Array(readLen);
-      const { bytesRead } = await handle.read(buffer, 0, readLen, position);
-      if (bytesRead === 0) {
-        finished = true;
-        await cleanup();
-        return { done: true };
-      }
-      position += bytesRead;
-      if (end !== void 0 && position > end) {
-        finished = true;
-        await cleanup();
-        return { done: false, value: buffer.subarray(0, bytesRead) };
-      }
-      return { done: false, value: buffer.subarray(0, bytesRead) };
-    };
-    const stream = new NodeReadable(readFn, cleanup);
-    stream.path = toPathString(filePath);
+    const stream = readStreamFromHandle({
+      // Opened lazily on first read, as before — creating the stream must not touch the disk.
+      acquire: async () => providedFd != null ? createFileHandle(providedFd, this._async) : await this.promises.open(toPathString(filePath), opts?.flags ?? "r"),
+      // A caller-supplied fd stays the caller's to close.
+      autoClose: providedFd == null && opts?.autoClose !== false,
+      path: toPathString(filePath),
+      // A descriptor handed in by the caller has its own position, and node reads from it; one we
+      // opened ourselves is at zero, where the two are the same.
+      followCursor: providedFd != null
+    }, options);
     return stream;
   }
   createWriteStream(filePath, options) {
-    const opts = typeof options === "string" ? { } : options;
-    let position = opts?.start ?? 0;
-    let handle = null;
-    const providedWFd = opts?.fd;
-    const ownsWHandle = providedWFd == null;
-    const writeFn = async (chunk) => {
-      if (!handle) {
-        if (providedWFd != null) {
-          handle = createFileHandle(providedWFd, this._async);
-        } else {
-          handle = await this.promises.open(toPathString(filePath), opts?.flags ?? "w");
-        }
-      }
-      const { bytesWritten } = await handle.write(chunk, 0, chunk.byteLength, position);
-      position += bytesWritten;
-    };
-    const closeFn = async () => {
-      if (handle) {
-        if (opts?.flush) {
-          await handle.sync();
-        }
-        if (ownsWHandle) {
-          await handle.close();
-        }
-        handle = null;
-      }
-    };
-    return new NodeWritable(toPathString(filePath), writeFn, closeFn);
+    const opts = typeof options === "string" ? void 0 : options;
+    const providedFd = opts?.fd;
+    const stream = writeStreamFromHandle({
+      acquire: async () => providedFd != null ? createFileHandle(providedFd, this._async) : await this.promises.open(toPathString(filePath), opts?.flags ?? "w"),
+      autoClose: providedFd == null && opts?.autoClose !== false,
+      path: toPathString(filePath),
+      followCursor: providedFd != null
+    }, options);
+    return stream;
   }
   // ---- Utility methods ----
   flushSync() {
@@ -3955,6 +4643,99 @@ var VFSFileSystem = class {
       }
     }
   }
+  /**
+   * Tear the workers down when the page goes away, without needing the caller to remember.
+   *
+   * The OPFS mirror worker holds a recursive `FileSystemObserver`, and Chromium aborts the
+   * **browser process** — `FATAL: Detected dangling raw_ptr in unretained` — when a page is
+   * destroyed with one still attached. Callers cannot reasonably be relied on to call
+   * {@link dispose} before every navigation, and `pagehide` is too late to round-trip a message
+   * to the worker and back: nothing will run the event loop again.
+   *
+   * So this does the one thing that works synchronously — terminate the relay. The mirror worker
+   * is a *nested* worker owned by the relay, so killing the parent destroys the child's context
+   * and the observer with it, before teardown can trip over it.
+   *
+   * `event.persisted` means the page is going into the back/forward cache and may be restored,
+   * so the filesystem is left alone in that case.
+   */
+  installUnloadTeardown() {
+    if (typeof addEventListener !== "function" || typeof document === "undefined") return;
+    this.onPageHide = (event) => {
+      if (event.persisted) return;
+      try {
+        this.syncWorker?.terminate();
+      } catch {
+      }
+      try {
+        this.asyncWorker?.terminate();
+      } catch {
+      }
+    };
+    addEventListener("pagehide", this.onPageHide);
+  }
+  /**
+   * Ask the sync relay to release what it owns, and wait briefly for it to confirm.
+   *
+   * The thing that actually has to happen here is the OPFS mirror worker disconnecting its
+   * recursive `FileSystemObserver`. Everything else the relay holds dies with the worker; an
+   * attached observer does not, and Chromium aborts the browser process on a page teardown that
+   * leaves one dangling. Bounded, because a close must not be able to hang.
+   */
+  async shutdownRelay() {
+    if (!this.syncWorker) return;
+    const worker = this.syncWorker;
+    const previous = worker.onmessage;
+    try {
+      await new Promise((resolve2) => {
+        const done = () => {
+          clearTimeout(timer);
+          worker.onmessage = previous;
+          resolve2();
+        };
+        const timer = setTimeout(done, 750);
+        worker.onmessage = (e) => {
+          if (e.data?.type === "shutdown-done") done();
+          else if (typeof previous === "function") previous.call(worker, e);
+        };
+        worker.postMessage({ type: "shutdown" });
+      });
+    } catch {
+    }
+  }
+  /**
+   * Release every resource this instance owns: the relay workers, the OPFS mirror worker, and
+   * the `FileSystemObserver` registered on the origin's storage.
+   *
+   * Worth calling explicitly in anything that creates instances repeatedly — a test suite, an
+   * app that switches volumes — because the observer is the one thing that does not simply die
+   * with the page. The instance is unusable afterwards; construct a new one to reopen the volume.
+   *
+   * Named `dispose` rather than `close` because `close(fd)` is already node's descriptor API and
+   * means something entirely different. `await using fs = new VFSFileSystem()` works too.
+   */
+  async dispose() {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.onPageHide) {
+      removeEventListener("pagehide", this.onPageHide);
+      this.onPageHide = null;
+    }
+    await this.shutdownRelay();
+    try {
+      this.syncWorker?.terminate();
+    } catch {
+    }
+    try {
+      this.asyncWorker?.terminate();
+    } catch {
+    }
+    this.isReady = false;
+  }
+  /** `await using` support, so an instance can be scoped to a block. */
+  [Symbol.asyncDispose]() {
+    return this.dispose();
+  }
   /** Switch the filesystem mode at runtime.
    *
    *  Typical flow for IDE corruption recovery:
@@ -3976,6 +4757,7 @@ var VFSFileSystem = class {
       this.resolveReady = resolve2;
       this.rejectReady = reject;
     });
+    await this.shutdownRelay();
     this.syncWorker.terminate();
     this.asyncWorker.terminate();
     const sabSize = this.config.sabSize;
@@ -4076,123 +4858,168 @@ var VFSFileSystem = class {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    if (isFdArg(filePath)) return this._cb(readFileFd(this._async, filePath, opts), cb);
+    toPathString(filePath);
     return this._cb(this.promises.readFile(filePath, opts), cb);
   }
   writeFile(filePath, data, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    if (isFdArg(filePath)) return this._cbVoid(writeFileFd(this._async, filePath, data, opts), cb);
+    toPathString(filePath);
     return this._cbVoid(this.promises.writeFile(filePath, data, opts), cb);
   }
   appendFile(filePath, data, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    if (isFdArg(filePath)) return this._cbVoid(appendFileFd(this._async, filePath, data, opts), cb);
+    toPathString(filePath);
     return this._cbVoid(this.promises.appendFile(filePath, data, opts), cb);
   }
   mkdir(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    toPathString(filePath);
     return this._cb(this.promises.mkdir(filePath, opts), cb);
   }
   rmdir(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    toPathString(filePath);
     return this._cbVoid(this.promises.rmdir(filePath, opts), cb);
   }
   rm(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    toPathString(filePath);
     return this._cbVoid(this.promises.rm(filePath, opts), cb);
   }
   unlink(filePath, callback) {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cbVoid(this.promises.unlink(filePath), callback);
   }
   readdir(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    toPathString(filePath);
     return this._cb(this.promises.readdir(filePath, opts), cb);
   }
   stat(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    toPathString(filePath);
     return this._cb(this.promises.stat(filePath, opts), cb);
   }
   lstat(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    toPathString(filePath);
     return this._cb(this.promises.lstat(filePath, opts), cb);
   }
   access(filePath, modeOrCallback, callback) {
     const cb = typeof modeOrCallback === "function" ? modeOrCallback : callback;
     this._validateCb(cb);
     const mode = typeof modeOrCallback === "function" ? void 0 : modeOrCallback;
+    toPathString(filePath);
     return this._cbVoid(this.promises.access(filePath, mode), cb);
   }
   rename(oldPath, newPath, callback) {
     this._validateCb(callback);
+    toPathString(oldPath);
+    toPathString(newPath);
     return this._cbVoid(this.promises.rename(oldPath, newPath), callback);
   }
   copyFile(src, dest, modeOrCallback, callback) {
     const cb = typeof modeOrCallback === "function" ? modeOrCallback : callback;
     this._validateCb(cb);
     const mode = typeof modeOrCallback === "function" ? void 0 : modeOrCallback;
+    toPathString(src);
+    toPathString(dest);
     return this._cbVoid(this.promises.copyFile(src, dest, mode), cb);
   }
   truncate(filePath, lenOrCallback, callback) {
     const cb = typeof lenOrCallback === "function" ? lenOrCallback : callback;
     this._validateCb(cb);
     const len = typeof lenOrCallback === "function" ? void 0 : lenOrCallback;
+    toPathString(filePath);
     return this._cbVoid(this.promises.truncate(filePath, len), cb);
   }
-  realpath(filePath, callback) {
-    this._validateCb(callback);
-    return this._cb(this.promises.realpath(filePath), callback);
+  realpath(filePath, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    this._validateCb(cb);
+    return this._cb(this.promises.realpath(filePath, opts), cb);
   }
   chmod(filePath, mode, callback) {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cbVoid(this.promises.chmod(filePath, mode), callback);
   }
   chown(filePath, uid, gid, callback) {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cbVoid(this.promises.chown(filePath, uid, gid), callback);
   }
   utimes(filePath, atime, mtime, callback) {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cbVoid(this.promises.utimes(filePath, atime, mtime), callback);
   }
   symlink(target, linkPath, typeOrCallback, callback) {
     const cb = typeof typeOrCallback === "function" ? typeOrCallback : callback;
     this._validateCb(cb);
     const type = typeof typeOrCallback === "function" ? void 0 : typeOrCallback;
+    toPathString(target);
+    toPathString(linkPath);
     return this._cbVoid(this.promises.symlink(target, linkPath, type), cb);
   }
   readlink(filePath, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    toPathString(filePath);
     return this._cb(this.promises.readlink(filePath, opts), cb);
   }
   link(existingPath, newPath, callback) {
     this._validateCb(callback);
+    toPathString(existingPath);
+    toPathString(newPath);
     return this._cbVoid(this.promises.link(existingPath, newPath), callback);
   }
-  open(filePath, flags, modeOrCallback, callback) {
-    const cb = typeof modeOrCallback === "function" ? modeOrCallback : callback;
+  open(filePath, flagsOrCallback, modeOrCallback, callback) {
+    let flags = "r";
+    let mode;
+    let cb;
+    if (typeof flagsOrCallback === "function") {
+      cb = flagsOrCallback;
+    } else {
+      flags = flagsOrCallback ?? "r";
+      if (typeof modeOrCallback === "function") {
+        cb = modeOrCallback;
+      } else {
+        mode = modeOrCallback;
+        cb = callback;
+      }
+    }
     this._validateCb(cb);
-    const mode = typeof modeOrCallback === "function" ? void 0 : modeOrCallback;
+    toPathString(filePath);
     return this._cb(this.promises.open(filePath, flags, mode), cb, (handle) => [handle.fd]);
   }
-  mkdtemp(prefix, callback) {
-    this._validateCb(callback);
-    return this._cb(this.promises.mkdtemp(prefix), callback);
+  mkdtemp(prefix, optionsOrCallback, callback) {
+    const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    this._validateCb(cb);
+    toPathString(prefix);
+    return this._cb(this.promises.mkdtemp(prefix, opts), cb);
   }
   cp(src, dest, optionsOrCallback, callback) {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
@@ -4322,6 +5149,7 @@ var VFSFileSystem = class {
   }
   opendir(filePath, callback) {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cb(this.promises.opendir(filePath), callback);
   }
   glob(pattern, optionsOrCallback, callback) {
@@ -4344,14 +5172,17 @@ var VFSFileSystem = class {
   }
   lchmod(filePath, mode, callback) {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cbVoid(this.promises.lchmod(filePath, mode), callback);
   }
   lchown(filePath, uid, gid, callback) {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cbVoid(this.promises.lchown(filePath, uid, gid), callback);
   }
   lutimes(filePath, atime, mtime, callback) {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cbVoid(this.promises.lutimes(filePath, atime, mtime), callback);
   }
 };
@@ -4366,49 +5197,60 @@ var VFSPromises = class {
   get constants() {
     return constants;
   }
-  readFile(filePath, options) {
+  // Unlike the callback API, the promise API takes a **FileHandle** rather than a raw descriptor
+  // in the path position — `fsPromises.readFile(fd)` is an ERR_INVALID_ARG_TYPE in Node, and
+  // stays one here because `toPathString` rejects numbers.
+  async readFile(filePath, options) {
+    if (isFileHandle(filePath)) return filePath.readFile(options);
     return readFile(this._async, toPathString(filePath), options);
   }
-  writeFile(filePath, data, options) {
+  async writeFile(filePath, data, options) {
+    if (isFileHandle(filePath)) return filePath.writeFile(data, options);
     return writeFile(this._async, toPathString(filePath), data, options);
   }
-  appendFile(filePath, data, options) {
+  async appendFile(filePath, data, options) {
+    if (isFileHandle(filePath)) return filePath.appendFile(data, options);
     return appendFile(this._async, toPathString(filePath), data, options);
   }
-  mkdir(filePath, options) {
+  async mkdir(filePath, options) {
     return mkdir(this._async, toPathString(filePath), options);
   }
-  rmdir(filePath, options) {
+  async rmdir(filePath, options) {
     return rmdir(this._async, toPathString(filePath), options);
   }
-  rm(filePath, options) {
+  async rm(filePath, options) {
     return rm(this._async, toPathString(filePath), options);
   }
-  unlink(filePath) {
+  async unlink(filePath) {
     return unlink(this._async, toPathString(filePath));
   }
-  readdir(filePath, options) {
+  async readdir(filePath, options) {
     return readdir(this._async, toPathString(filePath), options);
   }
-  glob(pattern, options) {
+  async glob(pattern, options) {
     return glob(this._async, pattern, options);
   }
-  stat(filePath, options) {
+  async stat(filePath, options) {
     return stat(this._async, toPathString(filePath), options);
   }
-  lstat(filePath, options) {
+  async lstat(filePath, options) {
     return lstat(this._async, toPathString(filePath), options);
   }
-  access(filePath, mode) {
+  async access(filePath, mode) {
     return access(this._async, toPathString(filePath), mode);
   }
-  rename(oldPath, newPath) {
+  async rename(oldPath, newPath) {
     return rename(this._async, toPathString(oldPath), toPathString(newPath));
   }
-  copyFile(src, dest, mode) {
+  async copyFile(src, dest, mode) {
     return copyFile(this._async, toPathString(src), toPathString(dest), mode);
   }
   async cp(src, dest, options) {
+    assertCopyable(toPathString(src), toPathString(dest));
+    return this._cpInner(src, dest, options);
+  }
+  /** The recursive worker; its destinations are legitimately inside the destination tree. */
+  async _cpInner(src, dest, options) {
     const srcPath = toPathString(src);
     const destPath = toPathString(dest);
     const force = options?.force !== false;
@@ -4418,7 +5260,7 @@ var VFSPromises = class {
     const srcStat = dereference ? await this.stat(srcPath) : await this.lstat(srcPath);
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
-        throw createError("EISDIR", "cp", srcPath);
+        throw cpEisdirNotRecursive(srcPath);
       }
       try {
         await this.mkdir(destPath, { recursive: true });
@@ -4429,7 +5271,7 @@ var VFSPromises = class {
       for (const entry of entries) {
         const srcChild = join(srcPath, entry.name);
         const destChild = join(destPath, entry.name);
-        await this.cp(srcChild, destChild, options);
+        await this._cpInner(srcChild, destChild, options);
       }
     } else if (srcStat.isSymbolicLink() && !dereference) {
       const target = await this.readlink(srcPath);
@@ -4440,7 +5282,7 @@ var VFSPromises = class {
       } catch {
       }
       if (destExists) {
-        if (errorOnExist) throw createError("EEXIST", "cp", destPath);
+        if (errorOnExist) throw cpTargetExists(destPath);
         if (!force) return;
         await this.unlink(destPath);
       }
@@ -4453,7 +5295,7 @@ var VFSPromises = class {
       } catch {
       }
       if (destExists) {
-        if (errorOnExist) throw createError("EEXIST", "cp", destPath);
+        if (errorOnExist) throw cpTargetExists(destPath);
         if (!force) return;
       }
       await this.copyFile(srcPath, destPath, errorOnExist ? constants.COPYFILE_EXCL : 0);
@@ -4463,89 +5305,86 @@ var VFSPromises = class {
       await this.utimes(destPath, st.atime, st.mtime);
     }
   }
-  truncate(filePath, len) {
+  async truncate(filePath, len) {
     return truncate(this._async, toPathString(filePath), len);
   }
-  realpath(filePath) {
-    return realpath(this._async, toPathString(filePath));
+  async realpath(filePath, options) {
+    return realpath(this._async, toRealpathString(filePath), options);
   }
-  exists(filePath) {
+  async exists(filePath) {
     return exists(this._async, toPathString(filePath));
   }
-  chmod(filePath, mode) {
+  async chmod(filePath, mode) {
     return chmod(this._async, toPathString(filePath), mode);
   }
   /** Like chmod but operates on the symlink itself. In this VFS, delegates to chmod. */
-  lchmod(filePath, mode) {
-    return chmod(this._async, filePath, mode);
+  async lchmod(filePath, mode) {
+    return chmod(this._async, toPathString(filePath), mode);
   }
   /** chmod on an open file descriptor. Engine resolves fd → inode and
    *  mutates the mode bits directly. */
-  fchmod(fd, mode) {
+  async fchmod(fd, mode) {
     return fchmod(this._async, fd, mode);
   }
-  chown(filePath, uid, gid) {
+  async chown(filePath, uid, gid) {
     return chown(this._async, toPathString(filePath), uid, gid);
   }
   /** Like chown but operates on the symlink itself. In this VFS, delegates to chown. */
-  lchown(filePath, uid, gid) {
-    return chown(this._async, filePath, uid, gid);
+  async lchown(filePath, uid, gid) {
+    return chown(this._async, toPathString(filePath), uid, gid);
   }
   /** chown on an open file descriptor. Engine resolves fd → inode and
    *  mutates uid/gid directly. */
-  fchown(fd, uid, gid) {
+  async fchown(fd, uid, gid) {
     return fchown(this._async, fd, uid, gid);
   }
-  utimes(filePath, atime, mtime) {
+  async utimes(filePath, atime, mtime) {
     return utimes(this._async, toPathString(filePath), atime, mtime);
   }
   /** utimes on an open file descriptor. Engine resolves fd → inode and
    *  mutates atime/mtime directly. */
-  futimes(fd, atime, mtime) {
+  async futimes(fd, atime, mtime) {
     return futimes(this._async, fd, atime, mtime);
   }
   /** Like utimes but operates on the symlink itself. In this VFS, delegates to utimes. */
-  lutimes(filePath, atime, mtime) {
-    return utimes(this._async, filePath, atime, mtime);
+  async lutimes(filePath, atime, mtime) {
+    return utimes(this._async, toPathString(filePath), atime, mtime);
   }
-  symlink(target, linkPath, type) {
+  async symlink(target, linkPath, type) {
     return symlink(this._async, toPathString(target), toPathString(linkPath));
   }
-  readlink(filePath, options) {
+  async readlink(filePath, options) {
     return readlink(this._async, toPathString(filePath), options);
   }
-  link(existingPath, newPath) {
+  async link(existingPath, newPath) {
     return link(this._async, toPathString(existingPath), toPathString(newPath));
   }
-  open(filePath, flags, mode) {
+  async open(filePath, flags, mode) {
     return open(this._async, toPathString(filePath), flags, mode);
   }
-  opendir(filePath) {
-    return opendir(this._async, toPathString(filePath));
+  async opendir(filePath, options) {
+    return opendir(this._async, toPathString(filePath), options);
   }
-  mkdtemp(prefix) {
-    return mkdtemp(this._async, prefix);
+  /**
+   * `mkdtemp` whose result cleans itself up — see `mkdtempDisposableSync`. Disposal is async
+   * here (`await using`), so the symbol is `Symbol.asyncDispose` and `remove()` returns a promise.
+   */
+  async mkdtempDisposable(prefix) {
+    const path = await mkdtemp(this._async, prefix);
+    const remove = () => this.rm(path, { recursive: true, force: true });
+    return { path, remove, [Symbol.asyncDispose]: remove };
+  }
+  async mkdtemp(prefix, options) {
+    return mkdtemp(this._async, toPathString(prefix), options);
   }
   async openAsBlob(filePath, options) {
     const data = await this.readFile(filePath);
     const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(data);
     return new Blob([bytes], { type: options?.type ?? "" });
   }
-  async statfs(path) {
-    return {
-      type: 1447449377,
-      // "VFS!"
-      bsize: 4096,
-      blocks: 1024 * 1024,
-      // ~4GB virtual capacity
-      bfree: 512 * 1024,
-      // ~2GB free (estimate)
-      bavail: 512 * 1024,
-      files: 1e4,
-      // default max inodes
-      ffree: 5e3
-      // estimate half free
-    };
+  /** Real volume statistics — see the note on `VFSFileSystem.statfsSync`. */
+  async statfs(path = "/") {
+    return statfs(this._async, toPathString(path));
   }
   async *watch(filePath, options) {
     yield* watchAsync(this._ns, this._async, filePath, options);
@@ -4643,7 +5482,7 @@ function crc32(bytes, start = 0, end = bytes.byteLength) {
 var encoder10 = new TextEncoder();
 var PREGROW_HEADROOM_BLOCKS = 16384;
 var decoder8 = new TextDecoder();
-var VFSEngine = class {
+var VFSEngine = class _VFSEngine {
   handle;
   pathIndex = /* @__PURE__ */ new Map();
   // path → inode index
@@ -4666,6 +5505,22 @@ var VFSEngine = class {
   fdTable = /* @__PURE__ */ new Map();
   nextFd = 3;
   // 0=stdin, 1=stdout, 2=stderr reserved
+  /**
+   * Whether an fd's open flags permit reading / writing.
+   *
+   * The low two bits of the flags are the access mode (O_RDONLY=0, O_WRONLY=1, O_RDWR=2). These
+   * were not enforced: reading from a descriptor opened `'w'` returned 0 bytes instead of EBADF,
+   * and writing through one opened `'r'` succeeded. Both are errors in Node, and code that
+   * relies on the error to detect a mis-opened file saw silence instead. Found by the fd fuzzer.
+   */
+  static isReadable(flags) {
+    const mode = flags & 3;
+    return mode === 0 || mode === 2;
+  }
+  static isWritable(flags) {
+    const mode = flags & 3;
+    return mode === 1 || mode === 2;
+  }
   // Reusable buffers to avoid allocations
   inodeBuf = new Uint8Array(INODE_SIZE);
   inodeView = new DataView(this.inodeBuf.buffer);
@@ -4719,6 +5574,21 @@ var VFSEngine = class {
   // scaffolding mutates pathIndex directly.
   childIndex = /* @__PURE__ */ new Map();
   childIndexGen = 0;
+  /** Where the next block search resumes — see allocateBlocks. Reset on mount/format. */
+  allocCursor = 0;
+  /**
+   * Set when path resolution gave up because a symlink chain exceeded MAX_SYMLINK_DEPTH.
+   *
+   * The resolvers return `undefined` for both "not there" and "went in circles", which every
+   * caller then reported as ENOENT — so a symlink pointing at itself looked like a missing file
+   * instead of the ELOOP Node reports. Reset at the start of every top-level resolve and read
+   * immediately after, via `resolveFailureStatus`.
+   */
+  symlinkLoopDetected = false;
+  /** ENOENT, or ELOOP when the last resolve gave up on a symlink cycle. */
+  resolveFailureStatus() {
+    return this.symlinkLoopDetected ? CODE_TO_STATUS.ELOOP : CODE_TO_STATUS.ENOENT;
+  }
   // Configurable upper bounds
   maxInodes = 4e6;
   // Default ceiling on data blocks. The on-disk bitmap region is reserved for
@@ -5182,34 +6052,60 @@ var VFSEngine = class {
       written += n;
     }
   }
+  /**
+   * Find and reserve `count` contiguous free blocks.
+   *
+   * Next-fit: the search resumes where the last allocation ended and wraps once, rather than
+   * restarting at block 0 every time. Restarting meant each allocation first walked past every
+   * block already in use, so creating files into a filling volume cost O(allocated) each and
+   * O(n²) overall — measured at 8 µs per create on an empty volume rising to 16 µs by 16k files.
+   * With a cursor, sequential allocation is O(count).
+   *
+   * Wrapping preserves the old guarantee that the volume only grows when no contiguous run
+   * exists anywhere: the second pass covers everything below the cursor, extended by `count - 1`
+   * so a run straddling the cursor is still found.
+   */
   allocateBlocks(count) {
     if (count === 0) return 0;
+    let start = this.scanForRun(this.allocCursor, this.totalBlocks, count);
+    if (start < 0 && this.allocCursor > 0) {
+      const wrapEnd = Math.min(this.allocCursor + count - 1, this.totalBlocks);
+      start = this.scanForRun(0, wrapEnd, count);
+    }
+    if (start < 0) return this.growAndAllocate(count);
+    const end = start + count - 1;
+    const bitmap = this.bitmap;
+    for (let j = start; j <= end; j++) bitmap[j >>> 3] |= 1 << (j & 7);
+    this.markBitmapDirty(start >>> 3, end >>> 3);
+    this.freeBlocks -= count;
+    this.superblockDirty = true;
+    this.allocCursor = end + 1 >= this.totalBlocks ? 0 : end + 1;
+    return start;
+  }
+  /**
+   * First index in [from, to) starting a run of `count` free blocks, or -1.
+   *
+   * Fully-allocated bytes are skipped eight blocks at a time. That matters on a filling volume,
+   * where the overwhelming majority of the bitmap the scan crosses is solid 0xFF.
+   */
+  scanForRun(from, to, count) {
     const bitmap = this.bitmap;
     let run = 0;
-    let start = 0;
-    for (let i = 0; i < this.totalBlocks; i++) {
-      const byteIdx = i >>> 3;
-      const bitIdx = i & 7;
-      const used = bitmap[byteIdx] >>> bitIdx & 1;
-      if (used) {
+    let start = from;
+    for (let i = from; i < to; i++) {
+      if (run === 0 && (i & 7) === 0 && bitmap[i >>> 3] === 255) {
+        i += 7;
+        start = i + 1;
+        continue;
+      }
+      if (bitmap[i >>> 3] >>> (i & 7) & 1) {
         run = 0;
         start = i + 1;
-      } else {
-        run++;
-        if (run === count) {
-          for (let j = start; j <= i; j++) {
-            const bj = j >>> 3;
-            const bi = j & 7;
-            bitmap[bj] |= 1 << bi;
-          }
-          this.markBitmapDirty(start >>> 3, i >>> 3);
-          this.freeBlocks -= count;
-          this.superblockDirty = true;
-          return start;
-        }
+      } else if (++run === count) {
+        return start;
       }
     }
-    return this.growAndAllocate(count);
+    return -1;
   }
   /** Highest block count the reserved on-disk bitmap region can represent.
    *  The bitmap lives in [bitmapOffset, dataOffset); each byte covers 8 blocks.
@@ -5328,7 +6224,11 @@ var VFSEngine = class {
   }
   // ========== Path resolution ==========
   resolvePath(path, depth = 0) {
-    if (depth > MAX_SYMLINK_DEPTH) return void 0;
+    if (depth === 0) this.symlinkLoopDetected = false;
+    if (depth > MAX_SYMLINK_DEPTH) {
+      this.symlinkLoopDetected = true;
+      return void 0;
+    }
     const idx = this.pathIndex.get(path);
     if (idx === void 0) {
       return this.resolvePathComponents(path, true, depth);
@@ -5353,7 +6253,11 @@ var VFSEngine = class {
    * (where files actually exist in pathIndex), not under the symlink path.
    */
   resolvePathFull(path, followLast = true, depth = 0) {
-    if (depth > MAX_SYMLINK_DEPTH) return void 0;
+    if (depth === 0) this.symlinkLoopDetected = false;
+    if (depth > MAX_SYMLINK_DEPTH) {
+      this.symlinkLoopDetected = true;
+      return void 0;
+    }
     const parts = path.split("/").filter(Boolean);
     let current = "/";
     for (let i = 0; i < parts.length; i++) {
@@ -5376,6 +6280,28 @@ var VFSEngine = class {
     const finalIdx = this.pathIndex.get(current);
     if (finalIdx === void 0) return void 0;
     return { idx: finalIdx, resolvedPath: current };
+  }
+  /**
+   * Follow a symlink chain to the path a *create* should land on.
+   *
+   * `resolvePathFull` gives up when the final target does not exist, which is exactly the
+   * dangling-link case: `writeFileSync('/link', …)` where `/link` → `t3` and `t3` is absent.
+   * Callers then created a file at `/link` itself, destroying the symlink — Node follows the
+   * link and creates `/t3`, leaving the link intact.
+   *
+   * Returns `path` unchanged when it is not a symlink, so callers on the common path pay a
+   * single Map lookup, and `null` when the chain exceeds MAX_SYMLINK_DEPTH — a cycle, which
+   * callers must report as ELOOP rather than writing to wherever the walk happened to stop.
+   */
+  resolveDanglingLink(path, depth = 0) {
+    if (depth > MAX_SYMLINK_DEPTH) return null;
+    const idx = this.pathIndex.get(path);
+    if (idx === void 0) return path;
+    const inode = this.readInode(idx);
+    if (inode.type !== INODE_TYPE.SYMLINK) return path;
+    const target = decoder8.decode(this.readData(inode.firstBlock, inode.blockCount, inode.size));
+    const resolved = target.startsWith("/") ? target : this.resolveRelative(path, target);
+    return this.resolveDanglingLink(resolved, depth + 1);
   }
   resolveRelative(from, target) {
     const dir = from.substring(0, from.lastIndexOf("/")) || "/";
@@ -5466,7 +6392,7 @@ var VFSEngine = class {
       }
     }
     if (idx === void 0) idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    if (idx === void 0) return { status: this.resolveFailureStatus(), data: null };
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR, data: null };
     const data = inode.size > 0 ? this.readData(inode.firstBlock, inode.blockCount, inode.size) : new Uint8Array(0);
@@ -5484,7 +6410,17 @@ var VFSEngine = class {
     const parentStatus = this.ensureParent(path);
     if (parentStatus !== 0) return { status: parentStatus };
     const t2 = this.debug ? performance.now() : 0;
-    const existingIdx = this.resolvePathComponents(path, true);
+    let existingIdx = this.resolvePathComponents(path, true);
+    if (existingIdx === void 0) {
+      const linkTarget = this.resolveDanglingLink(path);
+      if (linkTarget === null) return { status: CODE_TO_STATUS.ELOOP };
+      if (linkTarget !== path) {
+        path = linkTarget;
+        const targetParentStatus = this.ensureParent(path);
+        if (targetParentStatus !== 0) return { status: targetParentStatus };
+        existingIdx = this.resolvePathComponents(path, true);
+      }
+    }
     const t3 = this.debug ? performance.now() : 0;
     let tAlloc = t3, tData = t3, tInode = t3;
     if (existingIdx !== void 0) {
@@ -5541,6 +6477,14 @@ var VFSEngine = class {
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
     const combinedSize = inode.size + data.byteLength;
     const neededBlocks = Math.ceil(combinedSize / this.blockSize);
+    if (neededBlocks <= inode.blockCount) {
+      this.handle.write(data, { at: this.dataOffset + inode.firstBlock * this.blockSize + inode.size });
+      inode.size = combinedSize;
+      inode.mtime = Date.now();
+      this.writeInode(existingIdx, inode);
+      this.commitPending();
+      return { status: 0 };
+    }
     const newFirst = this.allocateBlocks(neededBlocks);
     const newBase = this.dataOffset + newFirst * this.blockSize;
     if (inode.size > 0) {
@@ -5588,10 +6532,11 @@ var VFSEngine = class {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
     if (idx === void 0) {
+      const failure = this.resolveFailureStatus();
       if (this.isImplicitDirectory(path)) {
         return this.encodeImplicitDirStatResponse(path);
       }
-      return { status: CODE_TO_STATUS.ENOENT, data: null };
+      return { status: failure, data: null };
     }
     return this.encodeStatResponse(idx);
   }
@@ -5738,6 +6683,11 @@ var VFSEngine = class {
         this.deletePathIndex(child);
       }
     }
+    if (path === "/") {
+      this.pathIndexGen++;
+      this.commitPending();
+      return { status: 0 };
+    }
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
     this.deletePathIndex(path);
@@ -5761,56 +6711,43 @@ var VFSEngine = class {
       return { status: CODE_TO_STATUS.ENOENT, data: null };
     }
     const withFileTypes = (flags & 1) !== 0;
-    const children = this.getDirectChildrenWithImplicit(effectiveDirPath);
     if (withFileTypes) {
-      let totalSize2 = 4;
-      const entries = [];
-      for (const child of children) {
-        const name = child.path.substring(child.path.lastIndexOf("/") + 1);
-        const nameBytes = encoder10.encode(name);
-        let type;
-        if (child.type === "implicit") {
-          type = INODE_TYPE.DIRECTORY;
-        } else {
-          const childIdx = this.pathIndex.get(child.path);
-          const childInode = this.readInode(childIdx);
-          type = childInode.type;
-        }
-        entries.push({ name: nameBytes, type });
-        totalSize2 += 2 + nameBytes.byteLength + 1;
-      }
-      const buf2 = new Uint8Array(totalSize2);
+      this.ensureChildIndex();
+      const typedNames = this.childIndex.get(effectiveDirPath);
+      if (!typedNames) return { status: 0, data: new Uint8Array([0, 0, 0, 0]) };
+      const names2 = [...typedNames.keys()].sort();
+      const prefix = effectiveDirPath === "/" ? "/" : effectiveDirPath + "/";
+      let capacity2 = 4;
+      for (const name of names2) capacity2 += 3 + name.length * 3;
+      const buf2 = new Uint8Array(capacity2);
       const view2 = new DataView(buf2.buffer);
-      view2.setUint32(0, entries.length, true);
+      view2.setUint32(0, names2.length, true);
       let offset2 = 4;
-      for (const entry of entries) {
-        view2.setUint16(offset2, entry.name.byteLength, true);
-        offset2 += 2;
-        buf2.set(entry.name, offset2);
-        offset2 += entry.name.byteLength;
-        buf2[offset2++] = entry.type;
+      for (const name of names2) {
+        const { written } = encoder10.encodeInto(name, buf2.subarray(offset2 + 2));
+        view2.setUint16(offset2, written, true);
+        offset2 += 2 + written;
+        const childIdx = this.pathIndex.get(prefix + name);
+        buf2[offset2++] = childIdx === void 0 ? INODE_TYPE.DIRECTORY : this.readInode(childIdx).type;
       }
-      return { status: 0, data: buf2 };
+      return { status: 0, data: buf2.subarray(0, offset2) };
     }
-    let totalSize = 4;
-    const nameEntries = [];
-    for (const child of children) {
-      const name = child.path.substring(child.path.lastIndexOf("/") + 1);
-      const nameBytes = encoder10.encode(name);
-      nameEntries.push(nameBytes);
-      totalSize += 2 + nameBytes.byteLength;
-    }
-    const buf = new Uint8Array(totalSize);
+    this.ensureChildIndex();
+    const childNames = this.childIndex.get(effectiveDirPath);
+    if (!childNames) return { status: 0, data: new Uint8Array([0, 0, 0, 0]) };
+    const names = [...childNames.keys()].sort();
+    let capacity = 4;
+    for (const name of names) capacity += 2 + name.length * 3;
+    const buf = new Uint8Array(capacity);
     const view = new DataView(buf.buffer);
-    view.setUint32(0, nameEntries.length, true);
+    view.setUint32(0, names.length, true);
     let offset = 4;
-    for (const nameBytes of nameEntries) {
-      view.setUint16(offset, nameBytes.byteLength, true);
-      offset += 2;
-      buf.set(nameBytes, offset);
-      offset += nameBytes.byteLength;
+    for (const name of names) {
+      const { written } = encoder10.encodeInto(name, buf.subarray(offset + 2));
+      view.setUint16(offset, written, true);
+      offset += 2 + written;
     }
-    return { status: 0, data: buf };
+    return { status: 0, data: buf.subarray(0, offset) };
   }
   // ---- RENAME ----
   rename(oldPath, newPath) {
@@ -5896,7 +6833,7 @@ var VFSEngine = class {
   truncate(path, len = 0) {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === void 0) return { status: this.resolveFailureStatus() };
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
     if (len === 0) {
@@ -5951,18 +6888,28 @@ var VFSEngine = class {
     srcPath = this.normalizePath(srcPath);
     destPath = this.normalizePath(destPath);
     const srcIdx = this.resolvePathComponents(srcPath, true);
-    if (srcIdx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (srcIdx === void 0) return { status: this.resolveFailureStatus() };
     const srcInode = this.readInode(srcIdx);
-    if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
+    if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTSUP };
     if (flags & 1 && (this.pathIndex.has(destPath) || this.isImplicitDirectory(destPath))) {
       return { status: CODE_TO_STATUS.EEXIST };
     }
     if (srcPath === destPath) return { status: 0 };
     const srcSize = srcInode.size;
     const srcFirstBlock = srcInode.firstBlock;
+    const srcMode = srcInode.mode;
     const emptyStatus = this.write(destPath, new Uint8Array(0));
     if (emptyStatus.status !== 0) return emptyStatus;
-    if (srcSize === 0) return { status: 0 };
+    if (srcSize === 0) {
+      const emptyIdx = this.resolvePathComponents(destPath, true);
+      if (emptyIdx !== void 0) {
+        const emptyInode = this.readInode(emptyIdx);
+        emptyInode.mode = emptyInode.mode & -4096 | srcMode & 4095;
+        this.writeInode(emptyIdx, emptyInode);
+        this.commitPending();
+      }
+      return { status: 0 };
+    }
     const destIdx = this.resolvePathComponents(destPath, true);
     if (destIdx === void 0) return { status: CODE_TO_STATUS.EIO };
     const destInode = this.readInode(destIdx);
@@ -5984,6 +6931,7 @@ var VFSEngine = class {
     destInode.blockCount = neededBlocks;
     destInode.size = srcSize;
     destInode.mtime = Date.now();
+    destInode.mode = destInode.mode & -4096 | srcMode & 4095;
     this.writeInode(destIdx, destInode);
     this.commitPending();
     return { status: 0 };
@@ -5993,8 +6941,9 @@ var VFSEngine = class {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
     if (idx === void 0) {
+      const failure = this.resolveFailureStatus();
       if (this.isImplicitDirectory(path)) return { status: 0 };
-      return { status: CODE_TO_STATUS.ENOENT };
+      return { status: failure };
     }
     if (mode === 0) return { status: 0 };
     if (!this.strictPermissions) return { status: 0 };
@@ -6016,10 +6965,11 @@ var VFSEngine = class {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
     if (idx === void 0) {
+      const failure = this.resolveFailureStatus();
       if (this.isImplicitDirectory(path)) {
         return { status: 0, data: encoder10.encode(path) };
       }
-      return { status: CODE_TO_STATUS.ENOENT, data: null };
+      return { status: failure, data: null };
     }
     const inode = this.readInode(idx);
     const resolvedPath = this.readPath(inode.pathOffset, inode.pathLength);
@@ -6029,7 +6979,7 @@ var VFSEngine = class {
   chmod(path, mode) {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === void 0) return { status: this.resolveFailureStatus() };
     const inode = this.readInode(idx);
     inode.mode = inode.mode & S_IFMT | mode & 4095;
     inode.ctime = Date.now();
@@ -6040,7 +6990,7 @@ var VFSEngine = class {
   chown(path, uid, gid) {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === void 0) return { status: this.resolveFailureStatus() };
     const inode = this.readInode(idx);
     inode.uid = uid;
     inode.gid = gid;
@@ -6052,7 +7002,7 @@ var VFSEngine = class {
   utimes(path, atime, mtime) {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === void 0) return { status: this.resolveFailureStatus() };
     const inode = this.readInode(idx);
     inode.atime = atime;
     inode.mtime = mtime;
@@ -6088,7 +7038,7 @@ var VFSEngine = class {
     existingPath = this.normalizePath(existingPath);
     newPath = this.normalizePath(newPath);
     const srcIdx = this.resolvePathComponents(existingPath, true);
-    if (srcIdx === void 0) return { status: CODE_TO_STATUS.ENOENT };
+    if (srcIdx === void 0) return { status: this.resolveFailureStatus() };
     const srcInode = this.readInode(srcIdx);
     if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EPERM };
     if (this.pathIndex.has(newPath) || this.isImplicitDirectory(newPath)) {
@@ -6122,7 +7072,17 @@ var VFSEngine = class {
     const hasExcl = (flags & 128) !== 0;
     let idx = this.resolvePathComponents(path, true);
     if (idx === void 0) {
-      if (!hasCreate) return { status: CODE_TO_STATUS.ENOENT, data: null };
+      const linkTarget = this.resolveDanglingLink(path);
+      if (linkTarget === null) return { status: CODE_TO_STATUS.ELOOP, data: null };
+      if (linkTarget !== path) {
+        path = linkTarget;
+        idx = this.resolvePathComponents(path, true);
+      }
+    }
+    if (idx === void 0) {
+      if (!hasCreate) return { status: this.resolveFailureStatus(), data: null };
+      const parentStatus = this.ensureParent(path);
+      if (parentStatus !== 0) return { status: parentStatus, data: null };
       idx = this.createInode(path, INODE_TYPE.FILE, this.fileModeFor(reqMode), 0);
     } else if (hasExcl && hasCreate) {
       return { status: CODE_TO_STATUS.EEXIST, data: null };
@@ -6146,7 +7106,9 @@ var VFSEngine = class {
   fread(fd, length, position) {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF, data: null };
+    if (!_VFSEngine.isReadable(entry.flags)) return { status: CODE_TO_STATUS.EBADF, data: null };
     const inode = this.readInode(entry.inodeIdx);
+    if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR, data: null };
     const pos = position ?? entry.position;
     const readLen = Math.min(length, inode.size - pos);
     if (readLen <= 0) return { status: 0, data: new Uint8Array(0) };
@@ -6162,6 +7124,7 @@ var VFSEngine = class {
   fwrite(fd, data, position) {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF, data: null };
+    if (!_VFSEngine.isWritable(entry.flags)) return { status: CODE_TO_STATUS.EBADF, data: null };
     const inode = this.readInode(entry.inodeIdx);
     const isAppend = (entry.flags & 1024) !== 0;
     const pos = isAppend ? inode.size : position ?? entry.position;
@@ -6227,11 +7190,38 @@ var VFSEngine = class {
   ftruncate(fd, len = 0) {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    if (!_VFSEngine.isWritable(entry.flags)) return { status: CODE_TO_STATUS.EINVAL };
     const inode = this.readInode(entry.inodeIdx);
     const path = this.readPath(inode.pathOffset, inode.pathLength);
     return this.truncate(path, len);
   }
   // ---- FSYNC ----
+  /**
+   * Real volume statistics.
+   *
+   * `statfs` used to be answered by the filesystem layer with fixed constants — always ~4 GB
+   * capacity and ~2 GB free, whatever the volume actually held — so anything checking free space
+   * before a large write got a number unrelated to reality. These come from the superblock the
+   * allocator maintains.
+   *
+   * Payload: [type u32][bsize u32][blocks u32][bfree u32][files u32][ffree u32].
+   */
+  statfs(path = "/") {
+    path = this.normalizePath(path);
+    if (this.resolvePathComponents(path, true) === void 0 && !this.isImplicitDirectory(path)) {
+      return { status: this.resolveFailureStatus(), data: null };
+    }
+    const usedInodes = new Set(this.pathIndex.values()).size;
+    const buf = new Uint8Array(24);
+    const dv = new DataView(buf.buffer);
+    dv.setUint32(0, VFS_MAGIC, true);
+    dv.setUint32(4, this.blockSize, true);
+    dv.setUint32(8, this.totalBlocks, true);
+    dv.setUint32(12, this.freeBlocks, true);
+    dv.setUint32(16, this.inodeCount, true);
+    dv.setUint32(20, Math.max(0, this.inodeCount - usedInodes), true);
+    return { status: 0, data: buf };
+  }
   fsync() {
     this.commitPending();
     this.handle.flush();
@@ -6543,7 +7533,7 @@ var VFSEngine = class {
     const prefix = dirPath === "/" ? "/" : dirPath + "/";
     const descendants = [];
     for (const path of this.pathIndex.keys()) {
-      if (path.startsWith(prefix)) descendants.push(path);
+      if (path !== dirPath && path.startsWith(prefix)) descendants.push(path);
     }
     return descendants.sort((a, b) => {
       const da = a.split("/").length;
@@ -7123,7 +8113,7 @@ var dirname2 = (p) => {
 };
 var basename3 = (p) => p.slice(p.lastIndexOf("/") + 1);
 var childPath = (dir, name) => dir === "/" ? "/" + name : dir + "/" + name;
-function fsError(code, msg) {
+function fsError2(code, msg) {
   const e = new Error(`${code}: ${msg}`);
   e.code = code;
   return e;
@@ -7245,13 +8235,13 @@ var TreeDrive = class {
   }
   requireDirOf(p) {
     const d = this.nodes.get(dirname2(p));
-    if (!d) throw fsError("ENOENT", `no such file or directory, '${dirname2(p)}'`);
-    if (d.type !== "dir") throw fsError("ENOTDIR", `not a directory, '${dirname2(p)}'`);
+    if (!d) throw fsError2("ENOENT", `no such file or directory, '${dirname2(p)}'`);
+    if (d.type !== "dir") throw fsError2("ENOTDIR", `not a directory, '${dirname2(p)}'`);
   }
   async stat(path) {
     await this.ready();
     const n = this.nodes.get(norm(path));
-    if (!n) throw fsError("ENOENT", `no such file or directory, '${path}'`);
+    if (!n) throw fsError2("ENOENT", `no such file or directory, '${path}'`);
     return { type: n.type, size: n.type === "file" ? n.data.byteLength : 0, mtimeMs: n.mtimeMs, ctimeMs: n.ctimeMs, sync: "local" };
   }
   async exists(path) {
@@ -7262,8 +8252,8 @@ var TreeDrive = class {
     await this.ready();
     const dir = norm(path);
     const n = this.nodes.get(dir);
-    if (!n) throw fsError("ENOENT", `no such file or directory, '${path}'`);
-    if (n.type !== "dir") throw fsError("ENOTDIR", `not a directory, '${path}'`);
+    if (!n) throw fsError2("ENOENT", `no such file or directory, '${path}'`);
+    if (n.type !== "dir") throw fsError2("ENOTDIR", `not a directory, '${path}'`);
     const out = [];
     for (const name of n.children) {
       const node = this.nodes.get(childPath(dir, name));
@@ -7274,8 +8264,8 @@ var TreeDrive = class {
   async readFile(path) {
     await this.ready();
     const n = this.nodes.get(norm(path));
-    if (!n) throw fsError("ENOENT", `no such file or directory, '${path}'`);
-    if (n.type !== "file") throw fsError("EISDIR", `illegal operation on a directory, '${path}'`);
+    if (!n) throw fsError2("ENOENT", `no such file or directory, '${path}'`);
+    if (n.type !== "file") throw fsError2("EISDIR", `illegal operation on a directory, '${path}'`);
     return n.data.slice();
   }
   async writeFile(path, data) {
@@ -7283,7 +8273,7 @@ var TreeDrive = class {
     const target = norm(path);
     this.requireDirOf(target);
     const existing = this.nodes.get(target);
-    if (existing?.type === "dir") throw fsError("EISDIR", `illegal operation on a directory, '${path}'`);
+    if (existing?.type === "dir") throw fsError2("EISDIR", `illegal operation on a directory, '${path}'`);
     this.link(target, { type: "file", data: data.slice(), mtimeMs: this.now(), ctimeMs: existing?.ctimeMs ?? this.now() });
     await this.save();
   }
@@ -7295,10 +8285,10 @@ var TreeDrive = class {
       cur += "/" + segs2[i];
       const ex = this.nodes.get(cur);
       if (ex) {
-        if (ex.type !== "dir") throw fsError("ENOTDIR", `not a directory, '${cur}'`);
+        if (ex.type !== "dir") throw fsError2("ENOTDIR", `not a directory, '${cur}'`);
         continue;
       }
-      if (!opts?.recursive && i < segs2.length - 1) throw fsError("ENOENT", `no such file or directory, '${cur}'`);
+      if (!opts?.recursive && i < segs2.length - 1) throw fsError2("ENOENT", `no such file or directory, '${cur}'`);
       this.link(cur, { type: "dir", mtimeMs: this.now(), ctimeMs: this.now(), children: /* @__PURE__ */ new Set() });
     }
     await this.save();
@@ -7310,7 +8300,7 @@ var TreeDrive = class {
     if (!n) return;
     if (n.type === "dir") {
       const desc = this.descendants(target);
-      if (desc.length && !opts?.recursive) throw fsError("ENOTEMPTY", `directory not empty, '${path}'`);
+      if (desc.length && !opts?.recursive) throw fsError2("ENOTEMPTY", `directory not empty, '${path}'`);
       for (const c of desc) {
         this.nodes.delete(c);
         this.markDel(c);
@@ -7323,10 +8313,10 @@ var TreeDrive = class {
     await this.ready();
     const a = norm(from), b = norm(to);
     const n = this.nodes.get(a);
-    if (!n) throw fsError("ENOENT", `no such file or directory, '${from}'`);
+    if (!n) throw fsError2("ENOENT", `no such file or directory, '${from}'`);
     if (a === b) return;
     this.requireDirOf(b);
-    if (n.type === "dir" && b.startsWith(a + "/")) throw fsError("EINVAL", `invalid argument, rename '${from}' -> '${to}'`);
+    if (n.type === "dir" && b.startsWith(a + "/")) throw fsError2("EINVAL", `invalid argument, rename '${from}' -> '${to}'`);
     this.suspend++;
     try {
       if (this.nodes.has(b)) await this.remove(b, { recursive: true });
@@ -7351,9 +8341,9 @@ var TreeDrive = class {
   async copy(from, to) {
     await this.ready();
     const a = norm(from), b = norm(to);
-    if (!this.nodes.has(a)) throw fsError("ENOENT", `no such file or directory, '${from}'`);
+    if (!this.nodes.has(a)) throw fsError2("ENOENT", `no such file or directory, '${from}'`);
     if (this.nodes.get(a).type === "dir" && (b === a || b.startsWith(a + "/"))) {
-      throw fsError("EINVAL", `cannot copy a directory into itself, '${from}' -> '${to}'`);
+      throw fsError2("EINVAL", `cannot copy a directory into itself, '${from}' -> '${to}'`);
     }
     this.suspend++;
     try {
@@ -7729,7 +8719,7 @@ function norm3(p) {
 var segs = (p) => norm3(p).split("/").filter(Boolean);
 var baseName = (p) => segs(p).slice(-1)[0] || "";
 var dirName = (p) => "/" + segs(p).slice(0, -1).join("/");
-function fsError2(code, msg) {
+function fsError3(code, msg) {
   const e = new Error(`${code}: ${msg}`);
   e.code = code;
   return e;
@@ -7778,7 +8768,7 @@ function localFolderSupported() {
 }
 async function pickDirectory() {
   const picker = globalThis.showDirectoryPicker;
-  if (!picker) throw fsError2("ENOTSUP", "directory picker not supported");
+  if (!picker) throw fsError3("ENOTSUP", "directory picker not supported");
   return picker({ mode: "readwrite" });
 }
 var LocalFolderDrive = class {
@@ -7796,7 +8786,7 @@ var LocalFolderDrive = class {
     if (!this.root) this.root = await loadHandle(this.id);
     if (!this.root) {
       this.state = "disconnected";
-      throw fsError2("ENOENT", "no folder handle; pick a folder");
+      throw fsError3("ENOENT", "no folder handle; pick a folder");
     }
     const perm = await this.ensurePermission(true);
     this.state = perm === "granted" ? "ready" : "disconnected";
@@ -7810,7 +8800,7 @@ var LocalFolderDrive = class {
     return p;
   }
   async dirHandle(path, create = false) {
-    if (!this.root) throw fsError2("ENOENT", "folder not attached");
+    if (!this.root) throw fsError3("ENOENT", "folder not attached");
     let cur = this.root;
     for (const seg of segs(path)) cur = await cur.getDirectoryHandle(seg, { create });
     return cur;
@@ -7906,7 +8896,7 @@ var LocalFolderDrive = class {
       return;
     }
     const a = norm3(from), b = norm3(to);
-    if (b === a || b.startsWith(a + "/")) throw fsError2("EINVAL", `cannot copy a directory into itself, '${from}' -> '${to}'`);
+    if (b === a || b.startsWith(a + "/")) throw fsError3("EINVAL", `cannot copy a directory into itself, '${from}' -> '${to}'`);
     await this.mkdir(to, { recursive: true });
     for (const e of await this.list(from)) await this.copy(`${from}/${e.name}`, `${to}/${e.name}`);
   }
@@ -7930,7 +8920,7 @@ function norm4(p) {
   }
   return "/" + parts.join("/");
 }
-function fsError3(code, msg) {
+function fsError4(code, msg) {
   const e = new Error(`${code}: ${msg}`);
   e.code = code;
   return e;
@@ -7976,10 +8966,10 @@ var CloudDrive = class {
     const res = await this._fetch(this.url(op, q), init2);
     if (res.status === 401) {
       this.state = "disconnected";
-      throw fsError3("EAUTH", "cloud session expired; reconnect");
+      throw fsError4("EAUTH", "cloud session expired; reconnect");
     }
-    if (res.status === 404) throw fsError3("ENOENT", "not found");
-    if (!res.ok) throw fsError3("EIO", `cloud ${op} failed (${res.status})`);
+    if (res.status === 404) throw fsError4("ENOENT", "not found");
+    if (!res.ok) throw fsError4("EIO", `cloud ${op} failed (${res.status})`);
     return res.json();
   }
   async stat(path) {
@@ -8002,18 +8992,18 @@ var CloudDrive = class {
     const res = await this._fetch(this.url("read", { path: norm4(path) }));
     if (res.status === 401) {
       this.state = "disconnected";
-      throw fsError3("EAUTH", "cloud session expired; reconnect");
+      throw fsError4("EAUTH", "cloud session expired; reconnect");
     }
-    if (!res.ok) throw fsError3("EIO", `cloud read failed (${res.status})`);
+    if (!res.ok) throw fsError4("EIO", `cloud read failed (${res.status})`);
     return new Uint8Array(await res.arrayBuffer());
   }
   async writeFile(path, data) {
     const res = await this._fetch(this.url("write", { path: norm4(path) }), { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: new Blob([data]) });
     if (res.status === 401) {
       this.state = "disconnected";
-      throw fsError3("EAUTH", "cloud session expired; reconnect");
+      throw fsError4("EAUTH", "cloud session expired; reconnect");
     }
-    if (!res.ok) throw fsError3("EIO", `cloud write failed (${res.status})`);
+    if (!res.ok) throw fsError4("EIO", `cloud write failed (${res.status})`);
   }
   async mkdir(path) {
     await this.api("mkdir", { method: "POST" }, { path: norm4(path) });
@@ -8216,6 +9206,6 @@ function init() {
   return getDefaultFS().init();
 }
 
-export { CloudDrive, DriveManager, FSError, IndexedDbDrive, LocalFolderDrive, LocalStorageDrive, MemoryDrive, NodeReadable, NodeWritable, NodeReadable as ReadStream, SAB_OFFSETS, SIGNAL, SimpleEventEmitter, SyncEngine, TreeDrive, VFSFileSystem, VfsDrive, NodeWritable as WriteStream, acquireFsLock, constants, createError, createFS, createServiceWorkerBridge, dropHandle, getDefaultFS, init, loadFromOPFS, loadHandle, localFolderSupported, path_exports as path, pickDirectory, releaseFsLock, repairVFS, statusToError, unpackToOPFS };
+export { BigIntStats, CloudDrive, Dir, Dirent, DriveManager, FSError, IndexedDbDrive, LocalFolderDrive, LocalStorageDrive, MemoryDrive, NodeReadable, NodeWritable, NodeReadable as ReadStream, SAB_OFFSETS, SIGNAL, SimpleEventEmitter, Stats, SyncEngine, TreeDrive, VFSFileSystem, VfsDrive, NodeWritable as WriteStream, acquireFsLock, constants, createError, createFS, createServiceWorkerBridge, dropHandle, getDefaultFS, init, loadFromOPFS, loadHandle, localFolderSupported, path_exports as path, pickDirectory, releaseFsLock, repairVFS, statusToError, unpackToOPFS };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map

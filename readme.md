@@ -82,6 +82,28 @@ const defaultFs = getDefaultFS();
 await init(); // initializes the default singleton
 ```
 
+### Runnable examples
+
+[`examples/`](examples/) has four starting points you can run against this repo with no install:
+
+```bash
+npm run build
+npm run example            # 01-quickstart at http://localhost:5173
+npm run example 02-files-and-streams
+```
+
+| Example | What it shows |
+|---|---|
+| [01-quickstart](examples/01-quickstart/) | Mounting a volume; the sync and promises APIs side by side |
+| [02-files-and-streams](examples/02-files-and-streams/) | Descriptors, `FileHandle`, read/write streams, `readLines`, `cp -r`, `glob` |
+| [03-worker-hosted](examples/03-worker-hosted/) | The instance inside a worker, so the sync API works in every tab — Safari included |
+| [04-vite](examples/04-vite/) | The same as a real project: `npm install`, bare imports, bundler config |
+
+The server they run on sets the [COOP/COEP headers](#coopcoep-headers) the sync API needs; see
+[examples/README.md](examples/README.md) for what that means for your own host. Each example is
+loaded in a real browser by [examples.spec.ts](tests/benchmark/examples.spec.ts), so a broken one
+fails the suite rather than the reader.
+
 ## Configuration
 
 ```typescript
@@ -166,8 +188,112 @@ fs.statSync('/pub.txt').mode & 0o777;      // 0o644
 ```
 
 Permission bits are stored and reported, but only *enforced* by `access()` when you opt in with
-`strictPermissions: true`. One limitation remains: `opfs` fallback mode stores no permission
-metadata at all, so entries there always read back as the synthetic 0755/0644.
+`strictPermissions: true`.
+
+### File descriptors in place of a path
+
+`readFile`, `writeFile` and `appendFile` accept an open descriptor where a path goes, as in Node.
+The semantics are **not** the path semantics, and the differences are easy to trip over:
+
+```js
+const fd = fs.openSync('/log.txt', 'r+');   // contents: 'AAA'
+
+fs.appendFileSync(fd, 'B');                 // 'BAA' — writes at the cursor, does NOT append
+fs.closeSync(fd);                           // the descriptor is yours to close
+```
+
+- Every operation starts at the descriptor's **current position** and advances it. Calling
+  `readFileSync(fd)` twice returns the contents, then `''`.
+- `writeFile(fd, …)` **does not truncate** — writing `'ab'` over `'XXXXXXXXXX'` leaves
+  `'abXXXXXXXX'`.
+- `appendFile(fd, …)` **does not seek to end-of-file**. It is `writeFile`; the appending comes
+  from having opened with `'a'` (O_APPEND), as the example above shows.
+- The descriptor is **left open**, and `flag`/`mode` are ignored since the file is already open.
+
+The raw-number form is available on the sync and callback APIs. `fs.promises` takes a
+`FileHandle` instead — `fsPromises.readFile(fd)` is an `ERR_INVALID_ARG_TYPE` in Node and here:
+
+```js
+const handle = await fs.promises.open('/log.txt', 'r');
+await fs.promises.readFile(handle);         // ok
+```
+
+### Result objects
+
+`stat`, `readdir({ withFileTypes: true })` and `opendir` return real classes, so node's
+`instanceof` type-tests work and the objects serialise the way node's do:
+
+```js
+fs.statSync('/f') instanceof fs.Stats           // true
+entry instanceof fs.Dirent                       // true
+fs.opendirSync('/d') instanceof fs.Dir           // true
+
+Object.keys(fs.statSync('/f'))   // node's own-property list, in node's order
+JSON.stringify(fs.statSync('/f'))// same fields node emits
+```
+
+`Stats`, `BigIntStats`, `Dirent` and `Dir` are also exported from the package for direct import.
+The type predicates live on the prototype and read `mode & S_IFMT` as node's do, and
+`atime`/`mtime`/`ctime`/`birthtime` are built lazily on first access — a `stat` no longer
+allocates seven closures and four `Date`s it may never use, which makes building one
+**5.4× faster** ([stats-alloc.bench.ts](src/tests/stats-alloc.bench.ts)).
+
+Two intentional differences from current node, both for backward compatibility:
+`Dirent.path` is kept as a getter aliasing `parentPath` (node deprecated it and removed it in
+v24), and `Stats.atimeNs`/`mtimeNs`/`ctimeNs`/`birthtimeNs` remain readable as getters (node has
+them on bigint stats only). Neither appears in `Object.keys` or `JSON.stringify`.
+
+`Dir` supports the full node API including `readSync()` and `closeSync()`, and `opendir`
+honours `recursive`.
+
+### Argument validation timing
+
+Node's three APIs report a bad path at three different moments, and code depends on the
+difference. All three are reproduced:
+
+```js
+fs.statSync({})                  // throws
+fs.stat({}, cb)                  // throws at the call site — cb is never called
+fs.promises.stat({}).catch(e => …) // rejects; nothing is thrown
+```
+
+Errors carry Node's codes (`ERR_INVALID_ARG_TYPE`, `ERR_OUT_OF_RANGE`, …), so callers can branch
+on `err.code` rather than matching message text. `realpath` is Node's one exception — it
+stringifies its argument instead of type-checking it, so `realpathSync({ toString: () => '/tmp' })`
+resolves and a non-path value gives `ENOENT`; that looseness is reproduced too.
+
+### Known divergences from Node
+
+All deliberate:
+
+- **An invalid descriptor passed to `fs.readFile(fd, cb)` reaches the callback.** Node defers the
+  check and then throws it *uncaught* from a later tick (inside `readFileAfterOpen`), taking the
+  process down instead of calling back — `fs.readFile(-1, cb)` is an unhandled `ERR_OUT_OF_RANGE`
+  crash. We report it to the callback, which is where the caller can act on it.
+- **`watch` reports a new file as `change`, not `rename`.** Node emits `rename` when an entry
+  appears or disappears; a file created by `writeFile` surfaces here as `change` (deletes do
+  report `rename`). Telling the two apart would need a per-write existence check on the hot path,
+  and Node's own event types are platform-dependent enough that its docs call them "not always
+  accurate" — so this is left as-is.
+- **`cp` with symlinks does not chase Node's behaviour**, deliberately: `node:fs` (v24) *aborts
+  the process* on two of these — copying onto an existing dangling link, and copying a tree
+  containing a cyclic link — with uncaught C++ exceptions rather than throwable errors. We copy
+  links as links and always terminate. Ordinary copies match Node exactly, permissions included.
+- **Hard links are copies.** `link()` duplicates the file rather than adding a second name for
+  one inode, and reports `nlink: 2` on both. Writing through one name does **not** change the
+  other — the defining property of a real hard link. The on-disk format stores exactly one path
+  per inode (`INODE.PATH_OFFSET`/`PATH_LENGTH`), so sharing would need a directory-entry table
+  and a format migration; that is not something to change underneath existing volumes. Symlinks
+  are real and behave correctly.
+- **No `ENAMETOOLONG`.** Real filesystems cap a path component at 255 bytes; we accept longer
+  names. Enforcing the limit would reject names existing volumes may already contain, so the
+  cap is left off.
+- **`opfs` fallback mode stores no permission metadata**, so entries there always read back as
+  the synthetic 0755/0644. Inherent to OPFS, which has no permission model; the default hybrid
+  mode persists real modes.
+
+Errno spellings that are platform-dependent in Node itself (`unlink` on a directory is `EISDIR`
+on Linux, `EPERM` on macOS) follow the Linux spelling.
 
 ### Filesystem Modes
 
@@ -192,9 +318,18 @@ const fastFs = new VFSFileSystem({ mode: 'vfs' });
 const safeFs = new VFSFileSystem({ mode: 'opfs' });
 ```
 
+> **In `opfs` mode, the sync API works everywhere except a WebKit page main thread.** Every
+> operation in this mode is async underneath, and `Atomics.wait` is illegal on a page's main
+> thread, so a sync call there busy-spins — which on WebKit starves the relay worker and the
+> response never arrives. It now fails with a clear error after 10 s instead of hanging the tab.
+> Two workarounds, both verified on all three engines: use `fs.promises.*`, or host the instance
+> **inside a Worker**, where `Atomics.wait` is legal and the sync API works normally. This matters
+> beyond the explicit option — `opfs` is also the automatic fallback when VFS corruption is
+> detected. Tracked by [opfs-mode-sync.spec.ts](tests/benchmark/opfs-mode-sync.spec.ts).
+
 **Hybrid mode** mirrors all VFS mutations to real OPFS files in the background:
 
-- **VFS → OPFS**: Every write, delete, mkdir, rename is replicated *after* the sync operation responds, so it never adds latency to an individual call. Bursts to the same path are coalesced.
+- **VFS → OPFS**: Every write, delete, mkdir, rename is replicated *after* the sync operation responds, so it adds nothing to the latency of an individual call. It does cost **sustained throughput**, because the mirroring runs on the same relay worker the next request needs: measured against real OPFS, creating files runs at ~1200/s in `vfs` mode and ~750/s in `hybrid`. Bursts to the same path are coalesced into one flush.
 - **OPFS → VFS**: A `FileSystemObserver` watches for external changes and syncs them back (Chrome 129+).
 
 This lets external tools (browser DevTools, OPFS extensions) see and modify files while VFS handles all the fast read/write operations internally.
@@ -426,6 +561,40 @@ Versus LightningFS (IndexedDB-based), in Chrome with `crossOriginIsolated` enabl
 
 **Reading these honestly:** numbers vary by browser and warm/cold state — measure your own workload. In-memory libraries like `memfs` will beat this on raw ops (no persistence to do), so the fair comparison is against other *persistent* browser filesystems. Writes are the work; reads are essentially free. On Safari, writes cost more because of slower OPFS sync-access handles (see [mode selection](#choosing-a-mode-performance)).
 
+### Versus `opfs-worker`
+
+LightningFS stores in IndexedDB and `memfs` never persists, so neither really tests the design —
+they test the storage medium. [`opfs-worker`](https://www.npmjs.com/package/opfs-worker) is the
+like-for-like case: a Node-style `fs` API over OPFS, doing its work in a worker. Per-operation
+cost in Chromium against real OPFS, from
+[opfs-worker.spec.ts](tests/benchmark/opfs-worker.spec.ts):
+
+| Operation | opfs-worker | ours (`hybrid`, default) | ours (`vfs`) |
+|---|---|---|---|
+| create 1KB | 1.81 ms | **1.06 ms** (1.7×) | **0.71 ms** (2.6×) |
+| overwrite | 1.62 ms | **0.42 ms** (3.8×) | **0.26 ms** (6.2×) |
+| read | 1.27 ms | **0.12 ms** (11×) | **0.10 ms** (12×) |
+| stat | 0.38 ms | **0.03 ms** (12×) | **0.03 ms** (12×) |
+| readdir | 2.43 ms | **0.09 ms** (26×) | **0.09 ms** (26×) |
+| rename | 7.10 ms | **0.90 ms** (7.9×) | **0.38 ms** (19×) |
+| unlink | 1.65 ms | **0.70 ms** (2.4×) | **0.49 ms** (3.4×) |
+| append | 1.79 ms | **0.31 ms** (5.7×) | **0.26 ms** (6.9×) |
+
+`opfs-worker` has no synchronous API, so this compares its facade against **`fs.promises`**, not
+against `fs.*Sync` — comparing our sync path to their async one would be measuring a capability
+gap, not speed. Both of our storage modes are shown because `hybrid` is the default and it
+additionally mirrors every mutation to real OPFS files, which is the honest number for an
+out-of-the-box install.
+
+Two rows are architecture rather than tighter code, and are worth discounting: `rename` is a
+copy-and-delete for anything working directly on OPFS files, because OPFS has no rename
+primitive; and `readdir`/`stat` never touch storage here at all, because the VFS keeps its
+directory index in shared memory.
+
+```bash
+npx playwright test opfs-worker --project=chromium
+```
+
 Run the suite yourself:
 
 ```bash
@@ -437,10 +606,10 @@ npm run benchmark:open
 ### Sync API (requires crossOriginIsolated)
 
 ```typescript
-// Read/Write
-fs.readFileSync(path, options?): Uint8Array | string
-fs.writeFileSync(path, data, options?): void
-fs.appendFileSync(path, data, options?): void   // { encoding?, mode?, flag?, flush? } | encoding
+// Read/Write — `path` may also be a file descriptor (see below)
+fs.readFileSync(path | fd, options?): Uint8Array | string
+fs.writeFileSync(path | fd, data, options?): void
+fs.appendFileSync(path | fd, data, options?): void   // { encoding?, mode?, flag?, flush? } | encoding
 
 // Directories
 fs.mkdirSync(path, options?): string | undefined   // options: { recursive?, mode? } | mode
@@ -486,10 +655,10 @@ fs.flushSync(): void
 ### Async API (always available)
 
 ```typescript
-// Read/Write
-fs.promises.readFile(path, options?): Promise<Uint8Array | string>
-fs.promises.writeFile(path, data, options?): Promise<void>
-fs.promises.appendFile(path, data, options?): Promise<void>
+// Read/Write — `path` may also be a FileHandle (not a raw descriptor; see below)
+fs.promises.readFile(path | handle, options?): Promise<Uint8Array | string>
+fs.promises.writeFile(path | handle, data, options?): Promise<void>
+fs.promises.appendFile(path | handle, data, options?): Promise<void>
 
 // Directories
 fs.promises.mkdir(path, options?): Promise<string | undefined>  // { recursive?, mode? } | mode
@@ -520,7 +689,7 @@ fs.promises.utimes(path, atime, mtime): Promise<void>
 
 // Advanced
 fs.promises.open(path, flags?, mode?): Promise<FileHandle>
-fs.promises.opendir(path): Promise<Dir>
+fs.promises.opendir(path, options?): Promise<Dir>   // { recursive?, encoding?, bufferSize? }
 fs.promises.mkdtemp(prefix): Promise<string>
 
 // Flush
@@ -529,23 +698,45 @@ fs.promises.flush(): Promise<void>
 
 ### Streams API
 
+`createReadStream` returns a Node-style readable — `.on('data')`, `.pipe()`, and `for await`,
+which works because the stream implements `Symbol.asyncIterator` as node's does:
+
 ```typescript
-// Readable stream (Web Streams API)
 const stream = fs.createReadStream('/large-file.bin', {
-  start: 0,           // byte offset to start
-  end: 1024,          // byte offset to stop
+  start: 0,                 // byte offset to start
+  end: 1024,                // byte offset to stop (inclusive, as in node)
   highWaterMark: 64 * 1024, // chunk size (default: 64KB)
 });
 for await (const chunk of stream) {
   console.log('Read chunk:', chunk.length, 'bytes');
 }
 
-// Writable stream
+// Writable — a node Writable, not a WHATWG WritableStream
 const writable = fs.createWriteStream('/output.bin');
-const writer = writable.getWriter();
-await writer.write(new Uint8Array([1, 2, 3]));
-await writer.close();
+writable.write(new Uint8Array([1, 2, 3]));
+writable.end();
+await new Promise((resolve) => writable.on('finish', resolve));
 ```
+
+Both accept an `fd` in the options, in which case the descriptor stays the caller's to close.
+
+### FileHandle
+
+`fs.promises.open()` returns a `FileHandle` with node's full API, including its stream methods:
+
+```typescript
+const handle = await fs.promises.open('/data.log', 'r');
+
+for await (const line of handle.readLines()) { … }   // lines, CRLF-aware
+handle.createReadStream(options?)                     // node Readable
+handle.createWriteStream(options?)                    // node Writable
+handle.readableWebStream()                            // WHATWG ReadableStream
+
+handle.on('close', () => { … });                      // it is an EventEmitter
+```
+
+A stream created from a handle **owns** it: node closes the handle when the stream finishes, so
+using it afterwards is `EBADF`. Pass `autoClose: false` to keep it open.
 
 ### Instance Methods
 
@@ -968,6 +1159,29 @@ All of these are **gated behind a UA check (`IS_WEBKIT`) and run only on WebKit.
 
 **Mode and write cost:** the OPFS **mirror** (`mode: 'hybrid'`, the default) writes every change to real OPFS files for interop; it's the main *write*-cost knob (reads are unaffected). If nothing reads the real OPFS files directly, `mode: 'vfs'` skips the mirror for the fastest writes. See [Filesystem Modes](#filesystem-modes).
 
+### What operations cost, and why
+
+`vfs` mode, measured against real OPFS ([profile-hotpath.spec.ts](tests/benchmark/profile-hotpath.spec.ts)):
+
+| operation | Chromium | Firefox | WebKit |
+|---|---|---|---|
+| create 256 B | 1209/s | 1355/s | **12433/s** |
+| create 8 KB | 1189/s | 1577/s | **12658/s** |
+| overwrite 8 KB | 3365/s | 5068/s | **17241/s** |
+| read 8 KB | 9675/s | 17135/s | 20096/s |
+| unlink | 2334/s | 2526/s | **16543/s** |
+| stat | **87k/s** | 44k/s | 27k/s |
+| exists | **121k/s** | 48k/s | 24k/s |
+| readdir (~800 entries) | **3284/s** | 2644/s | 2353/s |
+
+**The bottleneck is a different thing in each browser**, which is the single most useful thing to know here:
+
+- **Chromium is storage-bound.** A raw `FileSystemSyncAccessHandle.write` costs **0.22 ms there regardless of size** — 64 bytes and 8 KB are the same price ([opfs-floor.spec.ts](tests/benchmark/opfs-floor.spec.ts)). So cost tracks the *number* of writes an operation makes, not its bytes: a create needs five — path-table entry, file data, inode, free-block bitmap, superblock, each in a different region so none can be combined — while an overwrite that fits its existing blocks needs two. That is exactly the ~2.5× between them, and it means there is no overhead left in this library to remove on Chromium.
+- **WebKit is the opposite.** Its sync-handle writes cost **0.004 ms**, ~50× cheaper, so it creates files ~10× faster than Chromium — but its metadata operations are 3–5× *slower*, because those are pure `SharedArrayBuffer` round-trips and WebKit's relay needs the extra spin/yield handling described above. On Safari, per-operation overhead matters and write volume barely does.
+- **Firefox sits between the two**, and is the only engine where `flush()` is not free (0.21 ms, against 0.002 ms on Chromium).
+
+Practical consequences: overwriting beats creating everywhere, but *how much* depends on the engine. Metadata reads never touch storage, so `stat`/`exists` are cheap in absolute terms on every engine. Batching many small files into fewer larger ones is the biggest lever on Chromium and roughly irrelevant on Safari. And a benchmark run against an in-memory handle will overstate wins that Chromium's storage cost hides — measure in the browser you care about.
+
 ## Troubleshooting
 
 ### "SharedArrayBuffer is not defined"
@@ -993,6 +1207,77 @@ Make sure `opfsSync` is enabled (it's `true` by default). Files are mirrored to 
 ## Changelog
 
 See [CHANGELOG.md](./CHANGELOG.md) for the full version history.
+
+## Testing
+
+```bash
+npm test                 # unit + parity suites (Node, no browser needed)
+npx vitest bench ops     # full-stack op microbenchmarks
+npx vitest bench engine  # engine-only microbenchmarks
+npm run benchmark        # Playwright benchmark against real OPFS in Chromium
+
+# Correctness in real browsers — real OPFS, real workers, real SAB relay
+npx playwright test regression-fixes instance-parity watch cross-browser sab-chunking \
+  --project=chromium --project=firefox --project=webkit
+
+# Targeted browser benchmark against real OPFS (not an in-memory handle)
+npx playwright test append-readdir --project=chromium
+```
+
+[regression-fixes.spec.ts](tests/benchmark/regression-fixes.spec.ts) re-checks every bug fixed in
+3.3.6–3.3.9 through the shipped stack in Chromium, Firefox and WebKit — the Node suites prove the
+layouts agree, only a browser proves the SharedArrayBuffer relay and real OPFS agree with them.
+
+[instance-parity.spec.ts](tests/benchmark/instance-parity.spec.ts) extends differential testing to
+features that need a live filesystem instance — `cp`, `opendir`, the streams. The test body runs
+in Node and drives `node:fs` on a temp directory; `page.evaluate` drives the library in a browser
+against real OPFS; the two results are compared. That gives instance-level features the same
+no-room-for-a-wrong-expectation coverage the method layer has.
+
+[fuzz-stream-parity.test.ts](src/tests/fuzz-stream-parity.test.ts) covers the stream layer, where
+the interesting failures are about ordering rather than any single call's result.
+
+[fuzz-async-parity.test.ts](src/tests/fuzz-async-parity.test.ts) fuzzes the promise API, which is
+not the same code underneath — it hands the request to a relay that re-shapes it there, and that
+second step is where a wire-format bug once lived.
+
+[fuzz-fd-parity.test.ts](src/tests/fuzz-fd-parity.test.ts) does the same for file descriptors,
+which are stateful — an fd carries a position and flags that every read and write mutates, so
+behaviour depends on the sequence. It compares the file's whole contents after every step, and
+found that fd access modes were not enforced at all.
+
+[fuzz-parity.test.ts](src/tests/fuzz-parity.test.ts) goes further than any hand-written case: it
+runs a random sequence of operations against both filesystems with identical arguments, compares
+every outcome, then compares the whole resulting tree — path, type, size, contents and permission
+bits. Seeds are fixed so a failure reproduces exactly. It found four real divergences on its first
+run, including a `cp` that never terminated.
+
+[overload-audit.test.ts](src/tests/overload-audit.test.ts) exercises all 41 documented argument
+forms of the ~20 methods whose signature puts an optional argument *in the middle*
+(`fs.readFile(path[, options], cb)`), asserting each one both invokes the callback and keeps the
+options. Getting that wrong yields a method that returns normally, reports no error, and never
+calls back — which had happened four times.
+
+[api-surface.test.ts](src/tests/api-surface.test.ts) enumerates `node:fs` and `node:fs/promises`
+at runtime and asserts every function they expose exists here too, so a missing method is a test
+failure rather than a runtime surprise in someone's app.
+
+Every suite drives product code. That was not always true: five files re-implemented the logic
+they were checking and asserted against the copy, so they passed while the real thing was broken
+— `truncate-large.test.ts` verified float64 round-tripping with its own helpers while the shipped
+worker read the field as a uint32 and zeroed every truncated file. They now borrow the real
+methods off `VFSFileSystem.prototype` (the constructor needs workers, `Object.create` does not)
+or run the real encoders through the real decoder. Re-introducing that truncate bug now fails 17
+tests; before, it failed none.
+
+Most other suites assert behaviour someone believed Node has. [node-parity.test.ts](src/tests/node-parity.test.ts)
+does something stronger: it runs each operation twice — once through the full library stack
+(method layer → wire encoding → dispatch → `VFSEngine`, via an in-memory handle) and once
+through real `node:fs` on a temp directory — and compares contents, entry lists, sizes,
+permission bits and error `code`s. A divergence is a compatibility bug by construction, with no
+room for a wrong expectation. Timestamps and inode numbers are excluded, and the handful of
+genuinely platform-dependent errnos (`unlink` on a directory is `EISDIR` on Linux, `EPERM` on
+macOS) assert only that both sides refuse.
 
 ## Contributing
 

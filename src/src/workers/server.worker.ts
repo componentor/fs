@@ -16,20 +16,9 @@
 
 import { VFSEngine } from '../vfs/engine.js';
 import { decodeRequest, decodeSecondPath, encodeResponse, OP } from '../protocol/opcodes.js';
+import { dispatchOp } from '../protocol/dispatch.js';
 
 const engine = new VFSEngine();
-
-/**
- * Read a 4-byte LE mode from a request payload.
- *
- * chmod, mkdir and friends all carry their mode this way. `fallback` covers a client that sent no
- * payload — the wire format is additive, so a build predating mode-carrying mkdir must keep
- * behaving exactly as it did rather than creating 0000 directories.
- */
-function decodeMode(data: Uint8Array | null | undefined, fallback: number): number {
-  if (!data || data.byteLength < 4) return fallback;
-  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
-}
 
 // Map of tabId → received port (from client workers via Service Worker)
 const ports = new Map<string, MessagePort>();
@@ -60,245 +49,43 @@ let config: {
 function handleRequest(tabId: string, buffer: ArrayBuffer): ArrayBuffer {
   const { op, flags, path, data } = decodeRequest(buffer);
 
-  let result: { status: number; data?: Uint8Array | null };
+  // One shared decoder for every payload layout — see dispatch.ts. This used to be a private
+  // copy of that switch, and the copies drifted: TRUNCATE/FTRUNCATE lengths were read as uint32
+  // where the client writes float64, so every non-zero truncate emptied the file.
+  const result = dispatchOp(engine, tabId, op, flags, path, data);
 
-  switch (op) {
-    case OP.READ:
-      result = engine.read(path);
-      break;
-
-    case OP.WRITE:
-      result = engine.write(path, data ?? new Uint8Array(0), flags);
-      notifyOPFSSync('write', path, data);
-      break;
-
-    case OP.APPEND:
-      result = engine.append(path, data ?? new Uint8Array(0));
-      notifyOPFSSync('write', path, data);
-      break;
-
-    case OP.UNLINK:
-      result = engine.unlink(path);
-      notifyOPFSSync('delete', path);
-      break;
-
-    case OP.STAT:
-      result = engine.stat(path);
-      break;
-
-    case OP.LSTAT:
-      result = engine.lstat(path);
-      break;
-
-    case OP.MKDIR:
-      // The requested mode rides along as a 4-byte LE payload. Older clients send no payload at
-      // all, so fall back to mkdir's Node default of 0o777 (umask-reduced by the engine).
-      result = engine.mkdir(path, flags, decodeMode(data, 0o777));
-      notifyOPFSSync('mkdir', path);
-      break;
-
-    case OP.RMDIR:
-      result = engine.rmdir(path, flags);
-      notifyOPFSSync('delete', path);
-      break;
-
-    case OP.READDIR:
-      result = engine.readdir(path, flags);
-      break;
-
-    case OP.RENAME: {
-      const newPath = data ? decodeSecondPath(data) : '';
-      result = engine.rename(path, newPath);
-      notifyOPFSSync('rename', path, undefined, newPath);
-      break;
-    }
-
-    case OP.EXISTS:
-      result = engine.exists(path);
-      break;
-
-    case OP.TRUNCATE: {
-      const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = engine.truncate(path, len);
-      break;
-    }
-
-    case OP.COPY: {
-      const destPath = data ? decodeSecondPath(data) : '';
-      result = engine.copy(path, destPath, flags);
-      break;
-    }
-
-    case OP.ACCESS:
-      result = engine.access(path, flags);
-      break;
-
-    case OP.REALPATH:
-      result = engine.realpath(path);
-      break;
-
-    case OP.CHMOD: {
-      const mode = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = engine.chmod(path, mode);
-      break;
-    }
-
-    case OP.CHOWN: {
-      if (!data || data.byteLength < 8) {
-        result = { status: 7 }; // EINVAL
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const uid = dv.getUint32(0, true);
-      const gid = dv.getUint32(4, true);
-      result = engine.chown(path, uid, gid);
-      break;
-    }
-
-    case OP.UTIMES: {
-      if (!data || data.byteLength < 16) {
-        result = { status: 7 }; // EINVAL
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const atime = dv.getFloat64(0, true);
-      const mtime = dv.getFloat64(8, true);
-      result = engine.utimes(path, atime, mtime);
-      break;
-    }
-
-    case OP.SYMLINK: {
-      const target = data ? new TextDecoder().decode(data) : '';
-      result = engine.symlink(target, path);
-      break;
-    }
-
-    case OP.READLINK:
-      result = engine.readlink(path);
-      break;
-
-    case OP.LINK: {
-      const newPath = data ? decodeSecondPath(data) : '';
-      result = engine.link(path, newPath);
-      break;
-    }
-
-    case OP.OPEN: {
-      // O_CREAT's mode rides as a 4-byte LE payload; older clients send none, so fall back to
-      // open's Node default of 0o666 (umask-reduced by the engine, and only used on create).
-      result = engine.open(path, flags, tabId, decodeMode(data, 0o666));
-      break;
-    }
-
-    case OP.CLOSE: {
-      const fd = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = engine.close(fd);
-      break;
-    }
-
-    case OP.FREAD: {
-      if (!data || data.byteLength < 16) {
-        result = { status: 7 }; // EINVAL
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const length = dv.getUint32(4, true);
-      const pos = dv.getFloat64(8, true);
-      result = engine.fread(fd, length, pos === -1 ? null : pos);
-      break;
-    }
-
-    case OP.FWRITE: {
-      if (!data || data.byteLength < 12) {
-        result = { status: 7 }; // EINVAL
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const pos = dv.getFloat64(4, true);
-      const writeData = data.subarray(12);
-      result = engine.fwrite(fd, writeData, pos === -1 ? null : pos);
-      break;
-    }
-
-    case OP.FSTAT: {
-      const fd = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = engine.fstat(fd);
-      break;
-    }
-
-    case OP.FTRUNCATE: {
-      if (!data || data.byteLength < 8) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const len = dv.getUint32(4, true);
-      result = engine.ftruncate(fd, len);
-      break;
-    }
-
-    case OP.FSYNC:
-      result = engine.fsync();
-      break;
-
-    case OP.OPENDIR:
-      result = engine.opendir(path, tabId);
-      break;
-
-    case OP.MKDTEMP:
-      result = engine.mkdtemp(path);
-      break;
-
-    case OP.FCHMOD: {
-      // Payload: [fd: u32][mode: u32]
-      if (!data || data.byteLength < 8) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const mode = dv.getUint32(4, true);
-      result = engine.fchmod(fd, mode);
-      break;
-    }
-
-    case OP.FCHOWN: {
-      // Payload: [fd: u32][uid: u32][gid: u32]
-      if (!data || data.byteLength < 12) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const uid = dv.getUint32(4, true);
-      const gid = dv.getUint32(8, true);
-      result = engine.fchown(fd, uid, gid);
-      break;
-    }
-
-    case OP.FUTIMES: {
-      // Payload: [fd: u32][pad: u32][atime: f64][mtime: f64]
-      if (!data || data.byteLength < 24) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const atime = dv.getFloat64(8, true);
-      const mtime = dv.getFloat64(16, true);
-      result = engine.futimes(fd, atime, mtime);
-      break;
-    }
-
-    default:
-      result = { status: 7 }; // EINVAL — unknown op
-  }
+  if (result.status === 0) notifyMirror(op, path, data);
 
   const responseData = result.data instanceof Uint8Array ? result.data : undefined;
   return encodeResponse(result.status, responseData);
+}
+
+/**
+ * Forward a successful mutation to the OPFS mirror.
+ *
+ * Only ops that change the tree or a file's bytes are forwarded; reads and metadata queries are
+ * skipped. Previously these calls were interleaved with the dispatch switch and fired even when
+ * the op had failed — a rejected mkdir still told the mirror to create the directory.
+ */
+function notifyMirror(op: number, path: string, data: Uint8Array | null): void {
+  if (!opfsSyncPort) return;
+
+  switch (op) {
+    case OP.WRITE:
+    case OP.APPEND:
+      notifyOPFSSync('write', path, data);
+      break;
+    case OP.UNLINK:
+    case OP.RMDIR:
+      notifyOPFSSync('delete', path);
+      break;
+    case OP.MKDIR:
+      notifyOPFSSync('mkdir', path);
+      break;
+    case OP.RENAME:
+      notifyOPFSSync('rename', path, undefined, data ? decodeSecondPath(data) : '');
+      break;
+  }
 }
 
 /** Notify OPFS sync worker of a VFS mutation */

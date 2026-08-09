@@ -81,6 +81,24 @@ export class VFSEngine {
   private fdTable = new Map<number, FdEntry>();
   private nextFd = 3; // 0=stdin, 1=stdout, 2=stderr reserved
 
+  /**
+   * Whether an fd's open flags permit reading / writing.
+   *
+   * The low two bits of the flags are the access mode (O_RDONLY=0, O_WRONLY=1, O_RDWR=2). These
+   * were not enforced: reading from a descriptor opened `'w'` returned 0 bytes instead of EBADF,
+   * and writing through one opened `'r'` succeeded. Both are errors in Node, and code that
+   * relies on the error to detect a mis-opened file saw silence instead. Found by the fd fuzzer.
+   */
+  private static isReadable(flags: number): boolean {
+    const mode = flags & 3;
+    return mode === 0 /* O_RDONLY */ || mode === 2 /* O_RDWR */;
+  }
+
+  private static isWritable(flags: number): boolean {
+    const mode = flags & 3;
+    return mode === 1 /* O_WRONLY */ || mode === 2 /* O_RDWR */;
+  }
+
   // Reusable buffers to avoid allocations
   private inodeBuf = new Uint8Array(INODE_SIZE);
   private inodeView = new DataView(this.inodeBuf.buffer);
@@ -136,6 +154,24 @@ export class VFSEngine {
   // scaffolding mutates pathIndex directly.
   private childIndex = new Map<string, Map<string, number>>();
   private childIndexGen = 0;
+
+  /** Where the next block search resumes — see allocateBlocks. Reset on mount/format. */
+  private allocCursor = 0;
+
+  /**
+   * Set when path resolution gave up because a symlink chain exceeded MAX_SYMLINK_DEPTH.
+   *
+   * The resolvers return `undefined` for both "not there" and "went in circles", which every
+   * caller then reported as ENOENT — so a symlink pointing at itself looked like a missing file
+   * instead of the ELOOP Node reports. Reset at the start of every top-level resolve and read
+   * immediately after, via `resolveFailureStatus`.
+   */
+  private symlinkLoopDetected = false;
+
+  /** ENOENT, or ELOOP when the last resolve gave up on a symlink cycle. */
+  private resolveFailureStatus(): number {
+    return this.symlinkLoopDetected ? CODE_TO_STATUS.ELOOP : CODE_TO_STATUS.ENOENT;
+  }
 
   // Configurable upper bounds
   private maxInodes = 4_000_000;
@@ -753,40 +789,68 @@ export class VFSEngine {
     }
   }
 
+  /**
+   * Find and reserve `count` contiguous free blocks.
+   *
+   * Next-fit: the search resumes where the last allocation ended and wraps once, rather than
+   * restarting at block 0 every time. Restarting meant each allocation first walked past every
+   * block already in use, so creating files into a filling volume cost O(allocated) each and
+   * O(n²) overall — measured at 8 µs per create on an empty volume rising to 16 µs by 16k files.
+   * With a cursor, sequential allocation is O(count).
+   *
+   * Wrapping preserves the old guarantee that the volume only grows when no contiguous run
+   * exists anywhere: the second pass covers everything below the cursor, extended by `count - 1`
+   * so a run straddling the cursor is still found.
+   */
   private allocateBlocks(count: number): number {
     if (count === 0) return 0;
 
-    const bitmap = this.bitmap!;
-    let run = 0;
-    let start = 0;
-
-    for (let i = 0; i < this.totalBlocks; i++) {
-      const byteIdx = i >>> 3;
-      const bitIdx = i & 7;
-      const used = (bitmap[byteIdx] >>> bitIdx) & 1;
-
-      if (used) {
-        run = 0;
-        start = i + 1;
-      } else {
-        run++;
-        if (run === count) {
-          // Mark blocks as used in memory
-          for (let j = start; j <= i; j++) {
-            const bj = j >>> 3;
-            const bi = j & 7;
-            bitmap[bj] |= (1 << bi);
-          }
-          this.markBitmapDirty(start >>> 3, i >>> 3);
-          this.freeBlocks -= count;
-          this.superblockDirty = true;
-          return start;
-        }
-      }
+    let start = this.scanForRun(this.allocCursor, this.totalBlocks, count);
+    if (start < 0 && this.allocCursor > 0) {
+      const wrapEnd = Math.min(this.allocCursor + count - 1, this.totalBlocks);
+      start = this.scanForRun(0, wrapEnd, count);
     }
 
-    // No contiguous space — grow data region
-    return this.growAndAllocate(count);
+    // No contiguous space anywhere — grow the data region.
+    if (start < 0) return this.growAndAllocate(count);
+
+    const end = start + count - 1;
+    const bitmap = this.bitmap!;
+    for (let j = start; j <= end; j++) bitmap[j >>> 3] |= (1 << (j & 7));
+    this.markBitmapDirty(start >>> 3, end >>> 3);
+    this.freeBlocks -= count;
+    this.superblockDirty = true;
+    // Resume here next time. Past the end is fine: the wrap pass covers the rest.
+    this.allocCursor = end + 1 >= this.totalBlocks ? 0 : end + 1;
+    return start;
+  }
+
+  /**
+   * First index in [from, to) starting a run of `count` free blocks, or -1.
+   *
+   * Fully-allocated bytes are skipped eight blocks at a time. That matters on a filling volume,
+   * where the overwhelming majority of the bitmap the scan crosses is solid 0xFF.
+   */
+  private scanForRun(from: number, to: number, count: number): number {
+    const bitmap = this.bitmap!;
+    let run = 0;
+    let start = from;
+
+    for (let i = from; i < to; i++) {
+      // Only safe to skip a whole byte when aligned and not partway through a run.
+      if (run === 0 && (i & 7) === 0 && bitmap[i >>> 3] === 0xff) {
+        i += 7;              // the loop's i++ steps past the last bit of the byte
+        start = i + 1;
+        continue;
+      }
+      if ((bitmap[i >>> 3] >>> (i & 7)) & 1) {
+        run = 0;
+        start = i + 1;
+      } else if (++run === count) {
+        return start;
+      }
+    }
+    return -1;
   }
 
   /** Highest block count the reserved on-disk bitmap region can represent.
@@ -955,7 +1019,11 @@ export class VFSEngine {
   // ========== Path resolution ==========
 
   private resolvePath(path: string, depth: number = 0): number | undefined {
-    if (depth > MAX_SYMLINK_DEPTH) return undefined; // ELOOP
+    if (depth === 0) this.symlinkLoopDetected = false;
+    if (depth > MAX_SYMLINK_DEPTH) {
+      this.symlinkLoopDetected = true;
+      return undefined;
+    }
 
     const idx = this.pathIndex.get(path);
     if (idx === undefined) {
@@ -987,7 +1055,11 @@ export class VFSEngine {
    * (where files actually exist in pathIndex), not under the symlink path.
    */
   private resolvePathFull(path: string, followLast: boolean = true, depth: number = 0): { idx: number; resolvedPath: string } | undefined {
-    if (depth > MAX_SYMLINK_DEPTH) return undefined; // ELOOP
+    if (depth === 0) this.symlinkLoopDetected = false;
+    if (depth > MAX_SYMLINK_DEPTH) {
+      this.symlinkLoopDetected = true;
+      return undefined;
+    }
 
     const parts = path.split('/').filter(Boolean);
     let current = '/';
@@ -1020,6 +1092,30 @@ export class VFSEngine {
     const finalIdx = this.pathIndex.get(current);
     if (finalIdx === undefined) return undefined;
     return { idx: finalIdx, resolvedPath: current };
+  }
+
+  /**
+   * Follow a symlink chain to the path a *create* should land on.
+   *
+   * `resolvePathFull` gives up when the final target does not exist, which is exactly the
+   * dangling-link case: `writeFileSync('/link', …)` where `/link` → `t3` and `t3` is absent.
+   * Callers then created a file at `/link` itself, destroying the symlink — Node follows the
+   * link and creates `/t3`, leaving the link intact.
+   *
+   * Returns `path` unchanged when it is not a symlink, so callers on the common path pay a
+   * single Map lookup, and `null` when the chain exceeds MAX_SYMLINK_DEPTH — a cycle, which
+   * callers must report as ELOOP rather than writing to wherever the walk happened to stop.
+   */
+  private resolveDanglingLink(path: string, depth: number = 0): string | null {
+    if (depth > MAX_SYMLINK_DEPTH) return null;
+    const idx = this.pathIndex.get(path);
+    if (idx === undefined) return path;
+    const inode = this.readInode(idx);
+    if (inode.type !== INODE_TYPE.SYMLINK) return path;
+
+    const target = decoder.decode(this.readData(inode.firstBlock, inode.blockCount, inode.size));
+    const resolved = target.startsWith('/') ? target : this.resolveRelative(path, target);
+    return this.resolveDanglingLink(resolved, depth + 1);
   }
 
   private resolveRelative(from: string, target: string): string {
@@ -1125,7 +1221,7 @@ export class VFSEngine {
 
     // Slow path: full component resolution (handles symlinks, uncached inodes)
     if (idx === undefined) idx = this.resolvePathComponents(path, true);
-    if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT, data: null };
+    if (idx === undefined) return { status: this.resolveFailureStatus(), data: null };
 
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR, data: null };
@@ -1153,7 +1249,22 @@ export class VFSEngine {
     if (parentStatus !== 0) return { status: parentStatus };
     const t2 = this.debug ? performance.now() : 0;
 
-    const existingIdx = this.resolvePathComponents(path, true);
+    let existingIdx = this.resolvePathComponents(path, true);
+
+    if (existingIdx === undefined) {
+      // Nothing resolved — but the path itself may be a symlink whose target does not exist yet.
+      // Node writes *through* the link and creates the target; creating at the literal path
+      // would destroy the link. Costs one Map lookup, and only on the create path.
+      const linkTarget = this.resolveDanglingLink(path);
+      if (linkTarget === null) return { status: CODE_TO_STATUS.ELOOP };
+      if (linkTarget !== path) {
+        path = linkTarget;
+        // The target can live in a different directory than the link.
+        const targetParentStatus = this.ensureParent(path);
+        if (targetParentStatus !== 0) return { status: targetParentStatus };
+        existingIdx = this.resolvePathComponents(path, true);
+      }
+    }
     const t3 = this.debug ? performance.now() : 0;
 
     let tAlloc = t3, tData = t3, tInode = t3;
@@ -1234,16 +1345,33 @@ export class VFSEngine {
     const inode = this.readInode(existingIdx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
 
-    // Avoid materializing the whole (existing + data) file in a single
-    // Uint8Array — that blew up with "Array buffer allocation failed" on
-    // large appends (e.g. appending a few MB to a multi-hundred-MB file).
-    //
-    // Strategy: allocate a new block run sized to the total, copy the
-    // existing contents over in bounded chunks, then write the caller's
-    // `data` at the end. Peak allocation stays at 4 MB regardless of
-    // file size.
     const combinedSize = inode.size + data.byteLength;
     const neededBlocks = Math.ceil(combinedSize / this.blockSize);
+
+    // Fast path: the block run already reserved for this file has room for the new bytes, so
+    // just write them at the end. Blocks are 4 KB, so most appends land here.
+    //
+    // Without this, every append relocated the WHOLE file — allocate a fresh run, copy every
+    // existing byte, free the old run — making a repeatedly-appended log O(size) per call and
+    // O(n²) overall: adding 64 bytes to a 10 MB log copied 10 MB. `fwrite` has always taken the
+    // in-place path (it only relocates when neededBlocks exceeds blockCount), so the fd-based
+    // append route was already fast; this brings the single-op APPEND route in line.
+    if (neededBlocks <= inode.blockCount) {
+      this.handle.write(data, { at: this.dataOffset + inode.firstBlock * this.blockSize + inode.size });
+      inode.size = combinedSize;
+      inode.mtime = Date.now();
+      this.writeInode(existingIdx, inode);
+      this.commitPending();
+      return { status: 0 };
+    }
+
+    // Growth path. Avoid materializing the whole (existing + data) file in a single Uint8Array —
+    // that blew up with "Array buffer allocation failed" on large appends (e.g. appending a few
+    // MB to a multi-hundred-MB file).
+    //
+    // Strategy: allocate a new block run sized to the total, copy the existing contents over in
+    // bounded chunks, then write the caller's `data` at the end. Peak allocation stays at 4 MB
+    // regardless of file size.
     const newFirst = this.allocateBlocks(neededBlocks);
     const newBase = this.dataOffset + newFirst * this.blockSize;
     if (inode.size > 0) {
@@ -1306,11 +1434,14 @@ export class VFSEngine {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
     if (idx === undefined) {
+      // Capture WHY resolution failed before isImplicitDirectory runs — it resolves too, and
+      // would reset the flag that distinguishes a symlink cycle (ELOOP) from a missing path.
+      const failure = this.resolveFailureStatus();
       // Check for implicit directory (exists because files exist under it)
       if (this.isImplicitDirectory(path)) {
         return this.encodeImplicitDirStatResponse(path);
       }
-      return { status: CODE_TO_STATUS.ENOENT, data: null };
+      return { status: failure, data: null };
     }
 
     return this.encodeStatResponse(idx);
@@ -1507,7 +1638,18 @@ export class VFSEngine {
       }
     }
 
-    // Remove the directory itself
+    // Remove the directory itself — except the volume root, which has no parent to be removed
+    // from. A real filesystem cannot unlink its own mount point either. Deleting it left the
+    // volume with no root at all: `stat('/')` and `readdir('/')` both answered ENOENT
+    // afterwards, and `rm('/', { recursive: true })` is the ordinary way to clear a volume, so
+    // that state was easy to reach. The children are gone either way, which is what the caller
+    // asked for.
+    if (path === '/') {
+      this.pathIndexGen++;
+      this.commitPending();
+      return { status: 0 };
+    }
+
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
     this.deletePathIndex(path);
@@ -1539,69 +1681,77 @@ export class VFSEngine {
     }
 
     const withFileTypes = (flags & 1) !== 0;
-    // Use getDirectChildrenWithImplicit to discover both real and implicit children
-    const children = this.getDirectChildrenWithImplicit(effectiveDirPath);
 
     if (withFileTypes) {
-      // Encode as: count(u32) + entries[name_len(u16) + name(bytes) + type(u8)]
-      let totalSize = 4;
-      const entries: { name: Uint8Array; type: number }[] = [];
+      // Encode as: count(u32) + entries[name_len(u16) + name(bytes) + type(u8)].
+      //
+      // Same shape as the names-only path below: work from the child index's names, sort those
+      // (same order as sorting full paths, since every child shares one prefix), and write UTF-8
+      // straight into an over-allocated buffer with encodeInto. Only the classification needs a
+      // full path, and it is built once per child for the pathIndex probe instead of being
+      // constructed, sorted, and then sliced back apart.
+      this.ensureChildIndex();
+      const typedNames = this.childIndex.get(effectiveDirPath);
+      if (!typedNames) return { status: 0, data: new Uint8Array([0, 0, 0, 0]) };
 
-      for (const child of children) {
-        const name = child.path.substring(child.path.lastIndexOf('/') + 1);
-        const nameBytes = encoder.encode(name);
-        let type: number;
-        if (child.type === 'implicit') {
-          type = INODE_TYPE.DIRECTORY;
-        } else {
-          const childIdx = this.pathIndex.get(child.path)!;
-          const childInode = this.readInode(childIdx);
-          type = childInode.type;
-        }
-        entries.push({ name: nameBytes, type });
-        totalSize += 2 + nameBytes.byteLength + 1; // nameLen + name + type
-      }
+      const names = [...typedNames.keys()].sort();
+      const prefix = effectiveDirPath === '/' ? '/' : effectiveDirPath + '/';
 
-      const buf = new Uint8Array(totalSize);
+      // 3 bytes per UTF-16 unit is an upper bound for UTF-8; +3 covers the length and type bytes.
+      let capacity = 4;
+      for (const name of names) capacity += 3 + name.length * 3;
+
+      const buf = new Uint8Array(capacity);
       const view = new DataView(buf.buffer);
-      view.setUint32(0, entries.length, true);
+      view.setUint32(0, names.length, true);
       let offset = 4;
 
-      for (const entry of entries) {
-        view.setUint16(offset, entry.name.byteLength, true);
-        offset += 2;
-        buf.set(entry.name, offset);
-        offset += entry.name.byteLength;
-        buf[offset++] = entry.type;
+      for (const name of names) {
+        const { written } = encoder.encodeInto(name, buf.subarray(offset + 2));
+        view.setUint16(offset, written, true);
+        offset += 2 + written;
+        // A child with no pathIndex entry is implicit — it exists only because descendants pass
+        // through it, so it is a directory.
+        const childIdx = this.pathIndex.get(prefix + name);
+        buf[offset++] = childIdx === undefined ? INODE_TYPE.DIRECTORY : this.readInode(childIdx).type;
       }
 
-      return { status: 0, data: buf };
+      return { status: 0, data: buf.subarray(0, offset) };
     }
 
-    // Simple name list: count(u32) + entries[name_len(u16) + name(bytes)]
-    let totalSize = 4;
-    const nameEntries: Uint8Array[] = [];
+    this.ensureChildIndex();
+    const childNames = this.childIndex.get(effectiveDirPath);
+    if (!childNames) return { status: 0, data: new Uint8Array([0, 0, 0, 0]) };
 
-    for (const child of children) {
-      const name = child.path.substring(child.path.lastIndexOf('/') + 1);
-      const nameBytes = encoder.encode(name);
-      nameEntries.push(nameBytes);
-      totalSize += 2 + nameBytes.byteLength;
-    }
+    // Simple name list: count(u32) + entries[name_len(u16) + name(bytes)].
+    //
+    // This is the hot readdir shape (everything except withFileTypes), so it works from the
+    // child index's names directly rather than going through getDirectChildrenWithImplicit.
+    // That path builds a full path per child by concatenation, looks each one up in pathIndex
+    // to classify it real-or-implicit, sorts the long strings, and then slices the name back
+    // out — three allocations and a Map probe per entry, all of it discarded here because a
+    // name list does not care which children are implicit. Sorting the bare names gives the
+    // same order as sorting the full paths, since every child shares one prefix.
+    const names = [...childNames.keys()].sort();
 
-    const buf = new Uint8Array(totalSize);
+    // Size the buffer without a measuring pass: UTF-8 needs at most 3 bytes per UTF-16 code
+    // unit (a surrogate pair is 2 units → 4 bytes, still under 3×), so this is an upper bound.
+    // encodeInto writes straight into it and the result is trimmed to what was actually used.
+    let capacity = 4;
+    for (const name of names) capacity += 2 + name.length * 3;
+
+    const buf = new Uint8Array(capacity);
     const view = new DataView(buf.buffer);
-    view.setUint32(0, nameEntries.length, true);
+    view.setUint32(0, names.length, true);
     let offset = 4;
 
-    for (const nameBytes of nameEntries) {
-      view.setUint16(offset, nameBytes.byteLength, true);
-      offset += 2;
-      buf.set(nameBytes, offset);
-      offset += nameBytes.byteLength;
+    for (const name of names) {
+      const { written } = encoder.encodeInto(name, buf.subarray(offset + 2));
+      view.setUint16(offset, written, true);
+      offset += 2 + written;
     }
 
-    return { status: 0, data: buf };
+    return { status: 0, data: buf.subarray(0, offset) };
   }
 
   // ---- RENAME ----
@@ -1740,7 +1890,7 @@ export class VFSEngine {
   truncate(path: string, len: number = 0): { status: number } {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === undefined) return { status: this.resolveFailureStatus() };
 
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
@@ -1813,10 +1963,12 @@ export class VFSEngine {
     destPath = this.normalizePath(destPath);
 
     const srcIdx = this.resolvePathComponents(srcPath, true);
-    if (srcIdx === undefined) return { status: CODE_TO_STATUS.ENOENT };
+    if (srcIdx === undefined) return { status: this.resolveFailureStatus() };
 
     const srcInode = this.readInode(srcIdx);
-    if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
+    // Node reports ENOTSUP here, not EISDIR: copyFile is defined for files, so a directory
+    // source is an unsupported operation rather than a misuse of a directory.
+    if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.ENOTSUP };
 
     // COPYFILE_EXCL check
     if ((flags & 1) && (this.pathIndex.has(destPath) || this.isImplicitDirectory(destPath))) {
@@ -1828,6 +1980,7 @@ export class VFSEngine {
 
     const srcSize = srcInode.size;
     const srcFirstBlock = srcInode.firstBlock;
+    const srcMode = srcInode.mode;
 
     // Stage 1: create the destination as an empty file. This goes through
     // the normal `write` path which handles parent-directory creation,
@@ -1839,7 +1992,17 @@ export class VFSEngine {
     const emptyStatus = this.write(destPath, new Uint8Array(0));
     if (emptyStatus.status !== 0) return emptyStatus;
 
-    if (srcSize === 0) return { status: 0 };
+    if (srcSize === 0) {
+      // Empty source still has permissions to carry over.
+      const emptyIdx = this.resolvePathComponents(destPath, true);
+      if (emptyIdx !== undefined) {
+        const emptyInode = this.readInode(emptyIdx);
+        emptyInode.mode = (emptyInode.mode & ~0o7777) | (srcMode & 0o7777);
+        this.writeInode(emptyIdx, emptyInode);
+        this.commitPending();
+      }
+      return { status: 0 };
+    }
 
     // Stage 2: allocate a destination block run sized to the source, then
     // copy the bytes directly between block ranges via the file handle in
@@ -1869,6 +2032,10 @@ export class VFSEngine {
     destInode.blockCount = neededBlocks;
     destInode.size = srcSize;
     destInode.mtime = Date.now();
+    // Carry the source's permission bits over. The destination was created by write(), which
+    // applies the default file mode, so a 0600 source produced a 0644 copy — copyFile(2) and
+    // Node both give the copy the source's permissions. Found by the differential fuzzer.
+    destInode.mode = (destInode.mode & ~0o7777) | (srcMode & 0o7777);
     this.writeInode(destIdx, destInode);
     this.commitPending();
     return { status: 0 };
@@ -1879,9 +2046,12 @@ export class VFSEngine {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
     if (idx === undefined) {
+      // Capture WHY resolution failed first — isImplicitDirectory resolves too and would reset
+      // the flag that separates a symlink cycle (ELOOP) from a missing path. Same as stat().
+      const failure = this.resolveFailureStatus();
       // Check for implicit directory
       if (this.isImplicitDirectory(path)) return { status: 0 };
-      return { status: CODE_TO_STATUS.ENOENT };
+      return { status: failure };
     }
 
     if (mode === 0) return { status: 0 }; // F_OK — just check existence
@@ -1911,11 +2081,13 @@ export class VFSEngine {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
     if (idx === undefined) {
+      // Capture the failure reason before isImplicitDirectory resolves — see access()/stat().
+      const failure = this.resolveFailureStatus();
       // Check for implicit directory
       if (this.isImplicitDirectory(path)) {
         return { status: 0, data: encoder.encode(path) };
       }
-      return { status: CODE_TO_STATUS.ENOENT, data: null };
+      return { status: failure, data: null };
     }
 
     // Find the resolved path for this inode
@@ -1928,7 +2100,7 @@ export class VFSEngine {
   chmod(path: string, mode: number): { status: number } {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === undefined) return { status: this.resolveFailureStatus() };
 
     const inode = this.readInode(idx);
     // Preserve file type bits, update permission bits
@@ -1943,7 +2115,7 @@ export class VFSEngine {
   chown(path: string, uid: number, gid: number): { status: number } {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === undefined) return { status: this.resolveFailureStatus() };
 
     const inode = this.readInode(idx);
     inode.uid = uid;
@@ -1958,7 +2130,7 @@ export class VFSEngine {
   utimes(path: string, atime: number, mtime: number): { status: number } {
     path = this.normalizePath(path);
     const idx = this.resolvePathComponents(path, true);
-    if (idx === undefined) return { status: CODE_TO_STATUS.ENOENT };
+    if (idx === undefined) return { status: this.resolveFailureStatus() };
 
     const inode = this.readInode(idx);
     inode.atime = atime;
@@ -2005,7 +2177,7 @@ export class VFSEngine {
     newPath = this.normalizePath(newPath);
 
     const srcIdx = this.resolvePathComponents(existingPath, true);
-    if (srcIdx === undefined) return { status: CODE_TO_STATUS.ENOENT };
+    if (srcIdx === undefined) return { status: this.resolveFailureStatus() };
 
     const srcInode = this.readInode(srcIdx);
     if (srcInode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EPERM };
@@ -2052,7 +2224,20 @@ export class VFSEngine {
     let idx = this.resolvePathComponents(path, true);
 
     if (idx === undefined) {
-      if (!hasCreate) return { status: CODE_TO_STATUS.ENOENT, data: null };
+      // As in write(): the path may be a symlink whose target does not exist yet. O_CREAT must
+      // create the *target*, leaving the link intact — creating at the literal path destroys it.
+      const linkTarget = this.resolveDanglingLink(path);
+      if (linkTarget === null) return { status: CODE_TO_STATUS.ELOOP, data: null };
+      if (linkTarget !== path) {
+        path = linkTarget;
+        idx = this.resolvePathComponents(path, true);
+      }
+    }
+
+    if (idx === undefined) {
+      if (!hasCreate) return { status: this.resolveFailureStatus(), data: null };
+      const parentStatus = this.ensureParent(path);
+      if (parentStatus !== 0) return { status: parentStatus, data: null };
       // Create file
       idx = this.createInode(path, INODE_TYPE.FILE, this.fileModeFor(reqMode), 0);
     } else if (hasExcl && hasCreate) {
@@ -2082,8 +2267,15 @@ export class VFSEngine {
   fread(fd: number, length: number, position: number | null): { status: number; data: Uint8Array | null } {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF, data: null };
+    if (!VFSEngine.isReadable(entry.flags)) return { status: CODE_TO_STATUS.EBADF, data: null };
 
     const inode = this.readInode(entry.inodeIdx);
+    // A directory can be opened read-only — node allows it, and fstat on the descriptor works —
+    // but reading through it is EISDIR. Without this the read fell through to the size
+    // arithmetic below and returned an empty buffer, so `readFileSync(dirFd)` looked like an
+    // empty file instead of an error.
+    if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR, data: null };
+
     const pos = position ?? entry.position;
     const readLen = Math.min(length, inode.size - pos);
 
@@ -2106,6 +2298,7 @@ export class VFSEngine {
   fwrite(fd: number, data: Uint8Array, position: number | null): { status: number; data: Uint8Array | null } {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF, data: null };
+    if (!VFSEngine.isWritable(entry.flags)) return { status: CODE_TO_STATUS.EBADF, data: null };
 
     const inode = this.readInode(entry.inodeIdx);
     const isAppend = (entry.flags & 1024) !== 0; // O_APPEND
@@ -2201,6 +2394,9 @@ export class VFSEngine {
   ftruncate(fd: number, len: number = 0): { status: number } {
     const entry = this.fdTable.get(fd);
     if (!entry) return { status: CODE_TO_STATUS.EBADF };
+    // Node reports EINVAL here rather than the EBADF a read/write gets — truncating through a
+    // read-only descriptor is a bad *argument*, not a bad descriptor. Verified against node:fs.
+    if (!VFSEngine.isWritable(entry.flags)) return { status: CODE_TO_STATUS.EINVAL };
 
     const inode = this.readInode(entry.inodeIdx);
     const path = this.readPath(inode.pathOffset, inode.pathLength);
@@ -2208,6 +2404,41 @@ export class VFSEngine {
   }
 
   // ---- FSYNC ----
+  /**
+   * Real volume statistics.
+   *
+   * `statfs` used to be answered by the filesystem layer with fixed constants — always ~4 GB
+   * capacity and ~2 GB free, whatever the volume actually held — so anything checking free space
+   * before a large write got a number unrelated to reality. These come from the superblock the
+   * allocator maintains.
+   *
+   * Payload: [type u32][bsize u32][blocks u32][bfree u32][files u32][ffree u32].
+   */
+  statfs(path: string = '/'): { status: number; data: Uint8Array | null } {
+    // Node resolves the path first: statfs on something that is not there is ENOENT, not a
+    // report about the volume. We answered regardless of the path, which made a typo look like
+    // a healthy filesystem.
+    path = this.normalizePath(path);
+    if (this.resolvePathComponents(path, true) === undefined && !this.isImplicitDirectory(path)) {
+      return { status: this.resolveFailureStatus(), data: null };
+    }
+
+    // Distinct inode indices in the path index, not a pass over the inode table: the table lives
+    // on disk, so scanning it would mean one read per slot (100k by default). Counting distinct
+    // values is exact rather than approximate — hard links share an inode and must count once.
+    const usedInodes = new Set(this.pathIndex.values()).size;
+
+    const buf = new Uint8Array(24);
+    const dv = new DataView(buf.buffer);
+    dv.setUint32(0, VFS_MAGIC, true);
+    dv.setUint32(4, this.blockSize, true);
+    dv.setUint32(8, this.totalBlocks, true);
+    dv.setUint32(12, this.freeBlocks, true);
+    dv.setUint32(16, this.inodeCount, true);
+    dv.setUint32(20, Math.max(0, this.inodeCount - usedInodes), true);
+    return { status: 0, data: buf };
+  }
+
   fsync(): { status: number } {
     this.commitPending();
     this.handle.flush();
@@ -2578,7 +2809,11 @@ export class VFSEngine {
     const descendants: string[] = [];
 
     for (const path of this.pathIndex.keys()) {
-      if (path.startsWith(prefix)) descendants.push(path);
+      // `path !== dirPath` matters only for the root: its prefix is '/', which every path starts
+      // with — including '/' itself, so a recursive remove of the root deleted the root inode
+      // along with its children and left the volume with no root at all. For any other directory
+      // the trailing slash in `prefix` already excludes it.
+      if (path !== dirPath && path.startsWith(prefix)) descendants.push(path);
     }
 
     // Sort by depth (deepest first) for safe deletion

@@ -1,6 +1,8 @@
 import type { GlobOptions, Dirent } from '../types.js';
 import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { readdirSync, readdir } from './readdir.js';
+import { Dirent as DirentClass } from '../stats-classes.js';
+import { INODE_TYPE } from '../vfs/layout.js';
 import { statSync, stat } from './stat.js';
 
 // ============================================================================
@@ -154,19 +156,15 @@ function normalizeCwd(cwd: string | URL | undefined): string {
   return cwd.pathname || '/';
 }
 
-/** Build a Dirent from a file path + parent dir + stat. */
+/**
+ * Build a Dirent from a file path + parent dir + stat.
+ *
+ * The hand-written literal this replaced omitted `path` — node's deprecated alias of
+ * `parentPath` — so a glob result was missing a property a readdir result had.
+ */
 function makeDirent(parentPath: string, name: string, isDir: boolean, isSymlink: boolean): Dirent {
-  return {
-    name,
-    parentPath,
-    isFile: () => !isDir && !isSymlink,
-    isDirectory: () => isDir,
-    isBlockDevice: () => false,
-    isCharacterDevice: () => false,
-    isSymbolicLink: () => isSymlink,
-    isFIFO: () => false,
-    isSocket: () => false,
-  } as Dirent;
+  const type = isSymlink ? INODE_TYPE.SYMLINK : isDir ? INODE_TYPE.DIRECTORY : INODE_TYPE.FILE;
+  return new DirentClass(name, type, parentPath);
 }
 
 // ============================================================================

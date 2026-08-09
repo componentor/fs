@@ -10,53 +10,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { appendFileSync, appendFile } from '../src/methods/appendFile.js';
 import { OP, decodeRequest } from '../src/protocol/opcodes.js';
-import { VFSEngine } from '../src/vfs/engine.js';
-
-/** Minimal in-memory FileSystemSyncAccessHandle, as each engine test file defines. */
-class MockSyncHandle {
-  private buffer: Uint8Array;
-  private size: number;
-
-  constructor(initialSize: number = 0) {
-    this.buffer = new Uint8Array(initialSize);
-    this.size = initialSize;
-  }
-
-  getSize(): number { return this.size; }
-
-  truncate(newSize: number): void {
-    if (newSize > this.buffer.byteLength) {
-      const newBuf = new Uint8Array(newSize);
-      newBuf.set(this.buffer.subarray(0, this.size));
-      this.buffer = newBuf;
-    }
-    this.size = newSize;
-  }
-
-  read(buf: Uint8Array, opts?: { at?: number }): number {
-    const at = opts?.at ?? 0;
-    const len = Math.min(buf.byteLength, this.size - at);
-    if (len <= 0) return 0;
-    buf.set(this.buffer.subarray(at, at + len));
-    return len;
-  }
-
-  write(buf: Uint8Array, opts?: { at?: number }): number {
-    const at = opts?.at ?? 0;
-    const end = at + buf.byteLength;
-    if (end > this.buffer.byteLength) {
-      const newBuf = new Uint8Array(end * 2);
-      newBuf.set(this.buffer.subarray(0, this.size));
-      this.buffer = newBuf;
-    }
-    this.buffer.set(buf, at);
-    if (end > this.size) this.size = end;
-    return buf.byteLength;
-  }
-
-  flush(): void {}
-  close(): void {}
-}
+import { createHarness, type Harness } from './helpers/engine-transport.js';
 
 /** A sync transport that records every frame and hands back a usable fd for OPEN. */
 function recorder() {
@@ -189,58 +143,35 @@ describe('appendFile async', () => {
 });
 
 describe('appendFile semantics against the engine', () => {
-  let engine: VFSEngine;
+  let h: Harness;
 
-  beforeEach(() => {
-    engine = new VFSEngine();
-    engine.init(new MockSyncHandle(0) as unknown as FileSystemSyncAccessHandle);
-  });
+  beforeEach(() => { h = createHarness(); });
 
-  /** Drive the method layer against a real engine, so flags actually mean something. */
-  const transport = () => (buf: ArrayBuffer) => {
-    const { op, path, flags, data } = decodeRequest(buf);
-    switch (op) {
-      case OP.APPEND: return engine.append(path, data ?? new Uint8Array(0));
-      case OP.OPEN: return engine.open(path, flags, 't', new DataView(data!.buffer, data!.byteOffset, 4).getUint32(0, true));
-      case OP.FWRITE: {
-        // Payload is [fd: u32][position: f64][bytes…], decoded exactly as the worker does.
-        const dv = new DataView(data!.buffer, data!.byteOffset, data!.byteLength);
-        const pos = dv.getFloat64(4, true);
-        return engine.fwrite(dv.getUint32(0, true), data!.subarray(12), pos === -1 ? null : pos);
-      }
-      case OP.CLOSE: return engine.close(new DataView(data!.buffer, data!.byteOffset, 4).getUint32(0, true));
-      case OP.FSYNC: return { status: 0, data: null };
-      default: throw new Error(`unexpected op ${op}`);
-    }
-  };
-
-  const text = (p: string) => new TextDecoder().decode(engine.read(p).data!);
+  const text = (p: string) => new TextDecoder().decode(h.engine.read(p).data!);
   const perm = (p: string) => {
-    const st = engine.stat(p);
+    const st = h.engine.stat(p);
     return new DataView(st.data!.buffer, st.data!.byteOffset, st.data!.byteLength).getUint32(1, true) & 0o7777;
   };
 
   it('appends by default, and truncates for flag w', () => {
-    const req = transport();
-    appendFileSync(req, '/log', 'aa');
-    appendFileSync(req, '/log', 'bb');
+    appendFileSync(h.request, '/log', 'aa');
+    appendFileSync(h.request, '/log', 'bb');
     expect(text('/log')).toBe('aabb');
 
-    appendFileSync(req, '/log', 'cc', { flag: 'w' });
+    appendFileSync(h.request, '/log', 'cc', { flag: 'w' });
     expect(text('/log')).toBe('cc');
   });
 
   it("appends through the fd path too, when a mode forces flag 'a' open", () => {
-    const req = transport();
-    appendFileSync(req, '/log', 'aa', { mode: 0o600 });
-    appendFileSync(req, '/log', 'bb', { mode: 0o600 });
+    appendFileSync(h.request, '/log', 'aa', { mode: 0o600 });
+    appendFileSync(h.request, '/log', 'bb', { mode: 0o600 });
     expect(text('/log')).toBe('aabb');
     // Mode applies at creation only — the second call must not re-permission it.
     expect(perm('/log')).toBe(0o600);
   });
 
   it('umask-reduces the creation mode, as open(2) does', () => {
-    appendFileSync(transport(), '/wide', 'x', { mode: 0o777 });
+    appendFileSync(h.request, '/wide', 'x', { mode: 0o777 });
     expect(perm('/wide')).toBe(0o755);
   });
 });

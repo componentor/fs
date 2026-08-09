@@ -4,6 +4,18 @@
  * Tests the cp logic using VFSEngine directly, since VFSFileSystem requires
  * browser workers/SAB. We replicate the cpSync logic against the engine to
  * verify correct behavior.
+ *
+ * ⚠️  These exercise a MODEL of cp defined in this file, not `VFSFileSystem.cpSync`.
+ *
+ * cp lives on the filesystem instance, which needs real workers, so it could not be driven from
+ * Node when these were written — the model reproduces its logic against a bare engine instead.
+ * That means they cannot catch a divergence between the model and the product: the cp error
+ * codes were wrong (`EISDIR`/`EEXIST` where Node raises `ERR_FS_EISDIR`/`ERR_FS_CP_EEXIST`) and
+ * every test here still passed, because the model was wrong in exactly the same way.
+ *
+ * Keep them for the tree-walking logic they cover cheaply, but the authoritative coverage is
+ * [instance-parity.spec.ts](../../tests/benchmark/instance-parity.spec.ts), which runs the real
+ * `cpSync` in a browser and diffs the resulting tree against real `node:fs`.
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';

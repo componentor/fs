@@ -23,6 +23,20 @@ export default defineConfig({
         launchOptions: {
           args: [
             '--enable-features=FileSystemAccessAPI',
+            // Playwright's chrome-headless-shell ships with PartitionAlloc's dangling-`raw_ptr`
+            // detector on. Under the heaviest specs (the LightningFS comparison, create-scaling)
+            // it fires `FATAL: Detected dangling raw_ptr in unretained` while tearing down a page
+            // that used OPFS + FileSystemObserver, which aborts the whole browser process — so
+            // the *next* test fails with "Target page, context or browser has been closed", and
+            // which test that is moves around between runs.
+            //
+            // A dangling `raw_ptr` is a use-after-free in Chromium's own C++; JavaScript has no
+            // way to create one, so this is a browser bug our load happens to trigger, not a leak
+            // in this library. (Verified: a page that leaves a recursive FileSystemObserver
+            // attached and closes does *not* trip it — so it is not simply "we forgot to
+            // disconnect", and the teardown added in 3.3.29 does not make it go away either.)
+            // Release Chrome ships with this detector off, so no user sees it.
+            '--disable-features=PartitionAllocDanglingPtr',
           ],
         },
       },

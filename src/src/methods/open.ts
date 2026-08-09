@@ -1,27 +1,60 @@
-import type { Stats, BigIntStats, StatOptions, FileHandle, ReadOptions, WriteOptions, Encoding, Mode } from '../types.js';
+import type {
+  Stats, BigIntStats, StatOptions, FileHandle, ReadOptions, WriteOptions, Encoding, Mode,
+  ReadStreamOptions, WriteStreamOptions, FSReadStream, FSWriteStream,
+} from '../types.js';
 import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { OP, encodeRequest, encodeRequestU32 } from '../protocol/opcodes.js';
-import { statusToError } from '../errors.js';
+import { statusToError, invalidArgValue } from '../errors.js';
+import { toEpochMs } from '../protocol/payloads.js';
 import { parseFileMode, encodeMode } from './mode.js';
+import {
+  encodeFdPayload, encodeFreadPayload, encodeFwritePayload, encodeFtruncatePayload,
+} from '../protocol/payloads.js';
 import { decodeStats, decodeStatsBigInt } from '../stats.js';
+import { decodeBuffer, encodeString } from '../encoding.js';
+import { SimpleEventEmitter } from '../node-streams.js';
+import {
+  readStreamFromHandle, writeStreamFromHandle, linesFromStream, webStreamFromHandle,
+  type HandleSource,
+} from '../handle-streams.js';
 import { constants } from '../constants.js';
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+/**
+ * Node's flag strings → `O_*` bits.
+ *
+ * The `s` variants (`rs`, `rs+`, `as`, `as+`) were missing and fell through to the default
+ * `O_RDONLY`. That was invisible while access modes went unchecked; once they were enforced
+ * (3.3.19) an `as` descriptor would have rejected the very writes it was opened for. `s` means
+ * O_SYNC — "do not return until written" — which the engine already satisfies: every write goes
+ * through to the backing handle before the call returns, so the bit affects nothing beyond the
+ * access mode here.
+ *
+ * An unrecognised string is rejected rather than silently treated as read-only, matching Node:
+ * `fs.openSync(p, 'zz')` raises ERR_INVALID_ARG_VALUE rather than handing back a descriptor that
+ * cannot do what the caller asked.
+ */
 export function parseFlags(flags: string): number {
+  const { O_RDONLY, O_RDWR, O_WRONLY, O_CREAT, O_TRUNC, O_APPEND, O_EXCL } = constants;
   switch (flags) {
-    case 'r': return constants.O_RDONLY;
-    case 'r+': return constants.O_RDWR;
-    case 'w': return constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC;
-    case 'w+': return constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC;
-    case 'a': return constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND;
-    case 'a+': return constants.O_RDWR | constants.O_CREAT | constants.O_APPEND;
-    case 'wx': return constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_EXCL;
-    case 'wx+': return constants.O_RDWR | constants.O_CREAT | constants.O_TRUNC | constants.O_EXCL;
-    case 'ax': return constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_EXCL;
-    case 'ax+': return constants.O_RDWR | constants.O_CREAT | constants.O_APPEND | constants.O_EXCL;
-    default: return constants.O_RDONLY;
+    case 'r': return O_RDONLY;
+    case 'rs': return O_RDONLY;                                    // O_SYNC — see above
+    case 'r+': return O_RDWR;
+    case 'rs+': return O_RDWR;
+    case 'w': return O_WRONLY | O_CREAT | O_TRUNC;
+    case 'wx': return O_WRONLY | O_CREAT | O_TRUNC | O_EXCL;
+    case 'w+': return O_RDWR | O_CREAT | O_TRUNC;
+    case 'wx+': return O_RDWR | O_CREAT | O_TRUNC | O_EXCL;
+    case 'a': return O_WRONLY | O_CREAT | O_APPEND;
+    case 'ax': return O_WRONLY | O_CREAT | O_APPEND | O_EXCL;
+    case 'as': return O_WRONLY | O_CREAT | O_APPEND;
+    case 'a+': return O_RDWR | O_CREAT | O_APPEND;
+    case 'ax+': return O_RDWR | O_CREAT | O_APPEND | O_EXCL;
+    case 'as+': return O_RDWR | O_CREAT | O_APPEND;
+    default:
+      throw invalidArgValue('flags', flags, 'is invalid');
   }
 }
 
@@ -55,9 +88,7 @@ export function closeSync(
   syncRequest: SyncRequestFn,
   fd: number
 ): void {
-  const fdBuf = new Uint8Array(4);
-  new DataView(fdBuf.buffer).setUint32(0, fd, true);
-  const buf = encodeRequest(OP.CLOSE, '', 0, fdBuf);
+  const buf = encodeRequest(OP.CLOSE, '', 0, encodeFdPayload(fd));
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'close', String(fd));
 }
@@ -94,12 +125,7 @@ export function readSync(
     pos = bufferOrOptions.position ?? null;
   }
 
-  const fdBuf = new Uint8Array(16);
-  const dv = new DataView(fdBuf.buffer);
-  dv.setUint32(0, fd, true);
-  dv.setUint32(4, len, true);
-  dv.setFloat64(8, pos ?? -1, true);
-  const buf = encodeRequest(OP.FREAD, '', 0, fdBuf);
+  const buf = encodeRequest(OP.FREAD, '', 0, encodeFreadPayload(fd, len, pos));
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'read', String(fd));
   if (data) {
@@ -138,12 +164,7 @@ export function writeSyncFd(
     pos = position ?? null;
     writeData = bufferOrString.subarray(offset, offset + length);
   }
-  const fdBuf = new Uint8Array(12 + writeData.byteLength);
-  const dv = new DataView(fdBuf.buffer);
-  dv.setUint32(0, fd, true);
-  dv.setFloat64(4, pos ?? -1, true);
-  fdBuf.set(writeData, 12);
-  const buf = encodeRequest(OP.FWRITE, '', 0, fdBuf);
+  const buf = encodeRequest(OP.FWRITE, '', 0, encodeFwritePayload(fd, pos, writeData));
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'write', String(fd));
   return data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
@@ -154,9 +175,7 @@ export function fstatSync(
   fd: number,
   options?: StatOptions
 ): Stats | BigIntStats {
-  const fdBuf = new Uint8Array(4);
-  new DataView(fdBuf.buffer).setUint32(0, fd, true);
-  const buf = encodeRequest(OP.FSTAT, '', 0, fdBuf);
+  const buf = encodeRequest(OP.FSTAT, '', 0, encodeFdPayload(fd));
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'fstat', String(fd));
   return options?.bigint ? decodeStatsBigInt(data!) : decodeStats(data!);
@@ -167,11 +186,7 @@ export function ftruncateSync(
   fd: number,
   len: number = 0
 ): void {
-  const fdBuf = new Uint8Array(12);
-  const dv = new DataView(fdBuf.buffer);
-  dv.setUint32(0, fd, true);
-  dv.setFloat64(4, len, true);
-  const buf = encodeRequest(OP.FTRUNCATE, '', 0, fdBuf);
+  const buf = encodeRequest(OP.FTRUNCATE, '', 0, encodeFtruncatePayload(fd, len));
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'ftruncate', String(fd));
 }
@@ -202,7 +217,9 @@ export async function open(
 }
 
 export function createFileHandle(fd: number, asyncRequest: AsyncRequestFn): FileHandle {
-  return {
+  const events = new SimpleEventEmitter();
+
+  const handle: FileHandle = {
     fd,
 
     async read(
@@ -293,16 +310,23 @@ export function createFileHandle(fd: number, asyncRequest: AsyncRequestFn): File
 
     async readFile(options?: ReadOptions | Encoding | null) {
       const encoding = typeof options === 'string' ? options : options?.encoding;
-      const { status, data } = await asyncRequest(OP.FREAD, '', 0, null, undefined, { fd, length: Number.MAX_SAFE_INTEGER, position: 0 });
+      // From the *cursor*, not from zero. `open` leaves the cursor at 0, so the difference only
+      // shows once the handle has been read from: in Node a second `readFile()` returns '' and
+      // one that follows `read(buf, 0, 3)` starts at byte 3. Position 0 replayed the file
+      // instead, and left the cursor where it was.
+      const { status, data } = await asyncRequest(OP.FREAD, '', 0, null, undefined, { fd, length: Number.MAX_SAFE_INTEGER, position: -1 });
       if (status !== 0) throw statusToError(status, 'read', String(fd));
       const result = data ?? new Uint8Array(0);
-      if (encoding) return decoder.decode(result);
+      if (encoding) return decodeBuffer(result, encoding);
       return result;
     },
 
-    async writeFile(data: string | Uint8Array, _options?: WriteOptions | Encoding) {
-      const encoded = typeof data === 'string' ? encoder.encode(data) : data;
-      const { status } = await asyncRequest(OP.FWRITE, '', 0, null, undefined, { fd, data: encoded, position: 0 });
+    async writeFile(data: string | Uint8Array, options?: WriteOptions | Encoding) {
+      const encoding = typeof options === 'string' ? options : options?.encoding;
+      const encoded = typeof data === 'string'
+        ? (encoding ? encodeString(data, encoding) : encoder.encode(data))
+        : data;
+      const { status } = await asyncRequest(OP.FWRITE, '', 0, null, undefined, { fd, data: encoded, position: -1 });
       if (status !== 0) throw statusToError(status, 'write', String(fd));
     },
 
@@ -317,11 +341,14 @@ export function createFileHandle(fd: number, asyncRequest: AsyncRequestFn): File
       return decodeStats(data!);
     },
 
-    async appendFile(data: string | Uint8Array, _options?: WriteOptions | Encoding) {
-      const encoded = typeof data === 'string' ? encoder.encode(data) : data;
-      const st = await this.stat();
-      const { status } = await asyncRequest(OP.FWRITE, '', 0, null, undefined, { fd, data: encoded, position: st.size });
-      if (status !== 0) throw statusToError(status, 'write', String(fd));
+    /**
+     * In Node this is a documented **alias of `writeFile`** — the appending comes from opening
+     * with `'a'` (O_APPEND), not from the method. Seeking to end-of-file here made
+     * `handle.appendFile()` on an `'r+'` handle write past the cursor, where Node overwrites at
+     * it, and cost an extra `fstat` round-trip per call.
+     */
+    async appendFile(data: string | Uint8Array, options?: WriteOptions | Encoding) {
+      return this.writeFile(data, options);
     },
 
     async chmod(mode: number) {
@@ -352,8 +379,8 @@ export function createFileHandle(fd: number, asyncRequest: AsyncRequestFn): File
       const payload = new Uint8Array(24);
       const dv = new DataView(payload.buffer);
       dv.setUint32(0, fd, true);
-      dv.setFloat64(8, typeof atime === 'number' ? atime : atime.getTime(), true);
-      dv.setFloat64(16, typeof mtime === 'number' ? mtime : mtime.getTime(), true);
+      dv.setFloat64(8, toEpochMs(atime, 'atime'), true);
+      dv.setFloat64(16, toEpochMs(mtime, 'mtime'), true);
       const { status } = await asyncRequest(OP.FUTIMES, '', 0, payload);
       if (status !== 0) throw statusToError(status, 'futimes', String(fd));
     },
@@ -369,10 +396,62 @@ export function createFileHandle(fd: number, asyncRequest: AsyncRequestFn): File
     async close() {
       const { status } = await asyncRequest(OP.CLOSE, '', 0, null, undefined, { fd });
       if (status !== 0) throw statusToError(status, 'close', String(fd));
+      // node's FileHandle is an EventEmitter and emits 'close' here.
+      events.emit('close');
     },
 
     [Symbol.asyncDispose]() {
       return this.close();
     },
+
+    // ---- Streams over this handle ----
+    //
+    // All four were missing. A stream built from a handle **owns** it: node closes the handle
+    // when the stream ends, so `handle.stat()` afterwards is EBADF. `autoClose: false` opts out.
+    // The machinery is shared with `fs.createReadStream`/`createWriteStream` so the two cannot
+    // drift — see [handle-streams.ts](../handle-streams.ts).
+
+    createReadStream(options?: ReadStreamOptions | Encoding) {
+      return readStreamFromHandle(handleSource(options), options) as unknown as FSReadStream;
+    },
+
+    createWriteStream(options?: WriteStreamOptions | Encoding) {
+      return writeStreamFromHandle(handleSource(options), options) as unknown as FSWriteStream;
+    },
+
+    readLines(options?: ReadStreamOptions | Encoding) {
+      return linesFromStream(readStreamFromHandle(handleSource(options), options));
+    },
+
+    readableWebStream(_options?: { type?: 'bytes' }) {
+      return webStreamFromHandle(handleSource(undefined));
+    },
+
+    // ---- EventEmitter surface ----
+    on(event: string, listener: (...args: never[]) => void) { events.on(event, listener as never); return this; },
+    once(event: string, listener: (...args: never[]) => void) { events.once(event, listener as never); return this; },
+    off(event: string, listener: (...args: never[]) => void) { events.off(event, listener as never); return this; },
+    removeListener(event: string, listener: (...args: never[]) => void) { events.off(event, listener as never); return this; },
+    emit(event: string, ...args: never[]) { return events.emit(event, ...args); },
   };
+
+  /**
+   * Streams take the handle as-is and close it when they finish, which is node's default for a
+   * handle-backed stream. `autoClose: false` leaves it to the caller.
+   *
+   * `followCursor` is what makes this a stream over *this handle* rather than over its file: with
+   * no explicit `start` it picks up at the handle's current position and advances it, as node
+   * does — see {@link HandleSource.followCursor}.
+   */
+  function handleSource(options?: ReadStreamOptions | WriteStreamOptions | Encoding): HandleSource {
+    const opts = typeof options === 'string' ? undefined : options;
+    return {
+      acquire: async () => handle,
+      autoClose: opts?.autoClose !== false,
+      path: '', // node reports no path for a handle-backed stream
+      followCursor: true,
+    };
+  }
+
+  return handle;
 }

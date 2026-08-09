@@ -12,7 +12,7 @@
 
 import type {
   Encoding, ReadOptions, WriteOptions, MkdirOptions, RmdirOptions, RmOptions, CpOptions,
-  ReaddirOptions, StatOptions, Stats, BigIntStats, StatFs, Dirent, Dir, VFSConfig, FSMode, FileHandle, GlobOptions,
+  ReaddirOptions, StatOptions, Stats, BigIntStats, StatFs, Dirent, Dir, OpendirOptions, VFSConfig, FSMode, FileHandle, GlobOptions,
   WatchOptions, WatchFileOptions, WatchEventType, FSWatcher, WatchListener, WatchFileListener,
   ReadStreamOptions, WriteStreamOptions, FSReadStream, FSWriteStream, OpenAsBlobOptions, PathLike, Mode,
 } from './types.js';
@@ -22,9 +22,10 @@ import { SAB_OFFSETS, SIGNAL, OP, encodeRequest, decodeResponse } from './protoc
 import { acquireFsLock, releaseFsLock } from './protocol/fs-lock.js';
 
 // ---- Method imports ----
-import { readFileSync as _readFileSync, readFile as _readFile } from './methods/readFile.js';
-import { writeFileSync as _writeFileSync, writeFile as _writeFile } from './methods/writeFile.js';
-import { appendFileSync as _appendFileSync, appendFile as _appendFile } from './methods/appendFile.js';
+import { readFileSync as _readFileSync, readFile as _readFile, readFileFdSync as _readFileFdSync, readFileFd as _readFileFd } from './methods/readFile.js';
+import { writeFileSync as _writeFileSync, writeFile as _writeFile, writeFileFdSync as _writeFileFdSync, writeFileFd as _writeFileFd } from './methods/writeFile.js';
+import { appendFileSync as _appendFileSync, appendFile as _appendFile, appendFileFdSync as _appendFileFdSync, appendFileFd as _appendFileFd } from './methods/appendFile.js';
+import { isFdArg, isFileHandle } from './methods/fd-arg.js';
 import { existsSync as _existsSync, exists as _exists } from './methods/exists.js';
 import { mkdirSync as _mkdirSync, mkdir as _mkdir } from './methods/mkdir.js';
 import { rmdirSync as _rmdirSync, rmdir as _rmdir } from './methods/rmdir.js';
@@ -43,6 +44,7 @@ import { utimesSync as _utimesSync, utimes as _utimes, futimesSync as _futimesSy
 import { symlinkSync as _symlinkSync, readlinkSync as _readlinkSync, symlink as _symlink, readlink as _readlink } from './methods/symlink.js';
 import { linkSync as _linkSync, link as _link } from './methods/link.js';
 import { mkdtempSync as _mkdtempSync, mkdtemp as _mkdtemp } from './methods/mkdtemp.js';
+import { statfsSync as _statfsSync, statfs as _statfs } from './methods/statfs.js';
 import {
   openSync as _openSync, closeSync as _closeSync,
   readSync as _readSync, writeSyncFd as _writeSyncFd,
@@ -50,10 +52,13 @@ import {
   open as _open, createFileHandle as _createFileHandle,
 } from './methods/open.js';
 import { opendir as _opendir } from './methods/opendir.js';
+import { Dir as VFSDir } from './dir.js';
+import { readStreamFromHandle, writeStreamFromHandle } from './handle-streams.js';
+import { Stats as StatsClass, Dirent as DirentClass } from './stats-classes.js';
 import { watch as _watch, watchFile as _watchFile, unwatchFile as _unwatchFile, watchAsync as _watchAsync } from './methods/watch.js';
 import { globSync as _globSync, glob as _glob } from './methods/glob.js';
-import { join as pathJoin, toPathString } from './path.js';
-import { createError, statusToError as _statusToError } from './errors.js';
+import { join as pathJoin, toPathString, toRealpathString } from './path.js';
+import { createError, cpEisdirNotRecursive, cpTargetExists, cpSameSource, cpIntoSubdirectory, statusToError as _statusToError } from './errors.js';
 import { decodeStats as _decodeStats, decodeStatsBigInt as _decodeStatsBigInt } from './stats.js';
 import { constants } from './constants.js';
 
@@ -102,6 +107,26 @@ const SPIN_STALL_TIMEOUT_MS = 30_000;
 const SPIN_NO_HEARTBEAT_TIMEOUT_MS = 30_000;
 
 /**
+ * Absolute cap on a main-thread spin in `opfs` mode.
+ *
+ * Every operation in that mode is async underneath, and `Atomics.wait` is illegal on a page's
+ * main thread, so a sync call busy-spins. On Chromium the relay worker progresses anyway and
+ * ops finish in milliseconds; on Firefox and WebKit the spinning page starves the worker's OPFS
+ * continuations and the response never arrives. The heartbeat check cannot catch that — the
+ * worker's timer keeps firing, so it looks alive — and the page spins until the browser kills
+ * the tab. Ten seconds is far beyond any healthy op here and turns a dead tab into an error
+ * that says what to do.
+ */
+const OPFS_MAIN_THREAD_SPIN_TIMEOUT_MS = 10_000;
+
+const OPFS_SYNC_STALL_MESSAGE =
+  'VFS sync operation stalled in opfs mode. Sync calls from a page main thread are only ' +
+  'reliable on Chromium here: every operation is async underneath, and the spin-wait this ' +
+  'thread must use (Atomics.wait is illegal on the main thread) starves the relay worker on ' +
+  'Firefox and WebKit. Use fs.promises.* instead, or host the filesystem inside a Worker, ' +
+  'where the sync API works on every engine.';
+
+/**
  * Block the calling thread until `arr[index]` changes away from `value`.
  *
  * In a worker: plain Atomics.wait. On the main thread: spin-wait, aborting if
@@ -109,14 +134,31 @@ const SPIN_NO_HEARTBEAT_TIMEOUT_MS = 30_000;
  * while alive) stalls for SPIN_STALL_TIMEOUT_MS — i.e. abort on a dead worker,
  * not on a slow one. Without `heartbeatArr`, falls back to a plain ceiling.
  */
-function spinWait(arr: Int32Array, index: number, value: number, heartbeatArr?: Int32Array): void {
+function spinWait(
+  arr: Int32Array,
+  index: number,
+  value: number,
+  heartbeatArr?: Int32Array,
+  absoluteDeadlineMs?: number,
+  deadlineMessage?: string,
+): void {
   if (_canAtomicsWait) {
     Atomics.wait(arr, index, value);
     return;
   }
+  // An absolute cap on top of the heartbeat check, for the case where the worker is provably
+  // alive (its heartbeat timer keeps firing) yet never answers — see the opfs-mode note at the
+  // call site. Without it the page spins until the browser kills the tab.
+  const deadlineAt = absoluteDeadlineMs !== undefined ? performance.now() + absoluteDeadlineMs : Infinity;
+  const checkDeadline = (): void => {
+    if (performance.now() > deadlineAt) {
+      throw new Error(deadlineMessage ?? `VFS sync operation timed out after ${absoluteDeadlineMs}ms`);
+    }
+  };
   if (!heartbeatArr) {
     const start = performance.now();
     while (Atomics.load(arr, index) === value) {
+      checkDeadline();
       if (performance.now() - start > SPIN_NO_HEARTBEAT_TIMEOUT_MS) {
         throw new Error(
           `VFS sync operation timed out after ${SPIN_NO_HEARTBEAT_TIMEOUT_MS / 1000}s — relay worker did not respond`
@@ -128,6 +170,7 @@ function spinWait(arr: Int32Array, index: number, value: number, heartbeatArr?: 
   let lastBeat = Atomics.load(heartbeatArr, SAB_HEARTBEAT_INDEX);
   let lastProgress = performance.now();
   while (Atomics.load(arr, index) === value) {
+    checkDeadline();
     const beat = Atomics.load(heartbeatArr, SAB_HEARTBEAT_INDEX);
     if (beat !== lastBeat) {
       lastBeat = beat;
@@ -140,7 +183,37 @@ function spinWait(arr: Int32Array, index: number, value: number, heartbeatArr?: 
   }
 }
 
+/**
+ * Reject a copy whose destination is the source, or lives inside it.
+ *
+ * The subtree case is the dangerous one: a recursive copy into its own subtree recreates the
+ * destination inside itself on every pass and never terminates — an unbounded loop that hangs
+ * the tab and fills storage. Node rejects both with ERR_FS_CP_EINVAL before copying anything.
+ * Applied once per public `cp` entry point, never inside the recursion, whose destinations are
+ * legitimately inside the destination tree.
+ */
+function assertCopyable(srcPath: string, destPath: string): void {
+  if (srcPath === destPath) throw cpSameSource(srcPath);
+  // Compare with a trailing separator so '/xy' is not treated as inside '/x'.
+  const srcPrefix = srcPath.endsWith('/') ? srcPath : srcPath + '/';
+  if (destPath.startsWith(srcPrefix)) throw cpIntoSubdirectory(srcPath, destPath);
+}
+
 export class VFSFileSystem {
+  /**
+   * `fs.constants` — the flag/mode constants (`F_OK`, `O_CREAT`, `COPYFILE_EXCL`, …).
+   *
+   * This existed on `fs.promises.constants` but not on the instance, so the single most common
+   * form — `fs.access(p, fs.constants.F_OK)` — read a property of `undefined`.
+   */
+  get constants() { return constants; }
+
+  // The classes behind `stat`, `readdir({ withFileTypes: true })` and `opendir` results, exposed
+  // as node exposes them so `x instanceof fs.Stats` / `fs.Dirent` / `fs.Dir` type-tests work.
+  get Stats() { return StatsClass; }
+  get Dirent() { return DirentClass; }
+  get Dir() { return VFSDir; }
+
   // SAB for sync communication with sync relay worker (null when SAB unavailable)
   private sab!: SharedArrayBuffer;
   private ctrl!: Int32Array;
@@ -168,6 +241,10 @@ export class VFSFileSystem {
   private rejectReady!: (err: Error) => void;
   private initError: Error | null = null;
   private isReady = false;
+  /** Set by {@link dispose}; makes disposal idempotent. */
+  private closed = false;
+  /** The `pagehide` handler, kept so {@link dispose} can unregister it. */
+  private onPageHide: ((event: Event) => void) | null = null;
   /** True while a leader transition is in flight (promotion to leader, etc.).
    *  Cleared the moment the new sync-relay signals `ready`. Consumers can
    *  combine this with `isReady` to know when sync FS ops are safe again. */
@@ -196,6 +273,16 @@ export class VFSFileSystem {
 
   // Bound request functions for method delegation
   private _sync: SyncRequestFn = (buf) => this.syncRequest(buf);
+
+  /**
+   * Spin cap for the current mode: bounded in `opfs` mode, unbounded otherwise.
+   *
+   * `undefined` keeps hybrid/vfs behaviour exactly as it was — those service sync requests
+   * synchronously in the relay, so a long spin there means a genuinely slow op, not a stall.
+   */
+  private _opfsSpinCap(): number | undefined {
+    return this._mode === 'opfs' ? OPFS_MAIN_THREAD_SPIN_TIMEOUT_MS : undefined;
+  }
   private _async: AsyncRequestFn = (op, p, flags, data, path2, fdArgs) =>
     this.asyncRequest(op, p, flags, data, path2, fdArgs);
 
@@ -272,6 +359,7 @@ export class VFSFileSystem {
     // Spawn workers
     this.syncWorker = this.spawnWorker('sync-relay');
     this.asyncWorker = this.spawnWorker('async-relay');
+    this.installUnloadTeardown();
 
     // Handle messages from sync-relay
     this.syncWorker.onmessage = (e: MessageEvent) => {
@@ -830,7 +918,7 @@ export class VFSFileSystem {
         sent += chunkSize;
         if (sent < requestBytes.byteLength) {
           // Wait for worker to ack
-          spinWait(this.ctrl, 0, sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK, this.ctrl);
+          spinWait(this.ctrl, 0, sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK, this.ctrl, this._opfsSpinCap(), OPFS_SYNC_STALL_MESSAGE);
         }
       }
     }
@@ -850,7 +938,7 @@ export class VFSFileSystem {
     // invisible no-op transition). True today — a request only exceeds maxChunk
     // for WRITE/FWRITE/APPEND, whose responses are 8 bytes — but if that ever
     // changes, readPayload must be made to ack the final chunk too.
-    spinWait(this.ctrl, 0, multiChunkRequest ? SIGNAL.CHUNK : SIGNAL.REQUEST, this.ctrl);
+    spinWait(this.ctrl, 0, multiChunkRequest ? SIGNAL.CHUNK : SIGNAL.REQUEST, this.ctrl, this._opfsSpinCap(), OPFS_SYNC_STALL_MESSAGE);
 
     // Read response — may be chunked
     const signal = Atomics.load(this.ctrl, 0);
@@ -876,7 +964,7 @@ export class VFSFileSystem {
         // Ack and wait for next chunk
         Atomics.store(this.ctrl, 0, SIGNAL.CHUNK_ACK);
         Atomics.notify(this.ctrl, 0);
-        spinWait(this.ctrl, 0, SIGNAL.CHUNK_ACK, this.ctrl);
+        spinWait(this.ctrl, 0, SIGNAL.CHUNK_ACK, this.ctrl, this._opfsSpinCap(), OPFS_SYNC_STALL_MESSAGE);
 
         const nextLen = Atomics.load(this.ctrl, 3);
         responseBytes.set(new Uint8Array(this.sab, HEADER_SIZE, nextLen), received);
@@ -927,15 +1015,18 @@ export class VFSFileSystem {
 
   // ========== Sync API ==========
 
-  readFileSync(filePath: PathLike, options?: ReadOptions | Encoding | null): string | Uint8Array {
+  readFileSync(filePath: PathLike | number, options?: ReadOptions | Encoding | null): string | Uint8Array {
+    if (isFdArg(filePath)) return _readFileFdSync(this._sync, filePath, options);
     return _readFileSync(this._sync, toPathString(filePath), options);
   }
 
-  writeFileSync(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): void {
+  writeFileSync(filePath: PathLike | number, data: string | Uint8Array, options?: WriteOptions | Encoding): void {
+    if (isFdArg(filePath)) return _writeFileFdSync(this._sync, filePath, data, options);
     _writeFileSync(this._sync, toPathString(filePath), data, options);
   }
 
-  appendFileSync(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): void {
+  appendFileSync(filePath: PathLike | number, data: string | Uint8Array, options?: WriteOptions | Encoding): void {
+    if (isFdArg(filePath)) return _appendFileFdSync(this._sync, filePath, data, options);
     _appendFileSync(this._sync, toPathString(filePath), data, options);
   }
 
@@ -967,37 +1058,26 @@ export class VFSFileSystem {
     return _globSync(this._sync, pattern, options);
   }
 
-  opendirSync(filePath: PathLike): Dir {
+  opendirSync(filePath: PathLike, options?: OpendirOptions): Dir {
     const dirPath = toPathString(filePath);
-    const entries = this.readdirSync(dirPath, { withFileTypes: true }) as Dirent[];
-    let index = 0;
-
-    return {
-      path: dirPath,
-
-      async read(): Promise<Dirent | null> {
-        if (index >= entries.length) return null;
-        return entries[index++];
-      },
-
-      async close(): Promise<void> {
-        // Nothing to release — entries were read eagerly.
-      },
-
-      async *[Symbol.asyncIterator](): AsyncIterableIterator<Dirent> {
-        for (const entry of entries) {
-          yield entry;
-        }
-      },
-    };
+    const entries = this.readdirSync(dirPath, {
+      withFileTypes: true,
+      recursive: options?.recursive,
+    }) as Dirent[];
+    // No descriptor to release — the entries were read eagerly.
+    return new VFSDir(dirPath, entries);
   }
 
-  statSync(filePath: PathLike, options?: StatOptions): Stats | BigIntStats {
-    return _statSync(this._sync, toPathString(filePath), options);
+  statSync(filePath: PathLike, options?: StatOptions & { throwIfNoEntry?: true }): Stats | BigIntStats;
+  statSync(filePath: PathLike, options: StatOptions & { throwIfNoEntry: false }): Stats | BigIntStats | undefined;
+  statSync(filePath: PathLike, options?: StatOptions): Stats | BigIntStats | undefined {
+    return _statSync(this._sync, toPathString(filePath), options as StatOptions & { throwIfNoEntry: false });
   }
 
-  lstatSync(filePath: PathLike, options?: StatOptions): Stats | BigIntStats {
-    return _lstatSync(this._sync, toPathString(filePath), options);
+  lstatSync(filePath: PathLike, options?: StatOptions & { throwIfNoEntry?: true }): Stats | BigIntStats;
+  lstatSync(filePath: PathLike, options: StatOptions & { throwIfNoEntry: false }): Stats | BigIntStats | undefined;
+  lstatSync(filePath: PathLike, options?: StatOptions): Stats | BigIntStats | undefined {
+    return _lstatSync(this._sync, toPathString(filePath), options as StatOptions & { throwIfNoEntry: false });
   }
 
   renameSync(oldPath: PathLike, newPath: PathLike): void {
@@ -1008,7 +1088,27 @@ export class VFSFileSystem {
     _copyFileSync(this._sync, toPathString(src), toPathString(dest), mode);
   }
 
+  /**
+   * Reject a copy whose destination is the source, or lives inside it.
+   *
+   * The subtree case is the dangerous one: a recursive copy into its own subtree recreates the
+   * destination inside itself on every pass and never terminates — an unbounded loop that hangs
+   * the tab and fills storage. Node rejects both with ERR_FS_CP_EINVAL before copying anything.
+   *
+   * Called once per public `cp` entry point rather than inside the recursion, so the recursive
+   * calls (whose dest is legitimately inside the destination tree) are unaffected.
+   */
+  private _assertCopyable(srcPath: string, destPath: string): void {
+    assertCopyable(srcPath, destPath);
+  }
+
   cpSync(src: PathLike, dest: PathLike, options?: CpOptions): void {
+    this._assertCopyable(toPathString(src), toPathString(dest));
+    this._cpSyncInner(src, dest, options);
+  }
+
+  /** The recursive worker. Its destinations are legitimately inside the destination tree. */
+  private _cpSyncInner(src: PathLike, dest: PathLike, options?: CpOptions): void {
     const srcPath = toPathString(src);
     const destPath = toPathString(dest);
     const force = options?.force !== false;          // default true
@@ -1020,7 +1120,7 @@ export class VFSFileSystem {
 
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
-        throw createError('EISDIR', 'cp', srcPath);
+        throw cpEisdirNotRecursive(srcPath);
       }
       try {
         this.mkdirSync(destPath, { recursive: true });
@@ -1031,14 +1131,14 @@ export class VFSFileSystem {
       for (const entry of entries) {
         const srcChild = pathJoin(srcPath, entry.name);
         const destChild = pathJoin(destPath, entry.name);
-        this.cpSync(srcChild, destChild, options);
+        this._cpSyncInner(srcChild, destChild, options);
       }
     } else if (srcStat.isSymbolicLink() && !dereference) {
       const target = this.readlinkSync(srcPath) as string;
       let destExists = false;
       try { this.lstatSync(destPath); destExists = true; } catch {}
       if (destExists) {
-        if (errorOnExist) throw createError('EEXIST', 'cp', destPath);
+        if (errorOnExist) throw cpTargetExists(destPath);
         if (!force) return;
         this.unlinkSync(destPath);
       }
@@ -1047,7 +1147,7 @@ export class VFSFileSystem {
       let destExists = false;
       try { this.lstatSync(destPath); destExists = true; } catch {}
       if (destExists) {
-        if (errorOnExist) throw createError('EEXIST', 'cp', destPath);
+        if (errorOnExist) throw cpTargetExists(destPath);
         if (!force) return;
       }
       this.copyFileSync(srcPath, destPath, errorOnExist ? constants.COPYFILE_EXCL : 0);
@@ -1071,7 +1171,7 @@ export class VFSFileSystem {
 
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
-        throw createError('EISDIR', 'cp', src);
+        throw cpEisdirNotRecursive(src);
       }
       try {
         await this.promises.mkdir(dest, { recursive: true });
@@ -1089,7 +1189,7 @@ export class VFSFileSystem {
       let destExists = false;
       try { await this.promises.lstat(dest); destExists = true; } catch {}
       if (destExists) {
-        if (errorOnExist) throw createError('EEXIST', 'cp', dest);
+        if (errorOnExist) throw cpTargetExists(dest);
         if (!force) return;
         await this.promises.unlink(dest);
       }
@@ -1098,7 +1198,7 @@ export class VFSFileSystem {
       let destExists = false;
       try { await this.promises.lstat(dest); destExists = true; } catch {}
       if (destExists) {
-        if (errorOnExist) throw createError('EEXIST', 'cp', dest);
+        if (errorOnExist) throw cpTargetExists(dest);
         if (!force) return;
       }
       await this.promises.copyFile(src, dest, errorOnExist ? constants.COPYFILE_EXCL : 0);
@@ -1118,8 +1218,8 @@ export class VFSFileSystem {
     _accessSync(this._sync, toPathString(filePath), mode);
   }
 
-  realpathSync(filePath: PathLike): string {
-    return _realpathSync(this._sync, toPathString(filePath));
+  realpathSync(filePath: PathLike, options?: { encoding?: string | null } | string | null): string | Uint8Array {
+    return _realpathSync(this._sync, toRealpathString(filePath), options);
   }
 
   chmodSync(filePath: PathLike, mode: Mode): void {
@@ -1127,8 +1227,8 @@ export class VFSFileSystem {
   }
 
   /** Like chmodSync but operates on the symlink itself. In this VFS, delegates to chmodSync. */
-  lchmodSync(filePath: string, mode: Mode): void {
-    _chmodSync(this._sync, filePath, mode);
+  lchmodSync(filePath: PathLike, mode: Mode): void {
+    _chmodSync(this._sync, toPathString(filePath), mode);
   }
 
   /** chmod on an open file descriptor. Resolves the fd to its inode on the
@@ -1143,8 +1243,8 @@ export class VFSFileSystem {
   }
 
   /** Like chownSync but operates on the symlink itself. In this VFS, delegates to chownSync. */
-  lchownSync(filePath: string, uid: number, gid: number): void {
-    _chownSync(this._sync, filePath, uid, gid);
+  lchownSync(filePath: PathLike, uid: number, gid: number): void {
+    _chownSync(this._sync, toPathString(filePath), uid, gid);
   }
 
   /** chown on an open file descriptor. Mutates the underlying inode's uid/gid. */
@@ -1162,8 +1262,8 @@ export class VFSFileSystem {
   }
 
   /** Like utimesSync but operates on the symlink itself. In this VFS, delegates to utimesSync. */
-  lutimesSync(filePath: string, atime: Date | number, mtime: Date | number): void {
-    _utimesSync(this._sync, filePath, atime, mtime);
+  lutimesSync(filePath: PathLike, atime: Date | number, mtime: Date | number): void {
+    _utimesSync(this._sync, toPathString(filePath), atime, mtime);
   }
 
   symlinkSync(target: PathLike, linkPath: PathLike, type?: string | null): void {
@@ -1178,8 +1278,36 @@ export class VFSFileSystem {
     _linkSync(this._sync, toPathString(existingPath), toPathString(newPath));
   }
 
-  mkdtempSync(prefix: string): string {
-    return _mkdtempSync(this._sync, prefix);
+  mkdtempSync(prefix: PathLike, options?: { encoding?: string | null } | string | null): string | Uint8Array {
+    return _mkdtempSync(this._sync, toPathString(prefix), options);
+  }
+
+  /**
+   * The stream constructors, exposed as properties the way `node:fs` exposes them, so
+   * `x instanceof fs.ReadStream` and `fs.FileReadStream` resolve for code written against Node.
+   * `Stats`, `Dirent` and `Dir` are deliberately absent: they are structural interfaces here,
+   * not runtime classes, and a fake constructor would make `instanceof` lie.
+   */
+  get ReadStream(): typeof NodeReadable { return NodeReadable; }
+  get WriteStream(): typeof NodeWritable { return NodeWritable; }
+  /** Node's legacy aliases for the same two constructors. */
+  get FileReadStream(): typeof NodeReadable { return NodeReadable; }
+  get FileWriteStream(): typeof NodeWritable { return NodeWritable; }
+
+  /**
+   * `mkdtempSync` whose result cleans itself up — Node 24's explicit-resource-management form.
+   *
+   * ```js
+   * using dir = fs.mkdtempDisposableSync('/tmp/build-');
+   * // dir.path is removed when the block exits, however it exits
+   * ```
+   * `remove()` is idempotent so an explicit call followed by the implicit `Symbol.dispose`
+   * does not throw ENOENT.
+   */
+  mkdtempDisposableSync(prefix: string): { path: string; remove(): void; [Symbol.dispose](): void } {
+    const path = _mkdtempSync(this._sync, prefix) as string;
+    const remove = () => { this.rmSync(path, { recursive: true, force: true }); };
+    return { path, remove, [Symbol.dispose]: remove };
   }
 
   // ---- File descriptor sync methods ----
@@ -1299,33 +1427,33 @@ export class VFSFileSystem {
 
   // ---- statfs methods ----
 
-  statfsSync(_path?: string): StatFs {
-    return {
-      type: 0x56465321,       // "VFS!"
-      bsize: 4096,
-      blocks: 1024 * 1024,    // ~4GB virtual capacity
-      bfree: 512 * 1024,      // ~2GB free (estimate)
-      bavail: 512 * 1024,
-      files: 10000,            // default max inodes
-      ffree: 5000,             // estimate half free
-    };
+  /**
+   * Real volume statistics, read from the VFS superblock.
+   *
+   * This used to return fixed constants — always ~4 GB capacity with ~2 GB free, whatever the
+   * volume actually held — so code checking free space before a large write got an answer
+   * unrelated to reality, and never saw a full disk coming.
+   */
+  statfsSync(path: PathLike = '/'): StatFs {
+    return _statfsSync(this._sync, toPathString(path));
   }
 
   statfs(path: string, callback: (err: Error | null, stats?: StatFs) => void): void;
   statfs(path: string): Promise<StatFs>;
-  statfs(path: string, callback?: (err: Error | null, stats?: StatFs) => void): Promise<StatFs> | void {
-    const result = this.statfsSync(path);
+  statfs(path: string = '/', callback?: (err: Error | null, stats?: StatFs) => void): Promise<StatFs> | void {
+    // Route through the async transport rather than the sync one: the callback form must work
+    // without crossOriginIsolated, where the sync path is unavailable.
+    const promise = _statfs(this._async, path);
     if (callback) {
       this._validateCb(callback);
-      setTimeout(() => callback(null, result), 0);
-      return;
+      return this._cb(promise, callback) as void;
     }
-    return Promise.resolve(result);
+    return promise;
   }
 
   // ---- Watch methods ----
 
-  watch(filePath: PathLike, options?: WatchOptions | Encoding, listener?: WatchListener): FSWatcher {
+  watch(filePath: PathLike, options?: WatchOptions | Encoding | WatchListener, listener?: WatchListener): FSWatcher {
     return _watch(this.ns, toPathString(filePath), options, listener);
   }
 
@@ -1348,106 +1476,35 @@ export class VFSFileSystem {
   // ---- Stream methods ----
 
   createReadStream(filePath: PathLike, options?: ReadStreamOptions | string): FSReadStream {
-    const opts = typeof options === 'string' ? { encoding: options as Encoding } : options;
-    const start = opts?.start ?? 0;
-    const end = opts?.end;
-    const highWaterMark = opts?.highWaterMark ?? 64 * 1024;
-
-    let position = start;
-    let handle: import('./types.js').FileHandle | null = null;
-    let finished = false;
-
-    const cleanup = async () => {
-      if (handle && ownsHandle) {
-        try { await handle.close(); } catch { /* ignore close errors */ }
-      }
-      handle = null;
-    };
-
-    // If an fd is provided, create a handle wrapper around it instead of opening a new file
+    const opts = typeof options === 'string' ? undefined : options;
     const providedFd = opts?.fd;
-    let ownsHandle = providedFd == null; // only close if we opened it
-
-    const readFn = async (): Promise<{ done: boolean; value?: Uint8Array }> => {
-      if (finished) return { done: true };
-
-      // Lazily open the file on first read (or wrap provided fd)
-      if (!handle) {
-        if (providedFd != null) {
-          handle = _createFileHandle(providedFd, this._async);
-        } else {
-          handle = await this.promises.open(toPathString(filePath), opts?.flags ?? 'r');
-        }
-      }
-
-      const readLen = end !== undefined
-        ? Math.min(highWaterMark, end - position + 1)
-        : highWaterMark;
-
-      if (readLen <= 0) {
-        finished = true;
-        await cleanup();
-        return { done: true };
-      }
-
-      const buffer = new Uint8Array(readLen);
-      const { bytesRead } = await handle.read(buffer, 0, readLen, position);
-
-      if (bytesRead === 0) {
-        finished = true;
-        await cleanup();
-        return { done: true };
-      }
-
-      position += bytesRead;
-
-      if (end !== undefined && position > end) {
-        finished = true;
-        await cleanup();
-        return { done: false, value: buffer.subarray(0, bytesRead) };
-      }
-
-      return { done: false, value: buffer.subarray(0, bytesRead) };
-    };
-
-    const stream = new NodeReadable(readFn, cleanup) as unknown as FSReadStream;
-    (stream as unknown as NodeReadable).path = toPathString(filePath);
-
-    return stream;
+    const stream = readStreamFromHandle({
+      // Opened lazily on first read, as before — creating the stream must not touch the disk.
+      acquire: async () => providedFd != null
+        ? _createFileHandle(providedFd, this._async)
+        : await this.promises.open(toPathString(filePath), opts?.flags ?? 'r'),
+      // A caller-supplied fd stays the caller's to close.
+      autoClose: providedFd == null && opts?.autoClose !== false,
+      path: toPathString(filePath),
+      // A descriptor handed in by the caller has its own position, and node reads from it; one we
+      // opened ourselves is at zero, where the two are the same.
+      followCursor: providedFd != null,
+    }, options);
+    return stream as unknown as FSReadStream;
   }
 
   createWriteStream(filePath: PathLike, options?: WriteStreamOptions | string): FSWriteStream {
-    const opts = typeof options === 'string' ? { encoding: options as Encoding } : options;
-    let position = opts?.start ?? 0;
-    let handle: FileHandle | null = null;
-    const providedWFd = opts?.fd;
-    const ownsWHandle = providedWFd == null;
-
-    const writeFn = async (chunk: Uint8Array): Promise<void> => {
-      if (!handle) {
-        if (providedWFd != null) {
-          handle = _createFileHandle(providedWFd, this._async);
-        } else {
-          handle = await this.promises.open(toPathString(filePath), opts?.flags ?? 'w');
-        }
-      }
-      const { bytesWritten } = await handle.write(chunk, 0, chunk.byteLength, position);
-      position += bytesWritten;
-    };
-
-    const closeFn = async (): Promise<void> => {
-      if (handle) {
-        if (opts?.flush) {
-          await handle.sync();
-        }
-        if (ownsWHandle) {
-          await handle.close();
-        }
-        handle = null;
-      }
-    };
-
-    return new NodeWritable(toPathString(filePath), writeFn, closeFn) as unknown as FSWriteStream;
+    const opts = typeof options === 'string' ? undefined : options;
+    const providedFd = opts?.fd;
+    const stream = writeStreamFromHandle({
+      acquire: async () => providedFd != null
+        ? _createFileHandle(providedFd, this._async)
+        : await this.promises.open(toPathString(filePath), opts?.flags ?? 'w'),
+      autoClose: providedFd == null && opts?.autoClose !== false,
+      path: toPathString(filePath),
+      followCursor: providedFd != null,
+    }, options);
+    return stream as unknown as FSWriteStream;
   }
 
   // ---- Utility methods ----
@@ -1520,6 +1577,86 @@ export class VFSFileSystem {
     }
   }
 
+  /**
+   * Tear the workers down when the page goes away, without needing the caller to remember.
+   *
+   * The OPFS mirror worker holds a recursive `FileSystemObserver`, and Chromium aborts the
+   * **browser process** — `FATAL: Detected dangling raw_ptr in unretained` — when a page is
+   * destroyed with one still attached. Callers cannot reasonably be relied on to call
+   * {@link dispose} before every navigation, and `pagehide` is too late to round-trip a message
+   * to the worker and back: nothing will run the event loop again.
+   *
+   * So this does the one thing that works synchronously — terminate the relay. The mirror worker
+   * is a *nested* worker owned by the relay, so killing the parent destroys the child's context
+   * and the observer with it, before teardown can trip over it.
+   *
+   * `event.persisted` means the page is going into the back/forward cache and may be restored,
+   * so the filesystem is left alone in that case.
+   */
+  private installUnloadTeardown(): void {
+    if (typeof addEventListener !== 'function' || typeof document === 'undefined') return;
+    this.onPageHide = (event: Event) => {
+      if ((event as PageTransitionEvent).persisted) return;
+      try { this.syncWorker?.terminate(); } catch { /* already gone */ }
+      try { this.asyncWorker?.terminate(); } catch { /* already gone */ }
+    };
+    addEventListener('pagehide', this.onPageHide);
+  }
+
+  /**
+   * Ask the sync relay to release what it owns, and wait briefly for it to confirm.
+   *
+   * The thing that actually has to happen here is the OPFS mirror worker disconnecting its
+   * recursive `FileSystemObserver`. Everything else the relay holds dies with the worker; an
+   * attached observer does not, and Chromium aborts the browser process on a page teardown that
+   * leaves one dangling. Bounded, because a close must not be able to hang.
+   */
+  private async shutdownRelay(): Promise<void> {
+    if (!this.syncWorker) return;
+    const worker = this.syncWorker;
+    const previous = worker.onmessage;
+    try {
+      await new Promise<void>((resolve) => {
+        const done = () => { clearTimeout(timer); worker.onmessage = previous; resolve(); };
+        const timer = setTimeout(done, 750);
+        worker.onmessage = (e: MessageEvent) => {
+          if (e.data?.type === 'shutdown-done') done();
+          else if (typeof previous === 'function') previous.call(worker, e);
+        };
+        worker.postMessage({ type: 'shutdown' });
+      });
+    } catch { /* closing is best-effort */ }
+  }
+
+  /**
+   * Release every resource this instance owns: the relay workers, the OPFS mirror worker, and
+   * the `FileSystemObserver` registered on the origin's storage.
+   *
+   * Worth calling explicitly in anything that creates instances repeatedly — a test suite, an
+   * app that switches volumes — because the observer is the one thing that does not simply die
+   * with the page. The instance is unusable afterwards; construct a new one to reopen the volume.
+   *
+   * Named `dispose` rather than `close` because `close(fd)` is already node's descriptor API and
+   * means something entirely different. `await using fs = new VFSFileSystem()` works too.
+   */
+  async dispose(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    if (this.onPageHide) {
+      removeEventListener('pagehide', this.onPageHide);
+      this.onPageHide = null;
+    }
+    await this.shutdownRelay();
+    try { this.syncWorker?.terminate(); } catch { /* already gone */ }
+    try { this.asyncWorker?.terminate(); } catch { /* already gone */ }
+    this.isReady = false;
+  }
+
+  /** `await using` support, so an instance can be scoped to a block. */
+  [Symbol.asyncDispose](): Promise<void> {
+    return this.dispose();
+  }
+
   /** Switch the filesystem mode at runtime.
    *
    *  Typical flow for IDE corruption recovery:
@@ -1545,7 +1682,10 @@ export class VFSFileSystem {
       this.rejectReady = reject;
     });
 
-    // Terminate old workers and spawn fresh ones
+    // Terminate old workers and spawn fresh ones. The relay is asked to shut down first so the
+    // OPFS mirror worker it owns can detach its FileSystemObserver — terminating the relay
+    // outright orphans that worker, and the observer with it.
+    await this.shutdownRelay();
     this.syncWorker.terminate();
     this.asyncWorker.terminate();
 
@@ -1660,30 +1800,44 @@ export class VFSFileSystem {
     return promise;
   }
 
-  readFile(filePath: string, callback: (err: Error | null, data?: Uint8Array | string) => void): void;
-  readFile(filePath: string, options: ReadOptions | Encoding | null, callback: (err: Error | null, data?: Uint8Array | string) => void): void;
-  readFile(filePath: string, optionsOrCallback?: any, callback?: any): any {
+  // The callback API accepts a file descriptor where a path goes; `fsPromises` does not (it
+  // takes a FileHandle instead), so these route to the fd path directly rather than through
+  // `this.promises`.
+  // Node's two async APIs disagree about *when* a bad path is reported, and both behaviours are
+  // observable: the callback API validates synchronously and **throws** (`fs.stat(123, cb)`
+  // throws ERR_INVALID_ARG_TYPE at the call site), while `fsPromises.stat(123)` returns a
+  // rejected promise. The methods below therefore call `toPathString` themselves before handing
+  // off to `this.promises`, which is `async` and would otherwise turn the throw into a rejection.
+  readFile(filePath: string | number, callback: (err: Error | null, data?: Uint8Array | string) => void): void;
+  readFile(filePath: string | number, options: ReadOptions | Encoding | null, callback: (err: Error | null, data?: Uint8Array | string) => void): void;
+  readFile(filePath: any, optionsOrCallback?: any, callback?: any): any {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    if (isFdArg(filePath)) return this._cb(_readFileFd(this._async, filePath, opts), cb);
+    toPathString(filePath);
     return this._cb(this.promises.readFile(filePath, opts), cb);
   }
 
-  writeFile(filePath: string, data: string | Uint8Array, callback: (err: Error | null) => void): void;
-  writeFile(filePath: string, data: string | Uint8Array, options: WriteOptions | Encoding, callback: (err: Error | null) => void): void;
-  writeFile(filePath: string, data: string | Uint8Array, optionsOrCallback?: any, callback?: any): any {
+  writeFile(filePath: string | number, data: string | Uint8Array, callback: (err: Error | null) => void): void;
+  writeFile(filePath: string | number, data: string | Uint8Array, options: WriteOptions | Encoding, callback: (err: Error | null) => void): void;
+  writeFile(filePath: any, data: string | Uint8Array, optionsOrCallback?: any, callback?: any): any {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    if (isFdArg(filePath)) return this._cbVoid(_writeFileFd(this._async, filePath, data, opts), cb);
+    toPathString(filePath);
     return this._cbVoid(this.promises.writeFile(filePath, data, opts), cb);
   }
 
-  appendFile(filePath: string, data: string | Uint8Array, callback: (err: Error | null) => void): void;
-  appendFile(filePath: string, data: string | Uint8Array, options: WriteOptions | Encoding, callback: (err: Error | null) => void): void;
-  appendFile(filePath: string, data: string | Uint8Array, optionsOrCallback?: any, callback?: any): any {
+  appendFile(filePath: string | number, data: string | Uint8Array, callback: (err: Error | null) => void): void;
+  appendFile(filePath: string | number, data: string | Uint8Array, options: WriteOptions | Encoding, callback: (err: Error | null) => void): void;
+  appendFile(filePath: any, data: string | Uint8Array, optionsOrCallback?: any, callback?: any): any {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    if (isFdArg(filePath)) return this._cbVoid(_appendFileFd(this._async, filePath, data, opts), cb);
+    toPathString(filePath);
     return this._cbVoid(this.promises.appendFile(filePath, data, opts), cb);
   }
 
@@ -1693,6 +1847,7 @@ export class VFSFileSystem {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    toPathString(filePath);
     return this._cb(this.promises.mkdir(filePath, opts), cb);
   }
 
@@ -1702,6 +1857,7 @@ export class VFSFileSystem {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    toPathString(filePath);
     return this._cbVoid(this.promises.rmdir(filePath, opts), cb);
   }
 
@@ -1711,11 +1867,13 @@ export class VFSFileSystem {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    toPathString(filePath);
     return this._cbVoid(this.promises.rm(filePath, opts), cb);
   }
 
   unlink(filePath: string, callback?: (err: Error | null) => void): any {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cbVoid(this.promises.unlink(filePath), callback);
   }
 
@@ -1725,6 +1883,7 @@ export class VFSFileSystem {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    toPathString(filePath);
     return this._cb(this.promises.readdir(filePath, opts), cb);
   }
 
@@ -1734,6 +1893,7 @@ export class VFSFileSystem {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    toPathString(filePath);
     return this._cb(this.promises.stat(filePath, opts), cb);
   }
 
@@ -1743,6 +1903,7 @@ export class VFSFileSystem {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    toPathString(filePath);
     return this._cb(this.promises.lstat(filePath, opts), cb);
   }
 
@@ -1752,11 +1913,13 @@ export class VFSFileSystem {
     const cb = typeof modeOrCallback === 'function' ? modeOrCallback : callback;
     this._validateCb(cb);
     const mode = typeof modeOrCallback === 'function' ? undefined : modeOrCallback;
+    toPathString(filePath);
     return this._cbVoid(this.promises.access(filePath, mode), cb);
   }
 
   rename(oldPath: string, newPath: string, callback?: (err: Error | null) => void): any {
     this._validateCb(callback);
+    toPathString(oldPath); toPathString(newPath);
     return this._cbVoid(this.promises.rename(oldPath, newPath), callback);
   }
 
@@ -1766,6 +1929,7 @@ export class VFSFileSystem {
     const cb = typeof modeOrCallback === 'function' ? modeOrCallback : callback;
     this._validateCb(cb);
     const mode = typeof modeOrCallback === 'function' ? undefined : modeOrCallback;
+    toPathString(src); toPathString(dest);
     return this._cbVoid(this.promises.copyFile(src, dest, mode), cb);
   }
 
@@ -1775,26 +1939,36 @@ export class VFSFileSystem {
     const cb = typeof lenOrCallback === 'function' ? lenOrCallback : callback;
     this._validateCb(cb);
     const len = typeof lenOrCallback === 'function' ? undefined : lenOrCallback;
+    toPathString(filePath);
     return this._cbVoid(this.promises.truncate(filePath, len), cb);
   }
 
-  realpath(filePath: string, callback?: (err: Error | null, resolvedPath?: string) => void): any {
-    this._validateCb(callback);
-    return this._cb(this.promises.realpath(filePath), callback);
+  realpath(filePath: string, callback?: (err: Error | null, resolvedPath?: string | Uint8Array) => void): any;
+  realpath(filePath: string, options: { encoding?: string | null } | string | null, callback?: (err: Error | null, resolvedPath?: string | Uint8Array) => void): any;
+  realpath(filePath: string, optionsOrCallback?: any, callback?: any): any {
+    // Node: fs.realpath(path[, options], callback). The options argument was missing entirely
+    // here, so the documented three-argument form threw "cb must be of type function".
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    this._validateCb(cb);
+    return this._cb(this.promises.realpath(filePath, opts), cb);
   }
 
   chmod(filePath: string, mode: Mode, callback?: (err: Error | null) => void): any {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cbVoid(this.promises.chmod(filePath, mode), callback);
   }
 
   chown(filePath: string, uid: number, gid: number, callback?: (err: Error | null) => void): any {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cbVoid(this.promises.chown(filePath, uid, gid), callback);
   }
 
   utimes(filePath: string, atime: Date | number, mtime: Date | number, callback?: (err: Error | null) => void): any {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cbVoid(this.promises.utimes(filePath, atime, mtime), callback);
   }
 
@@ -1804,6 +1978,7 @@ export class VFSFileSystem {
     const cb = typeof typeOrCallback === 'function' ? typeOrCallback : callback;
     this._validateCb(cb);
     const type = typeof typeOrCallback === 'function' ? undefined : typeOrCallback;
+    toPathString(target); toPathString(linkPath);
     return this._cbVoid(this.promises.symlink(target, linkPath, type), cb);
   }
 
@@ -1813,26 +1988,54 @@ export class VFSFileSystem {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    toPathString(filePath);
     return this._cb(this.promises.readlink(filePath, opts), cb);
   }
 
   link(existingPath: string, newPath: string, callback?: (err: Error | null) => void): any {
     this._validateCb(callback);
+    toPathString(existingPath); toPathString(newPath);
     return this._cbVoid(this.promises.link(existingPath, newPath), callback);
   }
 
+  open(filePath: string, callback: (err: Error | null, fd?: number) => void): void;
   open(filePath: string, flags: string | number, callback: (err: Error | null, fd?: number) => void): void;
-  open(filePath: string, flags: string | number, mode: number, callback: (err: Error | null, fd?: number) => void): void;
-  open(filePath: string, flags: string | number, modeOrCallback?: any, callback?: any): any {
-    const cb = typeof modeOrCallback === 'function' ? modeOrCallback : callback;
+  open(filePath: string, flags: string | number, mode: Mode, callback: (err: Error | null, fd?: number) => void): void;
+  open(filePath: string, flagsOrCallback?: any, modeOrCallback?: any, callback?: any): any {
+    // Node: fs.open(path[, flags[, mode]], callback) — BOTH middle arguments are optional, so the
+    // callback can arrive in any of three positions. `flags` used to be required here, which meant
+    // `fs.open(path, cb)` consumed the callback as the flags string: the open still ran, but the
+    // callback was never invoked and no error was reported. Same failure shape as fs.watch's.
+    let flags: string | number = 'r';
+    let mode: Mode | undefined;
+    let cb: any;
+
+    if (typeof flagsOrCallback === 'function') {
+      cb = flagsOrCallback;
+    } else {
+      flags = flagsOrCallback ?? 'r';
+      if (typeof modeOrCallback === 'function') {
+        cb = modeOrCallback;
+      } else {
+        mode = modeOrCallback;
+        cb = callback;
+      }
+    }
+
     this._validateCb(cb);
-    const mode = typeof modeOrCallback === 'function' ? undefined : modeOrCallback;
+    toPathString(filePath);
     return this._cb(this.promises.open(filePath, flags, mode), cb, (handle: any) => [handle.fd]);
   }
 
-  mkdtemp(prefix: string, callback?: (err: Error | null, folder?: string) => void): any {
-    this._validateCb(callback);
-    return this._cb(this.promises.mkdtemp(prefix), callback);
+  mkdtemp(prefix: string, callback?: (err: Error | null, folder?: string | Uint8Array) => void): any;
+  mkdtemp(prefix: string, options: { encoding?: string | null } | string | null, callback?: (err: Error | null, folder?: string | Uint8Array) => void): any;
+  mkdtemp(prefix: string, optionsOrCallback?: any, callback?: any): any {
+    // Node: fs.mkdtemp(prefix[, options], callback) — same missing middle argument as realpath.
+    const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
+    const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    this._validateCb(cb);
+    toPathString(prefix);
+    return this._cb(this.promises.mkdtemp(prefix, opts), cb);
   }
 
   cp(src: string, dest: string, callback: (err: Error | null) => void): void;
@@ -1984,6 +2187,7 @@ export class VFSFileSystem {
 
   opendir(filePath: string, callback?: (err: Error | null, dir?: Dir) => void): any {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cb(this.promises.opendir(filePath), callback);
   }
 
@@ -2011,18 +2215,21 @@ export class VFSFileSystem {
     return this._cbVoid(this.promises.fchown(fd, uid, gid), callback);
   }
 
-  lchmod(filePath: string, mode: Mode, callback?: (err: Error | null) => void): any {
+  lchmod(filePath: PathLike, mode: Mode, callback?: (err: Error | null) => void): any {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cbVoid(this.promises.lchmod(filePath, mode), callback);
   }
 
-  lchown(filePath: string, uid: number, gid: number, callback?: (err: Error | null) => void): any {
+  lchown(filePath: PathLike, uid: number, gid: number, callback?: (err: Error | null) => void): any {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cbVoid(this.promises.lchown(filePath, uid, gid), callback);
   }
 
-  lutimes(filePath: string, atime: Date | number, mtime: Date | number, callback?: (err: Error | null) => void): any {
+  lutimes(filePath: PathLike, atime: Date | number, mtime: Date | number, callback?: (err: Error | null) => void): any {
     this._validateCb(callback);
+    toPathString(filePath);
     return this._cbVoid(this.promises.lutimes(filePath, atime, mtime), callback);
   }
 }
@@ -2041,63 +2248,81 @@ class VFSPromises {
   /** Node.js compat: fs.promises.constants (same as fs.constants) */
   get constants() { return constants; }
 
-  readFile(filePath: PathLike, options?: ReadOptions | Encoding | null) {
+  // Unlike the callback API, the promise API takes a **FileHandle** rather than a raw descriptor
+  // in the path position — `fsPromises.readFile(fd)` is an ERR_INVALID_ARG_TYPE in Node, and
+  // stays one here because `toPathString` rejects numbers.
+  async readFile(filePath: PathLike | FileHandle, options?: ReadOptions | Encoding | null) {
+    if (isFileHandle(filePath)) return filePath.readFile(options);
     return _readFile(this._async, toPathString(filePath), options);
   }
 
-  writeFile(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding) {
+  async writeFile(filePath: PathLike | FileHandle, data: string | Uint8Array, options?: WriteOptions | Encoding) {
+    if (isFileHandle(filePath)) return filePath.writeFile(data, options);
     return _writeFile(this._async, toPathString(filePath), data, options);
   }
 
-  appendFile(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding) {
+  async appendFile(filePath: PathLike | FileHandle, data: string | Uint8Array, options?: WriteOptions | Encoding) {
+    if (isFileHandle(filePath)) return filePath.appendFile(data, options);
     return _appendFile(this._async, toPathString(filePath), data, options);
   }
 
-  mkdir(filePath: PathLike, options?: MkdirOptions | Mode) {
+  async mkdir(filePath: PathLike, options?: MkdirOptions | Mode) {
     return _mkdir(this._async, toPathString(filePath), options);
   }
 
-  rmdir(filePath: PathLike, options?: RmdirOptions) {
+  async rmdir(filePath: PathLike, options?: RmdirOptions) {
     return _rmdir(this._async, toPathString(filePath), options);
   }
 
-  rm(filePath: PathLike, options?: RmOptions) {
+  async rm(filePath: PathLike, options?: RmOptions) {
     return _rm(this._async, toPathString(filePath), options);
   }
 
-  unlink(filePath: PathLike) {
+  async unlink(filePath: PathLike) {
     return _unlink(this._async, toPathString(filePath));
   }
 
-  readdir(filePath: PathLike, options?: ReaddirOptions | Encoding | null) {
+  async readdir(filePath: PathLike, options?: ReaddirOptions | Encoding | null) {
     return _readdir(this._async, toPathString(filePath), options);
   }
 
-  glob(pattern: string | string[], options?: GlobOptions): Promise<string[] | Dirent[]> {
+  async glob(pattern: string | string[], options?: GlobOptions): Promise<string[] | Dirent[]> {
     return _glob(this._async, pattern, options);
   }
 
-  stat(filePath: PathLike, options?: StatOptions) {
-    return _stat(this._async, toPathString(filePath), options);
+  stat(filePath: PathLike, options?: StatOptions & { throwIfNoEntry?: true }): Promise<Stats | BigIntStats>;
+  stat(filePath: PathLike, options: StatOptions & { throwIfNoEntry: false }): Promise<Stats | BigIntStats | undefined>;
+  async stat(filePath: PathLike, options?: StatOptions): Promise<Stats | BigIntStats | undefined> {
+    return _stat(this._async, toPathString(filePath), options as StatOptions & { throwIfNoEntry: false });
   }
 
-  lstat(filePath: PathLike, options?: StatOptions) {
-    return _lstat(this._async, toPathString(filePath), options);
+  lstat(filePath: PathLike, options?: StatOptions & { throwIfNoEntry?: true }): Promise<Stats | BigIntStats>;
+  lstat(filePath: PathLike, options: StatOptions & { throwIfNoEntry: false }): Promise<Stats | BigIntStats | undefined>;
+  async lstat(filePath: PathLike, options?: StatOptions): Promise<Stats | BigIntStats | undefined> {
+    return _lstat(this._async, toPathString(filePath), options as StatOptions & { throwIfNoEntry: false });
   }
 
-  access(filePath: PathLike, mode?: number) {
+  async access(filePath: PathLike, mode?: number) {
     return _access(this._async, toPathString(filePath), mode);
   }
 
-  rename(oldPath: PathLike, newPath: PathLike) {
+  async rename(oldPath: PathLike, newPath: PathLike) {
     return _rename(this._async, toPathString(oldPath), toPathString(newPath));
   }
 
-  copyFile(src: PathLike, dest: PathLike, mode?: number) {
+  async copyFile(src: PathLike, dest: PathLike, mode?: number) {
     return _copyFile(this._async, toPathString(src), toPathString(dest), mode);
   }
 
   async cp(src: PathLike, dest: PathLike, options?: CpOptions): Promise<void> {
+    // Same self/subtree guard as the sync form — an unguarded recursive copy into its own
+    // subtree never terminates. See VFSFileSystem._assertCopyable.
+    assertCopyable(toPathString(src), toPathString(dest));
+    return this._cpInner(src, dest, options);
+  }
+
+  /** The recursive worker; its destinations are legitimately inside the destination tree. */
+  private async _cpInner(src: PathLike, dest: PathLike, options?: CpOptions): Promise<void> {
     const srcPath = toPathString(src);
     const destPath = toPathString(dest);
     const force = options?.force !== false;
@@ -2111,7 +2336,7 @@ class VFSPromises {
 
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
-        throw createError('EISDIR', 'cp', srcPath);
+        throw cpEisdirNotRecursive(srcPath);
       }
       try {
         await this.mkdir(destPath, { recursive: true });
@@ -2122,14 +2347,14 @@ class VFSPromises {
       for (const entry of entries) {
         const srcChild = pathJoin(srcPath, entry.name);
         const destChild = pathJoin(destPath, entry.name);
-        await this.cp(srcChild, destChild, options);
+        await this._cpInner(srcChild, destChild, options);
       }
     } else if (srcStat.isSymbolicLink() && !dereference) {
       const target = await this.readlink(srcPath) as string;
       let destExists = false;
       try { await this.lstat(destPath); destExists = true; } catch {}
       if (destExists) {
-        if (errorOnExist) throw createError('EEXIST', 'cp', destPath);
+        if (errorOnExist) throw cpTargetExists(destPath);
         if (!force) return;
         await this.unlink(destPath);
       }
@@ -2138,7 +2363,7 @@ class VFSPromises {
       let destExists = false;
       try { await this.lstat(destPath); destExists = true; } catch {}
       if (destExists) {
-        if (errorOnExist) throw createError('EEXIST', 'cp', destPath);
+        if (errorOnExist) throw cpTargetExists(destPath);
         if (!force) return;
       }
       await this.copyFile(srcPath, destPath, errorOnExist ? constants.COPYFILE_EXCL : 0);
@@ -2150,85 +2375,95 @@ class VFSPromises {
     }
   }
 
-  truncate(filePath: PathLike, len?: number) {
+  async truncate(filePath: PathLike, len?: number) {
     return _truncate(this._async, toPathString(filePath), len);
   }
 
-  realpath(filePath: PathLike) {
-    return _realpath(this._async, toPathString(filePath));
+  async realpath(filePath: PathLike, options?: { encoding?: string | null } | string | null) {
+    return _realpath(this._async, toRealpathString(filePath), options);
   }
 
-  exists(filePath: PathLike) {
+  async exists(filePath: PathLike) {
     return _exists(this._async, toPathString(filePath));
   }
 
-  chmod(filePath: PathLike, mode: Mode) {
+  async chmod(filePath: PathLike, mode: Mode) {
     return _chmod(this._async, toPathString(filePath), mode);
   }
 
   /** Like chmod but operates on the symlink itself. In this VFS, delegates to chmod. */
-  lchmod(filePath: string, mode: Mode) {
-    return _chmod(this._async, filePath, mode);
+  async lchmod(filePath: PathLike, mode: Mode) {
+    return _chmod(this._async, toPathString(filePath), mode);
   }
 
   /** chmod on an open file descriptor. Engine resolves fd → inode and
    *  mutates the mode bits directly. */
-  fchmod(fd: number, mode: Mode): Promise<void> {
+  async fchmod(fd: number, mode: Mode): Promise<void> {
     return _fchmod(this._async, fd, mode);
   }
 
-  chown(filePath: PathLike, uid: number, gid: number) {
+  async chown(filePath: PathLike, uid: number, gid: number) {
     return _chown(this._async, toPathString(filePath), uid, gid);
   }
 
   /** Like chown but operates on the symlink itself. In this VFS, delegates to chown. */
-  lchown(filePath: string, uid: number, gid: number) {
-    return _chown(this._async, filePath, uid, gid);
+  async lchown(filePath: PathLike, uid: number, gid: number) {
+    return _chown(this._async, toPathString(filePath), uid, gid);
   }
 
   /** chown on an open file descriptor. Engine resolves fd → inode and
    *  mutates uid/gid directly. */
-  fchown(fd: number, uid: number, gid: number): Promise<void> {
+  async fchown(fd: number, uid: number, gid: number): Promise<void> {
     return _fchown(this._async, fd, uid, gid);
   }
 
-  utimes(filePath: PathLike, atime: Date | number, mtime: Date | number) {
+  async utimes(filePath: PathLike, atime: Date | number, mtime: Date | number) {
     return _utimes(this._async, toPathString(filePath), atime, mtime);
   }
 
   /** utimes on an open file descriptor. Engine resolves fd → inode and
    *  mutates atime/mtime directly. */
-  futimes(fd: number, atime: Date | number, mtime: Date | number): Promise<void> {
+  async futimes(fd: number, atime: Date | number, mtime: Date | number): Promise<void> {
     return _futimes(this._async, fd, atime, mtime);
   }
 
   /** Like utimes but operates on the symlink itself. In this VFS, delegates to utimes. */
-  lutimes(filePath: string, atime: Date | number, mtime: Date | number) {
-    return _utimes(this._async, filePath, atime, mtime);
+  async lutimes(filePath: PathLike, atime: Date | number, mtime: Date | number) {
+    return _utimes(this._async, toPathString(filePath), atime, mtime);
   }
 
-  symlink(target: PathLike, linkPath: PathLike, type?: string | null) {
+  async symlink(target: PathLike, linkPath: PathLike, type?: string | null) {
     return _symlink(this._async, toPathString(target), toPathString(linkPath), type);
   }
 
-  readlink(filePath: PathLike, options?: { encoding?: string | null } | string | null) {
+  async readlink(filePath: PathLike, options?: { encoding?: string | null } | string | null) {
     return _readlink(this._async, toPathString(filePath), options);
   }
 
-  link(existingPath: PathLike, newPath: PathLike) {
+  async link(existingPath: PathLike, newPath: PathLike) {
     return _link(this._async, toPathString(existingPath), toPathString(newPath));
   }
 
-  open(filePath: PathLike, flags?: string | number, mode?: number) {
+  async open(filePath: PathLike, flags?: string | number, mode?: Mode) {
     return _open(this._async, toPathString(filePath), flags, mode);
   }
 
-  opendir(filePath: PathLike) {
-    return _opendir(this._async, toPathString(filePath));
+  async opendir(filePath: PathLike, options?: OpendirOptions) {
+    return _opendir(this._async, toPathString(filePath), options);
   }
 
-  mkdtemp(prefix: string) {
-    return _mkdtemp(this._async, prefix);
+  /**
+   * `mkdtemp` whose result cleans itself up — see `mkdtempDisposableSync`. Disposal is async
+   * here (`await using`), so the symbol is `Symbol.asyncDispose` and `remove()` returns a promise.
+   */
+  async mkdtempDisposable(prefix: string): Promise<{ path: string; remove(): Promise<void>; [Symbol.asyncDispose](): Promise<void> }> {
+    const path = (await _mkdtemp(this._async, prefix)) as string;
+    const remove = () => this.rm(path, { recursive: true, force: true });
+    return { path, remove, [Symbol.asyncDispose]: remove };
+  }
+
+  async mkdtemp(prefix: PathLike, options?: { encoding?: string | null } | string | null) {
+    return _mkdtemp(this._async, toPathString(prefix), options);
   }
 
   async openAsBlob(filePath: string, options?: OpenAsBlobOptions): Promise<Blob> {
@@ -2237,16 +2472,9 @@ class VFSPromises {
     return new Blob([bytes as BlobPart], { type: options?.type ?? '' });
   }
 
-  async statfs(path: string): Promise<StatFs> {
-    return {
-      type: 0x56465321,       // "VFS!"
-      bsize: 4096,
-      blocks: 1024 * 1024,    // ~4GB virtual capacity
-      bfree: 512 * 1024,      // ~2GB free (estimate)
-      bavail: 512 * 1024,
-      files: 10000,            // default max inodes
-      ffree: 5000,             // estimate half free
-    };
+  /** Real volume statistics — see the note on `VFSFileSystem.statfsSync`. */
+  async statfs(path: PathLike = '/'): Promise<StatFs> {
+    return _statfs(this._async, toPathString(path));
   }
 
   async *watch(filePath: string, options?: WatchOptions): AsyncIterable<WatchEventType> {

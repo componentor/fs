@@ -37,6 +37,13 @@ self.addEventListener('unhandledrejection', (e) => {
   console.error('[sync-relay] unhandled rejection:', reason?.message ?? String(reason), reason?.stack ?? '');
 });
 import { VFS_MAGIC, VFS_VERSION, SUPERBLOCK, INODE_SIZE } from '../vfs/layout.js';
+import { dispatchOp } from '../protocol/dispatch.js';
+import { planMirror, sampleOpenPreState } from '../protocol/mirror-plan.js';
+import {
+  decodeModeArg, decodeTruncateArgs, decodeChownArgs, decodeTimesArgs, decodeFdArg,
+  decodeFreadArgs, decodeFwriteArgs, decodeFtruncateArgs, decodeFchmodArgs,
+  decodeFchownArgs, decodeFutimesArgs,
+} from '../protocol/payloads.js';
 
 const engine = new VFSEngine();
 
@@ -63,6 +70,8 @@ let leaderLoopRunning = false;
 // OPFS Sync Worker (leader mode only — mirrors VFS to real OPFS files)
 let opfsSyncPort: MessagePort | null = null;
 let opfsSyncEnabled = false;
+/** The mirror worker, so it can be shut down instead of orphaned. See the spawn site below. */
+let opfsSyncWorker: Worker | null = null;
 
 // Watch broadcast (leader mode only — fires on every VFS mutation)
 let watchBc: BroadcastChannel | null = null;
@@ -290,275 +299,16 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
   }
   const t1 = debug ? performance.now() : 0;
 
-  let result: { status: number; data?: Uint8Array | null };
-  let syncOp: number | undefined;
-  let syncPath: string | undefined;
-  let syncNewPath: string | undefined;
-
-  switch (op) {
-    case OP.READ:
-      result = engine.read(path);
-      break;
-
-    case OP.WRITE:
-      result = engine.write(path, data ?? new Uint8Array(0), flags);
-      if (result.status === 0) { syncOp = op; syncPath = path; }
-      break;
-
-    case OP.APPEND:
-      result = engine.append(path, data ?? new Uint8Array(0));
-      if (result.status === 0) { syncOp = op; syncPath = path; }
-      break;
-
-    case OP.UNLINK:
-      result = engine.unlink(path);
-      if (result.status === 0) { syncOp = op; syncPath = path; }
-      break;
-
-    case OP.STAT:
-      result = engine.stat(path);
-      break;
-
-    case OP.LSTAT:
-      result = engine.lstat(path);
-      break;
-
-    case OP.MKDIR:
-      // Requested mode arrives as a 4-byte LE payload; a client that sends none keeps mkdir's
-      // Node default of 0o777, which the engine then reduces by the umask.
-      result = engine.mkdir(path, flags, decodeMode(data, 0o777));
-      if (result.status === 0) { syncOp = op; syncPath = path; }
-      break;
-
-    case OP.RMDIR:
-      result = engine.rmdir(path, flags);
-      if (result.status === 0) { syncOp = op; syncPath = path; }
-      break;
-
-    case OP.READDIR:
-      result = engine.readdir(path, flags);
-      break;
-
-    case OP.RENAME: {
-      const newPath = data ? decodeSecondPath(data) : '';
-      result = engine.rename(path, newPath);
-      if (result.status === 0) { syncOp = op; syncPath = path; syncNewPath = newPath; }
-      break;
-    }
-
-    case OP.EXISTS:
-      result = engine.exists(path);
-      break;
-
-    case OP.TRUNCATE: {
-      const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getFloat64(0, true) : 0;
-      result = engine.truncate(path, len);
-      if (result.status === 0) { syncOp = op; syncPath = path; }
-      break;
-    }
-
-    case OP.COPY: {
-      const destPath = data ? decodeSecondPath(data) : '';
-      result = engine.copy(path, destPath, flags);
-      if (result.status === 0) { syncOp = op; syncPath = destPath; }
-      break;
-    }
-
-    case OP.ACCESS:
-      result = engine.access(path, flags);
-      break;
-
-    case OP.REALPATH:
-      result = engine.realpath(path);
-      break;
-
-    case OP.CHMOD: {
-      const chmodMode = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = engine.chmod(path, chmodMode);
-      if (result.status === 0) { syncOp = op; syncPath = path; }
-      break;
-    }
-
-    case OP.CHOWN: {
-      if (!data || data.byteLength < 8) {
-        result = { status: 7 }; // EINVAL
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const uid = dv.getUint32(0, true);
-      const gid = dv.getUint32(4, true);
-      result = engine.chown(path, uid, gid);
-      if (result.status === 0) { syncOp = op; syncPath = path; }
-      break;
-    }
-
-    case OP.UTIMES: {
-      if (!data || data.byteLength < 16) {
-        result = { status: 7 }; // EINVAL
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const atime = dv.getFloat64(0, true);
-      const mtime = dv.getFloat64(8, true);
-      result = engine.utimes(path, atime, mtime);
-      if (result.status === 0) { syncOp = op; syncPath = path; }
-      break;
-    }
-
-    case OP.SYMLINK: {
-      const target = data ? new TextDecoder().decode(data) : '';
-      result = engine.symlink(target, path);
-      if (result.status === 0) { syncOp = op; syncPath = path; }
-      break;
-    }
-
-    case OP.READLINK:
-      result = engine.readlink(path);
-      break;
-
-    case OP.LINK: {
-      const newPath = data ? decodeSecondPath(data) : '';
-      result = engine.link(path, newPath);
-      if (result.status === 0) { syncOp = op; syncPath = newPath; }
-      break;
-    }
-
-    case OP.OPEN: {
-      // open() mutates the VFS in two cases that must be mirrored: O_TRUNC
-      // empties an existing file, and O_CREAT of a missing path creates one
-      // (e.g. `open(p,'w')`+close as a touch, or createWriteStream opened and
-      // closed before any chunk). Neither emits a WRITE/TRUNCATE op, so without
-      // this the OPFS mirror keeps stale bytes (O_TRUNC) or lacks the file
-      // entirely (O_CREAT). A plain read-open, or O_CREAT of an already-present
-      // file (no content change), must not re-mirror — the cheap exists()
-      // pre-check (only for O_CREAT-without-O_TRUNC) avoids re-reading a large
-      // append-mode file on every open.
-      const willCreate = (flags & 64) !== 0;   // O_CREAT
-      const willTrunc = (flags & 512) !== 0;    // O_TRUNC
-      const existedBefore = willCreate && !willTrunc ? engine.exists(path).data?.[0] === 1 : false;
-      result = engine.open(path, flags, reqTabId, decodeMode(data, 0o666));
-      if (result.status === 0 && (willTrunc || (willCreate && !existedBefore))) {
-        syncOp = OP.WRITE;
-        syncPath = path;
-      }
-      break;
-    }
-
-    case OP.CLOSE: {
-      const fd = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = engine.close(fd);
-      break;
-    }
-
-    case OP.FREAD: {
-      if (!data || data.byteLength < 16) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const length = dv.getUint32(4, true);
-      const pos = dv.getFloat64(8, true);
-      result = engine.fread(fd, length, pos === -1 ? null : pos);
-      break;
-    }
-
-    case OP.FWRITE: {
-      if (!data || data.byteLength < 12) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const pos = dv.getFloat64(4, true);
-      const writeData = data.subarray(12);
-      result = engine.fwrite(fd, writeData, pos === -1 ? null : pos);
-      if (result.status === 0) { syncOp = op; syncPath = engine.getPathForFd(fd) ?? undefined; }
-      break;
-    }
-
-    case OP.FSTAT: {
-      const fd = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
-      result = engine.fstat(fd);
-      break;
-    }
-
-    case OP.FTRUNCATE: {
-      if (!data || data.byteLength < 12) {
-        result = { status: 7 };
-        break;
-      }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const len = dv.getFloat64(4, true);
-      result = engine.ftruncate(fd, len);
-      if (result.status === 0) { syncOp = op; syncPath = engine.getPathForFd(fd) ?? undefined; }
-      break;
-    }
-
-    case OP.FSYNC:
-      result = engine.fsync();
-      break;
-
-    case OP.OPENDIR:
-      result = engine.opendir(path, reqTabId);
-      break;
-
-    case OP.MKDTEMP:
-      result = engine.mkdtemp(path);
-      if (result.status === 0 && result.data) {
-        syncOp = op;
-        syncPath = new TextDecoder().decode(result.data instanceof Uint8Array ? result.data : new Uint8Array(0));
-      }
-      break;
-
-    case OP.FCHMOD: {
-      // Payload: [fd: u32][mode: u32]
-      if (!data || data.byteLength < 8) { result = { status: 7 }; break; }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const mode = dv.getUint32(4, true);
-      result = engine.fchmod(fd, mode);
-      if (result.status === 0) {
-        syncOp = OP.CHMOD;
-        syncPath = engine.getPathForFd(fd) ?? undefined;
-      }
-      break;
-    }
-
-    case OP.FCHOWN: {
-      // Payload: [fd: u32][uid: u32][gid: u32]
-      if (!data || data.byteLength < 12) { result = { status: 7 }; break; }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const uid = dv.getUint32(4, true);
-      const gid = dv.getUint32(8, true);
-      result = engine.fchown(fd, uid, gid);
-      if (result.status === 0) {
-        syncOp = OP.CHOWN;
-        syncPath = engine.getPathForFd(fd) ?? undefined;
-      }
-      break;
-    }
-
-    case OP.FUTIMES: {
-      // Payload: [fd: u32][pad: u32][atime: f64][mtime: f64]
-      if (!data || data.byteLength < 24) { result = { status: 7 }; break; }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const atime = dv.getFloat64(8, true);
-      const mtime = dv.getFloat64(16, true);
-      result = engine.futimes(fd, atime, mtime);
-      if (result.status === 0) {
-        syncOp = OP.UTIMES;
-        syncPath = engine.getPathForFd(fd) ?? undefined;
-      }
-      break;
-    }
-
-    default:
-      result = { status: 7 }; // EINVAL — unknown op
-  }
+  // Engine dispatch and mirror bookkeeping both come from shared modules. They used to be one
+  // inline switch here — a second implementation of the decode logic in dispatch.ts — and every
+  // encode/decode bug found in 3.3.6/3.3.7 came from a payload layout living in more than one
+  // place. mirror-plan.test.ts pins the mirror decisions this switch used to make.
+  const openPre = op === OP.OPEN ? sampleOpenPreState(engine, flags, path) : undefined;
+  const result = dispatchOp(engine, reqTabId, op, flags, path, data);
+  const mirror = planMirror(engine, op, path, data, result, openPre);
+  const syncOp = mirror?.op;
+  const syncPath = mirror?.path;
+  const syncNewPath = mirror?.newPath;
 
   if (debug) {
     const t2 = performance.now();
@@ -639,7 +389,8 @@ async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise
       result = await oe.exists(path);
       break;
     case OP.TRUNCATE: {
-      const len = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getFloat64(0, true) : 0;
+      const len = decodeTruncateArgs(data);
+      if (len === null) { result = { status: 7 }; break; }
       result = await oe.truncate(path, len);
       syncPath = path;
       break;
@@ -657,20 +408,20 @@ async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise
       result = await oe.realpath(path);
       break;
     case OP.CHMOD: {
-      const chmodMode = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
+      const chmodMode = decodeModeArg(data) ?? 0;
       result = await oe.chmod(path, chmodMode);
       break;
     }
     case OP.CHOWN: {
-      if (!data || data.byteLength < 8) { result = { status: 7 }; break; }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      result = await oe.chown(path, dv.getUint32(0, true), dv.getUint32(4, true));
+      const own = decodeChownArgs(data);
+      if (own === null) { result = { status: 7 }; break; }
+      result = await oe.chown(path, own.uid, own.gid);
       break;
     }
     case OP.UTIMES: {
-      if (!data || data.byteLength < 16) { result = { status: 7 }; break; }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      result = await oe.utimes(path, dv.getFloat64(0, true), dv.getFloat64(8, true));
+      const times = decodeTimesArgs(data);
+      if (times === null) { result = { status: 7 }; break; }
+      result = await oe.utimes(path, times.atime, times.mtime);
       break;
     }
     case OP.SYMLINK: {
@@ -691,40 +442,45 @@ async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise
       result = await oe.open(path, flags, reqTabId, decodeMode(data, 0o666));
       break;
     case OP.CLOSE: {
-      const fd = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
+      const fd = decodeFdArg(data);
+      if (fd === null) { result = { status: 7 }; break; }
       result = await oe.close(fd);
       break;
     }
     case OP.FREAD: {
-      if (!data || data.byteLength < 16) { result = { status: 7 }; break; }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const pos = dv.getFloat64(8, true);
-      result = await oe.fread(dv.getUint32(0, true), dv.getUint32(4, true), pos === -1 ? null : pos);
+      const rd = decodeFreadArgs(data);
+      if (rd === null) { result = { status: 7 }; break; }
+      result = await oe.fread(rd.fd, rd.length, rd.position);
       break;
     }
     case OP.FWRITE: {
-      if (!data || data.byteLength < 12) { result = { status: 7 }; break; }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      const fd = dv.getUint32(0, true);
-      const pos = dv.getFloat64(4, true);
-      result = await oe.fwrite(fd, data.subarray(12), pos === -1 ? null : pos);
-      syncPath = oe.getPathForFd(fd) ?? undefined;
+      const wr = decodeFwriteArgs(data);
+      if (wr === null) { result = { status: 7 }; break; }
+      result = await oe.fwrite(wr.fd, wr.bytes, wr.position);
+      syncPath = oe.getPathForFd(wr.fd) ?? undefined;
       break;
     }
     case OP.FSTAT: {
-      const fd = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;
+      const fd = decodeFdArg(data);
+      if (fd === null) { result = { status: 7 }; break; }
       result = await oe.fstat(fd);
       break;
     }
     case OP.FTRUNCATE: {
-      if (!data || data.byteLength < 12) { result = { status: 7 }; break; }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      result = await oe.ftruncate(dv.getUint32(0, true), dv.getFloat64(4, true));
-      syncPath = oe.getPathForFd(dv.getUint32(0, true)) ?? undefined;
+      const ft = decodeFtruncateArgs(data);
+      if (ft === null) { result = { status: 7 }; break; }
+      result = await oe.ftruncate(ft.fd, ft.len);
+      syncPath = oe.getPathForFd(ft.fd) ?? undefined;
       break;
     }
     case OP.FSYNC:
       result = await oe.fsync();
+      break;
+    case OP.STATFS:
+      // No VFS superblock in this mode — the OPFS engine answers from the Storage API quota,
+      // which is the real number available here. Returning EINVAL would be a regression: statfs
+      // worked (with invented values) in this mode before it was wired to the engine.
+      result = await oe.statfs();
       break;
     case OP.OPENDIR:
       result = await oe.opendir(path, reqTabId);
@@ -736,21 +492,21 @@ async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise
       }
       break;
     case OP.FCHMOD: {
-      if (!data || data.byteLength < 8) { result = { status: 7 }; break; }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      result = await oe.fchmod(dv.getUint32(0, true), dv.getUint32(4, true));
+      const cm = decodeFchmodArgs(data);
+      if (cm === null) { result = { status: 7 }; break; }
+      result = await oe.fchmod(cm.fd, cm.mode);
       break;
     }
     case OP.FCHOWN: {
-      if (!data || data.byteLength < 12) { result = { status: 7 }; break; }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      result = await oe.fchown(dv.getUint32(0, true), dv.getUint32(4, true), dv.getUint32(8, true));
+      const co = decodeFchownArgs(data);
+      if (co === null) { result = { status: 7 }; break; }
+      result = await oe.fchown(co.fd, co.uid, co.gid);
       break;
     }
     case OP.FUTIMES: {
-      if (!data || data.byteLength < 24) { result = { status: 7 }; break; }
-      const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-      result = await oe.futimes(dv.getUint32(0, true), dv.getFloat64(8, true), dv.getFloat64(16, true));
+      const ut = decodeFutimesArgs(data);
+      if (ut === null) { result = { status: 7 }; break; }
+      result = await oe.futimes(ut.fd, ut.atime, ut.mtime);
       break;
     }
     default:
@@ -1498,8 +1254,10 @@ async function initEngine(config: {
     opfsSyncPort.start();
 
     const workerUrl = new URL('./opfs-sync.worker.js', import.meta.url);
-    const syncWorker = new Worker(workerUrl, { type: 'module' });
-    syncWorker.postMessage(
+    // Held, not dropped: this used to be a local, so the worker — and the recursive
+    // FileSystemObserver inside it — outlived every attempt to shut the filesystem down.
+    opfsSyncWorker = new Worker(workerUrl, { type: 'module' });
+    opfsSyncWorker.postMessage(
       { type: 'init', root: config.opfsSyncRoot ?? config.root },
       [mc.port2],
     );
@@ -2063,6 +1821,29 @@ self.onmessage = async (e: MessageEvent) => {
   // --- Client disconnection (leader mode) ---
   if (msg.type === 'client-lost') {
     removeClientPort(msg.tabId);
+    return;
+  }
+
+  // --- Orderly shutdown ---
+  //
+  // Sent by `VFSFileSystem.close()`. The mirror worker has to be told to disconnect its
+  // FileSystemObserver *before* anything is terminated: a worker killed while a recursive
+  // observer is still attached is what makes Chromium abort the browser process during page
+  // teardown. Terminating it outright would skip that, so it gets a message and a moment.
+  if (msg.type === 'shutdown') {
+    if (opfsSyncWorker) {
+      const worker = opfsSyncWorker;
+      opfsSyncWorker = null;
+      await new Promise<void>((resolve) => {
+        const done = () => { clearTimeout(timer); worker.terminate(); resolve(); };
+        const timer = setTimeout(done, 500); // don't hang a close on an unresponsive worker
+        worker.onmessage = (ev: MessageEvent) => { if (ev.data?.type === 'shutdown-done') done(); };
+      });
+    }
+    try { opfsSyncPort?.close(); } catch { /* already closed */ }
+    opfsSyncPort = null;
+    opfsSyncEnabled = false;
+    (self as unknown as Worker).postMessage({ type: 'shutdown-done' });
     return;
   }
 };

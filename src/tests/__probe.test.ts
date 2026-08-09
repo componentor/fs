@@ -1,0 +1,20 @@
+import { it } from 'vitest';
+import { createFsHarness } from './helpers/engine-transport.js';
+import * as nodefs from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+it('recursive withFileTypes shape', () => {
+  const { fs } = createFsHarness();
+  const root = nodefs.mkdtempSync(join(tmpdir(), 'rw-'));
+  const j = (p: string) => join(root, p);
+  for (const mk of [(p: string) => fs.mkdirSync('/' + p, { recursive: true }), (p: string) => nodefs.mkdirSync(j(p), { recursive: true })]) mk('d/sub/deep');
+  fs.writeFileSync('/d/top', '1'); fs.writeFileSync('/d/sub/x', '1'); fs.writeFileSync('/d/sub/deep/y', '1');
+  nodefs.writeFileSync(j('d/top'), '1'); nodefs.writeFileSync(j('d/sub/x'), '1'); nodefs.writeFileSync(j('d/sub/deep/y'), '1');
+  const norm = (e: any, base: string) => `${e.name}@${e.parentPath.replace(base, '<d>')}${e.isDirectory() ? '/' : ''}`;
+  const ours = (fs.readdirSync('/d', { recursive: true, withFileTypes: true }) as any[]).map((e) => norm(e, '/d')).sort();
+  const theirs = (nodefs.readdirSync(j('d'), { recursive: true, withFileTypes: true }) as any[]).map((e) => norm(e, j('d'))).sort();
+  console.log('  ours  =', JSON.stringify(ours));
+  console.log('  node  =', JSON.stringify(theirs));
+  console.log('  match =', JSON.stringify(ours) === JSON.stringify(theirs));
+  nodefs.rmSync(root, { recursive: true, force: true });
+});

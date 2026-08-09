@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>@componentor/fs — files and streams</title>
+  <style>
+    body { font: 14px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.1rem; }
+    pre { background: #f5f5f5; padding: 1rem; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; }
+    .bad { color: #b00; }
+  </style>
+  <script type="importmap">
+    { "imports": { "@componentor/fs": "/vendor/index.js" } }
+  </script>
+</head>
+<body>
+  <h1>@componentor/fs — files, descriptors and streams</h1>
+  <pre id="out">running…</pre>
+
+  <script type="module">
+    import { VFSFileSystem } from '@componentor/fs';
+
+    const out = document.getElementById('out');
+    const lines = [];
+    const log = (...a) => { lines.push(a.join(' ')); out.textContent = lines.join('\n'); };
+    const section = (t) => log(`\n── ${t} ──`);
+
+    if (!crossOriginIsolated) {
+      out.innerHTML = '<span class="bad">Serve with COOP/COEP (examples/serve.js).</span>';
+      throw new Error('not crossOriginIsolated');
+    }
+
+    const fs = new VFSFileSystem({ root: '/streams-demo' });
+    await fs.init();
+    await fs.promises.rm('/', { recursive: true, force: true });
+
+    // ---- file descriptors ---------------------------------------------------
+    section('file descriptors');
+    const fd = fs.openSync('/log.txt', 'w+');
+    fs.writeSync(fd, 'line one\nline two\n');
+
+    // Reading through a descriptor starts at its current position, as in node.
+    const buf = new Uint8Array(8);
+    const bytes = fs.readSync(fd, buf, 0, 8, 0);   // explicit position 0
+    log('readSync(pos 0)   ', JSON.stringify(new TextDecoder().decode(buf.subarray(0, bytes))));
+    fs.closeSync(fd);
+
+    // ---- promises + FileHandle ---------------------------------------------
+    section('FileHandle');
+    const handle = await fs.promises.open('/log.txt', 'r');
+    log('handle.stat().size', (await handle.stat()).size);
+
+    // readLines() follows node's readline: no empty final line after a trailing \n.
+    const collected = [];
+    for await (const line of handle.readLines()) collected.push(line);
+    log('readLines         ', JSON.stringify(collected));
+    // readLines consumed the handle's stream, which closes the handle — node does the same.
+
+    // ---- write stream -------------------------------------------------------
+    section('createWriteStream');
+    await new Promise((resolve, reject) => {
+      const ws = fs.createWriteStream('/report.txt');
+      ws.on('error', reject);
+      ws.on('finish', resolve);
+      // Several writes queued in one tick land in order.
+      ws.write('first ');
+      ws.write('second ');
+      ws.end('third');
+    });
+    log('written           ', JSON.stringify(fs.readFileSync('/report.txt', 'utf8')));
+
+    // A per-write encoding is honoured, like node's.
+    await new Promise((resolve) => {
+      const ws = fs.createWriteStream('/latin.bin');
+      ws.on('finish', resolve);
+      ws.end('é', 'latin1');
+    });
+    log('latin1 bytes      ', JSON.stringify([...fs.readFileSync('/latin.bin')]), '(utf8 would be [195,169])');
+
+    // ---- read stream --------------------------------------------------------
+    section('createReadStream');
+    // Big enough to arrive in several chunks, with a multi-byte character on the seam.
+    fs.writeFileSync('/big.txt', 'a'.repeat(65_535) + 'é' + 'b'.repeat(100));
+
+    let text = '';
+    for await (const chunk of fs.createReadStream('/big.txt', 'utf8')) text += chunk;
+    log('for await, utf8   ', `${text.length} chars, é intact: ${text.includes('é')}, no U+FFFD: ${!text.includes('�')}`);
+
+    // `start`/`end` window a stream; `end` is inclusive.
+    let windowed = '';
+    for await (const chunk of fs.createReadStream('/report.txt', { start: 6, end: 11, encoding: 'utf8' })) windowed += chunk;
+    log('start:6 end:11    ', JSON.stringify(windowed));
+
+    // Breaking out early destroys the stream and releases the handle.
+    for await (const _chunk of fs.createReadStream('/big.txt')) break;
+    log('early break       ', 'stream destroyed, handle released');
+
+    // ---- copying and walking a tree ----------------------------------------
+    section('tree operations');
+    fs.mkdirSync('/src/pkg', { recursive: true });
+    fs.writeFileSync('/src/pkg/a.js', 'export const a = 1;');
+    fs.writeFileSync('/src/index.js', 'export * from "./pkg/a.js";');
+    fs.cpSync('/src', '/dst', { recursive: true });
+
+    const all = fs.readdirSync('/dst', { recursive: true });
+    log('cpSync -r         ', JSON.stringify(all.sort()));
+    log('glob              ', JSON.stringify(fs.globSync('/dst/**/*.js').sort()));
+
+    log('\nDone.');
+  </script>
+</body>
+</html>

@@ -1,4 +1,5 @@
 import type { ReaddirOptions, Encoding, Dirent } from '../types.js';
+import type { Dirent as DirentClass } from '../stats-classes.js';
 import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { OP, encodeRequest } from '../protocol/opcodes.js';
 import { statusToError } from '../errors.js';
@@ -52,20 +53,13 @@ function readdirRecursiveSync(
     const relativePath = prefix ? prefix + '/' + entry.name : entry.name;
 
     if (withFileTypes) {
-      const parentPath = prefix || effectiveRoot;
-      // Return a Dirent with the relative path as the name
-      results.push({
-        name: relativePath,
-        parentPath,
-        path: parentPath,
-        isFile: entry.isFile,
-        isDirectory: entry.isDirectory,
-        isBlockDevice: entry.isBlockDevice,
-        isCharacterDevice: entry.isCharacterDevice,
-        isSymbolicLink: entry.isSymbolicLink,
-        isFIFO: entry.isFIFO,
-        isSocket: entry.isSocket,
-      });
+      // Node's recursive `withFileTypes` reports the **basename** in `name` and the containing
+      // directory in `parentPath` — only the names-only form uses relative paths. We put the
+      // relative path in `name` and an unrelated value in `parentPath`, so walking a tree with
+      // both options produced entries that could not be located: `name` was 'sub/x' while
+      // `parentPath` said the root. Verified against node:fs.
+      const parentPath = prefix ? effectiveRoot + '/' + prefix : effectiveRoot;
+      results.push((entry as DirentClass).withParentPath(parentPath));
     } else {
       results.push(relativePath);
     }
@@ -96,19 +90,9 @@ async function readdirRecursiveAsync(
     const relativePath = prefix ? prefix + '/' + entry.name : entry.name;
 
     if (withFileTypes) {
-      const parentPath = prefix || effectiveRoot;
-      results.push({
-        name: relativePath,
-        parentPath,
-        path: parentPath,
-        isFile: entry.isFile,
-        isDirectory: entry.isDirectory,
-        isBlockDevice: entry.isBlockDevice,
-        isCharacterDevice: entry.isCharacterDevice,
-        isSymbolicLink: entry.isSymbolicLink,
-        isFIFO: entry.isFIFO,
-        isSocket: entry.isSocket,
-      });
+      // Same as the sync form: basename in `name`, containing directory in `parentPath`.
+      const parentPath = prefix ? effectiveRoot + '/' + prefix : effectiveRoot;
+      results.push((entry as DirentClass).withParentPath(parentPath));
     } else {
       results.push(relativePath);
     }

@@ -63,6 +63,12 @@ export interface ReaddirOptions {
 
 export interface StatOptions {
   bigint?: boolean;
+  /**
+   * When `false`, a missing path yields `undefined` instead of throwing ENOENT (Node 14.17+).
+   * Widely used to probe for a file without paying for an exception — TypeScript's own compiler
+   * host relies on it. Only ENOENT is suppressed; other errors still throw.
+   */
+  throwIfNoEntry?: boolean;
 }
 
 export interface BigIntStats {
@@ -142,6 +148,15 @@ export interface Dirent {
   isSymbolicLink(): boolean;
   isFIFO(): boolean;
   isSocket(): boolean;
+}
+
+/** Options for `opendir`/`opendirSync` (node 18.17+ for `recursive`). */
+export interface OpendirOptions {
+  encoding?: string | null;
+  /** Read-ahead hint in node; entries arrive in one response here, so it has no effect. */
+  bufferSize?: number;
+  /** Walk subdirectories too. Was accepted and ignored before. */
+  recursive?: boolean;
 }
 
 export interface StatFs {
@@ -274,6 +289,22 @@ export interface FileHandle {
   datasync(): Promise<void>;
   close(): Promise<void>;
   [Symbol.asyncDispose](): Promise<void>;
+
+  /** A read stream over this handle. Closes the handle when it ends unless `autoClose: false`. */
+  createReadStream(options?: ReadStreamOptions | Encoding): FSReadStream;
+  /** A write stream over this handle. Closes the handle on finish unless `autoClose: false`. */
+  createWriteStream(options?: WriteStreamOptions | Encoding): FSWriteStream;
+  /** The file's lines, as an async iterable. A trailing newline yields no final empty line. */
+  readLines(options?: ReadStreamOptions | Encoding): AsyncIterableIterator<string>;
+  /** A WHATWG `ReadableStream` of the file's bytes. */
+  readableWebStream(options?: { type?: 'bytes' }): ReadableStream<Uint8Array>;
+
+  // node's FileHandle is an EventEmitter and emits 'close'.
+  on(event: string, listener: (...args: never[]) => void): FileHandle;
+  once(event: string, listener: (...args: never[]) => void): FileHandle;
+  off(event: string, listener: (...args: never[]) => void): FileHandle;
+  removeListener(event: string, listener: (...args: never[]) => void): FileHandle;
+  emit(event: string, ...args: never[]): boolean;
 }
 
 export interface Dir {

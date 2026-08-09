@@ -1,22 +1,21 @@
 /**
  * Callback Timing Tests
  *
- * Verifies that callback-style fs methods fire callbacks as macrotasks
- * (via setTimeout) rather than microtasks (via Promise.then). This matches
- * the Node.js guarantee that callbacks are always asynchronous and scheduled
- * on the macrotask queue.
+ * Node guarantees a callback-style `fs` method never invokes its callback in the same turn:
+ * callbacks are scheduled as macrotasks (`setTimeout`), not microtasks (`Promise.then`). Code
+ * that relies on finishing its synchronous work before the callback runs depends on it.
  *
- * Since VFSFileSystem requires browser workers, we replicate the callback
- * wiring pattern from filesystem.ts and verify the scheduling behavior.
+ * These drive the **real** methods via `Object.create(VFSFileSystem.prototype)` with only
+ * `this.promises` stubbed, because the constructor needs workers and a SharedArrayBuffer. The
+ * previous version re-implemented the scheduling it was checking, so it asserted that a
+ * `setTimeout` in the test file calls `setTimeout` — true regardless of what the product does.
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { VFSFileSystem } from '../src/filesystem.js';
 
-/**
- * Creates a mock fs object that mirrors the VFSFileSystem callback wiring,
- * including the setTimeout macrotask scheduling.
- */
-function createMockFS() {
+/** Build an fs whose callback methods are the shipped ones, over stubbed promises. */
+function createRealFS() {
   const mockPromises = {
     readFile: vi.fn().mockResolvedValue(new Uint8Array([72, 105])),
     writeFile: vi.fn().mockResolvedValue(undefined),
@@ -24,54 +23,20 @@ function createMockFS() {
     exists: vi.fn().mockResolvedValue(true),
   };
 
-  const fs = {
-    promises: mockPromises,
-
-    readFile(filePath: string, optionsOrCallback?: any, callback?: any) {
-      const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-      const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
-      this.promises.readFile(filePath, opts).then(
-        (result: any) => setTimeout(() => cb(null, result), 0),
-        (err: any) => setTimeout(() => cb(err), 0),
-      );
-    },
-
-    writeFile(filePath: string, data: string | Uint8Array, optionsOrCallback?: any, callback?: any) {
-      const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-      const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
-      this.promises.writeFile(filePath, data, opts).then(
-        () => setTimeout(() => cb(null), 0),
-        (err: any) => setTimeout(() => cb(err), 0),
-      );
-    },
-
-    stat(filePath: string, optionsOrCallback?: any, callback?: any) {
-      const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
-      const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
-      this.promises.stat(filePath, opts).then(
-        (result: any) => setTimeout(() => cb(null, result), 0),
-        (err: any) => setTimeout(() => cb(err), 0),
-      );
-    },
-
-    exists(filePath: string, callback: (exists: boolean) => void) {
-      this.promises.exists(filePath).then(
-        (result: boolean) => setTimeout(() => callback(result), 0),
-        () => setTimeout(() => callback(false), 0),
-      );
-    },
-  };
+  const fs = Object.create(VFSFileSystem.prototype) as VFSFileSystem;
+  (fs as unknown as { promises: unknown }).promises = mockPromises;
 
   return { fs, mockPromises };
 }
 
+
 describe('Callback Timing', () => {
-  let fs: ReturnType<typeof createMockFS>['fs'];
-  let mockPromises: ReturnType<typeof createMockFS>['mockPromises'];
+  let fs: ReturnType<typeof createRealFS>['fs'];
+  let mockPromises: ReturnType<typeof createRealFS>['mockPromises'];
 
   beforeEach(() => {
     vi.useFakeTimers();
-    const mock = createMockFS();
+    const mock = createRealFS();
     fs = mock.fs;
     mockPromises = mock.mockPromises;
   });

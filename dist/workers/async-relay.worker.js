@@ -32,7 +32,8 @@ var OP = {
   MKDTEMP: 30,
   FCHMOD: 31,
   FCHOWN: 32,
-  FUTIMES: 33
+  FUTIMES: 33,
+  STATFS: 34
 };
 var STATUS = {
   OK: 0,
@@ -117,6 +118,42 @@ function encodeTwoPathRequest(op, path1, path2, flags = 0) {
   pv.setUint32(0, path2Bytes.byteLength, true);
   payload.set(path2Bytes, 4);
   return encodeRequest(op, path1, flags, payload);
+}
+
+// src/protocol/payloads.ts
+function encodeFdPayload(fd) {
+  const buf = new Uint8Array(4);
+  writeU32(buf, 0, fd);
+  return buf;
+}
+function encodeFreadPayload(fd, length, position) {
+  const buf = new Uint8Array(16);
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setUint32(4, length, true);
+  dv.setFloat64(8, position ?? -1, true);
+  return buf;
+}
+function encodeFwritePayload(fd, position, data) {
+  const buf = new Uint8Array(12 + data.byteLength);
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setFloat64(4, position ?? -1, true);
+  buf.set(data, 12);
+  return buf;
+}
+function encodeFtruncatePayload(fd, len) {
+  const buf = new Uint8Array(12);
+  const dv = new DataView(buf.buffer);
+  dv.setUint32(0, fd, true);
+  dv.setFloat64(4, len, true);
+  return buf;
+}
+function writeU32(buf, at, value) {
+  buf[at] = value;
+  buf[at + 1] = value >>> 8;
+  buf[at + 2] = value >>> 16;
+  buf[at + 3] = value >>> 24;
 }
 
 // src/protocol/sab-wait.ts
@@ -330,36 +367,15 @@ function encodeData(data) {
 }
 function encodeFdRequest(op, args) {
   switch (op) {
-    case OP.FREAD: {
-      const buf = new Uint8Array(16);
-      const view = new DataView(buf.buffer);
-      view.setUint32(0, args.fd, true);
-      view.setUint32(4, args.length ?? 0, true);
-      view.setFloat64(8, args.position ?? -1, true);
-      return encodeRequest(op, "", 0, buf);
-    }
-    case OP.FWRITE: {
-      const writeData = args.data ?? new Uint8Array(0);
-      const buf = new Uint8Array(12 + writeData.byteLength);
-      const view = new DataView(buf.buffer);
-      view.setUint32(0, args.fd, true);
-      view.setFloat64(4, args.position ?? -1, true);
-      buf.set(writeData, 12);
-      return encodeRequest(op, "", 0, buf);
-    }
+    case OP.FREAD:
+      return encodeRequest(op, "", 0, encodeFreadPayload(args.fd, args.length ?? 0, args.position ?? -1));
+    case OP.FWRITE:
+      return encodeRequest(op, "", 0, encodeFwritePayload(args.fd, args.position ?? -1, args.data ?? new Uint8Array(0)));
     case OP.FSTAT:
-    case OP.CLOSE: {
-      const buf = new Uint8Array(4);
-      new DataView(buf.buffer).setUint32(0, args.fd, true);
-      return encodeRequest(op, "", 0, buf);
-    }
-    case OP.FTRUNCATE: {
-      const buf = new Uint8Array(8);
-      const view = new DataView(buf.buffer);
-      view.setUint32(0, args.fd, true);
-      view.setUint32(4, args.length ?? 0, true);
-      return encodeRequest(op, "", 0, buf);
-    }
+    case OP.CLOSE:
+      return encodeRequest(op, "", 0, encodeFdPayload(args.fd));
+    case OP.FTRUNCATE:
+      return encodeRequest(op, "", 0, encodeFtruncatePayload(args.fd, args.length ?? 0));
     case OP.FSYNC:
       return encodeRequest(op, "", 0);
     default:

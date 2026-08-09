@@ -38,6 +38,7 @@ export const OP = {
   FCHMOD: 31,
   FCHOWN: 32,
   FUTIMES: 33,
+  STATFS: 34,
 } as const;
 
 export type OpCode = (typeof OP)[keyof typeof OP];

@@ -14,54 +14,7 @@ import { parseFileMode } from '../src/methods/mode.js';
 import { openSync, open as openAsync } from '../src/methods/open.js';
 import { OP, encodeRequest, encodeRequestU32, decodeRequest } from '../src/protocol/opcodes.js';
 import { VFSEngine } from '../src/vfs/engine.js';
-
-/** Minimal in-memory FileSystemSyncAccessHandle, as each engine test file defines. */
-class MockSyncHandle {
-  private buffer: Uint8Array;
-  private size: number;
-
-  constructor(initialSize: number = 0) {
-    this.buffer = new Uint8Array(initialSize);
-    this.size = initialSize;
-  }
-
-  getSize(): number {
-    return this.size;
-  }
-
-  truncate(newSize: number): void {
-    if (newSize > this.buffer.byteLength) {
-      const newBuf = new Uint8Array(newSize);
-      newBuf.set(this.buffer.subarray(0, this.size));
-      this.buffer = newBuf;
-    }
-    this.size = newSize;
-  }
-
-  read(buf: Uint8Array, opts?: { at?: number }): number {
-    const at = opts?.at ?? 0;
-    const len = Math.min(buf.byteLength, this.size - at);
-    if (len <= 0) return 0;
-    buf.set(this.buffer.subarray(at, at + len));
-    return len;
-  }
-
-  write(buf: Uint8Array, opts?: { at?: number }): number {
-    const at = opts?.at ?? 0;
-    const end = at + buf.byteLength;
-    if (end > this.buffer.byteLength) {
-      const newBuf = new Uint8Array(end * 2);
-      newBuf.set(this.buffer.subarray(0, this.size));
-      this.buffer = newBuf;
-    }
-    this.buffer.set(buf, at);
-    if (end > this.size) this.size = end;
-    return buf.byteLength;
-  }
-
-  flush(): void {}
-  close(): void {}
-}
+import { MockSyncHandle } from './helpers/mock-handle.js';
 
 
 /** The mode a request frame actually carries (4-byte LE payload after the path). */

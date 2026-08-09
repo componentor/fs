@@ -144,22 +144,25 @@ describe('readdir recursive', () => {
       expect(result).toHaveLength(6);
     });
 
-    it('should return Dirents with relative path names when withFileTypes + recursive', () => {
+    it('should return Dirents with basenames and absolute parents when withFileTypes + recursive', () => {
+      // Node reports basenames here, with the containing directory in parentPath; the
+      // names-only recursive form is the one that yields relative paths. Both are asserted:
+      // together they are what makes an entry locatable.
       const result = readdirSync(makeSyncRequest(), '/root', {
         recursive: true,
         withFileTypes: true,
       }) as Dirent[];
 
-      const names = result.map(d => d.name);
-      expect(names).toContain('file1.txt');
-      expect(names).toContain('sub');
-      expect(names).toContain('sub/file2.txt');
-      expect(names).toContain('sub/deep');
-      expect(names).toContain('sub/deep/file3.txt');
-      expect(names).toContain('empty');
+      const located = result.map((d) => `${d.parentPath}/${d.name}`).sort();
+      expect(located).toContain('/root/file1.txt');
+      expect(located).toContain('/root/sub');
+      expect(located).toContain('/root/sub/file2.txt');
+      expect(located).toContain('/root/sub/deep');
+      expect(located).toContain('/root/sub/deep/file3.txt');
+      expect(located).toContain('/root/empty');
 
       // Verify type methods work
-      const deepFile = result.find(d => d.name === 'sub/deep/file3.txt')!;
+      const deepFile = result.find(d => d.name === 'file3.txt')!;
       expect(deepFile.isFile()).toBe(true);
       expect(deepFile.isDirectory()).toBe(false);
 
@@ -207,16 +210,17 @@ describe('readdir recursive', () => {
       expect(result).toHaveLength(6);
     });
 
-    it('should return Dirents with relative paths when withFileTypes + recursive', async () => {
+    it('should return Dirents with basenames and absolute parents when withFileTypes + recursive', async () => {
+      // Node reports the basename here and puts the directory in parentPath; only the
+      // names-only recursive form yields relative paths. Verified against node:fs.
       const result = (await readdir(makeAsyncRequest(), '/root', {
         recursive: true,
         withFileTypes: true,
       })) as Dirent[];
 
-      const names = result.map(d => d.name);
-      expect(names).toContain('sub/deep/file3.txt');
-
-      const deepFile = result.find(d => d.name === 'sub/deep/file3.txt')!;
+      const deepFile = result.find(d => d.name === 'file3.txt')!;
+      expect(deepFile).toBeDefined();
+      expect(deepFile.parentPath).toBe('/root/sub/deep');
       expect(deepFile.isFile()).toBe(true);
     });
 

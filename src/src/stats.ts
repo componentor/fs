@@ -3,7 +3,7 @@
  * Decodes binary stat responses from the server into Node.js-compatible objects.
  */
 
-import type { Stats, BigIntStats, Dirent } from './types.js';
+import { Stats, BigIntStats, Dirent } from './stats-classes.js';
 import { INODE_TYPE } from './vfs/layout.js';
 
 /**
@@ -35,41 +35,12 @@ export function decodeStats(data: Uint8Array): Stats {
   // Backwards compatible: older 49-byte buffers default nlink to 1
   const nlink = data.byteLength >= 53 ? view.getUint32(49, true) : 1;
 
-  const isFile = type === INODE_TYPE.FILE;
-  const isDirectory = type === INODE_TYPE.DIRECTORY;
-  const isSymlink = type === INODE_TYPE.SYMLINK;
-
-  return {
-    isFile: () => isFile,
-    isDirectory: () => isDirectory,
-    isBlockDevice: () => false,
-    isCharacterDevice: () => false,
-    isSymbolicLink: () => isSymlink,
-    isFIFO: () => false,
-    isSocket: () => false,
-    dev: 1,
-    ino,
-    mode,
-    nlink,
-    uid,
-    gid,
-    rdev: 0,
-    size,
-    blksize: 4096,
-    blocks: Math.ceil(size / 512),
-    atimeMs,
-    mtimeMs,
-    ctimeMs,
-    birthtimeMs: ctimeMs,
-    atime: new Date(atimeMs),
-    mtime: new Date(mtimeMs),
-    ctime: new Date(ctimeMs),
-    birthtime: new Date(ctimeMs),
-    atimeNs: atimeMs * 1_000_000,
-    mtimeNs: mtimeMs * 1_000_000,
-    ctimeNs: ctimeMs * 1_000_000,
-    birthtimeNs: ctimeMs * 1_000_000,
-  };
+  void type; // the file type now travels in `mode`'s S_IFMT bits, as it does in node
+  return new Stats(
+    1, mode, nlink, uid, gid, 0,
+    4096, ino, size, Math.ceil(size / 512),
+    atimeMs, mtimeMs, ctimeMs, ctimeMs,
+  );
 }
 
 /**
@@ -89,45 +60,13 @@ export function decodeStatsBigInt(data: Uint8Array): BigIntStats {
   const ino = view.getUint32(45, true);
   const nlink = data.byteLength >= 53 ? view.getUint32(49, true) : 1;
 
-  const isFile = type === INODE_TYPE.FILE;
-  const isDirectory = type === INODE_TYPE.DIRECTORY;
-  const isSymlink = type === INODE_TYPE.SYMLINK;
-
-  const atimeMsBigInt = BigInt(Math.trunc(atimeMs));
-  const mtimeMsBigInt = BigInt(Math.trunc(mtimeMs));
-  const ctimeMsBigInt = BigInt(Math.trunc(ctimeMs));
-
-  return {
-    isFile: () => isFile,
-    isDirectory: () => isDirectory,
-    isBlockDevice: () => false,
-    isCharacterDevice: () => false,
-    isSymbolicLink: () => isSymlink,
-    isFIFO: () => false,
-    isSocket: () => false,
-    dev: 1n,
-    ino: BigInt(ino),
-    mode: BigInt(mode),
-    nlink: BigInt(nlink),
-    uid: BigInt(uid),
-    gid: BigInt(gid),
-    rdev: 0n,
-    size: BigInt(Math.trunc(size)),
-    blksize: 4096n,
-    blocks: BigInt(Math.ceil(size / 512)),
-    atimeMs: atimeMsBigInt,
-    mtimeMs: mtimeMsBigInt,
-    ctimeMs: ctimeMsBigInt,
-    birthtimeMs: ctimeMsBigInt,
-    atime: new Date(atimeMs),
-    mtime: new Date(mtimeMs),
-    ctime: new Date(ctimeMs),
-    birthtime: new Date(ctimeMs),
-    atimeNs: atimeMsBigInt * 1_000_000n,
-    mtimeNs: mtimeMsBigInt * 1_000_000n,
-    ctimeNs: ctimeMsBigInt * 1_000_000n,
-    birthtimeNs: ctimeMsBigInt * 1_000_000n,
-  };
+  void type;
+  return new BigIntStats(
+    1n, BigInt(mode), BigInt(nlink), BigInt(uid), BigInt(gid), 0n,
+    4096n, BigInt(ino), BigInt(Math.trunc(size)), BigInt(Math.ceil(size / 512)),
+    BigInt(Math.trunc(atimeMs)), BigInt(Math.trunc(mtimeMs)),
+    BigInt(Math.trunc(ctimeMs)), BigInt(Math.trunc(ctimeMs)),
+  );
 }
 
 /**
@@ -154,22 +93,7 @@ export function decodeDirents(data: Uint8Array, parentPath: string = ''): Dirent
     offset += nameLen;
     const type = data[offset++];
 
-    const isFile = type === INODE_TYPE.FILE;
-    const isDirectory = type === INODE_TYPE.DIRECTORY;
-    const isSymlink = type === INODE_TYPE.SYMLINK;
-
-    entries.push({
-      name,
-      parentPath,
-      path: parentPath,
-      isFile: () => isFile,
-      isDirectory: () => isDirectory,
-      isBlockDevice: () => false,
-      isCharacterDevice: () => false,
-      isSymbolicLink: () => isSymlink,
-      isFIFO: () => false,
-      isSocket: () => false,
-    });
+    entries.push(new Dirent(name, type, parentPath));
   }
 
   return entries;

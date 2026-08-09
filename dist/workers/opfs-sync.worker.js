@@ -383,13 +383,14 @@ async function navigateToParent(path) {
   }
   return dir;
 }
+var observer = null;
 function setupObserver() {
   if (typeof FileSystemObserver === "undefined") {
     console.warn("[opfs-sync] FileSystemObserver not available \u2014 external changes will not be detected");
     return;
   }
   console.log("[opfs-sync] Setting up FileSystemObserver on mirrorRoot:", mirrorRoot.name || "(opfs-root)");
-  const observer = new FileSystemObserver((records) => {
+  observer = new FileSystemObserver((records) => {
     for (const record of records) {
       const path = normalizePath("/" + record.relativePathComponents.join("/"));
       if (path === "/.vfs.bin" || path === "/.vfs" || path.startsWith("/.vfs")) continue;
@@ -412,6 +413,14 @@ function setupObserver() {
     }
   });
   observer.observe(mirrorRoot, { recursive: true });
+}
+function teardownObserver() {
+  if (!observer) return;
+  try {
+    observer.disconnect();
+  } catch {
+  }
+  observer = null;
 }
 async function syncExternalChange(path, handle) {
   try {
@@ -467,6 +476,16 @@ self.onmessage = async (e) => {
     };
     serverPort.start();
     self.postMessage({ type: "ready" });
+    return;
+  }
+  if (msg.type === "shutdown") {
+    teardownObserver();
+    try {
+      serverPort?.close();
+    } catch {
+    }
+    self.postMessage({ type: "shutdown-done" });
+    self.close();
     return;
   }
 };

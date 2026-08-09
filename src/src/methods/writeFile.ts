@@ -2,10 +2,53 @@ import type { WriteOptions, Encoding } from '../types.js';
 import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { OP, encodeRequest } from '../protocol/opcodes.js';
 import { statusToError } from '../errors.js';
-import { parseFlags, openSync, closeSync, writeSyncFd, fdatasyncSync, open } from './open.js';
+import { parseFlags, openSync, closeSync, writeSyncFd, fdatasyncSync, open, createFileHandle } from './open.js';
+import { validateFdArg } from './fd-arg.js';
 import { encodeString } from '../encoding.js';
 
 const encoder = new TextEncoder();
+
+function encodeData(data: string | Uint8Array, encoding?: Encoding): Uint8Array {
+  if (typeof data !== 'string') return data;
+  return encoding ? encodeString(data, encoding) : encoder.encode(data);
+}
+
+/**
+ * `fs.writeFileSync(fd, data)` — writes at the descriptor's current position **without
+ * truncating**, and leaves it open. `flag` and `mode` are ignored: the file is already open.
+ * See [fd-arg.ts](./fd-arg.ts).
+ */
+export function writeFileFdSync(
+  syncRequest: SyncRequestFn,
+  fd: number,
+  data: string | Uint8Array,
+  options?: WriteOptions | Encoding
+): void {
+  validateFdArg(fd);
+  const opts = typeof options === 'string' ? { encoding: options } : options;
+  if (opts?.signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
+  const encoded = encodeData(data, opts?.encoding);
+  // position `null` = the cursor, which is what Node writes at here.
+  writeSyncFd(syncRequest, fd, encoded, 0, encoded.byteLength, null);
+  if (opts?.flush === true) fdatasyncSync(syncRequest, fd);
+}
+
+/** `fs.writeFile(fd, data, cb)` — the callback form. Same semantics as {@link writeFileFdSync}. */
+export async function writeFileFd(
+  asyncRequest: AsyncRequestFn,
+  fd: number,
+  data: string | Uint8Array,
+  options?: WriteOptions | Encoding
+): Promise<void> {
+  validateFdArg(fd);
+  const opts = typeof options === 'string' ? { encoding: options } : options;
+  const signal = opts?.signal;
+  if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
+  const handle = createFileHandle(fd, asyncRequest);
+  await handle.writeFile(encodeData(data, opts?.encoding));
+  if (opts?.flush === true) await handle.datasync();
+  if (signal?.aborted) throw new DOMException('The operation was aborted', 'AbortError');
+}
 
 export function writeFileSync(
   syncRequest: SyncRequestFn,

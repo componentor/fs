@@ -1,6 +1,7 @@
 import type { WatchOptions, WatchEventType, FSWatcher, WatchListener, WatchFileListener, WatchFileOptions, Stats } from '../types.js';
 import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { statSync } from './stat.js';
+import { Stats as StatsClass } from '../stats-classes.js';
 import * as path from '../path.js';
 
 // ========== Watcher Registry ==========
@@ -143,14 +144,22 @@ function matchWatcher(entry: WatchEntry, mutatedPath: string): string | null {
 export function watch(
   ns: string,
   filePath: string,
-  options?: WatchOptions | string,
+  options?: WatchOptions | string | WatchListener,
   listener?: WatchListener
 ): FSWatcher {
+  // Node's signature is `fs.watch(filename[, options][, listener])` — options is optional in the
+  // middle, so the listener frequently arrives in its slot. `fs.watch(dir, cb)` is the form the
+  // docs lead with and the one nearly all callers use.
+  //
+  // This used to accept the listener only in the third position: a two-argument call stored the
+  // callback as the options object and installed a no-op listener, so the watcher registered
+  // successfully, reported no error, and never fired. Three-argument calls worked, which is why
+  // it went unnoticed.
+  const listenerInOptions = typeof options === 'function';
+  const cb: WatchListener = (listenerInOptions ? options as WatchListener : listener) ?? (() => {});
   const opts: WatchOptions = typeof options === 'string'
     ? { encoding: options as any }
-    : (options ?? {});
-
-  const cb: WatchListener = listener ?? (() => {});
+    : (listenerInOptions || options == null ? {} : options as WatchOptions);
   const absPath = path.resolve(filePath);
   const signal = opts.signal;
   const asBuffer = (opts as { encoding?: string }).encoding === 'buffer';
@@ -290,21 +299,9 @@ function triggerWatchFile(entry: WatchFileEntry): void {
 }
 
 export function emptyStats(): Stats {
-  const zero = new Date(0);
-  return {
-    isFile: () => false,
-    isDirectory: () => false,
-    isBlockDevice: () => false,
-    isCharacterDevice: () => false,
-    isSymbolicLink: () => false,
-    isFIFO: () => false,
-    isSocket: () => false,
-    dev: 0, ino: 0, mode: 0, nlink: 0, uid: 0, gid: 0, rdev: 0,
-    size: 0, blksize: 4096, blocks: 0,
-    atimeMs: 0, mtimeMs: 0, ctimeMs: 0, birthtimeMs: 0,
-    atime: zero, mtime: zero, ctime: zero, birthtime: zero,
-    atimeNs: 0, mtimeNs: 0, ctimeNs: 0, birthtimeNs: 0,
-  };
+  // Every field zero, including `mode` — so the prototype's S_IFMT checks all report false,
+  // which is what the previous hand-written literal did explicitly.
+  return new StatsClass(0, 0, 0, 0, 0, 0, 4096, 0, 0, 0, 0, 0, 0, 0);
 }
 
 // ========== promises.watch() ==========

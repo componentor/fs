@@ -106,19 +106,24 @@ describe('recursive readdir Dirent parentPath', () => {
     }
   });
 
-  it('nested dirent has correct parentPath (e.g., "subdir" for "subdir/nested.txt")', () => {
+  it('a nested dirent carries its basename and the absolute directory holding it', () => {
+    // Captured from real node:fs: recursive withFileTypes reports the **basename** in `name`,
+    // with the containing directory in `parentPath` — only the names-only recursive form uses
+    // relative paths. This file previously asserted `name: 'subdir/nested.txt'` with a relative
+    // `parentPath: 'subdir'`, which matched neither Node nor itself: an entry whose name is a
+    // path but whose parent is also a path cannot be joined back into a usable location.
     const result = readdirSync(makeSyncRequest(), '/mydir', {
       recursive: true,
       withFileTypes: true,
     }) as Dirent[];
 
-    const nested = result.find(d => d.name === 'subdir/nested.txt')!;
+    const nested = result.find(d => d.name === 'nested.txt')!;
     expect(nested).toBeDefined();
-    expect(nested.parentPath).toBe('subdir');
+    expect(nested.parentPath).toBe('/mydir/subdir');
 
-    const deep = result.find(d => d.name === 'subdir/deep/bottom.txt')!;
+    const deep = result.find(d => d.name === 'bottom.txt')!;
     expect(deep).toBeDefined();
-    expect(deep.parentPath).toBe('subdir/deep');
+    expect(deep.parentPath).toBe('/mydir/subdir/deep');
   });
 
   it('top-level dirent has the original directory as parentPath', () => {
@@ -157,12 +162,12 @@ describe('recursive readdir Dirent parentPath', () => {
     expect(topLevel.parentPath).toBe('/mydir');
     expect(topLevel.path).toBe(topLevel.parentPath);
 
-    const nested = result.find(d => d.name === 'subdir/nested.txt')!;
-    expect(nested.parentPath).toBe('subdir');
+    const nested = result.find(d => d.name === 'nested.txt')!;
+    expect(nested.parentPath).toBe('/mydir/subdir');
     expect(nested.path).toBe(nested.parentPath);
 
-    const deep = result.find(d => d.name === 'subdir/deep/bottom.txt')!;
-    expect(deep.parentPath).toBe('subdir/deep');
+    const deep = result.find(d => d.name === 'bottom.txt')!;
+    expect(deep.parentPath).toBe('/mydir/subdir/deep');
     expect(deep.path).toBe(deep.parentPath);
   });
 });

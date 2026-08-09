@@ -1,7 +1,7 @@
 import type { RmOptions } from '../types.js';
 import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { OP, encodeRequest } from '../protocol/opcodes.js';
-import { statusToError } from '../errors.js';
+import { statusToError, eisdirNotRecursive } from '../errors.js';
 import { FSError } from '../errors.js';
 
 const RETRYABLE_CODES = new Set(['EBUSY', 'ENOTEMPTY', 'EPERM']);
@@ -19,7 +19,11 @@ function rmSyncCore(
   const buf = encodeRequest(OP.UNLINK, filePath, flags);
   const { status } = syncRequest(buf);
   if (status === 3) {
-    // EISDIR — it's a directory, use rmdir
+    // EISDIR — the target is a directory. Node requires `recursive` to remove one and throws
+    // ERR_FS_EISDIR otherwise, whether or not the directory is empty, and `force` does NOT
+    // suppress it (unlike ENOENT). Falling through to rmdir made `rm(emptyDir)` succeed and
+    // `rm(nonEmptyDir)` report ENOTEMPTY, neither of which is what Node does.
+    if (!options?.recursive) throw eisdirNotRecursive(filePath);
     const rmdirBuf = encodeRequest(OP.RMDIR, filePath, flags);
     const rmdirResult = syncRequest(rmdirBuf);
     if (rmdirResult.status !== 0) {
@@ -66,6 +70,8 @@ async function rmAsyncCore(
   const flags = (options?.recursive ? 1 : 0) | (options?.force ? 2 : 0);
   const { status } = await asyncRequest(OP.UNLINK, filePath, flags);
   if (status === 3) {
+    // See rmSyncCore: a directory needs `recursive`, and `force` does not excuse it.
+    if (!options?.recursive) throw eisdirNotRecursive(filePath);
     const { status: s2 } = await asyncRequest(OP.RMDIR, filePath, flags);
     if (s2 !== 0) {
       if (options?.force && s2 === 1) return;
