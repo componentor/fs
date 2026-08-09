@@ -1,6 +1,7 @@
 /**
  * Tests for:
- * 1. writeFile/writeFileSync respecting the `mode` option
+ * 1. writeFile/writeFileSync respecting the `mode` option (applied by the creating open, the
+ *    way Node does it — see the mode-parsing suite for the parser itself)
  * 2. readdir/readdirSync supporting `encoding: 'buffer'`
  */
 
@@ -39,30 +40,32 @@ function encodeNames(names: string[]): Uint8Array {
 /* ------------------------------------------------------------------ */
 
 describe('writeFileSync with mode option', () => {
-  it('applies chmod after write on fast path when mode is specified', () => {
+  it('carries the mode on the creating open, not a chmod afterwards', () => {
+    // Node semantics, both verified against node:fs: the mode is umask-reduced, and it is
+    // ignored when the file already exists. A trailing chmod gets both wrong — it applies the
+    // raw mode, and it re-permissions a file it did not create.
     const calls: { op: number; path: string }[] = [];
     const syncRequest = vi.fn((buf: ArrayBuffer) => {
       const { op, path } = decodeRequest(buf);
       calls.push({ op, path });
+      if (op === OP.OPEN) {
+        const fdBuf = new Uint8Array(4);
+        new DataView(fdBuf.buffer).setUint32(0, 5, true);
+        return { status: 0, data: fdBuf };
+      }
       return { status: 0, data: null };
     });
 
     writeFileSync(syncRequest, '/test.txt', 'hello', { mode: 0o755 });
 
-    // Should have two calls: WRITE then CHMOD
-    expect(calls).toHaveLength(2);
-    expect(calls[0].op).toBe(OP.WRITE);
+    expect(calls.map(c => c.op)).not.toContain(OP.CHMOD);
+    expect(calls[0].op).toBe(OP.OPEN);
     expect(calls[0].path).toBe('/test.txt');
-    expect(calls[1].op).toBe(OP.CHMOD);
-    expect(calls[1].path).toBe('/test.txt');
 
-    // Verify mode value encoded in CHMOD request
-    const chmodBuf = syncRequest.mock.calls[1][0];
-    const { data } = decodeRequest(chmodBuf);
-    if (data) {
-      const mode = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
-      expect(mode).toBe(0o755);
-    }
+    // The mode rides on the OPEN request as a 4-byte LE payload.
+    const { data } = decodeRequest(syncRequest.mock.calls[0][0]);
+    expect(data?.byteLength).toBe(4);
+    expect(new DataView(data!.buffer, data!.byteOffset, 4).getUint32(0, true)).toBe(0o755);
   });
 
   it('does not call chmod when mode is not specified (fast path)', () => {
@@ -103,21 +106,25 @@ describe('writeFileSync with mode option', () => {
 });
 
 describe('writeFile async with mode option', () => {
-  it('applies chmod after write on fast path when mode is specified', async () => {
-    const calls: { op: number; path: string }[] = [];
-    const asyncRequest = vi.fn(async (op: number, path: string, _flags: number, _data?: Uint8Array) => {
-      calls.push({ op, path });
+  it('carries the mode on the creating open, not a chmod afterwards', async () => {
+    const calls: { op: number; path: string; data?: Uint8Array }[] = [];
+    const asyncRequest = vi.fn(async (op: number, path: string, _flags: number, data?: Uint8Array) => {
+      calls.push({ op, path, data });
+      if (op === OP.OPEN) {
+        const fdBuf = new Uint8Array(4);
+        new DataView(fdBuf.buffer).setUint32(0, 5, true);
+        return { status: 0, data: fdBuf };
+      }
       return { status: 0, data: null };
     });
 
     await writeFile(asyncRequest, '/test.txt', 'hello', { mode: 0o755 });
 
-    // Should have two calls: WRITE then CHMOD
-    expect(calls).toHaveLength(2);
-    expect(calls[0].op).toBe(OP.WRITE);
+    expect(calls.map(c => c.op)).not.toContain(OP.CHMOD);
+    expect(calls[0].op).toBe(OP.OPEN);
     expect(calls[0].path).toBe('/test.txt');
-    expect(calls[1].op).toBe(OP.CHMOD);
-    expect(calls[1].path).toBe('/test.txt');
+    const modeBuf = calls[0].data!;
+    expect(new DataView(modeBuf.buffer, modeBuf.byteOffset, 4).getUint32(0, true)).toBe(0o755);
   });
 
   it('does not call chmod when mode is not specified', async () => {

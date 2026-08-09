@@ -559,7 +559,12 @@ export class OPFSEngine {
 
   // ========== File descriptor operations ==========
 
-  async open(path: string, flags: number, _tabId: string): Promise<OPFSResult> {
+  /**
+   * open. `_reqMode` keeps this signature interchangeable with {@link VFSEngine.open}; as with
+   * this engine's mkdir and chmod, OPFS stores no permission metadata, so the mode is accepted
+   * and discarded and files read back as the synthetic 0644 encodeStat reports.
+   */
+  async open(path: string, flags: number, _tabId: string, _reqMode: number = 0o666): Promise<OPFSResult> {
     path = this.normalizePath(path);
     const hasCreate = (flags & 64) !== 0;   // O_CREAT
     const hasTrunc = (flags & 512) !== 0;    // O_TRUNC

@@ -1,7 +1,8 @@
 import type { Stats, BigIntStats, StatOptions, FileHandle, ReadOptions, WriteOptions, Encoding, Mode } from '../types.js';
 import type { SyncRequestFn, AsyncRequestFn } from './context.js';
-import { OP, encodeRequest } from '../protocol/opcodes.js';
+import { OP, encodeRequest, encodeRequestU32 } from '../protocol/opcodes.js';
 import { statusToError } from '../errors.js';
+import { parseFileMode, encodeMode } from './mode.js';
 import { decodeStats, decodeStatsBigInt } from '../stats.js';
 import { constants } from '../constants.js';
 
@@ -25,19 +26,26 @@ export function parseFlags(flags: string): number {
 }
 
 /**
- * `_mode` is accepted and **dropped**: the OPEN opcode carries no mode payload, so a file
- * created by O_CREAT always gets `DEFAULT_FILE_MODE`. `writeFile` covers the common case by
- * chmod-ing after the write; plumbing it through OPEN the way MKDIR now does is the remaining
- * gap. Kept in the signature so callers type-check and so it lands correctly when wired up.
+ * Node's `fs.open` defaults `mode` to 0o666; the engine subtracts its umask, exactly as
+ * open(2) does. With the default 0o022 that yields the historical 0o644, so callers that pass
+ * no mode are unaffected. The mode is only consulted when O_CREAT actually creates the file.
  */
+export const DEFAULT_OPEN_MODE = 0o666;
+
+/** Resolve open's mode argument the way Node does — absent means 0o666, not "no mode". */
+export function resolveOpenMode(mode?: Mode): number {
+  return mode === undefined ? DEFAULT_OPEN_MODE : parseFileMode(mode, 'mode');
+}
+
 export function openSync(
   syncRequest: SyncRequestFn,
   filePath: string,
   flags: string | number = 'r',
-  _mode?: Mode
+  mode?: Mode
 ): number {
   const numFlags = typeof flags === 'string' ? parseFlags(flags) : flags;
-  const buf = encodeRequest(OP.OPEN, filePath, numFlags);
+  // Zero-allocation encode: the mode goes straight into the request buffer.
+  const buf = encodeRequestU32(OP.OPEN, filePath, numFlags, resolveOpenMode(mode));
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'open', filePath);
   return new DataView(data!.buffer, data!.byteOffset, data!.byteLength).getUint32(0, true);
@@ -183,10 +191,11 @@ export async function open(
   asyncRequest: AsyncRequestFn,
   filePath: string,
   flags?: string | number,
-  _mode?: Mode
+  mode?: Mode
 ): Promise<FileHandle> {
   const numFlags = typeof flags === 'string' ? parseFlags(flags ?? 'r') : (flags ?? 0);
-  const { status, data } = await asyncRequest(OP.OPEN, filePath, numFlags);
+  // Async path posts to a relay worker, so it needs a real (and per-call fresh) Uint8Array.
+  const { status, data } = await asyncRequest(OP.OPEN, filePath, numFlags, encodeMode(resolveOpenMode(mode)));
   if (status !== 0) throw statusToError(status, 'open', filePath);
   const fd = new DataView(data!.buffer, data!.byteOffset, data!.byteLength).getUint32(0, true);
   return createFileHandle(fd, asyncRequest);

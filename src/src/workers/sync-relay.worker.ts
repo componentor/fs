@@ -436,7 +436,7 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
       const willCreate = (flags & 64) !== 0;   // O_CREAT
       const willTrunc = (flags & 512) !== 0;    // O_TRUNC
       const existedBefore = willCreate && !willTrunc ? engine.exists(path).data?.[0] === 1 : false;
-      result = engine.open(path, flags, reqTabId);
+      result = engine.open(path, flags, reqTabId, decodeMode(data, 0o666));
       if (result.status === 0 && (willTrunc || (willCreate && !existedBefore))) {
         syncOp = OP.WRITE;
         syncPath = path;
@@ -688,7 +688,7 @@ async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise
       break;
     }
     case OP.OPEN:
-      result = await oe.open(path, flags, reqTabId);
+      result = await oe.open(path, flags, reqTabId, decodeMode(data, 0o666));
       break;
     case OP.CLOSE: {
       const fd = data ? new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true) : 0;

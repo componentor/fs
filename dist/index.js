@@ -598,6 +598,30 @@ function outOfRange(name, range, value) {
   return err;
 }
 
+// src/methods/mode.ts
+var OCTAL_STRING = /^[0-7]+$/;
+function parseFileMode(mode, name, def) {
+  mode ??= def;
+  if (typeof mode === "string") {
+    if (!OCTAL_STRING.test(mode)) {
+      throw invalidArgValue(name, mode, "must be a 32-bit unsigned integer or an octal string");
+    }
+    return parseInt(mode, 8);
+  }
+  if (typeof mode !== "number") throw invalidArgType(name, "number", mode);
+  if (!Number.isInteger(mode)) throw outOfRange(name, "an integer", mode);
+  if (mode < 0 || mode > 4294967295) throw outOfRange(name, ">= 0 && <= 4294967295", mode);
+  return mode;
+}
+function encodeMode(mode) {
+  const buf = new Uint8Array(4);
+  buf[0] = mode;
+  buf[1] = mode >>> 8;
+  buf[2] = mode >>> 16;
+  buf[3] = mode >>> 24;
+  return buf;
+}
+
 // src/vfs/layout.ts
 var VFS_MAGIC = 1447449377;
 var VFS_VERSION = 1;
@@ -674,6 +698,7 @@ var DEFAULT_DIR_MODE = 16877;
 var DEFAULT_SYMLINK_MODE = 41471;
 var DEFAULT_UMASK = 18;
 var S_IFMT = 61440;
+var S_IFREG = 32768;
 var S_IFDIR = 16384;
 var MAX_SYMLINK_DEPTH = 40;
 var INITIAL_PATH_TABLE_SIZE = 256 * 1024;
@@ -925,9 +950,13 @@ function parseFlags(flags) {
       return constants.O_RDONLY;
   }
 }
-function openSync(syncRequest, filePath, flags = "r", _mode) {
+var DEFAULT_OPEN_MODE = 438;
+function resolveOpenMode(mode) {
+  return mode === void 0 ? DEFAULT_OPEN_MODE : parseFileMode(mode, "mode");
+}
+function openSync(syncRequest, filePath, flags = "r", mode) {
   const numFlags = typeof flags === "string" ? parseFlags(flags) : flags;
-  const buf = encodeRequest(OP.OPEN, filePath, numFlags);
+  const buf = encodeRequestU32(OP.OPEN, filePath, numFlags, resolveOpenMode(mode));
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "open", filePath);
   return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
@@ -1022,9 +1051,9 @@ function fdatasyncSync(syncRequest, fd) {
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "fdatasync", String(fd));
 }
-async function open(asyncRequest, filePath, flags, _mode) {
+async function open(asyncRequest, filePath, flags, mode) {
   const numFlags = typeof flags === "string" ? parseFlags(flags ?? "r") : flags ?? 0;
-  const { status, data } = await asyncRequest(OP.OPEN, filePath, numFlags);
+  const { status, data } = await asyncRequest(OP.OPEN, filePath, numFlags, encodeMode(resolveOpenMode(mode)));
   if (status !== 0) throw statusToError(status, "open", filePath);
   const fd = new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
   return createFileHandle(fd, asyncRequest);
@@ -1346,65 +1375,6 @@ async function readFile(asyncRequest, filePath, options) {
   }
 }
 
-// src/methods/mode.ts
-var OCTAL_STRING = /^[0-7]+$/;
-function parseFileMode(mode, name, def) {
-  mode ??= def;
-  if (typeof mode === "string") {
-    if (!OCTAL_STRING.test(mode)) {
-      throw invalidArgValue(name, mode, "must be a 32-bit unsigned integer or an octal string");
-    }
-    return parseInt(mode, 8);
-  }
-  if (typeof mode !== "number") throw invalidArgType(name, "number", mode);
-  if (!Number.isInteger(mode)) throw outOfRange(name, "an integer", mode);
-  if (mode < 0 || mode > 4294967295) throw outOfRange(name, ">= 0 && <= 4294967295", mode);
-  return mode;
-}
-function encodeMode(mode) {
-  const buf = new Uint8Array(4);
-  buf[0] = mode;
-  buf[1] = mode >>> 8;
-  buf[2] = mode >>> 16;
-  buf[3] = mode >>> 24;
-  return buf;
-}
-
-// src/methods/chmod.ts
-function requireMode(mode) {
-  return parseFileMode(mode, "mode");
-}
-function chmodSync(syncRequest, filePath, mode) {
-  const buf = encodeRequestU32(OP.CHMOD, filePath, 0, requireMode(mode));
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "chmod", filePath);
-}
-async function chmod(asyncRequest, filePath, mode) {
-  const { status } = await asyncRequest(OP.CHMOD, filePath, 0, encodeMode(requireMode(mode)));
-  if (status !== 0) throw statusToError(status, "chmod", filePath);
-}
-function fchmodSync(syncRequest, fd, mode) {
-  const buf = encodeRequest(OP.FCHMOD, "", 0, encodeFdMode(fd, requireMode(mode)));
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "fchmod", String(fd));
-}
-async function fchmod(asyncRequest, fd, mode) {
-  const { status } = await asyncRequest(OP.FCHMOD, "", 0, encodeFdMode(fd, requireMode(mode)));
-  if (status !== 0) throw statusToError(status, "fchmod", String(fd));
-}
-function encodeFdMode(fd, mode) {
-  const payload = new Uint8Array(8);
-  payload[0] = fd;
-  payload[1] = fd >>> 8;
-  payload[2] = fd >>> 16;
-  payload[3] = fd >>> 24;
-  payload[4] = mode;
-  payload[5] = mode >>> 8;
-  payload[6] = mode >>> 16;
-  payload[7] = mode >>> 24;
-  return payload;
-}
-
 // src/methods/writeFile.ts
 var encoder3 = new TextEncoder();
 function writeFileSync(syncRequest, filePath, data, options) {
@@ -1415,19 +1385,17 @@ function writeFileSync(syncRequest, filePath, data, options) {
   if (signal?.aborted) {
     throw new DOMException("The operation was aborted", "AbortError");
   }
-  if (!flag || flag === "w") {
+  if ((!flag || flag === "w") && opts?.mode === void 0) {
     const flags = opts?.flush === true ? 1 : 0;
     const buf = encodeRequest(OP.WRITE, filePath, flags, encoded);
     const { status } = syncRequest(buf);
     if (status !== 0) throw statusToError(status, "write", filePath);
-    if (opts?.mode !== void 0) {
-      chmodSync(syncRequest, filePath, opts.mode);
-    }
     return;
   }
-  const fd = openSync(syncRequest, filePath, flag, opts?.mode);
+  const fd = openSync(syncRequest, filePath, flag ?? "w", opts?.mode);
   try {
     writeSyncFd(syncRequest, fd, encoded, 0, encoded.byteLength, 0);
+    if (opts?.flush === true) fdatasyncSync(syncRequest, fd);
   } finally {
     closeSync(syncRequest, fd);
   }
@@ -1440,19 +1408,17 @@ async function writeFile(asyncRequest, filePath, data, options) {
   if (signal?.aborted) {
     throw new DOMException("The operation was aborted", "AbortError");
   }
-  if (!flag || flag === "w") {
+  if ((!flag || flag === "w") && opts?.mode === void 0) {
     const flags = opts?.flush === true ? 1 : 0;
     const { status } = await asyncRequest(OP.WRITE, filePath, flags, encoded);
     if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
     if (status !== 0) throw statusToError(status, "write", filePath);
-    if (opts?.mode !== void 0) {
-      await chmod(asyncRequest, filePath, opts.mode);
-    }
     return;
   }
-  const handle = await open(asyncRequest, filePath, flag, opts?.mode);
+  const handle = await open(asyncRequest, filePath, flag ?? "w", opts?.mode);
   try {
     await handle.writeFile(encoded);
+    if (opts?.flush === true) await handle.datasync();
     if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
   } finally {
     await handle.close();
@@ -1841,6 +1807,41 @@ async function realpath(asyncRequest, filePath) {
   const { status, data } = await asyncRequest(OP.REALPATH, filePath);
   if (status !== 0) throw statusToError(status, "realpath", filePath);
   return decoder5.decode(data);
+}
+
+// src/methods/chmod.ts
+function requireMode(mode) {
+  return parseFileMode(mode, "mode");
+}
+function chmodSync(syncRequest, filePath, mode) {
+  const buf = encodeRequestU32(OP.CHMOD, filePath, 0, requireMode(mode));
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "chmod", filePath);
+}
+async function chmod(asyncRequest, filePath, mode) {
+  const { status } = await asyncRequest(OP.CHMOD, filePath, 0, encodeMode(requireMode(mode)));
+  if (status !== 0) throw statusToError(status, "chmod", filePath);
+}
+function fchmodSync(syncRequest, fd, mode) {
+  const buf = encodeRequest(OP.FCHMOD, "", 0, encodeFdMode(fd, requireMode(mode)));
+  const { status } = syncRequest(buf);
+  if (status !== 0) throw statusToError(status, "fchmod", String(fd));
+}
+async function fchmod(asyncRequest, fd, mode) {
+  const { status } = await asyncRequest(OP.FCHMOD, "", 0, encodeFdMode(fd, requireMode(mode)));
+  if (status !== 0) throw statusToError(status, "fchmod", String(fd));
+}
+function encodeFdMode(fd, mode) {
+  const payload = new Uint8Array(8);
+  payload[0] = fd;
+  payload[1] = fd >>> 8;
+  payload[2] = fd >>> 16;
+  payload[3] = fd >>> 24;
+  payload[4] = mode;
+  payload[5] = mode >>> 8;
+  payload[6] = mode >>> 16;
+  payload[7] = mode >>> 24;
+  return payload;
 }
 
 // src/methods/chown.ts
@@ -3574,7 +3575,7 @@ var VFSFileSystem = class {
   }
   // ---- File descriptor sync methods ----
   openSync(filePath, flags = "r", mode) {
-    return openSync(this._sync, toPathString(filePath), flags);
+    return openSync(this._sync, toPathString(filePath), flags, mode);
   }
   closeSync(fd) {
     closeSync(this._sync, fd);
@@ -4405,7 +4406,7 @@ var VFSPromises = class {
     return link(this._async, toPathString(existingPath), toPathString(newPath));
   }
   open(filePath, flags, mode) {
-    return open(this._async, toPathString(filePath), flags);
+    return open(this._async, toPathString(filePath), flags, mode);
   }
   opendir(filePath) {
     return opendir(this._async, toPathString(filePath));
@@ -5561,6 +5562,10 @@ var VFSEngine = class {
   dirModeFor(reqMode) {
     return S_IFDIR | reqMode & 4095 & ~(this.umask & 511);
   }
+  /** Same, for a newly created regular file. Node's open defaults reqMode to 0o666 → 0o644. */
+  fileModeFor(reqMode) {
+    return S_IFREG | reqMode & 4095 & ~(this.umask & 511);
+  }
   mkdirRecursive(path, reqMode = 511) {
     const parts = path.split("/").filter(Boolean);
     let current = "";
@@ -5990,7 +5995,15 @@ var VFSEngine = class {
     return { status: 0 };
   }
   // ---- OPEN (file descriptor) ----
-  open(path, flags, tabId) {
+  /**
+   * open(2). `reqMode` is the mode an O_CREAT open asks for; the umask is subtracted from it
+   * here, as the kernel does. It defaults to 0o666 — Node's default for `open` — so an omitted
+   * mode still lands on the historical 0o644 under the default 0o022 umask.
+   *
+   * The mode applies **only when the file is created**. Re-opening an existing file with a
+   * different mode leaves its permissions alone, matching open(2) and Node.
+   */
+  open(path, flags, tabId, reqMode = 438) {
     path = this.normalizePath(path);
     const hasCreate = (flags & 64) !== 0;
     const hasTrunc = (flags & 512) !== 0;
@@ -5998,8 +6011,7 @@ var VFSEngine = class {
     let idx = this.resolvePathComponents(path, true);
     if (idx === void 0) {
       if (!hasCreate) return { status: CODE_TO_STATUS.ENOENT, data: null };
-      const mode = DEFAULT_FILE_MODE & ~(this.umask & 511);
-      idx = this.createInode(path, INODE_TYPE.FILE, mode, 0);
+      idx = this.createInode(path, INODE_TYPE.FILE, this.fileModeFor(reqMode), 0);
     } else if (hasExcl && hasCreate) {
       return { status: CODE_TO_STATUS.EEXIST, data: null };
     }

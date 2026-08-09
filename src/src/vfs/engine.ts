@@ -1425,6 +1425,11 @@ export class VFSEngine {
     return S_IFDIR | ((reqMode & 0o7777) & ~(this.umask & 0o777));
   }
 
+  /** Same, for a newly created regular file. Node's open defaults reqMode to 0o666 → 0o644. */
+  private fileModeFor(reqMode: number): number {
+    return S_IFREG | ((reqMode & 0o7777) & ~(this.umask & 0o777));
+  }
+
   private mkdirRecursive(path: string, reqMode: number = 0o777): { status: number; data: Uint8Array | null } {
     const parts = path.split('/').filter(Boolean);
     let current = '';
@@ -2029,7 +2034,15 @@ export class VFSEngine {
   }
 
   // ---- OPEN (file descriptor) ----
-  open(path: string, flags: number, tabId: string): { status: number; data: Uint8Array | null } {
+  /**
+   * open(2). `reqMode` is the mode an O_CREAT open asks for; the umask is subtracted from it
+   * here, as the kernel does. It defaults to 0o666 — Node's default for `open` — so an omitted
+   * mode still lands on the historical 0o644 under the default 0o022 umask.
+   *
+   * The mode applies **only when the file is created**. Re-opening an existing file with a
+   * different mode leaves its permissions alone, matching open(2) and Node.
+   */
+  open(path: string, flags: number, tabId: string, reqMode: number = 0o666): { status: number; data: Uint8Array | null } {
     path = this.normalizePath(path);
 
     const hasCreate = (flags & 64) !== 0;  // O_CREAT
@@ -2041,8 +2054,7 @@ export class VFSEngine {
     if (idx === undefined) {
       if (!hasCreate) return { status: CODE_TO_STATUS.ENOENT, data: null };
       // Create file
-      const mode = DEFAULT_FILE_MODE & ~(this.umask & 0o777);
-      idx = this.createInode(path, INODE_TYPE.FILE, mode, 0);
+      idx = this.createInode(path, INODE_TYPE.FILE, this.fileModeFor(reqMode), 0);
     } else if (hasExcl && hasCreate) {
       return { status: CODE_TO_STATUS.EEXIST, data: null };
     }

@@ -184,7 +184,9 @@ function handleRequest(tabId: string, buffer: ArrayBuffer): ArrayBuffer {
     }
 
     case OP.OPEN: {
-      result = engine.open(path, flags, tabId);
+      // O_CREAT's mode rides as a 4-byte LE payload; older clients send none, so fall back to
+      // open's Node default of 0o666 (umask-reduced by the engine, and only used on create).
+      result = engine.open(path, flags, tabId, decodeMode(data, 0o666));
       break;
     }
 

@@ -132,11 +132,23 @@ A mode may be a uint32 or an octal **string** (`'0700'`), and a recursive `mkdir
 every level it creates — both matching Node. Invalid modes throw Node's own
 `ERR_INVALID_ARG_VALUE` / `ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`.
 
+Files work the same way. `open`'s mode defaults to Node's 0o666 (0o644 after the default umask)
+and, as in `open(2)`, applies **only when the file is created** — re-opening an existing file
+with a different mode leaves its permissions alone. `writeFile`'s `mode` option follows the same
+rule, because it rides along with the creating open:
+
+```js
+fs.writeFileSync('/secret.txt', data, { mode: 0o600 });
+fs.statSync('/secret.txt').mode & 0o777;   // 0o600
+
+fs.closeSync(fs.openSync('/pub.txt', 'w'));
+fs.statSync('/pub.txt').mode & 0o777;      // 0o644
+```
+
 Permission bits are stored and reported, but only *enforced* by `access()` when you opt in with
-`strictPermissions: true`. Two current limitations: `open(path, flags, mode)` ignores its mode
-(files are created with the default; `writeFile`'s `mode` option works, via a chmod after the
-write), and `opfs` mode stores no permission metadata at all, so directories there always read
-back as 0755.
+`strictPermissions: true`. Two current limitations: `appendFile` ignores its options entirely
+(mode *and* encoding), and `opfs` fallback mode stores no permission metadata at all, so entries
+there always read back as the synthetic 0755/0644.
 
 ### Filesystem Modes
 

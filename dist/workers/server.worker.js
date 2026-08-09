@@ -74,6 +74,7 @@ var DEFAULT_DIR_MODE = 16877;
 var DEFAULT_SYMLINK_MODE = 41471;
 var DEFAULT_UMASK = 18;
 var S_IFMT = 61440;
+var S_IFREG = 32768;
 var S_IFDIR = 16384;
 var MAX_SYMLINK_DEPTH = 40;
 var INITIAL_PATH_TABLE_SIZE = 256 * 1024;
@@ -1174,6 +1175,10 @@ var VFSEngine = class {
   dirModeFor(reqMode) {
     return S_IFDIR | reqMode & 4095 & ~(this.umask & 511);
   }
+  /** Same, for a newly created regular file. Node's open defaults reqMode to 0o666 → 0o644. */
+  fileModeFor(reqMode) {
+    return S_IFREG | reqMode & 4095 & ~(this.umask & 511);
+  }
   mkdirRecursive(path, reqMode = 511) {
     const parts = path.split("/").filter(Boolean);
     let current = "";
@@ -1603,7 +1608,15 @@ var VFSEngine = class {
     return { status: 0 };
   }
   // ---- OPEN (file descriptor) ----
-  open(path, flags, tabId) {
+  /**
+   * open(2). `reqMode` is the mode an O_CREAT open asks for; the umask is subtracted from it
+   * here, as the kernel does. It defaults to 0o666 — Node's default for `open` — so an omitted
+   * mode still lands on the historical 0o644 under the default 0o022 umask.
+   *
+   * The mode applies **only when the file is created**. Re-opening an existing file with a
+   * different mode leaves its permissions alone, matching open(2) and Node.
+   */
+  open(path, flags, tabId, reqMode = 438) {
     path = this.normalizePath(path);
     const hasCreate = (flags & 64) !== 0;
     const hasTrunc = (flags & 512) !== 0;
@@ -1611,8 +1624,7 @@ var VFSEngine = class {
     let idx = this.resolvePathComponents(path, true);
     if (idx === void 0) {
       if (!hasCreate) return { status: CODE_TO_STATUS.ENOENT, data: null };
-      const mode = DEFAULT_FILE_MODE & ~(this.umask & 511);
-      idx = this.createInode(path, INODE_TYPE.FILE, mode, 0);
+      idx = this.createInode(path, INODE_TYPE.FILE, this.fileModeFor(reqMode), 0);
     } else if (hasExcl && hasCreate) {
       return { status: CODE_TO_STATUS.EEXIST, data: null };
     }
@@ -2296,7 +2308,7 @@ function handleRequest(tabId, buffer) {
       break;
     }
     case OP.OPEN: {
-      result = engine.open(path, flags, tabId);
+      result = engine.open(path, flags, tabId, decodeMode(data, 438));
       break;
     }
     case OP.CLOSE: {

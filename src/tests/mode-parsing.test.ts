@@ -7,11 +7,62 @@
  * below was captured from real `node:fs` on this machine (umask 0o022) before being written.
  */
 
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { mkdirSync, mkdir } from '../src/methods/mkdir.js';
 import { chmodSync, chmod, fchmodSync } from '../src/methods/chmod.js';
 import { parseFileMode } from '../src/methods/mode.js';
+import { openSync, open as openAsync } from '../src/methods/open.js';
 import { OP, encodeRequest, encodeRequestU32, decodeRequest } from '../src/protocol/opcodes.js';
+import { VFSEngine } from '../src/vfs/engine.js';
+
+/** Minimal in-memory FileSystemSyncAccessHandle, as each engine test file defines. */
+class MockSyncHandle {
+  private buffer: Uint8Array;
+  private size: number;
+
+  constructor(initialSize: number = 0) {
+    this.buffer = new Uint8Array(initialSize);
+    this.size = initialSize;
+  }
+
+  getSize(): number {
+    return this.size;
+  }
+
+  truncate(newSize: number): void {
+    if (newSize > this.buffer.byteLength) {
+      const newBuf = new Uint8Array(newSize);
+      newBuf.set(this.buffer.subarray(0, this.size));
+      this.buffer = newBuf;
+    }
+    this.size = newSize;
+  }
+
+  read(buf: Uint8Array, opts?: { at?: number }): number {
+    const at = opts?.at ?? 0;
+    const len = Math.min(buf.byteLength, this.size - at);
+    if (len <= 0) return 0;
+    buf.set(this.buffer.subarray(at, at + len));
+    return len;
+  }
+
+  write(buf: Uint8Array, opts?: { at?: number }): number {
+    const at = opts?.at ?? 0;
+    const end = at + buf.byteLength;
+    if (end > this.buffer.byteLength) {
+      const newBuf = new Uint8Array(end * 2);
+      newBuf.set(this.buffer.subarray(0, this.size));
+      this.buffer = newBuf;
+    }
+    this.buffer.set(buf, at);
+    if (end > this.size) this.size = end;
+    return buf.byteLength;
+  }
+
+  flush(): void {}
+  close(): void {}
+}
+
 
 /** The mode a request frame actually carries (4-byte LE payload after the path). */
 const modeOf = (buf: ArrayBuffer) => {
@@ -196,5 +247,94 @@ describe('encodeRequestU32', () => {
 
   it('masks the value to 32 bits like DataView.setUint32 does', () => {
     expect(modeOf(encodeRequestU32(OP.CHMOD, '/f', 0, 0xffffffff))).toBe(0xffffffff);
+  });
+});
+
+
+describe('open mode', () => {
+  const okOpen = () =>
+    vi.fn().mockImplementation(() => {
+      const fd = new Uint8Array(4);
+      new DataView(fd.buffer).setUint32(0, 5, true);
+      return { status: 0, data: fd };
+    });
+
+  it("defaults to Node's 0o666 when no mode is given", () => {
+    const req = okOpen();
+    openSync(req, '/f', 'w');
+    expect(modeOf(req.mock.calls[0][0])).toBe(0o666);
+  });
+
+  it('carries an explicit mode, including an octal string', () => {
+    const req = okOpen();
+    openSync(req, '/f', 'w', 0o600);
+    expect(modeOf(req.mock.calls[0][0])).toBe(0o600);
+    openSync(req, '/g', 'w', '0600');
+    expect(modeOf(req.mock.calls[1][0])).toBe(0o600);
+  });
+
+  it('rejects a bad mode before issuing any request', () => {
+    const req = okOpen();
+    expect(() => openSync(req, '/f', 'w', 'abc')).toThrow(
+      expect.objectContaining({ code: 'ERR_INVALID_ARG_VALUE' })
+    );
+    expect(req).not.toHaveBeenCalled();
+  });
+
+  it('async open carries the mode as a fresh per-call payload', async () => {
+    const req = vi.fn().mockImplementation(async () => {
+      const fd = new Uint8Array(4);
+      new DataView(fd.buffer).setUint32(0, 5, true);
+      return { status: 0, data: fd };
+    });
+    await Promise.all([openAsync(req, '/a', 'w', 0o600), openAsync(req, '/b', 'w', 0o640)]);
+    const [a, b] = req.mock.calls.map((c) => c[3] as Uint8Array);
+    expect(a).not.toBe(b);
+    expect(new DataView(a.buffer, a.byteOffset, 4).getUint32(0, true)).toBe(0o600);
+    expect(new DataView(b.buffer, b.byteOffset, 4).getUint32(0, true)).toBe(0o640);
+  });
+});
+
+describe('open mode (VFS engine)', () => {
+  let engine: VFSEngine;
+
+  beforeEach(() => {
+    engine = new VFSEngine();
+    engine.init(new MockSyncHandle(0) as unknown as FileSystemSyncAccessHandle);
+  });
+
+  /** Permission bits the engine actually stored for `path`. */
+  const perm = (path: string) => {
+    const st = engine.stat(path);
+    expect(st.status).toBe(0);
+    return new DataView(st.data!.buffer, st.data!.byteOffset, st.data!.byteLength)
+      .getUint32(1, true) & 0o7777;
+  };
+
+  const O_CREAT_WRONLY = 64 | 1;
+
+  it('creates a file with the requested mode', () => {
+    expect(engine.open('/priv', O_CREAT_WRONLY, 't', 0o600).status).toBe(0);
+    expect(perm('/priv')).toBe(0o600);
+  });
+
+  it('subtracts the umask, exactly as open(2) does', () => {
+    // Default umask 0o022, so Node's default 0o666 lands on the historical 0o644 — which is
+    // what makes this a no-op for every caller that passes no mode.
+    expect(engine.open('/plain', O_CREAT_WRONLY, 't', 0o666).status).toBe(0);
+    expect(perm('/plain')).toBe(0o644);
+    expect(engine.open('/wide', O_CREAT_WRONLY, 't', 0o777).status).toBe(0);
+    expect(perm('/wide')).toBe(0o755);
+  });
+
+  it('defaults to 0o644 when the caller supplies no mode at all', () => {
+    expect(engine.open('/dflt', O_CREAT_WRONLY, 't').status).toBe(0);
+    expect(perm('/dflt')).toBe(0o644);
+  });
+
+  it('ignores the mode when the file already exists, as open(2) does', () => {
+    expect(engine.open('/keep', O_CREAT_WRONLY, 't', 0o600).status).toBe(0);
+    expect(engine.open('/keep', O_CREAT_WRONLY, 't', 0o777).status).toBe(0);
+    expect(perm('/keep')).toBe(0o600);
   });
 });
