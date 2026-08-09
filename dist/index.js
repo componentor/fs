@@ -1427,16 +1427,61 @@ async function writeFile(asyncRequest, filePath, data, options) {
 
 // src/methods/appendFile.ts
 var encoder4 = new TextEncoder();
+function resolveOptions(options) {
+  const opts = typeof options === "string" ? { encoding: options } : options;
+  const flag = opts?.flag;
+  return {
+    opts,
+    flag,
+    /** True when APPEND alone can express the request. */
+    fastPath: (!flag || flag === "a") && opts?.mode === void 0 && opts?.flush !== true
+  };
+}
+function encodeData(data, encoding) {
+  if (typeof data !== "string") return data;
+  return encoding ? encodeString(data, encoding) : encoder4.encode(data);
+}
 function appendFileSync(syncRequest, filePath, data, options) {
-  const encoded = typeof data === "string" ? encoder4.encode(data) : data;
-  const buf = encodeRequest(OP.APPEND, filePath, 0, encoded);
-  const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "appendFile", filePath);
+  const { opts, flag, fastPath } = resolveOptions(options);
+  const encoded = encodeData(data, opts?.encoding);
+  if (opts?.signal?.aborted) {
+    throw new DOMException("The operation was aborted", "AbortError");
+  }
+  if (fastPath) {
+    const buf = encodeRequest(OP.APPEND, filePath, 0, encoded);
+    const { status } = syncRequest(buf);
+    if (status !== 0) throw statusToError(status, "appendFile", filePath);
+    return;
+  }
+  const fd = openSync(syncRequest, filePath, flag ?? "a", opts?.mode);
+  try {
+    writeSyncFd(syncRequest, fd, encoded, 0, encoded.byteLength, 0);
+    if (opts?.flush === true) fdatasyncSync(syncRequest, fd);
+  } finally {
+    closeSync(syncRequest, fd);
+  }
 }
 async function appendFile(asyncRequest, filePath, data, options) {
-  const encoded = typeof data === "string" ? encoder4.encode(data) : data;
-  const { status } = await asyncRequest(OP.APPEND, filePath, 0, encoded);
-  if (status !== 0) throw statusToError(status, "appendFile", filePath);
+  const { opts, flag, fastPath } = resolveOptions(options);
+  const encoded = encodeData(data, opts?.encoding);
+  const signal = opts?.signal;
+  if (signal?.aborted) {
+    throw new DOMException("The operation was aborted", "AbortError");
+  }
+  if (fastPath) {
+    const { status } = await asyncRequest(OP.APPEND, filePath, 0, encoded);
+    if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+    if (status !== 0) throw statusToError(status, "appendFile", filePath);
+    return;
+  }
+  const handle = await open(asyncRequest, filePath, flag ?? "a", opts?.mode);
+  try {
+    await handle.writeFile(encoded);
+    if (opts?.flush === true) await handle.datasync();
+    if (signal?.aborted) throw new DOMException("The operation was aborted", "AbortError");
+  } finally {
+    await handle.close();
+  }
 }
 
 // src/methods/exists.ts
@@ -1453,7 +1498,7 @@ async function exists(asyncRequest, filePath) {
 // src/methods/mkdir.ts
 var decoder4 = new TextDecoder();
 var DEFAULT_MKDIR_MODE = 511;
-function resolveOptions(options) {
+function resolveOptions2(options) {
   if (typeof options === "number" || typeof options === "string") {
     return { flags: 0, mode: parseFileMode(options, "mode") };
   }
@@ -1465,14 +1510,14 @@ function resolveOptions(options) {
   };
 }
 function mkdirSync(syncRequest, filePath, options) {
-  const { flags, mode } = resolveOptions(options);
+  const { flags, mode } = resolveOptions2(options);
   const buf = encodeRequestU32(OP.MKDIR, filePath, flags, mode);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "mkdir", filePath);
   return data ? decoder4.decode(data) : void 0;
 }
 async function mkdir(asyncRequest, filePath, options) {
-  const { flags, mode } = resolveOptions(options);
+  const { flags, mode } = resolveOptions2(options);
   const { status, data } = await asyncRequest(OP.MKDIR, filePath, flags, encodeMode(mode));
   if (status !== 0) throw statusToError(status, "mkdir", filePath);
   return data ? decoder4.decode(data) : void 0;
@@ -3355,7 +3400,7 @@ var VFSFileSystem = class {
     writeFileSync(this._sync, toPathString(filePath), data, options);
   }
   appendFileSync(filePath, data, options) {
-    appendFileSync(this._sync, toPathString(filePath), data);
+    appendFileSync(this._sync, toPathString(filePath), data, options);
   }
   existsSync(filePath) {
     return existsSync(this._sync, toPathString(filePath));
@@ -4261,7 +4306,7 @@ var VFSPromises = class {
     return writeFile(this._async, toPathString(filePath), data, options);
   }
   appendFile(filePath, data, options) {
-    return appendFile(this._async, toPathString(filePath), data);
+    return appendFile(this._async, toPathString(filePath), data, options);
   }
   mkdir(filePath, options) {
     return mkdir(this._async, toPathString(filePath), options);

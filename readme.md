@@ -146,9 +146,8 @@ fs.statSync('/pub.txt').mode & 0o777;      // 0o644
 ```
 
 Permission bits are stored and reported, but only *enforced* by `access()` when you opt in with
-`strictPermissions: true`. Two current limitations: `appendFile` ignores its options entirely
-(mode *and* encoding), and `opfs` fallback mode stores no permission metadata at all, so entries
-there always read back as the synthetic 0755/0644.
+`strictPermissions: true`. One limitation remains: `opfs` fallback mode stores no permission
+metadata at all, so entries there always read back as the synthetic 0755/0644.
 
 ### Filesystem Modes
 
@@ -421,7 +420,7 @@ npm run benchmark:open
 // Read/Write
 fs.readFileSync(path, options?): Uint8Array | string
 fs.writeFileSync(path, data, options?): void
-fs.appendFileSync(path, data): void
+fs.appendFileSync(path, data, options?): void   // { encoding?, mode?, flag?, flush? } | encoding
 
 // Directories
 fs.mkdirSync(path, options?): string | undefined   // options: { recursive?, mode? } | mode
@@ -470,7 +469,7 @@ fs.flushSync(): void
 // Read/Write
 fs.promises.readFile(path, options?): Promise<Uint8Array | string>
 fs.promises.writeFile(path, data, options?): Promise<void>
-fs.promises.appendFile(path, data): Promise<void>
+fs.promises.appendFile(path, data, options?): Promise<void>
 
 // Directories
 fs.promises.mkdir(path, options?): Promise<string | undefined>  // { recursive?, mode? } | mode
