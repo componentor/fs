@@ -74,6 +74,7 @@ var DEFAULT_DIR_MODE = 16877;
 var DEFAULT_SYMLINK_MODE = 41471;
 var DEFAULT_UMASK = 18;
 var S_IFMT = 61440;
+var S_IFDIR = 16384;
 var MAX_SYMLINK_DEPTH = 40;
 var INITIAL_PATH_TABLE_SIZE = 256 * 1024;
 var INITIAL_DATA_BLOCKS = 1024;
@@ -1144,23 +1145,36 @@ var VFSEngine = class {
     return { status: 0, data: buf };
   }
   // ---- MKDIR ----
-  mkdir(path, flags = 0) {
+  /**
+   * mkdir(2). `reqMode` is the caller's requested permission mode; the umask is subtracted from it
+   * here exactly as the kernel does. It defaults to 0o777 so an omitted mode still lands on the
+   * historical 0o755 under the default 0o022 umask.
+   *
+   * Honouring the mode is not cosmetic: software that creates a private directory and then stats it
+   * back treats a widened mode as a security failure and aborts. Chrome's ProcessSingleton is the
+   * canonical case — it mkdtemp()s its socket directory and CHECKs that the mode is exactly 0700,
+   * killing the browser at startup when the filesystem silently returns 0755.
+   */
+  mkdir(path, flags = 0, reqMode = 511) {
     path = this.normalizePath(path);
     const recursive = (flags & 1) !== 0;
     if (recursive) {
-      return this.mkdirRecursive(path);
+      return this.mkdirRecursive(path, reqMode);
     }
     if (this.pathIndex.has(path) || this.isImplicitDirectory(path)) {
       return { status: CODE_TO_STATUS.EEXIST, data: null };
     }
     const parentStatus = this.ensureParent(path);
     if (parentStatus !== 0) return { status: parentStatus, data: null };
-    const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
-    this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
+    this.createInode(path, INODE_TYPE.DIRECTORY, this.dirModeFor(reqMode), 0);
     this.commitPending();
     return { status: 0, data: null };
   }
-  mkdirRecursive(path) {
+  /** Permission bits a new directory gets: the request minus the umask, plus the S_IFDIR type. */
+  dirModeFor(reqMode) {
+    return S_IFDIR | reqMode & 4095 & ~(this.umask & 511);
+  }
+  mkdirRecursive(path, reqMode = 511) {
     const parts = path.split("/").filter(Boolean);
     let current = "";
     let firstCreated = null;
@@ -1174,8 +1188,7 @@ var VFSEngine = class {
         }
         continue;
       }
-      const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
-      this.createInode(current, INODE_TYPE.DIRECTORY, mode, 0);
+      this.createInode(current, INODE_TYPE.DIRECTORY, this.dirModeFor(reqMode), 0);
       if (!firstCreated) firstCreated = current;
     }
     this.commitPending();
@@ -1783,8 +1796,7 @@ var VFSEngine = class {
         this.mkdirRecursive(parentPath);
       }
     }
-    const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
-    this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
+    this.createInode(path, INODE_TYPE.DIRECTORY, this.dirModeFor(448), 0);
     this.commitPending();
     return { status: 0, data: encoder.encode(path) };
   }
@@ -2294,7 +2306,14 @@ var OPFSEngine = class {
   async lstat(path) {
     return this.stat(path);
   }
-  async mkdir(path, flags = 0) {
+  /**
+   * mkdir. `_reqMode` keeps this signature interchangeable with {@link VFSEngine.mkdir}, but OPFS
+   * stores no permission metadata, so — like this engine's chmod — the mode is accepted and
+   * discarded. Directories therefore always read back as the synthetic 0755 encodeStat reports.
+   * This engine is only reached as the corruption fallback; the hybrid default uses VFSEngine,
+   * which does persist modes.
+   */
+  async mkdir(path, flags = 0, _reqMode = 511) {
     path = this.normalizePath(path);
     const recursive = (flags & 1) !== 0;
     if (recursive) {
@@ -2988,6 +3007,10 @@ self.addEventListener("unhandledrejection", (e) => {
   console.error("[sync-relay] unhandled rejection:", reason?.message ?? String(reason), reason?.stack ?? "");
 });
 var engine = new VFSEngine();
+function decodeMode(data, fallback) {
+  if (!data || data.byteLength < 4) return fallback;
+  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
+}
 var opfsEngine = null;
 var opfsMode = false;
 var leaderInitialized = false;
@@ -3197,7 +3220,7 @@ function handleRequest(reqTabId, buffer) {
       result = engine.lstat(path);
       break;
     case OP.MKDIR:
-      result = engine.mkdir(path, flags);
+      result = engine.mkdir(path, flags, decodeMode(data, 511));
       if (result.status === 0) {
         syncOp = op;
         syncPath = path;
@@ -3488,7 +3511,7 @@ async function handleRequestOPFS(reqTabId, buffer) {
       result = await oe.lstat(path);
       break;
     case OP.MKDIR:
-      result = await oe.mkdir(path, flags);
+      result = await oe.mkdir(path, flags, decodeMode(data, 511));
       syncPath = path;
       break;
     case OP.RMDIR:
@@ -3980,7 +4003,7 @@ async function populateVFSFromOPFS(dir, prefix) {
   }
   for (const { name } of subdirs) {
     const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;
-    engine.mkdir(fullPath, 16877);
+    engine.mkdir(fullPath, 1, 493);
   }
   for (const { name, handle } of files) {
     const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;

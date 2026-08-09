@@ -315,7 +315,9 @@ async function handleRepair(root: string) {
 
     // Create directories — failure here is critical (blocks child files)
     for (const dir of dirs) {
-      if (engine.mkdir(dir.path, 0o040755).status !== 0) {
+      // (1 = recursive, 0o755 = mode) — a recovered directory's parent may itself be lost, so
+      // creating parents on the way down is deliberate.
+      if (engine.mkdir(dir.path, 1, 0o755).status !== 0) {
         criticalErrors++;
         lost++;
         if (criticalErrors >= MAX_CRITICAL_ERRORS) {
@@ -420,7 +422,7 @@ async function handleLoad(root: string) {
       .sort((a, b) => a.path.localeCompare(b.path));
 
     for (const dir of dirs) {
-      if (engine.mkdir(dir.path, 0o040755).status === 0) {
+      if (engine.mkdir(dir.path, 1, 0o755).status === 0) {
         directories++;
       }
     }

@@ -1,4 +1,4 @@
-import type { Stats, BigIntStats, StatOptions, FileHandle, ReadOptions, WriteOptions, Encoding } from '../types.js';
+import type { Stats, BigIntStats, StatOptions, FileHandle, ReadOptions, WriteOptions, Encoding, Mode } from '../types.js';
 import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { OP, encodeRequest } from '../protocol/opcodes.js';
 import { statusToError } from '../errors.js';
@@ -24,11 +24,17 @@ export function parseFlags(flags: string): number {
   }
 }
 
+/**
+ * `_mode` is accepted and **dropped**: the OPEN opcode carries no mode payload, so a file
+ * created by O_CREAT always gets `DEFAULT_FILE_MODE`. `writeFile` covers the common case by
+ * chmod-ing after the write; plumbing it through OPEN the way MKDIR now does is the remaining
+ * gap. Kept in the signature so callers type-check and so it lands correctly when wired up.
+ */
 export function openSync(
   syncRequest: SyncRequestFn,
   filePath: string,
   flags: string | number = 'r',
-  _mode?: number
+  _mode?: Mode
 ): number {
   const numFlags = typeof flags === 'string' ? parseFlags(flags) : flags;
   const buf = encodeRequest(OP.OPEN, filePath, numFlags);
@@ -177,7 +183,7 @@ export async function open(
   asyncRequest: AsyncRequestFn,
   filePath: string,
   flags?: string | number,
-  _mode?: number
+  _mode?: Mode
 ): Promise<FileHandle> {
   const numFlags = typeof flags === 'string' ? parseFlags(flags ?? 'r') : (flags ?? 0);
   const { status, data } = await asyncRequest(OP.OPEN, filePath, numFlags);

@@ -47,7 +47,19 @@
       "Bash(PORT=3519 npx playwright test benchmark.spec --project=chromium)",
       "Bash(sed -n '100,108p' tests/benchmark/benchmark.spec.ts)",
       "Bash(PORT=3519 npx playwright test benchmark.spec --project=chromium -g \"Write performance\")",
-      "Bash(perl -i -pe 's/\"version\": \"3\\\\.1\\\\.0\"/\"version\": \"3.2.0\"/' package.json)"
+      "Bash(perl -i -pe 's/\"version\": \"3\\\\.1\\\\.0\"/\"version\": \"3.2.0\"/' package.json)",
+      "Bash(PORT=3939 npx playwright test opfs-mirror-rename --project=chromium)",
+      "Bash(PORT=3939 npx playwright test opfs-mirror-external --project=chromium)",
+      "Bash(PORT=3939 npx playwright test opfs-mirror-symlink --project=chromium)",
+      "Bash(PORT=3939 npx playwright test opfs-mirror --project=chromium)",
+      "Bash(grep -n \"getFileHandle\\(name, { create: true }\\)\\\\|const plan = planRenameMirror\\\\|cleanDescendants = existingInode.type\" src/src/workers/opfs-sync.worker.ts src/src/workers/sync-relay.worker.ts src/src/vfs/engine.ts)",
+      "Bash(PORT=3939 npx playwright test opfs-mirror-open opfs-mirror-symlink --project=chromium)",
+      "Bash(PORT=3939 npx playwright test opfs-mirror-external --project=chromium -g \"symlink TARGET\")",
+      "Bash(PORT=3939 npx playwright test opfs-mirror-symlink opfs-mirror-external --project=chromium)",
+      "Bash(grep -nE \"^#{1,3} \" README.md)",
+      "Bash(npx vitest *)",
+      "Bash(echo \"exit=$?\")",
+      "Bash(echo \"=== exit $? \\(1=no matches, good\\) ===\")"
     ]
   }
 }

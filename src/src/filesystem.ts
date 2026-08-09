@@ -14,7 +14,7 @@ import type {
   Encoding, ReadOptions, WriteOptions, MkdirOptions, RmdirOptions, RmOptions, CpOptions,
   ReaddirOptions, StatOptions, Stats, BigIntStats, StatFs, Dirent, Dir, VFSConfig, FSMode, FileHandle, GlobOptions,
   WatchOptions, WatchFileOptions, WatchEventType, FSWatcher, WatchListener, WatchFileListener,
-  ReadStreamOptions, WriteStreamOptions, FSReadStream, FSWriteStream, OpenAsBlobOptions, PathLike,
+  ReadStreamOptions, WriteStreamOptions, FSReadStream, FSWriteStream, OpenAsBlobOptions, PathLike, Mode,
 } from './types.js';
 import { NodeReadable, NodeWritable } from './node-streams.js';
 import type { SyncRequestFn, AsyncRequestFn } from './methods/context.js';
@@ -943,7 +943,7 @@ export class VFSFileSystem {
     return _existsSync(this._sync, toPathString(filePath));
   }
 
-  mkdirSync(filePath: PathLike, options?: MkdirOptions | number): string | undefined {
+  mkdirSync(filePath: PathLike, options?: MkdirOptions | Mode): string | undefined {
     return _mkdirSync(this._sync, toPathString(filePath), options);
   }
 
@@ -1122,19 +1122,19 @@ export class VFSFileSystem {
     return _realpathSync(this._sync, toPathString(filePath));
   }
 
-  chmodSync(filePath: PathLike, mode: number): void {
+  chmodSync(filePath: PathLike, mode: Mode): void {
     _chmodSync(this._sync, toPathString(filePath), mode);
   }
 
   /** Like chmodSync but operates on the symlink itself. In this VFS, delegates to chmodSync. */
-  lchmodSync(filePath: string, mode: number): void {
+  lchmodSync(filePath: string, mode: Mode): void {
     _chmodSync(this._sync, filePath, mode);
   }
 
   /** chmod on an open file descriptor. Resolves the fd to its inode on the
    *  server side and mutates the inode's mode bits directly, matching what
    *  native Node's libuv does. */
-  fchmodSync(fd: number, mode: number): void {
+  fchmodSync(fd: number, mode: Mode): void {
     _fchmodSync(this._sync, fd, mode);
   }
 
@@ -1688,7 +1688,7 @@ export class VFSFileSystem {
   }
 
   mkdir(filePath: string, callback: (err: Error | null, path?: string) => void): void;
-  mkdir(filePath: string, options: MkdirOptions | number, callback: (err: Error | null, path?: string) => void): void;
+  mkdir(filePath: string, options: MkdirOptions | Mode, callback: (err: Error | null, path?: string) => void): void;
   mkdir(filePath: string, optionsOrCallback?: any, callback?: any): any {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
@@ -1783,7 +1783,7 @@ export class VFSFileSystem {
     return this._cb(this.promises.realpath(filePath), callback);
   }
 
-  chmod(filePath: string, mode: number, callback?: (err: Error | null) => void): any {
+  chmod(filePath: string, mode: Mode, callback?: (err: Error | null) => void): any {
     this._validateCb(callback);
     return this._cbVoid(this.promises.chmod(filePath, mode), callback);
   }
@@ -2001,7 +2001,7 @@ export class VFSFileSystem {
     return this._cbVoid(this.promises.futimes(fd, atime, mtime), callback);
   }
 
-  fchmod(fd: number, mode: number, callback?: (err: Error | null) => void): void {
+  fchmod(fd: number, mode: Mode, callback?: (err: Error | null) => void): void {
     this._validateCb(callback);
     return this._cbVoid(this.promises.fchmod(fd, mode), callback);
   }
@@ -2011,7 +2011,7 @@ export class VFSFileSystem {
     return this._cbVoid(this.promises.fchown(fd, uid, gid), callback);
   }
 
-  lchmod(filePath: string, mode: number, callback?: (err: Error | null) => void): any {
+  lchmod(filePath: string, mode: Mode, callback?: (err: Error | null) => void): any {
     this._validateCb(callback);
     return this._cbVoid(this.promises.lchmod(filePath, mode), callback);
   }
@@ -2053,7 +2053,7 @@ class VFSPromises {
     return _appendFile(this._async, toPathString(filePath), data, options);
   }
 
-  mkdir(filePath: PathLike, options?: MkdirOptions | number) {
+  mkdir(filePath: PathLike, options?: MkdirOptions | Mode) {
     return _mkdir(this._async, toPathString(filePath), options);
   }
 
@@ -2162,18 +2162,18 @@ class VFSPromises {
     return _exists(this._async, toPathString(filePath));
   }
 
-  chmod(filePath: PathLike, mode: number) {
+  chmod(filePath: PathLike, mode: Mode) {
     return _chmod(this._async, toPathString(filePath), mode);
   }
 
   /** Like chmod but operates on the symlink itself. In this VFS, delegates to chmod. */
-  lchmod(filePath: string, mode: number) {
+  lchmod(filePath: string, mode: Mode) {
     return _chmod(this._async, filePath, mode);
   }
 
   /** chmod on an open file descriptor. Engine resolves fd → inode and
    *  mutates the mode bits directly. */
-  fchmod(fd: number, mode: number): Promise<void> {
+  fchmod(fd: number, mode: Mode): Promise<void> {
     return _fchmod(this._async, fd, mode);
   }
 

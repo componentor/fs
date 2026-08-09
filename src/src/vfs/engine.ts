@@ -1386,12 +1386,22 @@ export class VFSEngine {
   }
 
   // ---- MKDIR ----
-  mkdir(path: string, flags: number = 0): { status: number; data: Uint8Array | null } {
+  /**
+   * mkdir(2). `reqMode` is the caller's requested permission mode; the umask is subtracted from it
+   * here exactly as the kernel does. It defaults to 0o777 so an omitted mode still lands on the
+   * historical 0o755 under the default 0o022 umask.
+   *
+   * Honouring the mode is not cosmetic: software that creates a private directory and then stats it
+   * back treats a widened mode as a security failure and aborts. Chrome's ProcessSingleton is the
+   * canonical case — it mkdtemp()s its socket directory and CHECKs that the mode is exactly 0700,
+   * killing the browser at startup when the filesystem silently returns 0755.
+   */
+  mkdir(path: string, flags: number = 0, reqMode: number = 0o777): { status: number; data: Uint8Array | null } {
     path = this.normalizePath(path);
     const recursive = (flags & 1) !== 0;
 
     if (recursive) {
-      return this.mkdirRecursive(path);
+      return this.mkdirRecursive(path, reqMode);
     }
 
     // Check if already exists (explicit or implicit)
@@ -1403,15 +1413,19 @@ export class VFSEngine {
     const parentStatus = this.ensureParent(path);
     if (parentStatus !== 0) return { status: parentStatus, data: null };
 
-    const mode = DEFAULT_DIR_MODE & ~(this.umask & 0o777);
-    this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
+    this.createInode(path, INODE_TYPE.DIRECTORY, this.dirModeFor(reqMode), 0);
 
     this.commitPending();
     // Non-recursive mkdir returns undefined (null data) per Node.js spec
     return { status: 0, data: null };
   }
 
-  private mkdirRecursive(path: string): { status: number; data: Uint8Array | null } {
+  /** Permission bits a new directory gets: the request minus the umask, plus the S_IFDIR type. */
+  private dirModeFor(reqMode: number): number {
+    return S_IFDIR | ((reqMode & 0o7777) & ~(this.umask & 0o777));
+  }
+
+  private mkdirRecursive(path: string, reqMode: number = 0o777): { status: number; data: Uint8Array | null } {
     const parts = path.split('/').filter(Boolean);
     let current = '';
     let firstCreated: string | null = null;
@@ -1428,8 +1442,7 @@ export class VFSEngine {
         continue;
       }
 
-      const mode = DEFAULT_DIR_MODE & ~(this.umask & 0o777);
-      this.createInode(current, INODE_TYPE.DIRECTORY, mode, 0);
+      this.createInode(current, INODE_TYPE.DIRECTORY, this.dirModeFor(reqMode), 0);
       if (!firstCreated) firstCreated = current;
     }
 
@@ -2274,8 +2287,11 @@ export class VFSEngine {
       }
     }
 
-    const mode = DEFAULT_DIR_MODE & ~(this.umask & 0o777);
-    this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
+    // mkdtemp(3) creates the directory with mkdir(path, S_IRWXU) — a PRIVATE 0700 directory, not
+    // the 0755 an ordinary mkdir gets. Callers rely on that privacy: the directory is meant to hold
+    // secrets (sockets, keys, scratch state) that no other user may reach, and several programs
+    // stat it back and abort if it is group/world-readable.
+    this.createInode(path, INODE_TYPE.DIRECTORY, this.dirModeFor(0o700), 0);
 
     this.commitPending();
     return { status: 0, data: encoder.encode(path) };

@@ -257,7 +257,14 @@ export class OPFSEngine {
     return this.stat(path);
   }
 
-  async mkdir(path: string, flags: number = 0): Promise<OPFSResult> {
+  /**
+   * mkdir. `_reqMode` keeps this signature interchangeable with {@link VFSEngine.mkdir}, but OPFS
+   * stores no permission metadata, so — like this engine's chmod — the mode is accepted and
+   * discarded. Directories therefore always read back as the synthetic 0755 encodeStat reports.
+   * This engine is only reached as the corruption fallback; the hybrid default uses VFSEngine,
+   * which does persist modes.
+   */
+  async mkdir(path: string, flags: number = 0, _reqMode: number = 0o777): Promise<OPFSResult> {
     path = this.normalizePath(path);
     const recursive = (flags & 1) !== 0;
 

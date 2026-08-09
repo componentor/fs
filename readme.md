@@ -113,6 +113,31 @@ const fs = new VFSFileSystem({
 });
 ```
 
+### File Permissions
+
+Modes behave as they do in Node. `mkdir` takes the mode you give it, the engine subtracts the
+umask exactly as `mkdir(2)` does in the kernel, and `stat` reads back what was actually stored:
+
+```js
+fs.mkdirSync('/private', { mode: 0o700 });
+fs.statSync('/private').mode & 0o777;   // 0o700
+
+fs.mkdirSync('/pub');                    // default 0o777 & ~umask(0o022)
+fs.statSync('/pub').mode & 0o777;        // 0o755
+
+fs.mkdtempSync('/tmp/run-');             // 0o700 — mkdtemp(3) is private by design
+```
+
+A mode may be a uint32 or an octal **string** (`'0700'`), and a recursive `mkdir` applies it to
+every level it creates — both matching Node. Invalid modes throw Node's own
+`ERR_INVALID_ARG_VALUE` / `ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`.
+
+Permission bits are stored and reported, but only *enforced* by `access()` when you opt in with
+`strictPermissions: true`. Two current limitations: `open(path, flags, mode)` ignores its mode
+(files are created with the default; `writeFile`'s `mode` option works, via a chmod after the
+write), and `opfs` mode stores no permission metadata at all, so directories there always read
+back as 0755.
+
 ### Filesystem Modes
 
 The `mode` option controls how the filesystem stores data:
@@ -387,7 +412,7 @@ fs.writeFileSync(path, data, options?): void
 fs.appendFileSync(path, data): void
 
 // Directories
-fs.mkdirSync(path, options?): void
+fs.mkdirSync(path, options?): string | undefined   // options: { recursive?, mode? } | mode
 fs.rmdirSync(path, options?): void
 fs.rmSync(path, options?): void
 fs.readdirSync(path, options?): string[] | Dirent[]
@@ -436,7 +461,7 @@ fs.promises.writeFile(path, data, options?): Promise<void>
 fs.promises.appendFile(path, data): Promise<void>
 
 // Directories
-fs.promises.mkdir(path, options?): Promise<void>
+fs.promises.mkdir(path, options?): Promise<string | undefined>  // { recursive?, mode? } | mode
 fs.promises.rmdir(path, options?): Promise<void>
 fs.promises.rm(path, options?): Promise<void>
 fs.promises.readdir(path, options?): Promise<string[] | Dirent[]>

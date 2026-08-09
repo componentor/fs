@@ -13,15 +13,22 @@ export interface ReadOptions {
 
 export interface WriteOptions {
   encoding?: Encoding;
-  mode?: number;
+  /** Honoured on the default ('w') flag path, which chmods the file after writing it. */
+  mode?: Mode;
   flag?: string;
   flush?: boolean;
   signal?: AbortSignal;
 }
 
+/**
+ * A file mode, as Node accepts it: a uint32, or an octal *string* ('0700', '777').
+ * Parsed by `parseFileMode` — see [mode.ts](./methods/mode.ts).
+ */
+export type Mode = number | string;
+
 export interface MkdirOptions {
   recursive?: boolean;
-  mode?: number;
+  mode?: Mode;
 }
 
 export interface RmdirOptions {

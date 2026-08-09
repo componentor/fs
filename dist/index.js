@@ -410,6 +410,19 @@ function encodeRequest(op, path, flags = 0, data) {
   }
   return buf;
 }
+function encodeRequestU32(op, path, flags, value) {
+  const pathBytes = encoder.encode(path);
+  const payloadOffset = 16 + pathBytes.byteLength;
+  const buf = new ArrayBuffer(payloadOffset + 4);
+  const view = new DataView(buf);
+  view.setUint32(0, op, true);
+  view.setUint32(4, flags, true);
+  view.setUint32(8, pathBytes.byteLength, true);
+  view.setUint32(12, 4, true);
+  new Uint8Array(buf).set(pathBytes, 16);
+  view.setUint32(payloadOffset, value >>> 0, true);
+  return buf;
+}
 function decodeResponse(buf) {
   const view = new DataView(buf);
   const status = view.getUint32(0, true);
@@ -556,6 +569,34 @@ function statusToError(status, syscall, path) {
   const code = STATUS_TO_CODE[status] ?? "EINVAL";
   return createError(code, syscall, path);
 }
+var kind = (name) => name.includes(".") ? "property" : "argument";
+function inspectArg(value) {
+  if (typeof value === "string") return `'${value}'`;
+  if (typeof value === "bigint") return `${value}n`;
+  return String(value);
+}
+function invalidArgType(name, expected, actual) {
+  let received;
+  if (actual === null || actual === void 0) received = String(actual);
+  else if (typeof actual === "object" || typeof actual === "function") {
+    received = `an instance of ${actual.constructor?.name ?? "Object"}`;
+  } else received = `type ${typeof actual} (${inspectArg(actual)})`;
+  const err = new TypeError(`The "${name}" ${kind(name)} must be of type ${expected}. Received ${received}`);
+  err.code = "ERR_INVALID_ARG_TYPE";
+  return err;
+}
+function invalidArgValue(name, value, reason) {
+  const err = new TypeError(`The ${kind(name)} '${name}' ${reason}. Received ${inspectArg(value)}`);
+  err.code = "ERR_INVALID_ARG_VALUE";
+  return err;
+}
+function outOfRange(name, range, value) {
+  const err = new RangeError(
+    `The value of "${name}" is out of range. It must be ${range}. Received ${inspectArg(value)}`
+  );
+  err.code = "ERR_OUT_OF_RANGE";
+  return err;
+}
 
 // src/vfs/layout.ts
 var VFS_MAGIC = 1447449377;
@@ -633,6 +674,7 @@ var DEFAULT_DIR_MODE = 16877;
 var DEFAULT_SYMLINK_MODE = 41471;
 var DEFAULT_UMASK = 18;
 var S_IFMT = 61440;
+var S_IFDIR = 16384;
 var MAX_SYMLINK_DEPTH = 40;
 var INITIAL_PATH_TABLE_SIZE = 256 * 1024;
 var INITIAL_DATA_BLOCKS = 1024;
@@ -1304,36 +1346,63 @@ async function readFile(asyncRequest, filePath, options) {
   }
 }
 
+// src/methods/mode.ts
+var OCTAL_STRING = /^[0-7]+$/;
+function parseFileMode(mode, name, def) {
+  mode ??= def;
+  if (typeof mode === "string") {
+    if (!OCTAL_STRING.test(mode)) {
+      throw invalidArgValue(name, mode, "must be a 32-bit unsigned integer or an octal string");
+    }
+    return parseInt(mode, 8);
+  }
+  if (typeof mode !== "number") throw invalidArgType(name, "number", mode);
+  if (!Number.isInteger(mode)) throw outOfRange(name, "an integer", mode);
+  if (mode < 0 || mode > 4294967295) throw outOfRange(name, ">= 0 && <= 4294967295", mode);
+  return mode;
+}
+function encodeMode(mode) {
+  const buf = new Uint8Array(4);
+  buf[0] = mode;
+  buf[1] = mode >>> 8;
+  buf[2] = mode >>> 16;
+  buf[3] = mode >>> 24;
+  return buf;
+}
+
 // src/methods/chmod.ts
+function requireMode(mode) {
+  return parseFileMode(mode, "mode");
+}
 function chmodSync(syncRequest, filePath, mode) {
-  const modeBuf = new Uint8Array(4);
-  new DataView(modeBuf.buffer).setUint32(0, mode, true);
-  const buf = encodeRequest(OP.CHMOD, filePath, 0, modeBuf);
+  const buf = encodeRequestU32(OP.CHMOD, filePath, 0, requireMode(mode));
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "chmod", filePath);
 }
 async function chmod(asyncRequest, filePath, mode) {
-  const modeBuf = new Uint8Array(4);
-  new DataView(modeBuf.buffer).setUint32(0, mode, true);
-  const { status } = await asyncRequest(OP.CHMOD, filePath, 0, modeBuf);
+  const { status } = await asyncRequest(OP.CHMOD, filePath, 0, encodeMode(requireMode(mode)));
   if (status !== 0) throw statusToError(status, "chmod", filePath);
 }
 function fchmodSync(syncRequest, fd, mode) {
-  const payload = new Uint8Array(8);
-  const dv = new DataView(payload.buffer);
-  dv.setUint32(0, fd, true);
-  dv.setUint32(4, mode, true);
-  const buf = encodeRequest(OP.FCHMOD, "", 0, payload);
+  const buf = encodeRequest(OP.FCHMOD, "", 0, encodeFdMode(fd, requireMode(mode)));
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "fchmod", String(fd));
 }
 async function fchmod(asyncRequest, fd, mode) {
-  const payload = new Uint8Array(8);
-  const dv = new DataView(payload.buffer);
-  dv.setUint32(0, fd, true);
-  dv.setUint32(4, mode, true);
-  const { status } = await asyncRequest(OP.FCHMOD, "", 0, payload);
+  const { status } = await asyncRequest(OP.FCHMOD, "", 0, encodeFdMode(fd, requireMode(mode)));
   if (status !== 0) throw statusToError(status, "fchmod", String(fd));
+}
+function encodeFdMode(fd, mode) {
+  const payload = new Uint8Array(8);
+  payload[0] = fd;
+  payload[1] = fd >>> 8;
+  payload[2] = fd >>> 16;
+  payload[3] = fd >>> 24;
+  payload[4] = mode;
+  payload[5] = mode >>> 8;
+  payload[6] = mode >>> 16;
+  payload[7] = mode >>> 24;
+  return payload;
 }
 
 // src/methods/writeFile.ts
@@ -1417,18 +1486,28 @@ async function exists(asyncRequest, filePath) {
 
 // src/methods/mkdir.ts
 var decoder4 = new TextDecoder();
+var DEFAULT_MKDIR_MODE = 511;
+function resolveOptions(options) {
+  if (typeof options === "number" || typeof options === "string") {
+    return { flags: 0, mode: parseFileMode(options, "mode") };
+  }
+  const mode = options?.mode;
+  return {
+    flags: options?.recursive ? 1 : 0,
+    // Only an *absent* mode takes the default; `{ mode: null }` is a type error, as in Node.
+    mode: mode === void 0 ? DEFAULT_MKDIR_MODE : parseFileMode(mode, "options.mode")
+  };
+}
 function mkdirSync(syncRequest, filePath, options) {
-  const opts = typeof options === "number" ? { } : options;
-  const flags = opts?.recursive ? 1 : 0;
-  const buf = encodeRequest(OP.MKDIR, filePath, flags);
+  const { flags, mode } = resolveOptions(options);
+  const buf = encodeRequestU32(OP.MKDIR, filePath, flags, mode);
   const { status, data } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "mkdir", filePath);
   return data ? decoder4.decode(data) : void 0;
 }
 async function mkdir(asyncRequest, filePath, options) {
-  const opts = typeof options === "number" ? { } : options;
-  const flags = opts?.recursive ? 1 : 0;
-  const { status, data } = await asyncRequest(OP.MKDIR, filePath, flags);
+  const { flags, mode } = resolveOptions(options);
+  const { status, data } = await asyncRequest(OP.MKDIR, filePath, flags, encodeMode(mode));
   if (status !== 0) throw statusToError(status, "mkdir", filePath);
   return data ? decoder4.decode(data) : void 0;
 }
@@ -5453,23 +5532,36 @@ var VFSEngine = class {
     return { status: 0, data: buf };
   }
   // ---- MKDIR ----
-  mkdir(path, flags = 0) {
+  /**
+   * mkdir(2). `reqMode` is the caller's requested permission mode; the umask is subtracted from it
+   * here exactly as the kernel does. It defaults to 0o777 so an omitted mode still lands on the
+   * historical 0o755 under the default 0o022 umask.
+   *
+   * Honouring the mode is not cosmetic: software that creates a private directory and then stats it
+   * back treats a widened mode as a security failure and aborts. Chrome's ProcessSingleton is the
+   * canonical case — it mkdtemp()s its socket directory and CHECKs that the mode is exactly 0700,
+   * killing the browser at startup when the filesystem silently returns 0755.
+   */
+  mkdir(path, flags = 0, reqMode = 511) {
     path = this.normalizePath(path);
     const recursive = (flags & 1) !== 0;
     if (recursive) {
-      return this.mkdirRecursive(path);
+      return this.mkdirRecursive(path, reqMode);
     }
     if (this.pathIndex.has(path) || this.isImplicitDirectory(path)) {
       return { status: CODE_TO_STATUS.EEXIST, data: null };
     }
     const parentStatus = this.ensureParent(path);
     if (parentStatus !== 0) return { status: parentStatus, data: null };
-    const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
-    this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
+    this.createInode(path, INODE_TYPE.DIRECTORY, this.dirModeFor(reqMode), 0);
     this.commitPending();
     return { status: 0, data: null };
   }
-  mkdirRecursive(path) {
+  /** Permission bits a new directory gets: the request minus the umask, plus the S_IFDIR type. */
+  dirModeFor(reqMode) {
+    return S_IFDIR | reqMode & 4095 & ~(this.umask & 511);
+  }
+  mkdirRecursive(path, reqMode = 511) {
     const parts = path.split("/").filter(Boolean);
     let current = "";
     let firstCreated = null;
@@ -5483,8 +5575,7 @@ var VFSEngine = class {
         }
         continue;
       }
-      const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
-      this.createInode(current, INODE_TYPE.DIRECTORY, mode, 0);
+      this.createInode(current, INODE_TYPE.DIRECTORY, this.dirModeFor(reqMode), 0);
       if (!firstCreated) firstCreated = current;
     }
     this.commitPending();
@@ -6092,8 +6183,7 @@ var VFSEngine = class {
         this.mkdirRecursive(parentPath);
       }
     }
-    const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
-    this.createInode(path, INODE_TYPE.DIRECTORY, mode, 0);
+    this.createInode(path, INODE_TYPE.DIRECTORY, this.dirModeFor(448), 0);
     this.commitPending();
     return { status: 0, data: encoder10.encode(path) };
   }

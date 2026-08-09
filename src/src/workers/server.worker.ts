@@ -19,6 +19,18 @@ import { decodeRequest, decodeSecondPath, encodeResponse, OP } from '../protocol
 
 const engine = new VFSEngine();
 
+/**
+ * Read a 4-byte LE mode from a request payload.
+ *
+ * chmod, mkdir and friends all carry their mode this way. `fallback` covers a client that sent no
+ * payload — the wire format is additive, so a build predating mode-carrying mkdir must keep
+ * behaving exactly as it did rather than creating 0000 directories.
+ */
+function decodeMode(data: Uint8Array | null | undefined, fallback: number): number {
+  if (!data || data.byteLength < 4) return fallback;
+  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
+}
+
 // Map of tabId → received port (from client workers via Service Worker)
 const ports = new Map<string, MessagePort>();
 
@@ -79,7 +91,9 @@ function handleRequest(tabId: string, buffer: ArrayBuffer): ArrayBuffer {
       break;
 
     case OP.MKDIR:
-      result = engine.mkdir(path, flags);
+      // The requested mode rides along as a 4-byte LE payload. Older clients send no payload at
+      // all, so fall back to mkdir's Node default of 0o777 (umask-reduced by the engine).
+      result = engine.mkdir(path, flags, decodeMode(data, 0o777));
       notifyOPFSSync('mkdir', path);
       break;
 

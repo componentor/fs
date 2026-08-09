@@ -39,6 +39,18 @@ self.addEventListener('unhandledrejection', (e) => {
 import { VFS_MAGIC, VFS_VERSION, SUPERBLOCK, INODE_SIZE } from '../vfs/layout.js';
 
 const engine = new VFSEngine();
+
+/**
+ * Read a 4-byte LE mode from a request payload.
+ *
+ * `fallback` covers a client that sent no payload — the wire format is additive, so a build
+ * predating mode-carrying mkdir must keep behaving exactly as before rather than creating
+ * 0000 directories.
+ */
+function decodeMode(data: Uint8Array | null | undefined, fallback: number): number {
+  if (!data || data.byteLength < 4) return fallback;
+  return new DataView(data.buffer, data.byteOffset, data.byteLength).getUint32(0, true);
+}
 let opfsEngine: OPFSEngine | null = null;
 let opfsMode = false;
 
@@ -312,7 +324,9 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
       break;
 
     case OP.MKDIR:
-      result = engine.mkdir(path, flags);
+      // Requested mode arrives as a 4-byte LE payload; a client that sends none keeps mkdir's
+      // Node default of 0o777, which the engine then reduces by the umask.
+      result = engine.mkdir(path, flags, decodeMode(data, 0o777));
       if (result.status === 0) { syncOp = op; syncPath = path; }
       break;
 
@@ -605,7 +619,7 @@ async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise
       result = await oe.lstat(path);
       break;
     case OP.MKDIR:
-      result = await oe.mkdir(path, flags);
+      result = await oe.mkdir(path, flags, decodeMode(data, 0o777));
       syncPath = path;
       break;
     case OP.RMDIR:
@@ -1287,7 +1301,7 @@ async function populateVFSFromOPFS(
   // recursive calls) can rely on their parents existing.
   for (const { name } of subdirs) {
     const fullPath = prefix ? `${prefix}/${name}` : `/${name}`;
-    engine.mkdir(fullPath, 0o040755);
+    engine.mkdir(fullPath, 1, 0o755);
   }
 
   // Stream each file through a single reusable chunk buffer.

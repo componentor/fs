@@ -1,15 +1,24 @@
+import type { Mode } from '../types.js';
 import type { SyncRequestFn, AsyncRequestFn } from './context.js';
-import { OP, encodeRequest } from '../protocol/opcodes.js';
+import { OP, encodeRequest, encodeRequestU32 } from '../protocol/opcodes.js';
 import { statusToError } from '../errors.js';
+import { parseFileMode, encodeMode } from './mode.js';
+
+/**
+ * chmod's mode is required — passing no `def` makes `undefined` a type error rather than
+ * some mode the caller never asked for. (It used to coerce to NaN → 0: chmod 000.)
+ */
+function requireMode(mode: Mode): number {
+  return parseFileMode(mode, 'mode');
+}
 
 export function chmodSync(
   syncRequest: SyncRequestFn,
   filePath: string,
-  mode: number
+  mode: Mode
 ): void {
-  const modeBuf = new Uint8Array(4);
-  new DataView(modeBuf.buffer).setUint32(0, mode, true);
-  const buf = encodeRequest(OP.CHMOD, filePath, 0, modeBuf);
+  // Zero-allocation encode: the mode goes straight into the request buffer.
+  const buf = encodeRequestU32(OP.CHMOD, filePath, 0, requireMode(mode));
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'chmod', filePath);
 }
@@ -17,11 +26,10 @@ export function chmodSync(
 export async function chmod(
   asyncRequest: AsyncRequestFn,
   filePath: string,
-  mode: number
+  mode: Mode
 ): Promise<void> {
-  const modeBuf = new Uint8Array(4);
-  new DataView(modeBuf.buffer).setUint32(0, mode, true);
-  const { status } = await asyncRequest(OP.CHMOD, filePath, 0, modeBuf);
+  // Async path posts to a relay worker, so it needs a real (and per-call fresh) Uint8Array.
+  const { status } = await asyncRequest(OP.CHMOD, filePath, 0, encodeMode(requireMode(mode)));
   if (status !== 0) throw statusToError(status, 'chmod', filePath);
 }
 
@@ -35,13 +43,9 @@ export async function chmod(
 export function fchmodSync(
   syncRequest: SyncRequestFn,
   fd: number,
-  mode: number
+  mode: Mode
 ): void {
-  const payload = new Uint8Array(8);
-  const dv = new DataView(payload.buffer);
-  dv.setUint32(0, fd, true);
-  dv.setUint32(4, mode, true);
-  const buf = encodeRequest(OP.FCHMOD, '', 0, payload);
+  const buf = encodeRequest(OP.FCHMOD, '', 0, encodeFdMode(fd, requireMode(mode)));
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'fchmod', String(fd));
 }
@@ -49,12 +53,16 @@ export function fchmodSync(
 export async function fchmod(
   asyncRequest: AsyncRequestFn,
   fd: number,
-  mode: number
+  mode: Mode
 ): Promise<void> {
-  const payload = new Uint8Array(8);
-  const dv = new DataView(payload.buffer);
-  dv.setUint32(0, fd, true);
-  dv.setUint32(4, mode, true);
-  const { status } = await asyncRequest(OP.FCHMOD, '', 0, payload);
+  const { status } = await asyncRequest(OP.FCHMOD, '', 0, encodeFdMode(fd, requireMode(mode)));
   if (status !== 0) throw statusToError(status, 'fchmod', String(fd));
+}
+
+/** [fd: u32][mode: u32], written without a DataView — see encodeMode. */
+function encodeFdMode(fd: number, mode: number): Uint8Array {
+  const payload = new Uint8Array(8);
+  payload[0] = fd; payload[1] = fd >>> 8; payload[2] = fd >>> 16; payload[3] = fd >>> 24;
+  payload[4] = mode; payload[5] = mode >>> 8; payload[6] = mode >>> 16; payload[7] = mode >>> 24;
+  return payload;
 }

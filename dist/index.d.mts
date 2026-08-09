@@ -13,14 +13,20 @@ interface ReadOptions {
 }
 interface WriteOptions {
     encoding?: Encoding;
-    mode?: number;
+    /** Honoured on the default ('w') flag path, which chmods the file after writing it. */
+    mode?: Mode;
     flag?: string;
     flush?: boolean;
     signal?: AbortSignal;
 }
+/**
+ * A file mode, as Node accepts it: a uint32, or an octal *string* ('0700', '777').
+ * Parsed by `parseFileMode` — see [mode.ts](./methods/mode.ts).
+ */
+type Mode = number | string;
 interface MkdirOptions {
     recursive?: boolean;
-    mode?: number;
+    mode?: Mode;
 }
 interface RmdirOptions {
     recursive?: boolean;
@@ -472,7 +478,7 @@ declare class VFSFileSystem {
     writeFileSync(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): void;
     appendFileSync(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): void;
     existsSync(filePath: PathLike): boolean;
-    mkdirSync(filePath: PathLike, options?: MkdirOptions | number): string | undefined;
+    mkdirSync(filePath: PathLike, options?: MkdirOptions | Mode): string | undefined;
     rmdirSync(filePath: PathLike, options?: RmdirOptions): void;
     rmSync(filePath: PathLike, options?: RmOptions): void;
     unlinkSync(filePath: PathLike): void;
@@ -488,13 +494,13 @@ declare class VFSFileSystem {
     truncateSync(filePath: PathLike, len?: number): void;
     accessSync(filePath: PathLike, mode?: number): void;
     realpathSync(filePath: PathLike): string;
-    chmodSync(filePath: PathLike, mode: number): void;
+    chmodSync(filePath: PathLike, mode: Mode): void;
     /** Like chmodSync but operates on the symlink itself. In this VFS, delegates to chmodSync. */
-    lchmodSync(filePath: string, mode: number): void;
+    lchmodSync(filePath: string, mode: Mode): void;
     /** chmod on an open file descriptor. Resolves the fd to its inode on the
      *  server side and mutates the inode's mode bits directly, matching what
      *  native Node's libuv does. */
-    fchmodSync(fd: number, mode: number): void;
+    fchmodSync(fd: number, mode: Mode): void;
     chownSync(filePath: PathLike, uid: number, gid: number): void;
     /** Like chownSync but operates on the symlink itself. In this VFS, delegates to chownSync. */
     lchownSync(filePath: string, uid: number, gid: number): void;
@@ -595,7 +601,7 @@ declare class VFSFileSystem {
     appendFile(filePath: string, data: string | Uint8Array, callback: (err: Error | null) => void): void;
     appendFile(filePath: string, data: string | Uint8Array, options: WriteOptions | Encoding, callback: (err: Error | null) => void): void;
     mkdir(filePath: string, callback: (err: Error | null, path?: string) => void): void;
-    mkdir(filePath: string, options: MkdirOptions | number, callback: (err: Error | null, path?: string) => void): void;
+    mkdir(filePath: string, options: MkdirOptions | Mode, callback: (err: Error | null, path?: string) => void): void;
     rmdir(filePath: string, callback: (err: Error | null) => void): void;
     rmdir(filePath: string, options: RmdirOptions, callback: (err: Error | null) => void): void;
     rm(filePath: string, callback: (err: Error | null) => void): void;
@@ -615,7 +621,7 @@ declare class VFSFileSystem {
     truncate(filePath: string, callback: (err: Error | null) => void): void;
     truncate(filePath: string, len: number, callback: (err: Error | null) => void): void;
     realpath(filePath: string, callback?: (err: Error | null, resolvedPath?: string) => void): any;
-    chmod(filePath: string, mode: number, callback?: (err: Error | null) => void): any;
+    chmod(filePath: string, mode: Mode, callback?: (err: Error | null) => void): any;
     chown(filePath: string, uid: number, gid: number, callback?: (err: Error | null) => void): any;
     utimes(filePath: string, atime: Date | number, mtime: Date | number, callback?: (err: Error | null) => void): any;
     symlink(target: string, linkPath: string, callback: (err: Error | null) => void): void;
@@ -651,9 +657,9 @@ declare class VFSFileSystem {
     glob(pattern: string, callback: (err: Error | null, matches?: string[]) => void): void;
     glob(pattern: string, options: GlobOptions, callback: (err: Error | null, matches?: string[]) => void): void;
     futimes(fd: number, atime: Date | number, mtime: Date | number, callback?: (err: Error | null) => void): void;
-    fchmod(fd: number, mode: number, callback?: (err: Error | null) => void): void;
+    fchmod(fd: number, mode: Mode, callback?: (err: Error | null) => void): void;
     fchown(fd: number, uid: number, gid: number, callback?: (err: Error | null) => void): void;
-    lchmod(filePath: string, mode: number, callback?: (err: Error | null) => void): any;
+    lchmod(filePath: string, mode: Mode, callback?: (err: Error | null) => void): any;
     lchown(filePath: string, uid: number, gid: number, callback?: (err: Error | null) => void): any;
     lutimes(filePath: string, atime: Date | number, mtime: Date | number, callback?: (err: Error | null) => void): any;
 }
@@ -708,7 +714,7 @@ declare class VFSPromises {
     readFile(filePath: PathLike, options?: ReadOptions | Encoding | null): Promise<string | Uint8Array<ArrayBufferLike>>;
     writeFile(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): Promise<void>;
     appendFile(filePath: PathLike, data: string | Uint8Array, options?: WriteOptions | Encoding): Promise<void>;
-    mkdir(filePath: PathLike, options?: MkdirOptions | number): Promise<string | undefined>;
+    mkdir(filePath: PathLike, options?: MkdirOptions | Mode): Promise<string | undefined>;
     rmdir(filePath: PathLike, options?: RmdirOptions): Promise<void>;
     rm(filePath: PathLike, options?: RmOptions): Promise<void>;
     unlink(filePath: PathLike): Promise<void>;
@@ -723,12 +729,12 @@ declare class VFSPromises {
     truncate(filePath: PathLike, len?: number): Promise<void>;
     realpath(filePath: PathLike): Promise<string>;
     exists(filePath: PathLike): Promise<boolean>;
-    chmod(filePath: PathLike, mode: number): Promise<void>;
+    chmod(filePath: PathLike, mode: Mode): Promise<void>;
     /** Like chmod but operates on the symlink itself. In this VFS, delegates to chmod. */
-    lchmod(filePath: string, mode: number): Promise<void>;
+    lchmod(filePath: string, mode: Mode): Promise<void>;
     /** chmod on an open file descriptor. Engine resolves fd → inode and
      *  mutates the mode bits directly. */
-    fchmod(fd: number, mode: number): Promise<void>;
+    fchmod(fd: number, mode: Mode): Promise<void>;
     chown(filePath: PathLike, uid: number, gid: number): Promise<void>;
     /** Like chown but operates on the symlink itself. In this VFS, delegates to chown. */
     lchown(filePath: string, uid: number, gid: number): Promise<void>;
