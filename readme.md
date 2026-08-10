@@ -571,6 +571,10 @@ cp node_modules/@componentor/fs/dist/workers/service.worker.js public/vfs-servic
 
 ```typescript
 const fs = new VFSFileSystem({ swUrl: '/vfs-service-worker.js' });
+
+// Relative paths resolve against the page, so an app served from a subpath works too:
+//   https://example.github.io/my-app/  →  .../my-app/vfs-service-worker.js
+const fs = new VFSFileSystem({ swUrl: './vfs-service-worker.js' });
 ```
 
 If you only use a single tab, the service worker is not needed — the tab always runs as the leader.

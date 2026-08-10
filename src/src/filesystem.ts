@@ -721,8 +721,14 @@ export class VFSFileSystem {
       };
     }
     if (!this.swReg) {
+      // Resolved against the **document**, not the origin. Against the origin, a relative
+      // `swUrl` silently jumped to the site root — so an app served from a subpath
+      // (`/fs/` on GitHub project pages, `/app/` behind a proxy) asked for a script that was
+      // never there and got a 404 at registration. An absolute `/path.js` still means exactly
+      // what it says; only the relative form changes, and only to what it should always have
+      // meant.
       const swUrl = this.config.swUrl
-        ? new URL(this.config.swUrl, location.origin)
+        ? new URL(this.config.swUrl, document.baseURI)
         : new URL('./workers/service.worker.js', import.meta.url);
       const scope = this.config.swScope ?? new URL(`./${this.ns}/`, swUrl).href;
       this.swReg = await navigator.serviceWorker.register(swUrl.href, { scope });

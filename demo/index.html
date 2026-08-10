@@ -345,10 +345,10 @@ async function benchmark() {
   try {
     fs = new VFSFileSystem({
       root: '/demo',
-      // The multi-tab broker is copied to the site root by the Pages workflow: a service
-      // worker's scope cannot exceed its own path, and Pages will not send
-      // `Service-Worker-Allowed`, so from /vendor/workers/ it could never reach this page.
-      swUrl: '/vfs-service-worker.js',
+      // Relative on purpose: this site is served from a subpath (`/fs/` on GitHub project
+      // pages), so an absolute `/vfs-service-worker.js` would point at the user-pages root and
+      // 404. The Pages workflow copies the broker next to this page.
+      swUrl: './vfs-service-worker.js',
     });
     await fs.init();
   } catch (err) {
