@@ -106,7 +106,35 @@
       display: grid;
       grid-template-columns: 1.15fr .85fr;
       gap: 1.25rem;
-      align-items: start;
+      /* stretch, not start: the cards beside the browser share its height, and clone and
+         benchmark match each other, so the rows read as rows rather than ragged columns. */
+      align-items: stretch;
+    }
+
+    /* Second row: two equal cards. */
+    .grid.pair {
+      grid-template-columns: 1fr 1fr;
+      margin-top: 1.25rem;
+    }
+
+    /* The cards beside the browser: the cross-tab card takes what it needs, the log takes the
+       rest, and together they come to the browser's height. */
+    .stack {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 1.25rem;
+      min-height: 0;
+    }
+
+    .stack > section {
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .stack > section .out {
+      flex: 1;
+      max-height: none;
     }
 
     @media (max-width:900px) {
@@ -338,10 +366,8 @@
     <div id="role" class="banner" style="display:none"></div>
 
     <div class="grid">
-      <!-- The left column carries the benchmark too. With every panel but the browser stacked
-           on the right, that column ran half again as tall as this one and pushed the benchmark
-           and the log below the fold. -->
-      <div style="display:grid; gap:1.25rem; align-content:start">
+      <!-- Row one: the browser, with the two small cards stacked beside it. The stack shares the
+           browser's height — the log takes whatever the cross-tab card leaves. -->
         <!-- ── file browser ─────────────────────────────────────────── -->
         <section class="panel">
         <h2>Files <span id="watchPill" class="pill">watching…</span></h2>
@@ -363,6 +389,28 @@
           </div>
         </section>
 
+      <div class="stack">
+        <!-- ── cross-tab ──────────────────────────────────────────── -->
+        <section class="panel">
+          <h2>Across tabs</h2>
+          <div class="toolbar">
+            <button id="btnTab" class="primary">Open a second tab ↗</button>
+            <button id="btnPing">Write from this tab</button>
+          </div>
+          <pre class="out" id="tabLog">One volume, many tabs. Open a second tab and write from either — the other updates on its own, through a shared worker and a leader/follower election.
+
+Close the leader tab and watch a follower take over: the badge above changes without a reload.</pre>
+        </section>
+        <!-- ── console ────────────────────────────────────────────── -->
+        <section class="panel">
+          <h2>Log</h2>
+          <pre class="out" id="log">ready</pre>
+        </section>
+      </div>
+    </div>
+
+    <!-- Row two: clone and benchmark side by side, matched heights. -->
+    <div class="grid pair">
       <!-- ── clone ──────────────────────────────────────────────── -->
       <section class="panel">
         <h2>Clone a repository <span class="pill">isomorphic-git, unmodified</span></h2>
@@ -405,27 +453,6 @@ instance unmodified, and the file browser above lists what it writes — with re
         <p id="benchRole" style="margin:0; padding:.6rem .9rem; border-top:1px solid var(--line);
          color:var(--muted); font-size:.83rem"></p>
       </section>
-      </div>
-
-      <div style="display:grid; gap:1.25rem; align-content:start">
-        <!-- ── cross-tab ──────────────────────────────────────────── -->
-        <section class="panel">
-          <h2>Across tabs</h2>
-          <div class="toolbar">
-            <button id="btnTab" class="primary">Open a second tab ↗</button>
-            <button id="btnPing">Write from this tab</button>
-          </div>
-          <pre class="out" id="tabLog">One volume, many tabs. Open a second tab and write from either — the other updates on its own, through a shared worker and a leader/follower election.
-
-Close the leader tab and watch a follower take over: the badge above changes without a reload.</pre>
-        </section>
-
-        <!-- ── console ────────────────────────────────────────────── -->
-        <section class="panel">
-          <h2>Log</h2>
-          <pre class="out" id="log">ready</pre>
-        </section>
-      </div>
     </div>
 
     <footer>
