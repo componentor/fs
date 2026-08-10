@@ -7,6 +7,11 @@
 # Pages cannot send COOP/COEP, so the synchronous API is switched on client-side by
 # demo/coi-serviceworker.js instead — which is also the demo's point: it shows the workaround
 # working on a host that cannot set headers.
+# Action majors are kept current deliberately: GitHub retires the Node runtime older actions
+# target (Node 20 was deprecated in 2025), and a workflow left on old majors starts warning and
+# eventually stops running. checkout@v7, setup-node@v5 and deploy-pages@v5 all run on Node 24;
+# upload-pages-artifact@v5 is a composite that delegates to upload-artifact@v7, which does too —
+# that transitive one is what the Node 20 warning was actually about.
 name: Deploy demo to Pages
 
 on:
@@ -33,11 +38,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
-          node-version: 22
+          # 24, not 22: the surface suites derive their expectations from the *running* Node
+          # (`Utf8Stream` exists only from 24), so CI should build and test on the version the
+          # claims were measured against.
+          node-version: 24
           cache: npm
 
       - run: npm ci
@@ -54,7 +62,7 @@ jobs:
           # Pages runs Jekyll by default, which strips files and folders beginning with `_`.
           touch _site/.nojekyll
 
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: _site
 
@@ -66,4 +74,4 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5
