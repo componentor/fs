@@ -1,5 +1,14 @@
 # Changelog
 
+## 4.0.1
+
+A patch for one bug that only appears once the package is deployed somewhere other than a domain
+root — which is to say, the case no local test server reproduces.
+
+- **Fixed: a relative `swUrl` jumped to the site root.** It was resolved against `location.origin`, so an app served from a subpath — `/fs/` on GitHub *project* pages, `/app/` behind a proxy — asked the browser to register a script that was never there and got `A bad HTTP response code (404) was received when fetching the script`, followed by "Failed to connect to leader". Multi-tab was unreachable for anyone not hosting at a domain root. It resolves against `document.baseURI` now. An absolute `/path.js` still means exactly what it says; only the relative form changes, and only to what it should always have meant.
+- Found by deploying the demo to GitHub Pages, which is served from `/fs/` — the case the local test server never exercised, because it serves from the root.
+- No API change and nothing else differs from 4.0.0; upgrade if you host under a subpath or use multi-tab.
+
 ## 4.0.0
 
 **The release that makes this library usable without installing it, and finishes `node:fs`.** Two headline
@@ -97,11 +106,6 @@ coverage is enforced rather than claimed.
 - **A worker-hosted instance no longer watches for external changes.** There is nowhere safe to put the observer: the page kills the worker outright. Hosting it on the page on the worker's behalf was tried and measured *worse* — one more observer that nothing reliably detaches, since `pagehide` does not fire when a page is closed programmatically. Mirroring outward is unaffected in every mode.
 - **Added `disposeAll()`**, alongside the per-instance `fs.dispose()`. Its registry is shared across module copies via `globalThis`, because a page can legitimately load the library from two URLs (a bundle and a CDN) while the resources at stake — OPFS handles and observers — are per-origin. Worth calling from anything that owns the page lifecycle.
 - **Honest note on the crash:** this reduces it, it does not eliminate it. The browser suite still trips it about once per full run and keeps one retry. The only configuration measured as fully deterministic (three consecutive runs, retries off, zero crashes) was registering no observer at all, which is too high a price for a feature that works. It is a Chromium bug, not something this code can be careful enough to avoid.
-
-### `swUrl` resolves against the page, not the origin
-
-- **Fixed: a relative `swUrl` jumped to the site root.** It was resolved against `location.origin`, so an app served from a subpath — `/fs/` on GitHub *project* pages, `/app/` behind a proxy — asked the browser to register a script that was never there and got `A bad HTTP response code (404) was received when fetching the script`, followed by "Failed to connect to leader". Multi-tab was unreachable for anyone not hosting at a domain root. It resolves against `document.baseURI` now. An absolute `/path.js` still means exactly what it says; only the relative form changes, and only to what it should always have meant.
-- Found by deploying the demo to GitHub Pages, which is served from `/fs/` — the case the local test server never exercised, because it serves from the root.
 
 ### `stat` on a directory is 3.3× faster
 
