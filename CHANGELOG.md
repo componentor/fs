@@ -1,5 +1,21 @@
 # Changelog
 
+## 4.1.3
+
+- **Fixed: `dispose()` never released the leader lock.** Leadership was held with `await new Promise(() => {})`, on the reasoning that the lock dies with the tab — true, but a disposed instance is not a closed tab. The dead instance kept `<ns>-leader` for the life of the page, so the next instance on the same volume started as a **follower of a leader whose relay workers were already terminated**, and its first synchronous call waited for a reply that could never come until the 30s stall guard. The lock is now resolved on dispose, and a queued follower's bid is aborted so a disposed instance cannot be elected later. Covered by a test that stubs `navigator.locks` with the queueing semantics the real thing has, rather than mocking the election away.
+
+### Known: a disposed instance still holds the volume open
+
+- **Reopening the same volume after `dispose()` hangs.** A leader holds an exclusive `createSyncAccessHandle` on the volume's `.vfs.bin`, and nothing closes it on shutdown, so the next instance waits on a handle nobody returns. Measured in Chromium: sequential create/dispose cycles on one root fail from the second onward, while fresh roots run ~550 ms every time. Waiting does not help — a 500 ms or 3 s pause between cycles still fails, so the handle is not merely released late.
+- Closing it in the relay's shutdown traded the hang for `EIO` on reopen, and flushing the engine first made it nondeterministic, so **that fix is not in this release**. One handle per volume is the intended design; the defect is that the count never returns to zero.
+- Affects `dispose()` followed by reopening the *same* root in the same page — the documented "app that switches volumes" case. Unaffected: fresh roots, and keeping one instance for the page's lifetime.
+
+### Demo
+
+- The benchmark measured the demo's own redraw loop. `watch` fires per mutation and the page redrew on every one, so a benchmark making ~490 mutations had a follower tab issue ~490 full listings — each a round trip through the leader — *while it was being timed*. Redraws are coalesced and suspended during the benchmark. Follower writes, two real tabs in Chromium: create **98.5 → 9.6 ms**, overwrite **76.2 → 2.5 ms**, unlink **68.5 → 2.6 ms**.
+- The main-thread panel builds its instance once instead of per click, which is what an app would do and sidesteps the volume-handle defect above. Five consecutive clicks run 74–262 ms; the second used to freeze the tab for 30s.
+- Grid rebalanced — every panel but the file browser was stacked in the right column, which ran half again as tall as the left and pushed the benchmark and the log below the fold.
+
 ## 4.1.2
 
 - **Fixed: `createServiceWorkerBridge` still resolved `swUrl` against the origin.** 4.0.1 fixed this in `filesystem.ts` and missed the second copy in `sw-bridge.ts`, so a **worker-hosted** instance on a subpath — the arrangement 4.1.1 moved the demo to, and the one Safari requires — registered a script that was not there. The failure surfaced two layers from its cause: a 404 on the service worker, then the instance could not become leader, then every call came back `EIO: i/o error, readdir '/'`. Both call sites resolve against `document.baseURI` now.
