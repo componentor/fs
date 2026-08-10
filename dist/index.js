@@ -3249,7 +3249,9 @@ function watch(ns, syncRequest, filePath, options, listener) {
     statSync(syncRequest, absPath);
   } catch (err) {
     const code = err.code;
-    throw code ? createError(code, "watch", filePath) : err;
+    if (code !== "EIO") {
+      throw code ? createError(code, "watch", filePath) : err;
+    }
   }
   let released = false;
   const release = () => {

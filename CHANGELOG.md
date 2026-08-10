@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.1.8
+
+- **Fixed: a tab could register no watcher at all and stay deaf to every change for the rest of its life.** `fs.watch` checks the path exists before registering, so a mistyped path throws instead of handing back a watcher that can never fire. That check is a synchronous call, and it is the *first* one a tab makes — and a follower whose leader port has not yet proved itself refuses such a call quickly with `EIO`, deliberately, because 4.1.5 replaced a ten-second stall with exactly that. So a tab that lost the election had this one check refused, threw out of `watch()` before registering anything, and never saw another change. `EIO` is the transport declining to answer rather than a fact about the path, and is no longer treated as one; `ENOENT` still throws.
+- **Measured, four tabs each writing in turn:** roughly one tab in sixteen went deaf before the fix (3 of 48, 4 of 56, 6 of 64 across runs); after it, 0 of 144.
+
+How it was found is worth recording, because three earlier attempts missed it. A raw `BroadcastChannel` opened beside the library's in every tab proved the browser delivered to the deaf tab while the library's watcher counted zero — which ruled out transmission, leadership and delivery in one measurement. Instrumenting the release path proved the entry was never removed, ruling out the refcount fixes in 4.1.6 and 4.1.7. Counters on `globalThis`, read directly rather than through console capture, then showed the deaf tab recording `watchCalled: 1` and no `ensureBc` — `watch()` entered and left before registering, which left exactly one statement it could have thrown from.
+
 ## 4.1.7
 
 - **Fixed: a tab could go deaf to watch events while every other tab kept working.** Isolated with a raw `BroadcastChannel` opened alongside the library's: the browser delivered every message to the affected tab (`raw: 4, 4, 4, 4`) while the library's watcher counted zero. So delivery was never the problem — the shared channel was being left without a handler, or closed, while a watcher was still registered on it. Two changes make that impossible rather than unlikely:

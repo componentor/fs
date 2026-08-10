@@ -256,11 +256,26 @@ export function watch(
   try {
     statSync(syncRequest, absPath);
   } catch (err) {
-    // Only a filesystem error is restated as `watch`; anything else — a transport that is not
-    // wired up, say — is a different failure and travels unchanged rather than being disguised
-    // as a missing file.
     const code = (err as { code?: string }).code;
-    throw code ? createError(code, 'watch', filePath) : err;
+    // `EIO` is not an answer about the path — it is the transport declining to give one.
+    //
+    // A follower's first synchronous call can fail this way while its leader port is still
+    // unproven: the call is refused quickly by design, because the alternative is a ten-second
+    // stall. `fs.watch` making an existence check its very first call meant a tab could lose the
+    // election, have this check refused, and throw — registering no watcher at all. That tab
+    // then never saw another change for the rest of its life, while every other tab worked.
+    // Measured at roughly one tab in sixteen, and the counters are unambiguous: `watch()` was
+    // entered and never reached the channel registration below.
+    //
+    // Node throws here to catch a path that does not exist, which is a permanent fact about the
+    // filesystem. A transport hiccup is not, so it must not be treated as one — register the
+    // watcher and let it deliver once the leader is reachable.
+    if (code !== 'EIO') {
+      // Only a filesystem error is restated as `watch`; anything else — a transport that is not
+      // wired up, say — is a different failure and travels unchanged rather than being disguised
+      // as a missing file.
+      throw code ? createError(code, 'watch', filePath) : err;
+    }
   }
 
   // One watcher, one release — however many times it is torn down.
