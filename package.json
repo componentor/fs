@@ -15,7 +15,7 @@
   "type": "module",
   "module": "./dist/index.js",
   "types": "./dist/index.d.mts",
-  "//sideEffects": "All modules are side-effect-free so bundlers can tree-shake (e.g. importing only the drive classes drops the VFS engine). The worker entry files DO have side effects (self.onmessage) \u2014 they're loaded as separate worker bundles, never imported for their side effects, but listed here defensively.",
+  "//sideEffects": "All modules are side-effect-free so bundlers can tree-shake (e.g. importing only the drive classes drops the VFS engine). The worker entry files DO have side effects (self.onmessage) — they're loaded as separate worker bundles, never imported for their side effects, but listed here defensively.",
   "sideEffects": [
     "**/*.worker.js",
     "**/workers/*.js"
@@ -57,6 +57,7 @@
     "@vitest/browser-playwright": "^4.0.16",
     "buffer": "^6.0.3",
     "events": "^3.3.0",
+    "isomorphic-git": "^1.41.3",
     "playwright": "^1.40.0",
     "tsup": "^8.0.0",
     "typescript": "^5.3.0",

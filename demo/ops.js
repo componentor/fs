@@ -10,8 +10,55 @@ import { runBench } from './bench.js';
 
 const join = (dir, name) => (dir === '/' ? '' : dir) + '/' + name;
 
-export function createOps(fs) {
+export function createOps(fs, emit = () => {}) {
   const ops = {
+    /**
+     * Clone a real repository with isomorphic-git, straight onto this filesystem.
+     *
+     * This is the claim the library exists to make, run end to end: isomorphic-git is written
+     * against node's `fs` and knows nothing about OPFS. It is handed this instance unmodified —
+     * same `promises` surface, same errors — and writes a working tree and a `.git` directory
+     * that the file browser above then lists with `readdirSync` and `statSync`.
+     *
+     * `corsProxy` is not a workaround for this filesystem: a browser cannot fetch github.com's
+     * git endpoints directly at all, whatever it stores the result in. isomorphic-git runs a
+     * public proxy for exactly this, and that is what its own documentation uses.
+     */
+    async clone({ url, dir, depth, ref }) {
+      const { git, http } = await import('./vendor-git.js');
+      fs.rmSync(dir, { recursive: true, force: true });
+      fs.mkdirSync(dir, { recursive: true });
+
+      const started = performance.now();
+      await git.clone({
+        fs,
+        http,
+        dir,
+        url,
+        ref: ref || undefined,
+        corsProxy: 'https://cors.isomorphic-git.org',
+        singleBranch: true,
+        depth: depth ?? 1,
+        onProgress: (p) => emit({ type: 'clone-progress', phase: p.phase, loaded: p.loaded, total: p.total }),
+        onMessage: (message) => emit({ type: 'clone-message', message: String(message).trim() }),
+      });
+      const ms = performance.now() - started;
+
+      // Read it back through the synchronous API — the point being that what git wrote is
+      // immediately there, with no await between writing and seeing it.
+      const entries = fs.readdirSync(dir);
+      const log = await git.log({ fs, dir, depth: 1 });
+      const head = log[0];
+      return {
+        ms,
+        entries: entries.length,
+        branch: await git.currentBranch({ fs, dir }) ?? 'HEAD',
+        commit: head ? head.oid.slice(0, 8) : null,
+        message: head ? head.commit.message.split('\n')[0].slice(0, 100) : null,
+        author: head ? head.commit.author.name : null,
+      };
+    },
+
     list(path) {
       // `statSync` with no await, on the fast path — the thing the demo exists to show.
       return fs.readdirSync(path, { withFileTypes: true })

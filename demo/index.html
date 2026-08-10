@@ -363,6 +363,29 @@
           </div>
         </section>
 
+      <!-- ── clone ──────────────────────────────────────────────── -->
+      <section class="panel">
+        <h2>Clone a repository <span class="pill">isomorphic-git, unmodified</span></h2>
+        <div class="toolbar">
+          <input id="cloneUrl" type="text" spellcheck="false"
+            style="flex:1 1 18rem; min-width:11rem; padding:.4rem .55rem; font:inherit;
+             font-size:.85rem; border:1px solid var(--line); border-radius:6px;
+             background:var(--code); color:var(--fg)" />
+          <label style="align-self:center; display:flex; gap:.35rem; align-items:center;
+           font-size:.83rem; color:var(--muted)">
+            depth <input id="cloneDepth" type="number" min="1" max="50" value="1"
+              style="width:3.4rem; padding:.35rem .4rem; font:inherit; font-size:.85rem;
+               border:1px solid var(--line); border-radius:6px; background:var(--code);
+               color:var(--fg)" />
+          </label>
+          <button id="btnClone" class="primary">Clone</button>
+        </div>
+        <pre class="out" id="cloneOut">Edit the URL and clone any public repository into this filesystem.
+
+isomorphic-git is written against node's fs and knows nothing about OPFS. It is handed this
+instance unmodified, and the file browser above lists what it writes — with readdirSync.</pre>
+      </section>
+
       <!-- ── benchmark ──────────────────────────────────────────── -->
       <section class="panel">
         <h2>Benchmark <span class="pill">your machine, right now</span></h2>
@@ -476,6 +499,15 @@ Close the leader tab and watch a follower take over: the badge above changes wit
       if (ok) $('watchPill').className = 'pill live';
     }
     function onRole(leading) { isLeader = leading; renderRole(); }
+    /** Progress emitted by a long-running op, from whichever host is running it. */
+    function onEmit(event) {
+      if (event.type === 'clone-progress') {
+        const pct = event.total ? ` ${Math.round((event.loaded / event.total) * 100)}%` : '';
+        $('cloneOut').textContent = `${event.phase}${pct}`;
+      } else if (event.type === 'clone-message') {
+        if (event.message) $('cloneOut').textContent = event.message;
+      }
+    }
 
     let worker = null;
     function startWorkerHost() {
@@ -494,6 +526,7 @@ Close the leader tab and watch a follower take over: the badge above changes wit
         if (data.type === 'role') { onRole(data.isLeader); return; }
         if (data.type === 'watching') { onWatching(data.ok); return; }
         if (data.type === 'watch') { onWatch(data.eventType, data.filename); return; }
+        if (data.type === 'clone-progress' || data.type === 'clone-message') { onEmit(data); return; }
         const entry = pending.get(data.id);
         if (!entry) return;
         pending.delete(data.id);
@@ -513,7 +546,7 @@ Close the leader tab and watch a follower take over: the badge above changes wit
         const fs = new VFSFileSystem({ root: '/demo' });
         pageFs = fs;
         await fs.init();
-        const ops = createOps(fs);
+        const ops = createOps(fs, (event) => onEmit(event));
         call = async (op, arg) => ops[op](arg);
         onRole(fs.isLeader);
         fs.onLeaderChange(onRole);
@@ -547,8 +580,29 @@ Close the leader tab and watch a follower take over: the badge above changes wit
       renderTimer = setTimeout(() => { renderTimer = null; render(); }, 120);
     }
 
+    /**
+     * Retry a call that failed with EIO during a leadership change.
+     *
+     * A follower's call fails fast when its leader port has not proved itself — that is
+     * deliberate, and far better than the 10s stall it replaced, but the answer is "outcome
+     * unknown, try again", not "broken". The relay asks for a fresh port on that failure, so the
+     * next attempt goes to the real leader. Treating the first EIO as fatal is what left a tab
+     * showing an empty browser and an uncaught `EIO: i/o error, readdir '/'` after another tab
+     * took over — reported with three followers open, and reproducible on any leader change.
+     */
+    async function callSettling(op, arg, attempts = 4) {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          return await call(op, arg);
+        } catch (err) {
+          if (err.code !== 'EIO' || attempt >= attempts) throw err;
+          await new Promise((resolve) => setTimeout(resolve, attempt * 250));
+        }
+      }
+    }
+
     async function render() {
-      const entries = await call('list', cwd);
+      const entries = await callSettling('list', cwd);
       $('crumbs').replaceChildren(...crumbTrail());
       $('btnUp').disabled = cwd === '/';
       emptyEl.style.display = entries.length ? 'none' : 'block';
@@ -803,6 +857,34 @@ Close the leader tab and watch a follower take over: the badge above changes wit
           + 'show it within a moment — it is the same volume.';
         render();
       };
+      $('cloneUrl').value = 'https://github.com/componentor/fs';
+      $('btnClone').onclick = async () => {
+        const url = $('cloneUrl').value.trim();
+        if (!url) return;
+        const dir = '/repo';
+        $('btnClone').disabled = true;
+        $('cloneOut').textContent = 'Cloning…';
+        try {
+          const r = await call('clone', { url, dir, depth: Number($('cloneDepth').value) || 1 });
+          $('cloneOut').textContent =
+            `Cloned ${url}\n  into ${dir} — ${r.entries} entries at the top level, in `
+            + `${(r.ms / 1000).toFixed(1)}s.\n\n`
+            + `  branch  ${r.branch}\n  commit  ${r.commit ?? '—'}`
+            + (r.author ? `\n  author  ${r.author}` : '')
+            + (r.message ? `\n  subject ${r.message}` : '')
+            + `\n\nOpen ${dir} in the browser above. Everything there was written by`
+            + ` isomorphic-git through this library's fs, and is listed back with readdirSync.`;
+          cwd = dir;
+          await render();
+        } catch (err) {
+          $('cloneOut').textContent = 'Clone failed: ' + err.message
+            + '\n\nA browser cannot reach github.com\'s git endpoints directly, so this goes'
+            + ' through isomorphic-git\'s public CORS proxy. If that is unreachable, or the'
+            + ' repository is private, the clone cannot start.';
+        }
+        $('btnClone').disabled = false;
+      };
+
       $('btnBench').onclick = async () => {
         $('btnBench').disabled = true;
         // Not cosmetic: redrawing on each of the benchmark's own mutations is exactly what made

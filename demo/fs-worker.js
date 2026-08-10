@@ -29,7 +29,7 @@ self.onmessage = async (event) => {
     try {
       fs = new VFSFileSystem({ root: '/demo', swBridge: msg.swBridge });
       await fs.init();
-      ops = createOps(fs);
+      ops = createOps(fs, (event) => post(event));
 
       post({ type: 'role', isLeader: fs.isLeader });
       fs.onLeaderChange((isLeader) => post({ type: 'role', isLeader }));
