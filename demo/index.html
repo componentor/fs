@@ -502,12 +502,16 @@ Close the leader tab and watch a follower take over: the badge above changes wit
       };
     }
 
+    /** Whichever instance this page owns, so the host switch can put it down before reloading. */
+    let pageFs = null;
+
     /** Page-hosted: no RPC at all, the calls happen right here on the main thread. */
     async function startOnThisThread() {
       const { VFSFileSystem } = await import('./vendor/index.js');
       const { createOps } = await import('./ops.js');
       try {
         const fs = new VFSFileSystem({ root: '/demo' });
+        pageFs = fs;
         await fs.init();
         const ops = createOps(fs);
         call = async (op, arg) => ops[op](arg);
@@ -703,9 +707,40 @@ Close the leader tab and watch a follower take over: the badge above changes wit
 
       b.innerHTML = (useWorker ? BANNER_WORKER : BANNER_PAGE)
         + ` <a href="#" id="switchHost">Run it in the ${other} instead →</a>`;
-      $('switchHost').onclick = (e) => {
-        e.preventDefault();
+      // Swapping host is an origin-wide change, so every tab has to let go and come back.
+      //
+      // Two reasons, both measured. All tabs share one volume — root `/demo`, namespace
+      // `vfs-_demo`, one `.vfs.bin` — and an instance that goes away without disposing keeps its
+      // exclusive handle on that file, so a tab reloading immediately races the handle it just
+      // abandoned. And the hosts cannot be mixed: a page-hosted leader does not broker for a
+      // worker-hosted follower, which left followers booting in ~10s and then not working. So the
+      // switch disposes locally, tells the other tabs to do the same, and everyone reinitialises.
+      const hostChannel = new BroadcastChannel('vfs-demo-host');
+
+      async function releaseHost() {
+        try {
+          if (pageFs) await pageFs.dispose();
+          else if (worker) worker.terminate();
+        } catch { /* going away regardless */ }
+      }
+
+      hostChannel.onmessage = async (event) => {
+        if (event.data?.type !== 'host-changed') return;
+        $('banner').className = 'banner';
+        $('banner').textContent = 'Host changed in another tab — reinitialising…';
+        await releaseHost();
+        location.reload();
+      };
+
+      $('switchHost').onclick = async (event) => {
+        event.preventDefault();
         localStorage.setItem('vfs-demo-host', useWorker ? 'page' : 'worker');
+        $('banner').className = 'banner';
+        $('banner').textContent = 'Switching host — reinitialising every tab…';
+        hostChannel.postMessage({ type: 'host-changed' });
+        await releaseHost();
+        // A beat for the other tabs to drop their handles before this one reopens the volume.
+        await new Promise((resolve) => setTimeout(resolve, 250));
         location.reload();
       };
 
