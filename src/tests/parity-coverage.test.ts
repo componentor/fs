@@ -53,6 +53,15 @@ interface Ctx {
   p: (rel: string) => string;
   /** A path this filesystem returned, reduced to the form the other side would report. */
   un: (abs: string) => string;
+  /**
+   * True for this library, false for `node:fs`.
+   *
+   * A case runs twice and normally must not care which side it is on — that is what keeps the two
+   * from drifting. The exception is an assertion that is only meaningful for one of them: node's
+   * `watchFile` polls, so whether a poll lands inside a test window is the scheduler's business
+   * and not a parity property.
+   */
+  isOurs: boolean;
 }
 
 /** A case: driven once per filesystem, its result compared across the two. */
@@ -74,12 +83,14 @@ beforeEach(() => {
     fsp: fs.promises,
     p: (rel) => `/${rel}`,
     un: (abs) => abs,
+    isOurs: true,
   };
   theirs = {
     fs: nodefs,
     fsp: nodefsp,
     p: (rel) => (rel ? join(root, rel) : root),
     un: (abs) => abs.replace(realRoot, '').replace(root, '') || '/',
+    isOurs: false,
   };
   seed(ours);
   seed(theirs);
@@ -1239,10 +1250,22 @@ const CASES: Record<string, Case> = {
     const delivered = await keepGrowing(c, () => seen.length > 0 && viaEvent.length > 0);
     c.fs.unwatchFile(c.p('file.txt'));
     restore(c);
-    // *Which* write a poll caught is the machine's business, so what is compared is that the
-    // listener was handed two stat snapshots of a file that had grown between them.
-    const [curr, prev] = seen[0] ?? [0, 0];
-    return [...shape, delivered, curr > prev, viaEvent.length > 0];
+
+    // Only the *shape* is compared against node. Whether a poll lands inside the window is the
+    // scheduler's business, not the filesystem's: node's watchFile polls, and under the CPU
+    // contention of a full parallel suite it has been seen to deliver nothing in 15 s on the same
+    // machine that delivers instantly when the file is run alone. Asserting that made the release
+    // gate fail for a reason that says nothing about parity.
+    //
+    // Delivery is still asserted — for *this* implementation, below — so a watcher that stops
+    // firing is still caught. It just is not compared against node's timing.
+    if (c.isOurs) {
+      expect(delivered, 'watchFile delivered to the listener').toBe(true);
+      expect(viaEvent.length, "watchFile emitted 'change'").toBeGreaterThan(0);
+      const [curr, prev] = seen[0] ?? [0, 0];
+      expect(curr > prev, 'listener saw the file grow').toBe(true);
+    }
+    return shape;
   },
 
   unwatchFile: async (c) => {

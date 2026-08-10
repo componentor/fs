@@ -66,6 +66,13 @@ describe('bitmap region — layout', () => {
 });
 
 describe('bitmap region — no overflow as the FS grows', () => {
+  // Deliberately heavy: 80 files x 600 KB is ~48 MB pushed through the mock handle, with an idle
+  // pre-grow on every iteration, specifically to cross the old ~62 MB reserved-region cap. The
+  // 5 s default was never a meaningful bound for that. Run alone the test takes ~1.5 s; run as
+  // part of the full suite it competes with every other file for CPU and has been seen at 5.8 s,
+  // which failed `npm run release` on the same machine that passes it in isolation. A ceiling
+  // that survives contention still catches a real hang — a regression here fails an assertion
+  // long before it runs for 60 s.
   it('grows well past the old ~62MB cap and stays consistent across a remount', () => {
     const handle = new MockSyncHandle(0);
     const engine = new VFSEngine();
@@ -111,7 +118,7 @@ describe('bitmap region — no overflow as the FS grows', () => {
       expect(r.data![0]).toBe(i & 0xff);
       expect(r.data![PER_FILE - 1]).toBe((i * 7) & 0xff);
     }
-  });
+  }, 60_000);
 
   it('randomized op mix keeps FREE_BLOCKS == bitmap clear-bits, in memory and after remount', () => {
     const SEEDS = [1, 42, 1337, 20260611, 7];
