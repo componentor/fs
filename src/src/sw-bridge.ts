@@ -47,8 +47,13 @@ export function createServiceWorkerBridge(
   const resolveSW = (): Promise<{ postMessage(message: unknown, transfer?: Transferable[]): void }> => {
     if (regPromise) return regPromise;
     regPromise = (async () => {
+      // Against the **document**, not the origin — the same fix as in filesystem.ts, which this
+      // copy did not get. Resolved against the origin, a relative `swUrl` jumps to the site root,
+      // so an app on a subpath (`/fs/` on GitHub project pages) registers a script that is not
+      // there. Registration then fails, the instance cannot become leader, and every later call
+      // fails with EIO — a 404 presenting as an I/O error two layers away.
       const swUrl = opts.swUrl
-        ? new URL(opts.swUrl, location.origin)
+        ? new URL(opts.swUrl, document.baseURI)
         : new URL('./workers/service.worker.js', import.meta.url);
       const scope = opts.swScope ?? new URL(`./${opts.ns}/`, swUrl).href;
       const reg = await navigator.serviceWorker.register(swUrl.href, { scope });

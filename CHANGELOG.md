@@ -1,5 +1,10 @@
 # Changelog
 
+## 4.1.2
+
+- **Fixed: `createServiceWorkerBridge` still resolved `swUrl` against the origin.** 4.0.1 fixed this in `filesystem.ts` and missed the second copy in `sw-bridge.ts`, so a **worker-hosted** instance on a subpath — the arrangement 4.1.1 moved the demo to, and the one Safari requires — registered a script that was not there. The failure surfaced two layers from its cause: a 404 on the service worker, then the instance could not become leader, then every call came back `EIO: i/o error, readdir '/'`. Both call sites resolve against `document.baseURI` now.
+- The two paths are exercised separately: a page-hosted instance registers through `filesystem.ts`, a worker-hosted one through the bridge, so fixing one told nothing about the other. Verified under a subpath in Chromium *and* WebKit: no 404s, no `EIO`, leader elected, files listed.
+
 ## 4.1.1
 
 - **Fixed: `swUrl` threw a `ReferenceError` in a worker.** 4.1.0 started resolving it against `document.baseURI`, which does not exist in a worker scope. A worker-hosted instance normally returns earlier via `swBridge` and never reaches that line, but one configured with `swUrl` and no bridge crashed instead of failing on a registration it could not perform anyway. It falls back to `location.href` off the main thread.

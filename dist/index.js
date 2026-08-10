@@ -6059,7 +6059,7 @@ function createServiceWorkerBridge(bridgePort, opts) {
   const resolveSW = () => {
     if (regPromise) return regPromise;
     regPromise = (async () => {
-      const swUrl = opts.swUrl ? new URL(opts.swUrl, location.origin) : new URL("./workers/service.worker.js", import.meta.url);
+      const swUrl = opts.swUrl ? new URL(opts.swUrl, document.baseURI) : new URL("./workers/service.worker.js", import.meta.url);
       const scope = opts.swScope ?? new URL(`./${opts.ns}/`, swUrl).href;
       const reg = await navigator.serviceWorker.register(swUrl.href, { scope });
       if (reg.active) return reg.active;
