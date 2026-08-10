@@ -397,17 +397,6 @@
 Close the leader tab and watch a follower take over: the badge above changes without a reload.</pre>
         </section>
 
-        <!-- ── main-thread sync ───────────────────────────────────── -->
-        <section class="panel">
-          <h2>Sync on the main thread <span id="mtPill" class="pill">not run</span></h2>
-          <div class="toolbar">
-            <button id="btnMain" class="primary">Run sync calls on this thread</button>
-          </div>
-          <pre class="out" id="mtOut">The listing above runs inside a worker, which is what Safari needs. But the sync API is not worker-only — on Chrome and Firefox it works directly on a page's main thread, no worker involved.
-
-This runs a page-hosted instance right here and times it.</pre>
-        </section>
-
         <!-- ── console ────────────────────────────────────────────── -->
         <section class="panel">
           <h2>Log</h2>
@@ -467,7 +456,7 @@ This runs a page-hosted instance right here and times it.</pre>
     // it; the operations themselves are identical either way (ops.js).
     const webkitLike = /^((?!chrome|android|crios|fxios).)*safari/i.test(navigator.userAgent);
     const hostPref = localStorage.getItem('vfs-demo-host');
-    const useWorker = hostPref ? hostPref === 'worker' : webkitLike;
+    let useWorker = hostPref ? hostPref === 'worker' : webkitLike;
 
     let onReady;
     const ready = new Promise((resolve) => { onReady = resolve; });
@@ -489,7 +478,7 @@ This runs a page-hosted instance right here and times it.</pre>
     function onRole(leading) { isLeader = leading; renderRole(); }
 
     let worker = null;
-    if (useWorker) {
+    function startWorkerHost() {
       worker = new Worker(new URL('./fs-worker.js', import.meta.url), { type: 'module' });
       let nextId = 1;
       const pending = new Map();
@@ -680,6 +669,7 @@ This runs a page-hosted instance right here and times it.</pre>
 
     (async function start() {
       if (useWorker) {
+        startWorkerHost();
         // The bridge lets the worker reach `navigator.serviceWorker`, which worker scopes on
         // Safari and Firefox cannot. `ns` is `vfs-${root}` with every non-alphanumeric as `_`.
         const channel = new MessageChannel();
@@ -689,6 +679,7 @@ This runs a page-hosted instance right here and times it.</pre>
         // A page reaches `navigator.serviceWorker` on its own; no bridge needed.
         startOnThisThread();
       }
+
 
       const boot = await ready;
       if (boot.error) {
@@ -700,16 +691,17 @@ This runs a page-hosted instance right here and times it.</pre>
       const b = $('banner');
       b.className = 'banner ok';
       const other = useWorker ? 'page' : 'worker';
-      b.innerHTML = (useWorker
-        ? '<strong>Filesystem running in a worker.</strong> Every listing below comes from '
-          + '<code>readdirSync</code> and <code>statSync</code> called with no <code>await</code> — '
-          + 'inside the worker, where the blocking wait is a real <code>Atomics.wait</code>. That is '
-          + 'the arrangement Safari needs; on a page main thread a sync call there can stall for 30 '
-          + 'seconds.'
-        : '<strong>Filesystem running on this page\'s main thread.</strong> Every listing below comes '
-          + 'from <code>readdirSync</code> and <code>statSync</code> called directly here, with no '
-          + 'worker and no <code>await</code>. Safari is the exception — there a main-thread sync '
-          + 'call busy-spins and can stall for 30 seconds, so it defaults to a worker.')
+      const BANNER_WORKER = '<strong>Filesystem running in a worker.</strong> Every listing below '
+        + 'comes from <code>readdirSync</code> and <code>statSync</code> called with no '
+        + '<code>await</code> — inside the worker, where the blocking wait is a real '
+        + '<code>Atomics.wait</code>. That is the arrangement Safari needs; on a page main thread '
+        + 'a sync call there can stall for 30 seconds.';
+      const BANNER_PAGE = '<strong>Filesystem running on this page\'s main thread.</strong> Every '
+        + 'listing below comes from <code>readdirSync</code> and <code>statSync</code> called '
+        + 'directly here, with no worker and no <code>await</code>. Safari is the exception — there '
+        + 'a main-thread sync call busy-spins and can stall for 30 seconds, so it uses a worker.';
+
+      b.innerHTML = (useWorker ? BANNER_WORKER : BANNER_PAGE)
         + ` <a href="#" id="switchHost">Run it in the ${other} instead →</a>`;
       $('switchHost').onclick = (e) => {
         e.preventDefault();
@@ -773,80 +765,6 @@ This runs a page-hosted instance right here and times it.</pre>
         renderSuspended = false;
         $('btnBench').disabled = false;
         render();
-      };
-
-      // ── main-thread sync, on demand ───────────────────────────────────────────
-      //
-      // The capability is real and it is the headline feature — it just is not safe to put on the
-      // boot path on WebKit, where a main-thread sync call busy-spins (Atomics.wait is illegal
-      // there), starves the worker's continuations and sits until the 30s stall guard. So it runs
-      // when asked, on its own volume, and reports what actually happened.
-      if (webkitLike) {
-        $('mtPill').textContent = 'expect a freeze';
-        $('btnMain').textContent = 'Run anyway (freezes this tab)';
-      }
-
-      let mainFs = null;
-      /** The page-hosted instance, built once and kept — see the note in the click handler. */
-      const ensureMainFs = async () => {
-        if (mainFs) return mainFs;
-        const { VFSFileSystem } = await import('./vendor/index.js');
-        // Its own volume, so it does not join the election for the one the worker owns — which
-        // also means it benchmarks as a leader, comparable with the worker's leader numbers.
-        mainFs = new VFSFileSystem({ root: '/demo-main-thread' });
-        await mainFs.init();
-        return mainFs;
-      };
-      if (!useWorker) {
-        $('mtPill').textContent = 'already here';
-        $('mtOut').textContent = 'The file browser above is already running on this thread — this '
-          + 'panel repeats the point on a volume of its own, so you can see the calls in isolation.';
-      }
-      $('btnMain').onclick = async () => {
-        $('btnMain').disabled = true;
-        $('mtPill').textContent = 'running…';
-        $('mtOut').textContent = webkitLike
-          ? 'Running on the main thread. On WebKit this tab may freeze for ~30s — that is the '
-          + 'behaviour the worker arrangement exists to avoid.'
-          : 'Running on the main thread…';
-        await new Promise((r) => setTimeout(r, 50));   // let the UI paint before we block it
-
-        try {
-          // Built once and kept. It used to be constructed and disposed per click, which froze
-          // the tab for 30s from the second click on: a disposed instance does not release its
-          // exclusive handle on the volume, so reopening the same volume waits on a handle
-          // nobody will give back. Keeping one instance is what an app would do anyway.
-          await ensureMainFs();
-
-          const t0 = performance.now();
-          mainFs.mkdirSync('/notes', { recursive: true });
-          mainFs.writeFileSync('/notes/hello.txt', 'written from the page main thread');
-          const text = mainFs.readFileSync('/notes/hello.txt', 'utf8');   // blocks, returns a value
-          const size = mainFs.statSync('/notes/hello.txt').size;
-          const names = mainFs.readdirSync('/notes');
-          const ms = performance.now() - t0;
-
-          $('mtPill').textContent = ms < 1000 ? 'works here' : 'slow here';
-          $('mtPill').className = 'pill' + (ms < 1000 ? ' live' : '');
-          $('mtOut').textContent =
-            `Five synchronous calls on this page's main thread, no worker, no await:\n\n`
-            + `  mkdirSync('/notes')\n  writeFileSync('/notes/hello.txt', …)\n`
-            + `  readFileSync(…, 'utf8')  -> ${JSON.stringify(text)}\n`
-            + `  statSync(…).size         -> ${size}\n`
-            + `  readdirSync('/notes')    -> ${JSON.stringify(names)}\n\n`
-            + `Total: ${ms.toFixed(1)} ms.\n\n`
-            + (ms < 1000
-              ? 'That is the sync API working directly on the main thread — supported on Chrome and '
-              + 'Firefox. Safari is the exception, which is why the browser above runs in a worker.'
-              : 'That took long enough to show the problem: on WebKit a main-thread sync call '
-              + 'busy-spins and starves the worker it is waiting on. Run the instance in a worker '
-              + 'there, as the file browser above does.');
-        } catch (err) {
-          $('mtPill').textContent = 'failed';
-          $('mtOut').textContent = 'Main-thread sync failed: ' + err.message
-            + '\n\nThis is expected on WebKit; use a worker-hosted instance there.';
-        }
-        $('btnMain').disabled = false;
       };
 
       await render();
