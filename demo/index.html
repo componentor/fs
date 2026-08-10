@@ -717,18 +717,43 @@ Close the leader tab and watch a follower take over: the badge above changes wit
       // switch disposes locally, tells the other tabs to do the same, and everyone reinitialises.
       const hostChannel = new BroadcastChannel('vfs-demo-host');
 
+      /** How long a follower waits after detaching, so the new leader is up before it attaches. */
+      const FOLLOWER_REATTACH_DELAY_MS = 2000;
+
       async function releaseHost() {
         try {
-          if (pageFs) await pageFs.dispose();
-          else if (worker) worker.terminate();
+          if (pageFs) { await pageFs.dispose(); return; }
+          if (!worker) return;
+          // Ask the worker to dispose rather than killing it. `terminate()` skips dispose
+          // altogether — the leader lock stays held, the broker keeps routing to a dead port and
+          // the volume's exclusive handle is never released, which left every tab broken after a
+          // swap until a manual reload.
+          await new Promise((resolve) => {
+            const done = () => { clearTimeout(timer); resolve(); };
+            const timer = setTimeout(done, 2000);
+            const previous = worker.onmessage;
+            worker.onmessage = (event) => {
+              if (event.data?.type === 'disposed') done();
+              else if (typeof previous === 'function') previous.call(worker, event);
+            };
+            worker.postMessage({ type: 'dispose' });
+          });
+          worker.terminate();
         } catch { /* going away regardless */ }
       }
 
       hostChannel.onmessage = async (event) => {
         if (event.data?.type !== 'host-changed') return;
+        // Detach now, reattach after the new leader exists.
+        //
+        // Every tab reloading at once means every tab races for the lock, and whoever loses
+        // attaches to a leader that is still coming up — which is a leadership change during
+        // boot, the one case the relay handles worst. Letting the initiating tab come up first
+        // and following it turns a race into a sequence.
         $('banner').className = 'banner';
-        $('banner').textContent = 'Host changed in another tab — reinitialising…';
+        $('banner').textContent = 'Host changed in another tab — waiting for the new leader…';
         await releaseHost();
+        await new Promise((resolve) => setTimeout(resolve, FOLLOWER_REATTACH_DELAY_MS));
         location.reload();
       };
 
@@ -739,8 +764,9 @@ Close the leader tab and watch a follower take over: the badge above changes wit
         $('banner').textContent = 'Switching host — reinitialising every tab…';
         hostChannel.postMessage({ type: 'host-changed' });
         await releaseHost();
-        // A beat for the other tabs to drop their handles before this one reopens the volume.
-        await new Promise((resolve) => setTimeout(resolve, 250));
+        // A beat for the other tabs to detach before this one reopens the volume as the new
+        // leader; they wait longer still, and attach to it once it is serving.
+        await new Promise((resolve) => setTimeout(resolve, 300));
         location.reload();
       };
 

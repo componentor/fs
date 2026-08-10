@@ -200,7 +200,30 @@ describe('FollowerForwarder', () => {
     expect(new FollowerForwarder(() => 't').hasPort).toBe(false);
   });
 
+  /**
+   * Give the port its one successful round trip.
+   *
+   * Suspicion now applies only to a port that *was* working and stopped — the dead-under-spin
+   * case it was built for. A port that has never answered is handled by reconnecting instead, so
+   * a test that wants to exercise suspicion has to prove the port first.
+   */
+  async function proveThePort(): Promise<void> {
+    const p = forwarder.forward(payload);
+    forwarder.handleResponse(port.posted[port.posted.length - 1].message.id, makeResponse());
+    await p;
+  }
+
+  it('an unproven port is not marked suspect — it reconnects instead', async () => {
+    const p = forwarder.forward(payload, true);
+    vi.advanceTimersByTime(FORWARD_DEADLINE_MS + 1);
+    expect(statusOf(await p)).toBe(STATUS.EIO);
+    // Marking it suspect would send every later call down the fail-fast path, so the port could
+    // never prove itself and the follower would stay broken for good.
+    expect(forwarder.portSuspect).toBe(false);
+  });
+
   it('a deadline timeout marks the port suspect; fail-fast requests then fail instantly', async () => {
+    await proveThePort();
     const p1 = forwarder.forward(payload, true);
     vi.advanceTimersByTime(FORWARD_DEADLINE_MS + 1);
     expect(statusOf(await p1)).toBe(STATUS.EIO);
@@ -213,6 +236,7 @@ describe('FollowerForwarder', () => {
   });
 
   it('non-fail-fast requests still attempt while suspect, and delivery heals it', async () => {
+    await proveThePort();
     const p1 = forwarder.forward(payload, true);
     vi.advanceTimersByTime(FORWARD_DEADLINE_MS + 1);
     await p1;
@@ -232,6 +256,7 @@ describe('FollowerForwarder', () => {
   });
 
   it('suspicion expires on its own after the suspect window', async () => {
+    await proveThePort();
     const p1 = forwarder.forward(payload, true);
     vi.advanceTimersByTime(FORWARD_DEADLINE_MS + 1);
     await p1;

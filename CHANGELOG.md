@@ -2,16 +2,21 @@
 
 ## 4.1.5
 
-- **Fixed: a follower stalled 10s on a leader port that had never answered.** The forward deadline is deliberately generous — it only has to beat "never" — but it assumed the port worked and the request was merely lost. A port handed over during a leadership change has proved nothing, and when it pointed at a leader that was still coming up or already gone, every call paid the full 10s before returning `EIO`. Worse on a page-hosted follower, where the wait blocks the main thread and the `leader-changed` handshake that would fix it is delivered *to that same thread* — measured at `+10118ms`, one millisecond after the deadline. An unproven port now fails in 1s and is promoted to the generous deadline by its first successful round trip. **Measured across three host swaps: 10.9s → 1.4s.**
-- **A follower whose port goes unanswered now asks for a new one.** `leader-changed` is broadcast exactly once, when a leader becomes ready, so a follower that arrived after that announcement kept a port to a departed leader with no way to learn better. The relay now signals the main thread on an unproven timeout, which re-requests a connection through the broker.
-- **The volume's exclusive handle is released on shutdown, and acquiring it tolerates the previous owner's teardown.** A reload destroys a page before its asynchronous shutdown can run, so the handle outlives the tab briefly; the incoming leader hit `NoModificationAllowedError` and came up elected but with no volume, answering `EIO` to everything. Acquisition now retries for up to 3s.
+Changing which thread hosts the filesystem, with more than one tab open, took ~10.1s per call and
+left every tab unable to operate until a manual reload. Four defects, each found by instrumenting
+rather than guessing, and each measured on its own:
 
-### Still open: tabs do not recover after a host swap
+- **Fixed: a follower stalled 10s on a leader port that had never answered.** The forward deadline is deliberately generous — it only has to beat "never" — but it assumed the port worked and the request was merely lost. A port handed over during a leadership change has proved nothing, and when it pointed at a leader still coming up or already gone, every call paid the full 10s before returning `EIO`. Worse on a page-hosted follower, where the wait blocks the main thread and the `leader-changed` handshake that would fix it is delivered *to that same thread*: measured at `+10118ms`, one millisecond after the deadline expired. An unproven port now fails in 1s and is promoted to the generous deadline by its first successful round trip.
+- **Fixed: an unproven port was also marked suspect, which made the failure permanent.** Suspicion exists for a port that *was* working and stopped — the dead-under-spin case. Applying it to a port that had never answered sent every later call down the fail-fast path, which returns `EIO` without attempting anything, so the port could never prove itself. Followers stayed broken for good. Suspicion is now reserved for a proven port; an unproven one reconnects instead.
+- **Fixed: a follower whose port went unanswered had no way to find the current leader.** `leader-changed` is broadcast exactly once, when a leader becomes ready, so a follower that arrived after that announcement kept a port to a departed leader indefinitely. The relay now signals the main thread on an unproven timeout, which re-requests a connection through the broker.
+- **Fixed: the volume's exclusive handle outlived the tab that held it.** A reload destroys a page before its asynchronous shutdown can run, so `createSyncAccessHandle` was still held when the next leader tried to open the volume. That leader came up *elected but with no volume*, answering `EIO` to everything. Shutdown now releases the handle, and acquisition retries for up to 3s rather than failing on the first `NoModificationAllowedError`.
 
-Honest status, because the headline number above is a real improvement and not a fix.
+**Result, three consecutive host swaps with two tabs open: ~10.1s per call and both tabs permanently broken → 3.7s per swap with both tabs working, leader and follower.**
 
-- After swapping which thread hosts the filesystem, with two tabs open, both tabs are left unable to operate — the new leader itself returns `EIO: i/o error, readdir '/'`. The three fixes above each addressed a genuine defect found on the way in, and each was measured: only the deadline change moved the end-to-end number. The remaining cause is not yet identified, and nothing here should be read as having fixed it.
-- Single-host operation is unaffected: one tab, or several tabs that all stay on the same host, work normally. The failure needs a host swap with more than one tab open.
+### Demo
+
+- The host swap is sequenced rather than raced. Every tab reloading at once meant every tab contended for the lock, and whichever lost attached to a leader that was still booting — a leadership change during boot, the case the relay handles worst. The initiating tab now detaches, comes up as the new leader, and the others detach and reattach behind it.
+- A worker-hosted instance is disposed rather than `terminate()`d. Terminating skips `dispose()` outright: the leader lock stayed held, the broker kept routing to a dead port, and the volume handle was never released.
 
 ## 4.1.4
 

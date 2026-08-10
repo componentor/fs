@@ -50,6 +50,18 @@ self.onmessage = async (event) => {
     return;
   }
 
+  // A clean shutdown, so the next instance can have the volume.
+  //
+  // This used to be a bare `worker.terminate()` from the page, which skips `dispose()` entirely:
+  // the leader lock stayed held, the service-worker broker kept routing to a dead port, and the
+  // volume's exclusive handle was never released. Swapping host left every tab unable to operate
+  // until a manual reload.
+  if (msg.type === 'dispose') {
+    try { await fs?.dispose(); } catch { /* going away regardless */ }
+    post({ type: 'disposed' });
+    return;
+  }
+
   const { id, op, arg } = msg;
   try {
     post({ id, ok: true, value: await ops[op](arg) });

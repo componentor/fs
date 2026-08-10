@@ -3097,8 +3097,10 @@ var FollowerForwarder = class _FollowerForwarder {
           const r = this.pendingResolve;
           this.pendingResolve = null;
           this.pendingAbandoned = true;
-          this.portSuspectUntil = Date.now() + _FollowerForwarder.SUSPECT_WINDOW_MS;
           const unproven = !this.portProven;
+          if (!unproven) {
+            this.portSuspectUntil = Date.now() + _FollowerForwarder.SUSPECT_WINDOW_MS;
+          }
           r(encodeResponse(STATUS.EIO));
           if (unproven) this.onUnprovenTimeout?.();
         }

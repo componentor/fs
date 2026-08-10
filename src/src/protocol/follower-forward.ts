@@ -169,8 +169,15 @@ export class FollowerForwarder {
           // Keep pendingSeq + mark abandoned so a late echo of this id is
           // recognized as ours and swallowed rather than leaking onward.
           this.pendingAbandoned = true;
-          this.portSuspectUntil = Date.now() + FollowerForwarder.SUSPECT_WINDOW_MS;
           const unproven = !this.portProven;
+          // Suspicion is for a port that *was* working and stopped — the dead-under-spin case.
+          // An unproven port has not failed that way; it has never been given the chance. Marking
+          // it suspect sends every later call down the fail-fast path, which returns EIO without
+          // attempting anything, so the port can never prove itself and the follower stays broken
+          // for good. Reconnect instead, and let the fresh port try on its own merits.
+          if (!unproven) {
+            this.portSuspectUntil = Date.now() + FollowerForwarder.SUSPECT_WINDOW_MS;
+          }
           r(encodeResponse(STATUS.EIO));
           if (unproven) this.onUnprovenTimeout?.();
         }
