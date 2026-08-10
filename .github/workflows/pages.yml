@@ -59,6 +59,11 @@ jobs:
           cp -r demo/. _site/
           mkdir -p _site/vendor
           cp -r dist/. _site/vendor/
+          # The multi-tab broker must sit at the site root. A service worker's scope cannot
+          # exceed its own path unless the server sends `Service-Worker-Allowed`, which Pages
+          # will not — so served from /vendor/workers/ it could never control the page. Copied
+          # to the root, its scope is `/`, and the demo points `swUrl` at it.
+          cp dist/workers/service.worker.js _site/vfs-service-worker.js
           # Pages runs Jekyll by default, which strips files and folders beginning with `_`.
           touch _site/.nojekyll
 
