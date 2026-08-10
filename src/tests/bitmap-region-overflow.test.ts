@@ -180,5 +180,6 @@ describe('bitmap region — no overflow as the FS grows', () => {
       const e2 = internals(e2raw);
       expect(e2.freeBlocks, `seed ${seed} remount`).toBe(clearBits(e2));
     }
-  });
+  }, 60_000);   // ~7s of fuzzing per run, and slower under a loaded suite — the stress test
+                //  above already carries this; this one was missed.
 });

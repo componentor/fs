@@ -447,6 +447,7 @@ describe('childIndex — randomized fuzz vs reference model', () => {
       for (const d of allParents) {
         assertListingMatchesReference(engine, d, `seed ${seed} final sweep`);
       }
-    });
+    }, 60_000);   // 800 ops x 5 seeds: 3-7s each in isolation, more when the suite is
+                  //  running them alongside everything else.
   }
 });
