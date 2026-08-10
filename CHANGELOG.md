@@ -1,5 +1,18 @@
 # Changelog
 
+## 4.1.5
+
+- **Fixed: a follower stalled 10s on a leader port that had never answered.** The forward deadline is deliberately generous — it only has to beat "never" — but it assumed the port worked and the request was merely lost. A port handed over during a leadership change has proved nothing, and when it pointed at a leader that was still coming up or already gone, every call paid the full 10s before returning `EIO`. Worse on a page-hosted follower, where the wait blocks the main thread and the `leader-changed` handshake that would fix it is delivered *to that same thread* — measured at `+10118ms`, one millisecond after the deadline. An unproven port now fails in 1s and is promoted to the generous deadline by its first successful round trip. **Measured across three host swaps: 10.9s → 1.4s.**
+- **A follower whose port goes unanswered now asks for a new one.** `leader-changed` is broadcast exactly once, when a leader becomes ready, so a follower that arrived after that announcement kept a port to a departed leader with no way to learn better. The relay now signals the main thread on an unproven timeout, which re-requests a connection through the broker.
+- **The volume's exclusive handle is released on shutdown, and acquiring it tolerates the previous owner's teardown.** A reload destroys a page before its asynchronous shutdown can run, so the handle outlives the tab briefly; the incoming leader hit `NoModificationAllowedError` and came up elected but with no volume, answering `EIO` to everything. Acquisition now retries for up to 3s.
+
+### Still open: tabs do not recover after a host swap
+
+Honest status, because the headline number above is a real improvement and not a fix.
+
+- After swapping which thread hosts the filesystem, with two tabs open, both tabs are left unable to operate — the new leader itself returns `EIO: i/o error, readdir '/'`. The three fixes above each addressed a genuine defect found on the way in, and each was measured: only the deadline change moved the end-to-end number. The remaining cause is not yet identified, and nothing here should be read as having fixed it.
+- Single-host operation is unaffected: one tab, or several tabs that all stay on the same host, work normally. The failure needs a host swap with more than one tab open.
+
 ## 4.1.4
 
 - **Fixed: a leader never told the service-worker broker it was leaving.** The broker holds one `serverPort` per volume. When a leader disposed or its tab reloaded, that slot kept a *detached* port — and posting to a detached port is a silent no-op per spec, so arriving followers' ports were dropped on the floor instead of being queued. `dispose()` and leadership handover now send `deregister-server`, which clears the slot so arrivals land on the pending queue and the next leader flushes them. The 5s re-registration heartbeat is also stopped on dispose, so a departing leader cannot re-register itself.

@@ -260,7 +260,10 @@ async function drainPortQueueAsync(): Promise<void> {
 // See FollowerForwarder for the reliability contract (no stale-response
 // resolution, EIO instead of infinite hang on a lost response, no blind
 // retry of possibly-applied mutations).
-const forwarder = new FollowerForwarder(() => tabId);
+const forwarder = new FollowerForwarder(() => tabId, undefined, () => {
+  // Ask the main thread for a fresh leader port; see the constructor's note.
+  (self as unknown as Worker).postMessage({ type: 'need-leader' });
+});
 
 // No-SAB mode: async-relay port (for forwarding in follower mode)
 let asyncRelayPort: MessagePort | null = null;
@@ -1033,6 +1036,48 @@ async function followerLoop(): Promise<void> {
 
 const OPFS_SKIP = new Set(['.vfs.bin', '.vfs.bin.tmp']);
 
+/**
+ * Take the volume's exclusive handle, waiting out the previous owner's teardown.
+ *
+ * `createSyncAccessHandle` is exclusive per file, and a context that goes away does not release
+ * its handle instantly — a reload destroys the page before its asynchronous shutdown can run, so
+ * the handle outlives the tab that held it by a short margin. The incoming leader would hit
+ * `NoModificationAllowedError` and come up with no volume at all: elected, but answering `EIO` to
+ * every call. Observed on every host swap in the demo, where both tabs reload at once and the new
+ * leader raced the old one's teardown.
+ *
+ * Retrying briefly is the whole fix. The window is small — the previous owner is already gone,
+ * the browser just has not finished reclaiming — so this returns on the first or second attempt
+ * in practice, and gives up rather than hanging if something genuinely still holds the file.
+ */
+async function openVolumeExclusive(
+  fileHandle: { createSyncAccessHandle(): Promise<any> },
+): Promise<any> {
+  const DEADLINE_MS = 3_000;
+  const RETRY_MS = 50;
+  const started = Date.now();
+  for (;;) {
+    try {
+      return await fileHandle.createSyncAccessHandle();
+    } catch (err) {
+      // Only the exclusivity error is worth waiting on; anything else is a real failure.
+      const name = (err as { name?: string })?.name;
+      if (name !== 'NoModificationAllowedError' && name !== 'InvalidStateError') throw err;
+      if (Date.now() - started >= DEADLINE_MS) throw err;
+      await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
+    }
+  }
+}
+
+/**
+ * The volume's exclusive sync access handle, kept so `shutdown` can hand it back.
+ *
+ * `createSyncAccessHandle` is exclusive per file, and terminating a worker does not release it
+ * promptly. Leaving it held meant the next instance to open this volume — the next leader after a
+ * reload, or any code disposing and reopening a root — waited on a handle nobody would return.
+ */
+let vfsVolumeHandle: { close(): void; flush?(): void } | null = null;
+
 // Chunk size for streamed population of fresh VFS from existing OPFS.
 // Caps peak memory during init at this size per file instead of
 // materializing every OPFS file into the heap simultaneously.
@@ -1210,7 +1255,8 @@ async function initEngine(config: {
 
   // Open VFS binary file with exclusive sync access
   const vfsFileHandle = await rootDir.getFileHandle('.vfs.bin', { create: true });
-  const vfsHandle = await vfsFileHandle.createSyncAccessHandle();
+  const vfsHandle = await openVolumeExclusive(vfsFileHandle);
+  vfsVolumeHandle = vfsHandle;
 
   // Pre-validate vfs.bin BEFORE engine.init() to prevent hangs from corrupt data
   // causing huge allocations or blocking Atomics loops. Throws early so the caller
@@ -1220,6 +1266,7 @@ async function initEngine(config: {
     const validationError = quickValidateVFS(vfsHandle, vfsSize, activeLimits);
     if (validationError) {
       try { vfsHandle.close(); } catch (_) {}
+      vfsVolumeHandle = null;
       throw new Error(`Corrupt VFS: ${validationError}`);
     }
   }
@@ -1860,6 +1907,12 @@ self.onmessage = async (e: MessageEvent) => {
     try { opfsSyncPort?.close(); } catch { /* already closed */ }
     opfsSyncPort = null;
     opfsSyncEnabled = false;
+    // Flush through the engine, then the handle, then release it: the next leader cannot open
+    // this volume until we do, and it must not inherit a half-written one.
+    try { engine.flush(); } catch { /* nothing buffered */ }
+    try { vfsVolumeHandle?.flush?.(); } catch { /* best effort */ }
+    try { vfsVolumeHandle?.close(); } catch { /* already gone */ }
+    vfsVolumeHandle = null;
     (self as unknown as Worker).postMessage({ type: 'shutdown-done' });
     return;
   }

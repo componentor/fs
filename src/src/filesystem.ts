@@ -493,6 +493,12 @@ export class VFSFileSystem {
     // Handle messages from sync-relay
     this.syncWorker.onmessage = (e: MessageEvent) => {
       const msg = e.data;
+      // The relay's port to the leader went unanswered. `leader-changed` is announced once, so a
+      // follower that arrived after the announcement has no other way to find the current leader.
+      if (msg.type === 'need-leader') {
+        if (this.isFollower && !this.closed) this.connectToLeader();
+        return;
+      }
       if (msg.type === 'ready') {
         this.isReady = true;
         this.transitioning = false;

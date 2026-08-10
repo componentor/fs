@@ -32,6 +32,27 @@ import { STATUS, encodeResponse } from './opcodes.js';
  *  in microseconds-to-milliseconds; 10s means a genuinely lost request. */
 export const FORWARD_DEADLINE_MS = 10_000;
 
+/**
+ * Deadline for a port that has never answered.
+ *
+ * The generous deadline above assumes the port works and the request was merely lost. A port that
+ * has not yet completed a single round trip carries no such evidence — and the case that produces
+ * one is a leadership change, where the follower is handed a port to a leader that is still coming
+ * up or already gone.
+ *
+ * That is where the 10s hurt most. A page-hosted follower blocks its main thread while waiting
+ * (`Atomics.wait` is illegal there, so it spins), and the handshake that would reconnect it to the
+ * live leader is delivered *to that same thread* — so the wait blocks the message that would fix
+ * it, and nothing can arrive until the deadline expires. Measured across a leadership change:
+ * `[VFS] Leader changed — reconnecting` landed at +10118ms, one millisecond after the deadline.
+ *
+ * Failing an unproven port quickly returns the thread to the event loop, the reconnect lands, and
+ * the caller's next call goes to the real leader. The first call after a leadership change still
+ * fails — the outcome is genuinely unknown, and EIO is the honest answer — but it costs a beat
+ * instead of ten seconds, and the one after it succeeds.
+ */
+export const UNPROVEN_DEADLINE_MS = 1_000;
+
 /** Minimal structural type so tests can use fake ports. */
 export interface LeaderPortLike {
   postMessage(message: unknown, transfer?: Transferable[]): void;
@@ -49,10 +70,22 @@ export class FollowerForwarder {
   private pendingAbandoned = false;
   private seqCounter = 0;
   private timer: ReturnType<typeof setTimeout> | null = null;
+  /** Cleared whenever the port is replaced; set by the first response it delivers. */
+  private portProven = false;
 
   constructor(
     private readonly getTabId: () => string,
     private readonly deadlineMs: number = FORWARD_DEADLINE_MS,
+    /**
+     * Called when an unproven port misses its deadline — the port is pointing at a leader that
+     * never answered, so the follower needs a fresh one.
+     *
+     * `leader-changed` is broadcast exactly once, when a leader becomes ready. A follower that
+     * arrives after that announcement never hears it, so it keeps a port to a leader that has
+     * gone and has no way to learn better. Asking for a new connection on failure is what closes
+     * that loop: the broker queues the request and the next leader flushes it.
+     */
+    private readonly onUnprovenTimeout?: () => void,
   ) {}
 
   get hasPort(): boolean {
@@ -66,6 +99,8 @@ export class FollowerForwarder {
       this.abortPending();
     }
     this.port = port;
+    // A new port has proved nothing yet, whatever the old one managed.
+    this.portProven = false;
   }
 
   /** Post a non-tracked message on the leader port (no-SAB async relay path). */
@@ -125,6 +160,7 @@ export class FollowerForwarder {
 
       this.port!.postMessage({ id: seq, tabId: this.getTabId(), buffer: buf }, [buf]);
 
+      const deadline = this.portProven ? this.deadlineMs : UNPROVEN_DEADLINE_MS;
       this.timer = setTimeout(() => {
         this.timer = null;
         if (this.pendingSeq === seq && this.pendingResolve) {
@@ -134,9 +170,11 @@ export class FollowerForwarder {
           // recognized as ours and swallowed rather than leaking onward.
           this.pendingAbandoned = true;
           this.portSuspectUntil = Date.now() + FollowerForwarder.SUSPECT_WINDOW_MS;
+          const unproven = !this.portProven;
           r(encodeResponse(STATUS.EIO));
+          if (unproven) this.onUnprovenTimeout?.();
         }
-      }, this.deadlineMs);
+      }, deadline);
     });
   }
 
@@ -148,8 +186,10 @@ export class FollowerForwarder {
    */
   handleResponse(id: unknown, buffer: ArrayBuffer): boolean {
     // Any delivery proves the port works — clear the dead-under-spin
-    // suspicion so sync requests resume attempting.
+    // suspicion so sync requests resume attempting, and promote the port off
+    // the short unproven deadline onto the generous one.
     this.portSuspectUntil = 0;
+    this.portProven = true;
     if (id === this.pendingSeq) {
       if (this.pendingResolve) {
         this.clearTimer();

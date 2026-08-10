@@ -3017,10 +3017,12 @@ function decodeSecondPath(data) {
 
 // src/protocol/follower-forward.ts
 var FORWARD_DEADLINE_MS = 1e4;
+var UNPROVEN_DEADLINE_MS = 1e3;
 var FollowerForwarder = class _FollowerForwarder {
-  constructor(getTabId, deadlineMs = FORWARD_DEADLINE_MS) {
+  constructor(getTabId, deadlineMs = FORWARD_DEADLINE_MS, onUnprovenTimeout) {
     this.getTabId = getTabId;
     this.deadlineMs = deadlineMs;
+    this.onUnprovenTimeout = onUnprovenTimeout;
   }
   port = null;
   pendingResolve = null;
@@ -3030,6 +3032,8 @@ var FollowerForwarder = class _FollowerForwarder {
   pendingAbandoned = false;
   seqCounter = 0;
   timer = null;
+  /** Cleared whenever the port is replaced; set by the first response it delivers. */
+  portProven = false;
   get hasPort() {
     return this.port !== null;
   }
@@ -3040,6 +3044,7 @@ var FollowerForwarder = class _FollowerForwarder {
       this.abortPending();
     }
     this.port = port;
+    this.portProven = false;
   }
   /** Post a non-tracked message on the leader port (no-SAB async relay path). */
   postRaw(message, transfer) {
@@ -3085,6 +3090,7 @@ var FollowerForwarder = class _FollowerForwarder {
       this.pendingResolve = resolve;
       const buf = payload.buffer.byteLength === payload.byteLength ? payload.buffer : payload.slice().buffer;
       this.port.postMessage({ id: seq, tabId: this.getTabId(), buffer: buf }, [buf]);
+      const deadline = this.portProven ? this.deadlineMs : UNPROVEN_DEADLINE_MS;
       this.timer = setTimeout(() => {
         this.timer = null;
         if (this.pendingSeq === seq && this.pendingResolve) {
@@ -3092,9 +3098,11 @@ var FollowerForwarder = class _FollowerForwarder {
           this.pendingResolve = null;
           this.pendingAbandoned = true;
           this.portSuspectUntil = Date.now() + _FollowerForwarder.SUSPECT_WINDOW_MS;
+          const unproven = !this.portProven;
           r(encodeResponse(STATUS.EIO));
+          if (unproven) this.onUnprovenTimeout?.();
         }
-      }, this.deadlineMs);
+      }, deadline);
     });
   }
   /**
@@ -3105,6 +3113,7 @@ var FollowerForwarder = class _FollowerForwarder {
    */
   handleResponse(id, buffer) {
     this.portSuspectUntil = 0;
+    this.portProven = true;
     if (id === this.pendingSeq) {
       if (this.pendingResolve) {
         this.clearTimer();
@@ -3656,7 +3665,9 @@ async function drainPortQueueAsync() {
     msg.port.postMessage({ id: msg.id, buffer: response }, [response]);
   }
 }
-var forwarder = new FollowerForwarder(() => tabId);
+var forwarder = new FollowerForwarder(() => tabId, void 0, () => {
+  self.postMessage({ type: "need-leader" });
+});
 var asyncRelayPort = null;
 function forwardToLeader(payload) {
   return forwarder.forward(payload);
@@ -4258,6 +4269,22 @@ async function followerLoop() {
   }
 }
 var OPFS_SKIP = /* @__PURE__ */ new Set([".vfs.bin", ".vfs.bin.tmp"]);
+async function openVolumeExclusive(fileHandle) {
+  const DEADLINE_MS = 3e3;
+  const RETRY_MS = 50;
+  const started = Date.now();
+  for (; ; ) {
+    try {
+      return await fileHandle.createSyncAccessHandle();
+    } catch (err) {
+      const name = err?.name;
+      if (name !== "NoModificationAllowedError" && name !== "InvalidStateError") throw err;
+      if (Date.now() - started >= DEADLINE_MS) throw err;
+      await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
+    }
+  }
+}
+var vfsVolumeHandle = null;
 var OPFS_POPULATE_CHUNK = 2 * 1024 * 1024;
 async function populateVFSFromOPFS(dir, prefix) {
   const subdirs = [];
@@ -4366,7 +4393,8 @@ async function initEngine(config) {
     }
   }
   const vfsFileHandle = await rootDir.getFileHandle(".vfs.bin", { create: true });
-  const vfsHandle = await vfsFileHandle.createSyncAccessHandle();
+  const vfsHandle = await openVolumeExclusive(vfsFileHandle);
+  vfsVolumeHandle = vfsHandle;
   const vfsSize = vfsHandle.getSize();
   if (vfsSize > 0) {
     const validationError = quickValidateVFS(vfsHandle, vfsSize, activeLimits);
@@ -4375,6 +4403,7 @@ async function initEngine(config) {
         vfsHandle.close();
       } catch (_) {
       }
+      vfsVolumeHandle = null;
       throw new Error(`Corrupt VFS: ${validationError}`);
     }
   }
@@ -4813,6 +4842,19 @@ self.onmessage = async (e) => {
     }
     opfsSyncPort = null;
     opfsSyncEnabled = false;
+    try {
+      engine.flush();
+    } catch {
+    }
+    try {
+      vfsVolumeHandle?.flush?.();
+    } catch {
+    }
+    try {
+      vfsVolumeHandle?.close();
+    } catch {
+    }
+    vfsVolumeHandle = null;
     self.postMessage({ type: "shutdown-done" });
     return;
   }
