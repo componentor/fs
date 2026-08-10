@@ -35,8 +35,18 @@ self.onmessage = async (event) => {
       fs.onLeaderChange((isLeader) => post({ type: 'role', isLeader }));
 
       try {
+        // `seq` is the diagnostic: it is stamped where the watcher actually fires, so a gap in
+        // the numbers the page sees means the message was lost between here and there, while a
+        // sequence that simply stops means the watcher itself went quiet. Those are different
+        // bugs and the symptom — a tab that stops seeing changes — looks identical for both.
+        let watchSeq = 0;
         fs.watch('/', { recursive: true }, (eventType, filename) => {
-          post({ type: 'watch', eventType, filename: filename ? String(filename) : null });
+          post({
+            type: 'watch',
+            seq: ++watchSeq,
+            eventType,
+            filename: filename ? String(filename) : null,
+          });
         });
         post({ type: 'watching', ok: true });
       } catch (err) {

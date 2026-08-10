@@ -486,7 +486,36 @@ Close the leader tab and watch a follower take over: the badge above changes wit
     let call;
 
     /** Shared by both hosts — the UI does not care which one produced the event. */
-    function onWatch(eventType, filename) {
+    /**
+     * Watch diagnostics, per tab.
+     *
+     * `fired` is stamped where the watcher fires, `received` is counted here, and `redraws`
+     * counts listings actually painted. A tab that has stopped following the filesystem is then
+     * self-diagnosing rather than a mystery: no events at all means the watcher went quiet, a gap
+     * between fired and received means messages were lost in transit, and events without redraws
+     * means delivery is fine and the repaint is what broke.
+     */
+    const watchStats = { received: 0, redraws: 0, gaps: 0, lastSeq: 0 };
+    function renderWatchPill(ok = true) {
+      const pill = $('watchPill');
+      if (!ok) { pill.textContent = 'watch unavailable'; return; }
+      pill.className = 'pill live';
+      pill.textContent = `live · ${watchStats.received} ev · ${watchStats.redraws} draws`
+        + (watchStats.gaps ? ` · ${watchStats.gaps} LOST` : '');
+      pill.title = watchStats.gaps
+        ? `${watchStats.gaps} watch message(s) never arrived — lost between the watcher and this page.`
+        : 'Watch events received, and listings redrawn, since this tab loaded.';
+    }
+
+    function onWatch(eventType, filename, seq) {
+      watchStats.received++;
+      if (typeof seq === 'number') {
+        if (watchStats.lastSeq && seq > watchStats.lastSeq + 1) {
+          watchStats.gaps += seq - watchStats.lastSeq - 1;
+        }
+        watchStats.lastSeq = seq;
+      }
+      renderWatchPill();
       log(`watch: ${eventType} ${filename ?? ''}`);
       scheduleRender();
       if (filename && filename.includes('tab-ping')) {
@@ -494,10 +523,7 @@ Close the leader tab and watch a follower take over: the badge above changes wit
           + new Date().toLocaleTimeString() + '.';
       }
     }
-    function onWatching(ok) {
-      $('watchPill').textContent = ok ? 'live' : 'watch unavailable';
-      if (ok) $('watchPill').className = 'pill live';
-    }
+    function onWatching(ok) { renderWatchPill(ok); }
     function onRole(leading) { isLeader = leading; renderRole(); }
     /** Progress emitted by a long-running op, from whichever host is running it. */
     function onEmit(event) {
@@ -525,7 +551,7 @@ Close the leader tab and watch a follower take over: the badge above changes wit
         if (data.type === 'ready') { onReady(data); return; }
         if (data.type === 'role') { onRole(data.isLeader); return; }
         if (data.type === 'watching') { onWatching(data.ok); return; }
-        if (data.type === 'watch') { onWatch(data.eventType, data.filename); return; }
+        if (data.type === 'watch') { onWatch(data.eventType, data.filename, data.seq); return; }
         if (data.type === 'clone-progress' || data.type === 'clone-message') { onEmit(data); return; }
         const entry = pending.get(data.id);
         if (!entry) return;
@@ -551,8 +577,9 @@ Close the leader tab and watch a follower take over: the badge above changes wit
         onRole(fs.isLeader);
         fs.onLeaderChange(onRole);
         try {
+          let watchSeq = 0;
           fs.watch('/', { recursive: true }, (eventType, filename) => {
-            onWatch(eventType, filename ? String(filename) : null);
+            onWatch(eventType, filename ? String(filename) : null, ++watchSeq);
           });
           onWatching(true);
         } catch { onWatching(false); }
@@ -618,6 +645,8 @@ Close the leader tab and watch a follower take over: the badge above changes wit
       $('btnUp').disabled = cwd === '/';
       emptyEl.style.display = entries.length ? 'none' : 'block';
 
+      watchStats.redraws++;
+      renderWatchPill();
       rowsEl.replaceChildren(...entries.map((entry) => {
         const full = join(cwd, entry.name);
         const tr = document.createElement('tr');
