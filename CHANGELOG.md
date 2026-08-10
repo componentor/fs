@@ -1,9 +1,6 @@
 # Changelog
 
-## Unreleased
-
-Nothing here has been published. The version in `package.json` stays at the last
-released one; a number gets chosen at release time, not before.
+## 4.1.6
 
 - **Fixed: a tab could register no watcher at all and stay deaf to every change for the rest of its life.** `fs.watch` checks the path exists before registering, so a mistyped path throws instead of handing back a watcher that can never fire. That check is a synchronous call, and it is the *first* one a tab makes — and a follower whose leader port has not yet proved itself refuses such a call quickly with `EIO`, deliberately, because 4.1.5 replaced a ten-second stall with exactly that. So a tab that lost the election had this one check refused, threw out of `watch()` before registering anything, and never saw another change. `EIO` is the transport declining to answer rather than a fact about the path, and is no longer treated as one; `ENOENT` still throws.
 - **Measured, four tabs each writing in turn:** roughly one tab in sixteen went deaf before the fix (3 of 48, 4 of 56, 6 of 64 across runs); after it, 0 of 144.
