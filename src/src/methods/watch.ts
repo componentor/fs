@@ -46,12 +46,27 @@ const fileWatchers = new Map<string, Set<WatchFileEntry>>();
 // Lazy BroadcastChannel with ref counting, per namespace
 const bcMap = new Map<string, { bc: BroadcastChannel; refCount: number }>();
 
+/** Whether any watcher in this context still depends on `ns`'s channel. */
+function hasLiveWatchers(ns: string): boolean {
+  for (const entry of watchers) if (entry.ns === ns) return true;
+  for (const set of fileWatchers.values()) {
+    for (const entry of set) if (entry.ns === ns) return true;
+  }
+  return false;
+}
+
 function ensureBc(ns: string): void {
-  const entry = bcMap.get(ns);
-  if (entry) { entry.refCount++; return; }
-  const bc = new BroadcastChannel(`${ns}-watch`);
-  bcMap.set(ns, { bc, refCount: 1 });
-  bc.onmessage = onBroadcast;
+  let entry = bcMap.get(ns);
+  if (!entry) {
+    entry = { bc: new BroadcastChannel(`${ns}-watch`), refCount: 0 };
+    bcMap.set(ns, entry);
+  }
+  entry.refCount++;
+  // Reattached every time, not only on creation. A handler that has been detached — or a channel
+  // reused through a path that never attached one — leaves the tab deaf while every other tab
+  // keeps working, and nothing about the symptom points here. Assigning an identical handler is
+  // idempotent, so paying for it on every registration costs nothing.
+  entry.bc.onmessage = onBroadcast;
 }
 
 function releaseBc(ns: string): void {
@@ -61,10 +76,17 @@ function releaseBc(ns: string): void {
   // watcher in this context, and the symptom (a tab that stops seeing changes) points nowhere
   // near the cause.
   if (entry.refCount <= 0) return;
-  if (--entry.refCount <= 0) {
-    entry.bc.close();
-    bcMap.delete(ns);
+  entry.refCount--;
+  if (entry.refCount > 0) return;
+  // The refcount says nobody is left; the registry is what actually knows. If they disagree, the
+  // registry wins — closing a channel that a live watcher still needs is the failure this whole
+  // guard exists to prevent, and an over-retained channel is merely a channel.
+  if (hasLiveWatchers(ns)) {
+    entry.refCount = 1;
+    return;
   }
+  entry.bc.close();
+  bcMap.delete(ns);
 }
 
 // ========== BroadcastChannel handler ==========

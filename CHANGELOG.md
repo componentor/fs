@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.1.7
+
+- **Fixed: a tab could go deaf to watch events while every other tab kept working.** Isolated with a raw `BroadcastChannel` opened alongside the library's: the browser delivered every message to the affected tab (`raw: 4, 4, 4, 4`) while the library's watcher counted zero. So delivery was never the problem — the shared channel was being left without a handler, or closed, while a watcher was still registered on it. Two changes make that impossible rather than unlikely:
+  - `ensureBc` reattaches `onmessage` on every registration instead of only when it creates the channel, so a detached handler cannot survive.
+  - `releaseBc` consults the watcher registry before closing. If the refcount says nobody is left but a live watcher disagrees, the registry wins: closing a channel a watcher still needs is the failure being prevented, while an over-retained channel is merely a channel.
+- The intermittency is what made this expensive to find. Four tabs, each writing in turn, reproduced it in two runs of three before the fix and not in four of five after — a race at registration, not a deterministic break, and the surviving symptom (a tab that silently stops seeing changes) points nowhere near the cause.
+
 ## 4.1.6
 
 - **Fixed: tearing a watcher down twice closed the broadcast channel other watchers were using.** Every `fs.watch` in a context shares one `BroadcastChannel`, refcounted. Closing released, an `AbortSignal` firing released again, and `close()` is callable repeatedly — so a single watcher could give back more references than it took. When the count hit zero with watchers still registered, the channel closed underneath them and they stopped receiving events permanently. A watcher now releases exactly once however many times it is torn down, and `releaseBc` refuses to decrement past zero.

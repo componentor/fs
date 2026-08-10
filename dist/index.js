@@ -3118,24 +3118,34 @@ function format(obj) {
 var watchers = /* @__PURE__ */ new Set();
 var fileWatchers = /* @__PURE__ */ new Map();
 var bcMap = /* @__PURE__ */ new Map();
-function ensureBc(ns) {
-  const entry = bcMap.get(ns);
-  if (entry) {
-    entry.refCount++;
-    return;
+function hasLiveWatchers(ns) {
+  for (const entry of watchers) if (entry.ns === ns) return true;
+  for (const set of fileWatchers.values()) {
+    for (const entry of set) if (entry.ns === ns) return true;
   }
-  const bc = new BroadcastChannel(`${ns}-watch`);
-  bcMap.set(ns, { bc, refCount: 1 });
-  bc.onmessage = onBroadcast;
+  return false;
+}
+function ensureBc(ns) {
+  let entry = bcMap.get(ns);
+  if (!entry) {
+    entry = { bc: new BroadcastChannel(`${ns}-watch`), refCount: 0 };
+    bcMap.set(ns, entry);
+  }
+  entry.refCount++;
+  entry.bc.onmessage = onBroadcast;
 }
 function releaseBc(ns) {
   const entry = bcMap.get(ns);
   if (!entry) return;
   if (entry.refCount <= 0) return;
-  if (--entry.refCount <= 0) {
-    entry.bc.close();
-    bcMap.delete(ns);
+  entry.refCount--;
+  if (entry.refCount > 0) return;
+  if (hasLiveWatchers(ns)) {
+    entry.refCount = 1;
+    return;
   }
+  entry.bc.close();
+  bcMap.delete(ns);
 }
 function onBroadcast(event) {
   const { eventType, path: mutatedPath } = event.data;
