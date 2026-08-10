@@ -457,44 +457,84 @@ This runs a page-hosted instance right here and times it.</pre>
     const fmt = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
     const join = (dir, name) => (dir === '/' ? '' : dir) + '/' + name;
 
-    // ── the worker, and the RPC to it ───────────────────────────────────────────
+    // ── whichever host owns the filesystem ──────────────────────────────────────
+    //
+    // Off WebKit the page owns it directly. `readFileSync` on a page's main thread, no worker,
+    // no await, is the claim this library makes — so the demo makes it, rather than hiding
+    // behind a worker and asserting it would work. On WebKit a main-thread sync call busy-spins,
+    // starves the worker it is waiting on and sits until the 30s stall guard, so there the
+    // worker is the default. One preference, and the file browser and the benchmark both follow
+    // it; the operations themselves are identical either way (ops.js).
+    const webkitLike = /^((?!chrome|android|crios|fxios).)*safari/i.test(navigator.userAgent);
+    const hostPref = localStorage.getItem('vfs-demo-host');
+    const useWorker = hostPref ? hostPref === 'worker' : webkitLike;
 
-    const worker = new Worker(new URL('./fs-worker.js', import.meta.url), { type: 'module' });
-    let nextId = 1;
-    const pending = new Map();
     let onReady;
     const ready = new Promise((resolve) => { onReady = resolve; });
+    let call;
 
-    function call(op, arg, transfer) {
-      const id = nextId++;
-      return new Promise((resolve, reject) => {
+    /** Shared by both hosts — the UI does not care which one produced the event. */
+    function onWatch(eventType, filename) {
+      log(`watch: ${eventType} ${filename ?? ''}`);
+      scheduleRender();
+      if (filename && filename.includes('tab-ping')) {
+        $('tabLog').textContent = `Another tab wrote ${filename} — picked up here automatically at `
+          + new Date().toLocaleTimeString() + '.';
+      }
+    }
+    function onWatching(ok) {
+      $('watchPill').textContent = ok ? 'live' : 'watch unavailable';
+      if (ok) $('watchPill').className = 'pill live';
+    }
+    function onRole(leading) { isLeader = leading; renderRole(); }
+
+    let worker = null;
+    if (useWorker) {
+      worker = new Worker(new URL('./fs-worker.js', import.meta.url), { type: 'module' });
+      let nextId = 1;
+      const pending = new Map();
+
+      call = (op, arg, transfer) => new Promise((resolve, reject) => {
+        const id = nextId++;
         pending.set(id, { resolve, reject });
         worker.postMessage({ id, op, arg }, transfer ?? []);
       });
+
+      worker.onmessage = ({ data }) => {
+        if (data.type === 'ready') { onReady(data); return; }
+        if (data.type === 'role') { onRole(data.isLeader); return; }
+        if (data.type === 'watching') { onWatching(data.ok); return; }
+        if (data.type === 'watch') { onWatch(data.eventType, data.filename); return; }
+        const entry = pending.get(data.id);
+        if (!entry) return;
+        pending.delete(data.id);
+        data.ok ? entry.resolve(data.value)
+          : entry.reject(Object.assign(new Error(data.error), { code: data.code }));
+      };
     }
 
-    worker.onmessage = ({ data }) => {
-      if (data.type === 'ready') { onReady(data); return; }
-      if (data.type === 'role') { isLeader = data.isLeader; renderRole(); return; }
-      if (data.type === 'watching') {
-        $('watchPill').textContent = data.ok ? 'live' : 'watch unavailable';
-        if (data.ok) $('watchPill').className = 'pill live';
-        return;
+    /** Page-hosted: no RPC at all, the calls happen right here on the main thread. */
+    async function startOnThisThread() {
+      const { VFSFileSystem } = await import('./vendor/index.js');
+      const { createOps } = await import('./ops.js');
+      try {
+        const fs = new VFSFileSystem({ root: '/demo' });
+        await fs.init();
+        const ops = createOps(fs);
+        call = async (op, arg) => ops[op](arg);
+        onRole(fs.isLeader);
+        fs.onLeaderChange(onRole);
+        try {
+          fs.watch('/', { recursive: true }, (eventType, filename) => {
+            onWatch(eventType, filename ? String(filename) : null);
+          });
+          onWatching(true);
+        } catch { onWatching(false); }
+        onReady({ isLeader: fs.isLeader });
+      } catch (err) {
+        onReady({ error: err.message });
       }
-      if (data.type === 'watch') {
-        log(`watch: ${data.eventType} ${data.filename ?? ''}`);
-        scheduleRender();
-        if (data.filename && data.filename.includes('tab-ping')) {
-          $('tabLog').textContent = `Another tab wrote ${data.filename} — picked up here automatically at `
-            + new Date().toLocaleTimeString() + '.';
-        }
-        return;
-      }
-      const entry = pending.get(data.id);
-      if (!entry) return;
-      pending.delete(data.id);
-      data.ok ? entry.resolve(data.value) : entry.reject(Object.assign(new Error(data.error), { code: data.code }));
-    };
+    }
 
     // ── file browser ────────────────────────────────────────────────────────────
 
@@ -639,11 +679,16 @@ This runs a page-hosted instance right here and times it.</pre>
     // ── boot ────────────────────────────────────────────────────────────────────
 
     (async function start() {
-      // The bridge lets the worker reach `navigator.serviceWorker`, which worker scopes on Safari and
-      // Firefox cannot. `ns` is `vfs-${root}` with every non-alphanumeric replaced by `_`.
-      const channel = new MessageChannel();
-      createServiceWorkerBridge(channel.port1, { ns: 'vfs-_demo', swUrl: './vfs-service-worker.js' });
-      worker.postMessage({ type: 'init', swBridge: channel.port2 }, [channel.port2]);
+      if (useWorker) {
+        // The bridge lets the worker reach `navigator.serviceWorker`, which worker scopes on
+        // Safari and Firefox cannot. `ns` is `vfs-${root}` with every non-alphanumeric as `_`.
+        const channel = new MessageChannel();
+        createServiceWorkerBridge(channel.port1, { ns: 'vfs-_demo', swUrl: './vfs-service-worker.js' });
+        worker.postMessage({ type: 'init', swBridge: channel.port2 }, [channel.port2]);
+      } else {
+        // A page reaches `navigator.serviceWorker` on its own; no bridge needed.
+        startOnThisThread();
+      }
 
       const boot = await ready;
       if (boot.error) {
@@ -654,10 +699,23 @@ This runs a page-hosted instance right here and times it.</pre>
 
       const b = $('banner');
       b.className = 'banner ok';
-      b.innerHTML = '<strong>Filesystem running in a worker.</strong> Every listing below comes from '
-        + '<code>readdirSync</code> and <code>statSync</code> called with no <code>await</code> — '
-        + 'inside the worker, where the blocking wait is a real <code>Atomics.wait</code>. That is the '
-        + 'arrangement Safari needs; on a page main thread a sync call there can stall for 30 seconds.';
+      const other = useWorker ? 'page' : 'worker';
+      b.innerHTML = (useWorker
+        ? '<strong>Filesystem running in a worker.</strong> Every listing below comes from '
+          + '<code>readdirSync</code> and <code>statSync</code> called with no <code>await</code> — '
+          + 'inside the worker, where the blocking wait is a real <code>Atomics.wait</code>. That is '
+          + 'the arrangement Safari needs; on a page main thread a sync call there can stall for 30 '
+          + 'seconds.'
+        : '<strong>Filesystem running on this page\'s main thread.</strong> Every listing below comes '
+          + 'from <code>readdirSync</code> and <code>statSync</code> called directly here, with no '
+          + 'worker and no <code>await</code>. Safari is the exception — there a main-thread sync '
+          + 'call busy-spins and can stall for 30 seconds, so it defaults to a worker.')
+        + ` <a href="#" id="switchHost">Run it in the ${other} instead →</a>`;
+      $('switchHost').onclick = (e) => {
+        e.preventDefault();
+        localStorage.setItem('vfs-demo-host', useWorker ? 'page' : 'worker');
+        location.reload();
+      };
 
       isLeader = boot.isLeader;
       renderRole();
@@ -698,6 +756,7 @@ This runs a page-hosted instance right here and times it.</pre>
         // a follower tab measure ~60 ms per write.
         renderSuspended = true;
         $('benchRows').innerHTML = '<tr><td colspan="3" style="padding:1rem .9rem">Running…</td></tr>';
+        if (!useWorker) await new Promise((r) => setTimeout(r, 50));   // paint before we block
         try {
           const { rows, isLeader: wasLeader } = await call('bench');
           $('benchRows').replaceChildren(...rows.map((r) => {
@@ -706,7 +765,8 @@ This runs a page-hosted instance right here and times it.</pre>
               + `<td class="n mono">${r.ops.toLocaleString()}/s</td>`;
             return tr;
           }));
-          $('benchNote').textContent = 'sync API · in a worker · ' + (wasLeader ? 'leader' : 'follower');
+          $('benchNote').textContent = 'sync API · ' + (useWorker ? 'in a worker' : 'on this thread')
+            + ' · ' + (wasLeader ? 'leader' : 'follower');
         } catch (err) {
           log('benchmark failed:', err.message);
         }
@@ -721,13 +781,27 @@ This runs a page-hosted instance right here and times it.</pre>
       // boot path on WebKit, where a main-thread sync call busy-spins (Atomics.wait is illegal
       // there), starves the worker's continuations and sits until the 30s stall guard. So it runs
       // when asked, on its own volume, and reports what actually happened.
-      const webkitLike = /^((?!chrome|android|crios|fxios).)*safari/i.test(navigator.userAgent);
       if (webkitLike) {
         $('mtPill').textContent = 'expect a freeze';
         $('btnMain').textContent = 'Run anyway (freezes this tab)';
       }
 
       let mainFs = null;
+      /** The page-hosted instance, built once and kept — see the note in the click handler. */
+      const ensureMainFs = async () => {
+        if (mainFs) return mainFs;
+        const { VFSFileSystem } = await import('./vendor/index.js');
+        // Its own volume, so it does not join the election for the one the worker owns — which
+        // also means it benchmarks as a leader, comparable with the worker's leader numbers.
+        mainFs = new VFSFileSystem({ root: '/demo-main-thread' });
+        await mainFs.init();
+        return mainFs;
+      };
+      if (!useWorker) {
+        $('mtPill').textContent = 'already here';
+        $('mtOut').textContent = 'The file browser above is already running on this thread — this '
+          + 'panel repeats the point on a volume of its own, so you can see the calls in isolation.';
+      }
       $('btnMain').onclick = async () => {
         $('btnMain').disabled = true;
         $('mtPill').textContent = 'running…';
@@ -738,16 +812,11 @@ This runs a page-hosted instance right here and times it.</pre>
         await new Promise((r) => setTimeout(r, 50));   // let the UI paint before we block it
 
         try {
-          const { VFSFileSystem } = await import('./vendor/index.js');
           // Built once and kept. It used to be constructed and disposed per click, which froze
           // the tab for 30s from the second click on: a disposed instance does not release its
           // exclusive handle on the volume, so reopening the same volume waits on a handle
           // nobody will give back. Keeping one instance is what an app would do anyway.
-          if (!mainFs) {
-            // Its own volume, so it does not join the election for the one the worker owns.
-            mainFs = new VFSFileSystem({ root: '/demo-main-thread' });
-            await mainFs.init();
-          }
+          await ensureMainFs();
 
           const t0 = performance.now();
           mainFs.mkdirSync('/notes', { recursive: true });
