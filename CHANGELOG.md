@@ -1,20 +1,19 @@
 # Changelog
 
-## 4.1.8
+## Unreleased
+
+Nothing here has been published. The version in `package.json` stays at the last
+released one; a number gets chosen at release time, not before.
 
 - **Fixed: a tab could register no watcher at all and stay deaf to every change for the rest of its life.** `fs.watch` checks the path exists before registering, so a mistyped path throws instead of handing back a watcher that can never fire. That check is a synchronous call, and it is the *first* one a tab makes — and a follower whose leader port has not yet proved itself refuses such a call quickly with `EIO`, deliberately, because 4.1.5 replaced a ten-second stall with exactly that. So a tab that lost the election had this one check refused, threw out of `watch()` before registering anything, and never saw another change. `EIO` is the transport declining to answer rather than a fact about the path, and is no longer treated as one; `ENOENT` still throws.
 - **Measured, four tabs each writing in turn:** roughly one tab in sixteen went deaf before the fix (3 of 48, 4 of 56, 6 of 64 across runs); after it, 0 of 144.
 
 How it was found is worth recording, because three earlier attempts missed it. A raw `BroadcastChannel` opened beside the library's in every tab proved the browser delivered to the deaf tab while the library's watcher counted zero — which ruled out transmission, leadership and delivery in one measurement. Instrumenting the release path proved the entry was never removed, ruling out the refcount fixes in 4.1.6 and 4.1.7. Counters on `globalThis`, read directly rather than through console capture, then showed the deaf tab recording `watchCalled: 1` and no `ensureBc` — `watch()` entered and left before registering, which left exactly one statement it could have thrown from.
 
-## 4.1.7
-
 - **Fixed: a tab could go deaf to watch events while every other tab kept working.** Isolated with a raw `BroadcastChannel` opened alongside the library's: the browser delivered every message to the affected tab (`raw: 4, 4, 4, 4`) while the library's watcher counted zero. So delivery was never the problem — the shared channel was being left without a handler, or closed, while a watcher was still registered on it. Two changes make that impossible rather than unlikely:
   - `ensureBc` reattaches `onmessage` on every registration instead of only when it creates the channel, so a detached handler cannot survive.
   - `releaseBc` consults the watcher registry before closing. If the refcount says nobody is left but a live watcher disagrees, the registry wins: closing a channel a watcher still needs is the failure being prevented, while an over-retained channel is merely a channel.
 - The intermittency is what made this expensive to find. Four tabs, each writing in turn, reproduced it in two runs of three before the fix and not in four of five after — a race at registration, not a deterministic break, and the surviving symptom (a tab that silently stops seeing changes) points nowhere near the cause.
-
-## 4.1.6
 
 - **Fixed: tearing a watcher down twice closed the broadcast channel other watchers were using.** Every `fs.watch` in a context shares one `BroadcastChannel`, refcounted. Closing released, an `AbortSignal` firing released again, and `close()` is callable repeatedly — so a single watcher could give back more references than it took. When the count hit zero with watchers still registered, the channel closed underneath them and they stopped receiving events permanently. A watcher now releases exactly once however many times it is torn down, and `releaseBc` refuses to decrement past zero.
 
