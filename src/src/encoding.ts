@@ -199,10 +199,36 @@ export function decodeBuffer(data: Uint8Array, encoding: string): string {
       return hex;
     }
 
-    case 'utf16le':
+    case 'utf16le': {
       // Node drops a trailing odd byte rather than emitting a replacement character.
-      return utf16Decoder.decode(data.length & 1 ? data.subarray(0, data.length - 1) : data);
+      const even = data.length & 1 ? data.subarray(0, data.length - 1) : data;
+      const decoded = utf16Decoder.decode(even);
+      // `TextDecoder` follows the WHATWG rule and replaces an unpaired surrogate with U+FFFD.
+      // `Buffer.toString('utf16le')` does not — it hands back the code unit untouched — so a
+      // file holding a lone surrogate read back mangled. Only re-decode when a U+FFFD actually
+      // appeared, which keeps the fast native path for the overwhelmingly common case.
+      return decoded.includes('�') ? utf16leRaw(even) : decoded;
+    }
   }
+}
+
+/**
+ * UTF-16LE with no validation, matching `Buffer.toString('utf16le')`.
+ *
+ * Code units are copied straight through, so unpaired surrogates survive instead of collapsing
+ * to U+FFFD. Chunked because `String.fromCharCode.apply` blows the argument limit on large
+ * inputs.
+ */
+function utf16leRaw(data: Uint8Array): string {
+  const units = new Uint16Array(data.length >> 1);
+  for (let i = 0; i < units.length; i++) units[i] = data[i * 2] | (data[i * 2 + 1] << 8);
+  const CHUNK = 8192;
+  if (units.length <= CHUNK) return String.fromCharCode(...units);
+  let out = '';
+  for (let i = 0; i < units.length; i += CHUNK) {
+    out += String.fromCharCode(...units.subarray(i, i + CHUNK));
+  }
+  return out;
 }
 
 /**

@@ -14,91 +14,101 @@ import { streamWriteAfterEnd } from './errors.js';
 
 type Listener = (...args: unknown[]) => void;
 
-export class SimpleEventEmitter {
-  private _listeners = new Map<string, Listener[]>();
-  private _onceSet = new WeakSet<Listener>();
+/** One registration. `once` is per-registration, not per-function — see {@link SimpleEventEmitter}. */
+interface Registration {
+  fn: Listener;
+  once: boolean;
+}
 
-  on(event: string, fn: Listener): this {
+export class SimpleEventEmitter {
+  /**
+   * Listeners as `{ fn, once }` records rather than bare functions.
+   *
+   * `once`-ness used to live in a `WeakSet` keyed by the function alone, which is wrong in two
+   * ways that both show up with ordinary code. Sharing one handler across two events —
+   * `once('a', f)` plus `on('b', f)` — meant firing `'b'` found `f` in the set and removed a
+   * listener that was supposed to be permanent. And registering the same function twice with
+   * `once` collapsed to one set entry, so the second registration was silently promoted to
+   * permanent. Node wraps each registration separately; these records do the same.
+   */
+  private _listeners = new Map<string, Registration[]>();
+
+  on(event: string, fn: Listener): this { return this._add(event, fn, false, false); }
+  addListener(event: string, fn: Listener): this { return this.on(event, fn); }
+  once(event: string, fn: Listener): this { return this._add(event, fn, true, false); }
+  prependListener(event: string, fn: Listener): this { return this._add(event, fn, false, true); }
+  prependOnceListener(event: string, fn: Listener): this { return this._add(event, fn, true, true); }
+
+  /**
+   * The single registration path. `protected` because `NodeReadable` hooks it to start flowing
+   * when a `'data'` listener appears — it used to override `on()`, which `once()` reached by
+   * delegating to it. Now that `once`/`prepend*` build their records directly, overriding `on()`
+   * would miss them, and `stream.once('data', …)` would never start the stream.
+   */
+  protected _add(event: string, fn: Listener, once: boolean, prepend: boolean): this {
     let arr = this._listeners.get(event);
     if (!arr) {
       arr = [];
       this._listeners.set(event, arr);
     }
-    arr.push(fn);
+    const entry: Registration = { fn, once };
+    if (prepend) arr.unshift(entry); else arr.push(entry);
     return this;
-  }
-
-  addListener(event: string, fn: Listener): this {
-    return this.on(event, fn);
-  }
-
-  once(event: string, fn: Listener): this {
-    this._onceSet.add(fn);
-    return this.on(event, fn);
   }
 
   off(event: string, fn: Listener): this {
     const arr = this._listeners.get(event);
     if (arr) {
-      const idx = arr.indexOf(fn);
-      if (idx !== -1) arr.splice(idx, 1);
+      // Node removes the most recently added matching registration.
+      for (let i = arr.length - 1; i >= 0; i--) {
+        if (arr[i].fn === fn) { arr.splice(i, 1); break; }
+      }
     }
     return this;
   }
 
-  removeListener(event: string, fn: Listener): this {
-    return this.off(event, fn);
-  }
+  removeListener(event: string, fn: Listener): this { return this.off(event, fn); }
 
   removeAllListeners(event?: string): this {
-    if (event !== undefined) {
-      this._listeners.delete(event);
-    } else {
-      this._listeners.clear();
-    }
+    if (event !== undefined) this._listeners.delete(event);
+    else this._listeners.clear();
     return this;
   }
 
   emit(event: string, ...args: unknown[]): boolean {
     const arr = this._listeners.get(event);
-    if (!arr || arr.length === 0) return false;
-    // Copy so that once-removals don't affect iteration.
-    const copy = arr.slice();
-    for (const fn of copy) {
-      if (this._onceSet.has(fn)) {
-        this._onceSet.delete(fn);
-        this.off(event, fn);
+    if (!arr || arr.length === 0) {
+      // Node throws when an 'error' event has nowhere to go rather than dropping it. Swallowing
+      // it silently is how a stream failure turns into a hang with no diagnostic.
+      if (event === 'error') {
+        const err = args[0];
+        if (err instanceof Error) throw err;
+        throw Object.assign(new Error(`Unhandled error. (${String(err)})`), { code: 'ERR_UNHANDLED_ERROR' });
       }
-      fn(...args);
+      return false;
+    }
+    // Copy so that once-removals do not disturb iteration.
+    const copy = arr.slice();
+    for (const entry of copy) {
+      if (entry.once) {
+        const idx = arr.indexOf(entry);
+        if (idx !== -1) arr.splice(idx, 1);
+      }
+      entry.fn(...args);
     }
     return true;
   }
 
-  listenerCount(event: string): number {
-    return this._listeners.get(event)?.length ?? 0;
-  }
+  listenerCount(event: string): number { return this._listeners.get(event)?.length ?? 0; }
+  listeners(event: string): Function[] { return (this._listeners.get(event) ?? []).map((e) => e.fn); }
+  rawListeners(event: string): Function[] { return this.listeners(event); }
 
-  rawListeners(event: string): Function[] {
-    return [...(this._listeners.get(event) ?? [])];
-  }
-
-  prependListener(event: string, fn: Listener): this {
-    const arr = this._listeners.get(event) ?? [];
-    arr.unshift(fn);
-    this._listeners.set(event, arr);
-    return this;
-  }
-
-  prependOnceListener(event: string, fn: Listener): this {
-    const wrapper: Listener = (...args: unknown[]) => {
-      this.off(event, wrapper);
-      fn(...args);
-    };
-    return this.prependListener(event, wrapper);
-  }
+  /** Node caps listeners per emitter and warns past it; there is no cap here. Shape only. */
+  setMaxListeners(_n: number): this { return this; }
+  getMaxListeners(): number { return 0; }
 
   eventNames(): string[] {
-    return [...this._listeners.keys()].filter(k => (this._listeners.get(k)?.length ?? 0) > 0);
+    return [...this._listeners.keys()].filter((k) => (this._listeners.get(k)?.length ?? 0) > 0);
   }
 }
 
@@ -151,9 +161,11 @@ export class NodeReadable extends SimpleEventEmitter {
 
   // ---- Flow control (override on to auto-resume) ----
 
-  on(event: string, fn: Listener): this {
-    super.on(event, fn);
-    // Attaching a 'data' listener switches to flowing mode (Node.js behaviour).
+  protected _add(event: string, fn: Listener, once: boolean, prepend: boolean): this {
+    super._add(event, fn, once, prepend);
+    // Attaching a 'data' listener switches to flowing mode (Node.js behaviour). Hooked here
+    // rather than on `on()` so `once('data', …)` and `prependListener('data', …)` start the
+    // stream too — they do not route through `on()`.
     if (event === 'data' && this._paused) {
       this.resume();
     }
@@ -421,6 +433,24 @@ export class NodeWritable extends SimpleEventEmitter {
     this._corked = false;
   }
 
+
+  /**
+   * Emit `'error'` from inside the internal write chain.
+   *
+   * `emit('error')` throws when nothing is listening, which is node's rule — but thrown from a
+   * `.then` handler it becomes an unhandled *rejection* of this stream's own chain: quieter than
+   * node, and it strands the chain. Node raises an uncaught exception instead (verified against a
+   * real `Writable`: a failing write with a callback but no `'error'` listener calls the callback
+   * and *then* crashes). Rethrowing out of band reproduces that and leaves the chain intact.
+   */
+  private _emitError(err: unknown): void {
+    if (this.listenerCount('error') > 0) {
+      this.emit('error', err);
+      return;
+    }
+    setTimeout(() => { throw err; }, 0);
+  }
+
   write(
     chunk: string | Uint8Array,
     encodingOrCb?: string | ((...args: unknown[]) => void),
@@ -432,9 +462,11 @@ export class NodeWritable extends SimpleEventEmitter {
     if (this._destroyed || this._finished || this._ending) {
       const err = streamWriteAfterEnd();
       // Node reports it to the callback *and* emits 'error'; without the emit a stream with no
-      // per-write callback loses the failure entirely.
+      // per-write callback loses the failure entirely. Emitted on a later tick, as node does —
+      // an unhandled 'error' now throws, and throwing it synchronously from here would break
+      // `write()`'s contract of returning false rather than raising.
       if (callback) callback(err);
-      this.emit('error', err);
+      queueMicrotask(() => this._emitError(err));
       return false;
     }
 
@@ -459,7 +491,7 @@ export class NodeWritable extends SimpleEventEmitter {
         (err: unknown) => {
           this._writing = false;
           if (callback) callback(err);
-          this.emit('error', err);
+          this._emitError(err);
           // Settle rather than rethrow: a rejected chain would strand every later write and
           // leave `end()` waiting forever on a promise nobody resolves.
         },
@@ -510,8 +542,8 @@ export class NodeWritable extends SimpleEventEmitter {
           if (callback) callback();
         })
         .catch((err: unknown) => {
-          this.emit('error', err);
           if (callback) callback(err);
+          this._emitError(err);
         });
     };
 

@@ -51,6 +51,10 @@ function realFS() {
   const fs = Object.create(VFSFileSystem.prototype) as VFSFileSystem;
   (fs as unknown as { promises: unknown; ns: string }).promises = promises;
   (fs as unknown as { ns: string }).ns = 'audit';
+  // `watch` now checks that its path exists — node throws ENOENT rather than handing back a
+  // watcher that can never fire — so the audit needs a sync transport that says "yes, a file".
+  // A zero-filled stats payload is enough: nothing here reads a field off it.
+  (fs as unknown as { _sync: () => unknown })._sync = () => ({ status: 0, data: new Uint8Array(53) });
   return { fs, promises };
 }
 

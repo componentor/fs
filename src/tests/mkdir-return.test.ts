@@ -249,6 +249,7 @@ describe('mkdir mode (VFS engine)', () => {
 
   it('mkdtemp creates a PRIVATE 0700 directory, not an ordinary mkdir 0755', () => {
     // mkdtemp(3) creates with S_IRWXU: its whole purpose is a directory only the owner can reach.
+    engine.mkdir('/tmp', 0, 0o755);   // mkdtemp requires an existing parent, as node does
     const r = engine.mkdtemp('/tmp/probe-XXXXXX');
     expect(r.status).toBe(0);
     expect(perm(decoder.decode(r.data!))).toBe(0o700);

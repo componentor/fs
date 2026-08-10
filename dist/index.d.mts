@@ -38,7 +38,19 @@ interface RmOptions {
     retryDelay?: number;
 }
 interface CpOptions {
-    /** Dereference symlinks (default: false) */
+    /**
+     * Called with the absolute source and destination of every entry; return `false` to skip it.
+     * Skipping a directory skips its whole subtree, as in node. Was accepted and ignored.
+     */
+    filter?: (src: string, dest: string) => boolean;
+    /**
+     * Dereference symlinks (default: false).
+     *
+     * Node's own behaviour here is inconsistent — under `recursive` it keeps a symlink as a
+     * symlink whether or not this is set, and at the top level `cp(link, dst, { dereference: true })`
+     * throws `ERR_FS_EISDIR` for a link to an ordinary file. Links are copied as links either way
+     * here, which matches node's recursive case and the documented stance in the readme.
+     */
     dereference?: boolean;
     /** Throw if destination exists (default: false) */
     errorOnExist?: boolean;
@@ -150,11 +162,19 @@ interface OpendirOptions {
 interface StatFs {
     type: number;
     bsize: number;
+    frsize: number;
     blocks: number;
     bfree: number;
     bavail: number;
     files: number;
     ffree: number;
+}
+/** `statfs` with `{ bigint: true }` — same fields, every one a `bigint`. */
+type BigIntStatFs = {
+    [K in keyof StatFs]: bigint;
+};
+interface StatFsOptions {
+    bigint?: boolean;
 }
 interface GlobOptions {
     /** Base directory to resolve relative patterns against. Default: '/' */
@@ -291,7 +311,17 @@ interface FileHandle {
     on(event: string, listener: (...args: never[]) => void): FileHandle;
     once(event: string, listener: (...args: never[]) => void): FileHandle;
     off(event: string, listener: (...args: never[]) => void): FileHandle;
+    addListener(event: string, listener: (...args: never[]) => void): FileHandle;
     removeListener(event: string, listener: (...args: never[]) => void): FileHandle;
+    removeAllListeners(event?: string): FileHandle;
+    prependListener(event: string, listener: (...args: never[]) => void): FileHandle;
+    prependOnceListener(event: string, listener: (...args: never[]) => void): FileHandle;
+    listeners(event: string): Function[];
+    rawListeners(event: string): Function[];
+    listenerCount(event: string): number;
+    eventNames(): string[];
+    setMaxListeners(n: number): FileHandle;
+    getMaxListeners(): number;
     emit(event: string, ...args: never[]): boolean;
 }
 interface Dir$1 {
@@ -300,8 +330,38 @@ interface Dir$1 {
     close(): Promise<void>;
     [Symbol.asyncIterator](): AsyncIterableIterator<Dirent$1>;
 }
-interface FSWatcher {
+/**
+ * The `EventEmitter` methods node's watchers carry.
+ *
+ * Declared here rather than imported from `node:events`, which does not exist in a browser —
+ * these are the members `SimpleEventEmitter` implements, which is what both watchers extend.
+ */
+interface WatcherEvents {
+    on(event: string, listener: (...args: any[]) => void): this;
+    once(event: string, listener: (...args: any[]) => void): this;
+    off(event: string, listener: (...args: any[]) => void): this;
+    addListener(event: string, listener: (...args: any[]) => void): this;
+    removeListener(event: string, listener: (...args: any[]) => void): this;
+    removeAllListeners(event?: string): this;
+    prependListener(event: string, listener: (...args: any[]) => void): this;
+    prependOnceListener(event: string, listener: (...args: any[]) => void): this;
+    emit(event: string, ...args: any[]): boolean;
+    listenerCount(event: string): number;
+    listeners(event: string): Function[];
+    rawListeners(event: string): Function[];
+    eventNames(): string[];
+    setMaxListeners(n: number): this;
+    getMaxListeners(): number;
+}
+/** What `fs.watch` returns. Emits `'change'` (eventType, filename) and `'close'`. */
+interface FSWatcher extends WatcherEvents {
     close(): void;
+    ref(): this;
+    unref(): this;
+}
+/** What `fs.watchFile` returns. Emits `'change'` (curr, prev), like node's `StatWatcher`. */
+interface StatWatcher extends WatcherEvents {
+    stop(): void;
     ref(): this;
     unref(): this;
 }
@@ -389,19 +449,39 @@ interface VFSConfig {
  */
 type Listener = (...args: unknown[]) => void;
 declare class SimpleEventEmitter {
+    /**
+     * Listeners as `{ fn, once }` records rather than bare functions.
+     *
+     * `once`-ness used to live in a `WeakSet` keyed by the function alone, which is wrong in two
+     * ways that both show up with ordinary code. Sharing one handler across two events —
+     * `once('a', f)` plus `on('b', f)` — meant firing `'b'` found `f` in the set and removed a
+     * listener that was supposed to be permanent. And registering the same function twice with
+     * `once` collapsed to one set entry, so the second registration was silently promoted to
+     * permanent. Node wraps each registration separately; these records do the same.
+     */
     private _listeners;
-    private _onceSet;
     on(event: string, fn: Listener): this;
     addListener(event: string, fn: Listener): this;
     once(event: string, fn: Listener): this;
+    prependListener(event: string, fn: Listener): this;
+    prependOnceListener(event: string, fn: Listener): this;
+    /**
+     * The single registration path. `protected` because `NodeReadable` hooks it to start flowing
+     * when a `'data'` listener appears — it used to override `on()`, which `once()` reached by
+     * delegating to it. Now that `once`/`prepend*` build their records directly, overriding `on()`
+     * would miss them, and `stream.once('data', …)` would never start the stream.
+     */
+    protected _add(event: string, fn: Listener, once: boolean, prepend: boolean): this;
     off(event: string, fn: Listener): this;
     removeListener(event: string, fn: Listener): this;
     removeAllListeners(event?: string): this;
     emit(event: string, ...args: unknown[]): boolean;
     listenerCount(event: string): number;
+    listeners(event: string): Function[];
     rawListeners(event: string): Function[];
-    prependListener(event: string, fn: Listener): this;
-    prependOnceListener(event: string, fn: Listener): this;
+    /** Node caps listeners per emitter and warns past it; there is no cap here. Shape only. */
+    setMaxListeners(_n: number): this;
+    getMaxListeners(): number;
     eventNames(): string[];
 }
 declare class NodeReadable extends SimpleEventEmitter {
@@ -431,7 +511,7 @@ declare class NodeReadable extends SimpleEventEmitter {
         done: boolean;
         value?: Uint8Array;
     }>, destroyFn?: () => Promise<void>);
-    on(event: string, fn: Listener): this;
+    protected _add(event: string, fn: Listener, once: boolean, prepend: boolean): this;
     pause(): this;
     resume(): this;
     /**
@@ -510,6 +590,16 @@ declare class NodeWritable extends SimpleEventEmitter {
      * In this minimal implementation we only track the flag for compatibility.
      */
     uncork(): void;
+    /**
+     * Emit `'error'` from inside the internal write chain.
+     *
+     * `emit('error')` throws when nothing is listening, which is node's rule — but thrown from a
+     * `.then` handler it becomes an unhandled *rejection* of this stream's own chain: quieter than
+     * node, and it strands the chain. Node raises an uncaught exception instead (verified against a
+     * real `Writable`: a failing write with a callback but no `'error'` listener calls the callback
+     * and *then* crashes). Rethrowing out of band reproduces that and leaves the chain intact.
+     */
+    private _emitError;
     write(chunk: string | Uint8Array, encodingOrCb?: string | ((...args: unknown[]) => void), cb?: (...args: unknown[]) => void): boolean;
     end(chunk?: string | Uint8Array | ((...args: unknown[]) => void), encodingOrCb?: string | ((...args: unknown[]) => void), cb?: (...args: unknown[]) => void): this;
     destroy(err?: Error): this;
@@ -669,6 +759,84 @@ declare class Dirent {
 }
 
 /**
+ * `fs.Utf8Stream` — node 24's buffered append-only stream for writing text to a file.
+ *
+ * Node added this in v24 as the engine behind fast logging (it is `sonic-boom` absorbed into
+ * core). It buffers writes and flushes them in batches, which is the whole point: a logger that
+ * issued one syscall per line would dominate the cost of whatever it was logging.
+ *
+ * It was the last `node:fs` export this library did not provide. The surface here — six methods
+ * and twelve getters — was read off a live `fs.Utf8Stream` rather than the docs, including the
+ * defaults (`append: true`, `contentMode: 'utf8'`, `minLength: 0`, `mode: undefined`) and the
+ * event order, which is `write` → `ready` → `drain`, then `finish` → `close` on `end()`.
+ *
+ * The one structural difference from node's: node's is a free function over the real filesystem,
+ * while this one has to be bound to a `VFSFileSystem` instance, so it is exposed as
+ * `fs.Utf8Stream` rather than as a module export. That is also why it is built by a factory.
+ */
+interface Utf8StreamOptions {
+    /** Path to write to. Either this or `fd` is required. */
+    dest?: string;
+    /** An already-open descriptor to write to, instead of opening `dest`. */
+    fd?: number;
+    /** Buffer until at least this many bytes are pending. `0` writes through. */
+    minLength?: number;
+    /** Drop writes once this many bytes are pending. `0` means no limit. */
+    maxLength?: number;
+    /** Append to the file rather than truncating it. Default `true`. */
+    append?: boolean;
+    /** Mode for a file this stream creates. */
+    mode?: number;
+    /** Create the parent directory if it is missing. Default `false`. */
+    mkdir?: boolean;
+    /** Use the synchronous API for every write. Default `false`. */
+    sync?: boolean;
+    /** `fsync` after each flush. Default `false`. */
+    fsync?: boolean;
+    /** Flush automatically every N ms. `0` disables. */
+    periodicFlush?: number;
+    /** `'utf8'` accepts strings; `'buffer'` accepts `Uint8Array`. Default `'utf8'`. */
+    contentMode?: 'utf8' | 'buffer';
+}
+/**
+ * The public shape, declared explicitly.
+ *
+ * Needed because the class is produced by a factory: TypeScript cannot emit a declaration for an
+ * anonymous class that has private fields, so the factory states what it returns instead. That
+ * it doubles as the documented surface is a fair trade.
+ */
+interface Utf8StreamInstance {
+    readonly fd: number;
+    readonly file: string | undefined;
+    readonly minLength: number;
+    readonly maxLength: number;
+    readonly writing: boolean;
+    readonly sync: boolean;
+    readonly fsync: boolean;
+    readonly append: boolean;
+    readonly mode: number | undefined;
+    readonly mkdir: boolean;
+    readonly periodicFlush: number;
+    readonly contentMode: 'utf8' | 'buffer';
+    write(chunk: string | Uint8Array): boolean;
+    flush(callback?: (err?: Error | null) => void): void;
+    flushSync(): void;
+    reopen(dest?: string): void;
+    end(): void;
+    destroy(): void;
+    on(event: string, fn: (...args: unknown[]) => void): this;
+    once(event: string, fn: (...args: unknown[]) => void): this;
+    off(event: string, fn: (...args: unknown[]) => void): this;
+    addListener(event: string, fn: (...args: unknown[]) => void): this;
+    removeListener(event: string, fn: (...args: unknown[]) => void): this;
+    removeAllListeners(event?: string): this;
+    listenerCount(event: string): number;
+    eventNames(): string[];
+    emit(event: string, ...args: unknown[]): boolean;
+}
+type Utf8StreamConstructor = new (options?: Utf8StreamOptions) => Utf8StreamInstance;
+
+/**
  * VFSFileSystem — main thread API.
  *
  * Provides Node.js-compatible sync and async filesystem methods.
@@ -680,6 +848,17 @@ declare class Dirent {
  * primarily runs inside workers where blocking is fine.
  */
 
+/**
+ * Dispose every live filesystem instance.
+ *
+ * The reason this is worth an export: each instance owns an OPFS mirror worker holding a
+ * recursive `FileSystemObserver`, and an observer still attached when its page is torn down
+ * makes Chromium abort the **browser process** (`FATAL: Detected dangling raw_ptr`). `pagehide`
+ * is too late to detach reliably — it can post the message but not wait for it — so anything
+ * that controls the page lifecycle (a test harness, an app tearing down a route) should call
+ * this and await it while the page is still running.
+ */
+declare function disposeAll(): Promise<void>;
 declare class VFSFileSystem {
     /**
      * `fs.constants` — the flag/mode constants (`F_OK`, `O_CREAT`, `COPYFILE_EXCL`, …).
@@ -729,10 +908,53 @@ declare class VFSFileSystem {
         readonly S_IROTH: 4;
         readonly S_IWOTH: 2;
         readonly S_IXOTH: 1;
+        readonly UV_DIRENT_UNKNOWN: 0;
+        readonly UV_DIRENT_FILE: 1;
+        readonly UV_DIRENT_DIR: 2;
+        readonly UV_DIRENT_LINK: 3;
+        readonly UV_DIRENT_FIFO: 4;
+        readonly UV_DIRENT_SOCKET: 5;
+        readonly UV_DIRENT_CHAR: 6;
+        readonly UV_DIRENT_BLOCK: 7;
+        readonly UV_FS_SYMLINK_DIR: 1;
+        readonly UV_FS_SYMLINK_JUNCTION: 2;
+        readonly UV_FS_O_FILEMAP: 0;
+        readonly O_SYMLINK: 2097152;
+        readonly UV_FS_COPYFILE_EXCL: 1;
+        readonly UV_FS_COPYFILE_FICLONE: 2;
+        readonly UV_FS_COPYFILE_FICLONE_FORCE: 4;
     };
     get Stats(): typeof Stats;
     get Dirent(): typeof Dirent;
     get Dir(): typeof Dir;
+    /**
+     * `fs.Utf8Stream` — node 24's buffered append stream, the engine behind fast logging.
+     *
+     * Built per instance rather than exported as a module constant, because it writes through
+     * *this* filesystem; node's can be a free class because there is only one real one. Cached so
+     * `fs.Utf8Stream === fs.Utf8Stream` and `instanceof` behaves.
+     */
+    get Utf8Stream(): Utf8StreamConstructor;
+    /**
+     * TypeScript-private rather than a `#` field on purpose: the test harness builds an instance
+     * with `Object.create(VFSFileSystem.prototype)` and never runs the constructor, and a real
+     * private field would not exist on such an object — reading it throws rather than returning
+     * `undefined`.
+     */
+    private _utf8StreamClass?;
+    /**
+     * Node's internal time coercion, exposed under the same underscored name node uses.
+     *
+     * Reduces a `Date`, a number of seconds, or a numeric string to seconds since the epoch. A
+     * negative number means *now*, which is the part that surprises people — see
+     * {@link toUnixTimestamp}.
+     */
+    _toUnixTimestamp(time: Date | number | string, name?: string): number;
+    /**
+     * Not on node's `fs` — node keeps `BigIntStats` internal — but `stat({ bigint: true })` returns
+     * one, and there was no way to `instanceof` the result. Exposed for symmetry with `Stats`.
+     */
+    get BigIntStats(): typeof BigIntStats;
     private sab;
     private ctrl;
     private readySab;
@@ -752,6 +974,18 @@ declare class VFSFileSystem {
     private closed;
     /** The `pagehide` handler, kept so {@link dispose} can unregister it. */
     private onPageHide;
+    /**
+     * Watches real OPFS for changes made outside this library.
+     *
+     * Lives here, in the scope that owns the instance, rather than inside the mirror worker — the
+     * whole point is that `disconnect()` is reachable **synchronously** from the unload path. A
+     * recursive observer still attached when its page is torn down makes Chromium abort the entire
+     * browser process, and an observer inside a nested worker cannot be detached in time: the page
+     * can post a shutdown at `pagehide` but cannot wait for it.
+     *
+     * Only the detected records cross into the worker; the file I/O stays there.
+     */
+    private externalObserver;
     /** True while a leader transition is in flight (promotion to leader, etc.).
      *  Cleared the moment the new sync-relay signals `ready`. Consumers can
      *  combine this with `isReady` to know when sync FS ops are safe again. */
@@ -841,6 +1075,14 @@ declare class VFSFileSystem {
     /** Promote from follower to leader (after leader tab dies and lock is acquired) */
     private promoteToLeader;
     /** Spawn an inline worker from bundled code */
+    /**
+     * Start one of the relay workers from source embedded in this bundle.
+     *
+     * This used to resolve `new URL('./workers/<name>.worker.js', import.meta.url)`, which meant
+     * the package could not be loaded from a CDN at all (a cross-origin `new Worker()` is a
+     * `SecurityError`) and needed `optimizeDeps.exclude` under Vite, whose pre-bundling rewrites
+     * that URL. See [worker-blob.ts](./workers/worker-blob.ts).
+     */
     private spawnWorker;
     /** Block until workers are ready */
     private ensureReady;
@@ -894,21 +1136,26 @@ declare class VFSFileSystem {
         encoding?: string | null;
     } | string | null): string | Uint8Array;
     chmodSync(filePath: PathLike, mode: Mode): void;
-    /** Like chmodSync but operates on the symlink itself. In this VFS, delegates to chmodSync. */
+    /**
+     * `chmod` on the symlink itself rather than on what it points at.
+     *
+     * This used to delegate straight to `chmodSync`, which follows the link — so it changed the
+     * **target's** permissions, the one outcome the `l` prefix exists to rule out.
+     */
     lchmodSync(filePath: PathLike, mode: Mode): void;
     /** chmod on an open file descriptor. Resolves the fd to its inode on the
      *  server side and mutates the inode's mode bits directly, matching what
      *  native Node's libuv does. */
     fchmodSync(fd: number, mode: Mode): void;
     chownSync(filePath: PathLike, uid: number, gid: number): void;
-    /** Like chownSync but operates on the symlink itself. In this VFS, delegates to chownSync. */
+    /** `chown` on the symlink itself rather than its target — see {@link lchmodSync}. */
     lchownSync(filePath: PathLike, uid: number, gid: number): void;
     /** chown on an open file descriptor. Mutates the underlying inode's uid/gid. */
     fchownSync(fd: number, uid: number, gid: number): void;
     utimesSync(filePath: PathLike, atime: Date | number, mtime: Date | number): void;
     /** utimes on an open file descriptor. Mutates the underlying inode's atime/mtime. */
     futimesSync(fd: number, atime: Date | number, mtime: Date | number): void;
-    /** Like utimesSync but operates on the symlink itself. In this VFS, delegates to utimesSync. */
+    /** Timestamps on the symlink itself rather than its target — see {@link lchmodSync}. */
     lutimesSync(filePath: PathLike, atime: Date | number, mtime: Date | number): void;
     symlinkSync(target: PathLike, linkPath: PathLike, type?: string | null): void;
     readlinkSync(filePath: PathLike, options?: {
@@ -921,8 +1168,9 @@ declare class VFSFileSystem {
     /**
      * The stream constructors, exposed as properties the way `node:fs` exposes them, so
      * `x instanceof fs.ReadStream` and `fs.FileReadStream` resolve for code written against Node.
-     * `Stats`, `Dirent` and `Dir` are deliberately absent: they are structural interfaces here,
-     * not runtime classes, and a fake constructor would make `instanceof` lie.
+     * `Stats`, `Dirent` and `Dir` are exposed the same way — see the getters near the top of the
+     * class. They became real classes in 3.3.27; before that they were object literals and there
+     * was nothing for `instanceof` to test against.
      */
     get ReadStream(): typeof NodeReadable;
     get WriteStream(): typeof NodeWritable;
@@ -978,11 +1226,11 @@ declare class VFSFileSystem {
      * volume actually held — so code checking free space before a large write got an answer
      * unrelated to reality, and never saw a full disk coming.
      */
-    statfsSync(path?: PathLike): StatFs;
+    statfsSync(path?: PathLike, options?: StatFsOptions): StatFs | BigIntStatFs;
     statfs(path: string, callback: (err: Error | null, stats?: StatFs) => void): void;
     statfs(path: string): Promise<StatFs>;
     watch(filePath: PathLike, options?: WatchOptions | Encoding | WatchListener, listener?: WatchListener): FSWatcher;
-    watchFile(filePath: PathLike, optionsOrListener?: WatchFileOptions | WatchFileListener, listener?: WatchFileListener): void;
+    watchFile(filePath: PathLike, optionsOrListener?: WatchFileOptions | WatchFileListener, listener?: WatchFileListener): StatWatcher;
     unwatchFile(filePath: PathLike, listener?: WatchFileListener): void;
     openAsBlob(filePath: string, options?: OpenAsBlobOptions): Promise<Blob>;
     createReadStream(filePath: PathLike, options?: ReadStreamOptions | string): FSReadStream;
@@ -1012,6 +1260,17 @@ declare class VFSFileSystem {
     whenReady(): Promise<void>;
     /** Internal — called by lifecycle handlers when sync-relay says 'ready'. */
     private fireReadyListeners;
+    /**
+     * Register the external-change observer, if this mode wants one and the browser has the API.
+     *
+     * Records are forwarded to the mirror worker, which reads the files and applies them; see
+     * `applyExternalRecords` in opfs-sync.worker.ts.
+     */
+    private watchExternalChanges;
+    /** Hand detected records to the mirror worker, which does the file I/O. */
+    private forwardExternalRecords;
+    /** Detach the observer. Synchronous on purpose — the unload path cannot await. */
+    private stopWatchingExternalChanges;
     /**
      * Tear the workers down when the page goes away, without needing the caller to remember.
      *
@@ -1191,6 +1450,21 @@ declare class VFSPromises {
         readonly S_IROTH: 4;
         readonly S_IWOTH: 2;
         readonly S_IXOTH: 1;
+        readonly UV_DIRENT_UNKNOWN: 0;
+        readonly UV_DIRENT_FILE: 1;
+        readonly UV_DIRENT_DIR: 2;
+        readonly UV_DIRENT_LINK: 3;
+        readonly UV_DIRENT_FIFO: 4;
+        readonly UV_DIRENT_SOCKET: 5;
+        readonly UV_DIRENT_CHAR: 6;
+        readonly UV_DIRENT_BLOCK: 7;
+        readonly UV_FS_SYMLINK_DIR: 1;
+        readonly UV_FS_SYMLINK_JUNCTION: 2;
+        readonly UV_FS_O_FILEMAP: 0;
+        readonly O_SYMLINK: 2097152;
+        readonly UV_FS_COPYFILE_EXCL: 1;
+        readonly UV_FS_COPYFILE_FICLONE: 2;
+        readonly UV_FS_COPYFILE_FICLONE_FORCE: 4;
     };
     readFile(filePath: PathLike | FileHandle, options?: ReadOptions | Encoding | null): Promise<string | Uint8Array<ArrayBufferLike>>;
     writeFile(filePath: PathLike | FileHandle, data: string | Uint8Array, options?: WriteOptions | Encoding): Promise<void>;
@@ -1200,7 +1474,18 @@ declare class VFSPromises {
     rm(filePath: PathLike, options?: RmOptions): Promise<void>;
     unlink(filePath: PathLike): Promise<void>;
     readdir(filePath: PathLike, options?: ReaddirOptions | Encoding | null): Promise<Uint8Array<ArrayBufferLike>[] | string[] | Dirent$1[]>;
-    glob(pattern: string | string[], options?: GlobOptions): Promise<string[] | Dirent$1[]>;
+    /**
+     * `fsPromises.glob` — an **async iterator** of matches, which is what node returns.
+     *
+     * This used to be `async glob(): Promise<string[]>`, so the documented way to consume it —
+     * `for await (const p of fsp.glob(pattern))` — got a promise, which is not async-iterable, and
+     * silently produced nothing. `await`ing it worked, which is why it looked fine: the shape was
+     * only wrong for the usage node's own docs show.
+     *
+     * Matches are gathered before the first yield rather than streamed. Observably identical for a
+     * consumer, and the engine answers a glob in one round trip, so there is nothing to stream.
+     */
+    glob(pattern: string | string[], options?: GlobOptions): AsyncGenerator<string | Dirent$1>;
     stat(filePath: PathLike, options?: StatOptions & {
         throwIfNoEntry?: true;
     }): Promise<Stats$1 | BigIntStats$1>;
@@ -1225,13 +1510,13 @@ declare class VFSPromises {
     } | string | null): Promise<string | Uint8Array<ArrayBufferLike>>;
     exists(filePath: PathLike): Promise<boolean>;
     chmod(filePath: PathLike, mode: Mode): Promise<void>;
-    /** Like chmod but operates on the symlink itself. In this VFS, delegates to chmod. */
+    /** `chmod` on the symlink itself — see {@link lchmodSync}. */
     lchmod(filePath: PathLike, mode: Mode): Promise<void>;
     /** chmod on an open file descriptor. Engine resolves fd → inode and
      *  mutates the mode bits directly. */
     fchmod(fd: number, mode: Mode): Promise<void>;
     chown(filePath: PathLike, uid: number, gid: number): Promise<void>;
-    /** Like chown but operates on the symlink itself. In this VFS, delegates to chown. */
+    /** `chown` on the symlink itself rather than its target — see {@link lchmodSync}. */
     lchown(filePath: PathLike, uid: number, gid: number): Promise<void>;
     /** chown on an open file descriptor. Engine resolves fd → inode and
      *  mutates uid/gid directly. */
@@ -1240,7 +1525,7 @@ declare class VFSPromises {
     /** utimes on an open file descriptor. Engine resolves fd → inode and
      *  mutates atime/mtime directly. */
     futimes(fd: number, atime: Date | number, mtime: Date | number): Promise<void>;
-    /** Like utimes but operates on the symlink itself. In this VFS, delegates to utimes. */
+    /** Timestamps on the symlink itself rather than its target — see {@link lchmodSync}. */
     lutimes(filePath: PathLike, atime: Date | number, mtime: Date | number): Promise<void>;
     symlink(target: PathLike, linkPath: PathLike, type?: string | null): Promise<void>;
     readlink(filePath: PathLike, options?: {
@@ -1263,12 +1548,13 @@ declare class VFSPromises {
     } | string | null): Promise<string | Uint8Array<ArrayBufferLike>>;
     openAsBlob(filePath: string, options?: OpenAsBlobOptions): Promise<Blob>;
     /** Real volume statistics — see the note on `VFSFileSystem.statfsSync`. */
-    statfs(path?: PathLike): Promise<StatFs>;
+    statfs(path?: PathLike, options?: StatFsOptions): Promise<StatFs | BigIntStatFs>;
     watch(filePath: string, options?: WatchOptions): AsyncIterable<WatchEventType>;
     fstat(fd: number, options?: StatOptions): Promise<Stats$1 | BigIntStats$1>;
     ftruncate(fd: number, len?: number): Promise<void>;
-    fsync(_fd: number): Promise<void>;
-    fdatasync(_fd: number): Promise<void>;
+    fsync(fd: number): Promise<void>;
+    fdatasync(fd: number): Promise<void>;
+    /** The volume-wide flush: no descriptor, so nothing to validate. */
     flush(): Promise<void>;
     purge(): Promise<void>;
 }
@@ -1444,6 +1730,21 @@ declare const constants: {
     readonly S_IROTH: 4;
     readonly S_IWOTH: 2;
     readonly S_IXOTH: 1;
+    readonly UV_DIRENT_UNKNOWN: 0;
+    readonly UV_DIRENT_FILE: 1;
+    readonly UV_DIRENT_DIR: 2;
+    readonly UV_DIRENT_LINK: 3;
+    readonly UV_DIRENT_FIFO: 4;
+    readonly UV_DIRENT_SOCKET: 5;
+    readonly UV_DIRENT_CHAR: 6;
+    readonly UV_DIRENT_BLOCK: 7;
+    readonly UV_FS_SYMLINK_DIR: 1;
+    readonly UV_FS_SYMLINK_JUNCTION: 2;
+    readonly UV_FS_O_FILEMAP: 0;
+    readonly O_SYMLINK: 2097152;
+    readonly UV_FS_COPYFILE_EXCL: 1;
+    readonly UV_FS_COPYFILE_FICLONE: 2;
+    readonly UV_FS_COPYFILE_FICLONE_FORCE: 4;
 };
 
 /**
@@ -1665,4 +1966,4 @@ declare function getDefaultFS(): VFSFileSystem;
 /** Async init helper — avoids blocking main thread */
 declare function init(): Promise<void>;
 
-export { BigIntStats, type CpOptions, Dir, Dirent, Drive, DriveCapabilities, DriveEntry, DriveReadable, DriveStat, DriveWritable, type Encoding, FSError, type FSMode, type FSReadStream, type FSWatcher, type FSWriteStream, type FileHandle, type LoadResult, type MkdirOptions, NodeReadable, NodeWritable, type OpenAsBlobOptions, type OpendirOptions, type PathLike, type ReadOptions, NodeReadable as ReadStream, type ReadStreamOptions, type ReaddirOptions, type RepairResult, type RmOptions, type RmdirOptions, SAB_OFFSETS, SIGNAL, type ServiceWorkerBridgeOptions, SimpleEventEmitter, type StatFs, type StatOptions, Stats, type UnpackResult, type VFSConfig, VFSFileSystem, type VFSLimits, VfsDrive, type WatchEventType, type WatchFileListener, type WatchListener, type WatchOptions, type WriteOptions, NodeWritable as WriteStream, type WriteStreamOptions, acquireFsLock, constants, createError, createFS, createServiceWorkerBridge, getDefaultFS, init, loadFromOPFS, path, releaseFsLock, repairVFS, statusToError, unpackToOPFS };
+export { BigIntStats, type CpOptions, Dir, Dirent, Drive, DriveCapabilities, DriveEntry, DriveReadable, DriveStat, DriveWritable, type Encoding, FSError, type FSMode, type FSReadStream, type FSWatcher, type FSWriteStream, type FileHandle, type LoadResult, type MkdirOptions, NodeReadable, NodeWritable, type OpenAsBlobOptions, type OpendirOptions, type PathLike, type ReadOptions, NodeReadable as ReadStream, type ReadStreamOptions, type ReaddirOptions, type RepairResult, type RmOptions, type RmdirOptions, SAB_OFFSETS, SIGNAL, type ServiceWorkerBridgeOptions, SimpleEventEmitter, type StatFs, type StatOptions, Stats, type UnpackResult, type VFSConfig, VFSFileSystem, type VFSLimits, VfsDrive, type WatchEventType, type WatchFileListener, type WatchListener, type WatchOptions, type WriteOptions, NodeWritable as WriteStream, type WriteStreamOptions, acquireFsLock, constants, createError, createFS, createServiceWorkerBridge, disposeAll, getDefaultFS, init, loadFromOPFS, path, releaseFsLock, repairVFS, statusToError, unpackToOPFS };

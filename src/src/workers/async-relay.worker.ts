@@ -306,11 +306,12 @@ function encodeFdRequest(op: number, args: { fd: number; length?: number; positi
       return encodeRequest(op, '', 0, encodeFwritePayload(args.fd, args.position ?? -1, args.data ?? new Uint8Array(0)));
     case OP.FSTAT:
     case OP.CLOSE:
+    // FSYNC's flush is volume-wide, but the descriptor still has to travel: the engine answers
+    // EBADF for one that is already closed, which is what `handle.sync()` after `close()` gets.
+    case OP.FSYNC:
       return encodeRequest(op, '', 0, encodeFdPayload(args.fd));
     case OP.FTRUNCATE:
       return encodeRequest(op, '', 0, encodeFtruncatePayload(args.fd, args.length ?? 0));
-    case OP.FSYNC:
-      return encodeRequest(op, '', 0);
     default:
       return encodeRequest(op, '', 0);
   }

@@ -132,14 +132,31 @@ function writeU32(buf: Uint8Array, at: number, value: number): void {
  * it rather than quietly becoming `NaN` in the payload.
  */
 export function toEpochMs(time: Date | number | string, name = 'time'): number {
-  if (time instanceof Date) return time.getTime();
+  return toUnixTimestamp(time, name) * 1000;
+}
 
-  // Node accepts a numeric string here, so '1600000000' behaves like the number.
-  const seconds = typeof time === 'string' ? Number(time) : time;
-  if (typeof seconds !== 'number' || !Number.isFinite(seconds)) {
-    throw invalidArgType(name, 'number | string | Date', time);
+/**
+ * Node's `toUnixTimestamp` — a time argument reduced to **seconds** since the epoch.
+ *
+ * Exported as `fs._toUnixTimestamp`, which node exposes too. The underscore is node's own: it is
+ * an internal helper that leaked into the public object and stayed, and code that reproduces
+ * node's time coercion reaches for it.
+ *
+ * The rule that is easy to miss, and that this got wrong: **a negative number means "now"**, not
+ * a pre-epoch instant. `fs.utimesSync(p, -1, -1)` stamps the current time in node; here it used
+ * to stamp one second *before* 1970. Verified against a live `node:fs` rather than the docs,
+ * which do not mention it.
+ */
+export function toUnixTimestamp(time: Date | number | string, name = 'time'): number {
+  // A numeric string behaves like the number: '1600000000' is accepted.
+  if (typeof time === 'string' && String(Number(time)) === time.trim() && time.trim() !== '') {
+    return Number(time);
   }
-  return seconds * 1000;
+  if (typeof time === 'number' && Number.isFinite(time)) {
+    return time < 0 ? Date.now() / 1000 : time;
+  }
+  if (time instanceof Date) return time.getTime() / 1000;
+  throw invalidArgType(name, 'number | string | Date', time);
 }
 
 // ---- Decoders ----

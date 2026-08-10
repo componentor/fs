@@ -110,7 +110,13 @@ describe('openAsBlob', () => {
     expect(text).toBe(content);
   });
 
-  it('should throw when readFile rejects (non-existent file)', async () => {
+  /**
+   * Node does not surface the errno here, and neither does this: `createBlobFromFilePath` reports
+   * any failure to open as `TypeError: Unable to open file as blob` with
+   * `code: 'ERR_INVALID_ARG_VALUE'`. Rethrowing the ENOENT would read better, and would also mean
+   * `catch (e) { if (e.code === 'ENOENT') … }` behaving differently here than in node.
+   */
+  it('reports a file it cannot open as node does, not as the errno', async () => {
     const readFile = vi.fn().mockRejectedValue(
       Object.assign(new Error("ENOENT: no such file or directory, open '/missing.txt'"), {
         code: 'ENOENT',
@@ -119,7 +125,14 @@ describe('openAsBlob', () => {
         path: '/missing.txt',
       }),
     );
-    await expect(fsOpenAsBlob(readFile)('/missing.txt')).rejects.toThrow('ENOENT');
+    const failure = fsOpenAsBlob(readFile)('/missing.txt');
+    await expect(failure).rejects.toThrow('Unable to open file as blob');
+    await expect(failure).rejects.toMatchObject({ code: 'ERR_INVALID_ARG_VALUE' });
+  });
+
+  it('leaves an error that is not an open failure alone', async () => {
+    const readFile = vi.fn().mockRejectedValue(Object.assign(new Error('disk fell over'), { code: 'EIO' }));
+    await expect(fsOpenAsBlob(readFile)('/x.txt')).rejects.toMatchObject({ code: 'EIO' });
   });
 
   it('should handle empty files', async () => {

@@ -12,8 +12,8 @@
 
 import type {
   Encoding, ReadOptions, WriteOptions, MkdirOptions, RmdirOptions, RmOptions, CpOptions,
-  ReaddirOptions, StatOptions, Stats, BigIntStats, StatFs, Dirent, Dir, OpendirOptions, VFSConfig, FSMode, FileHandle, GlobOptions,
-  WatchOptions, WatchFileOptions, WatchEventType, FSWatcher, WatchListener, WatchFileListener,
+  ReaddirOptions, StatOptions, Stats, BigIntStats, StatFs, BigIntStatFs, StatFsOptions, Dirent, Dir, OpendirOptions, VFSConfig, FSMode, FileHandle, GlobOptions,
+  WatchOptions, WatchFileOptions, WatchEventType, FSWatcher, StatWatcher, WatchListener, WatchFileListener,
   ReadStreamOptions, WriteStreamOptions, FSReadStream, FSWriteStream, OpenAsBlobOptions, PathLike, Mode,
 } from './types.js';
 import { NodeReadable, NodeWritable } from './node-streams.js';
@@ -54,10 +54,16 @@ import {
 import { opendir as _opendir } from './methods/opendir.js';
 import { Dir as VFSDir } from './dir.js';
 import { readStreamFromHandle, writeStreamFromHandle } from './handle-streams.js';
-import { Stats as StatsClass, Dirent as DirentClass } from './stats-classes.js';
+import { workerFromSource, terminateWorker } from './workers/worker-blob.js';
+// Bundled worker sources, embedded as text at build time so a worker never needs a URL.
+import syncRelaySource from './workers/inlined/sync-relay.workertext';
+import asyncRelaySource from './workers/inlined/async-relay.workertext';
+import { Stats as StatsClass, BigIntStats as BigIntStatsClass, Dirent as DirentClass } from './stats-classes.js';
 import { watch as _watch, watchFile as _watchFile, unwatchFile as _unwatchFile, watchAsync as _watchAsync } from './methods/watch.js';
 import { globSync as _globSync, glob as _glob } from './methods/glob.js';
-import { join as pathJoin, toPathString, toRealpathString } from './path.js';
+import { join as pathJoin, dirname as pathDirname, toPathString, toRealpathString } from './path.js';
+import { createUtf8StreamClass, type Utf8StreamConstructor } from './utf8-stream.js';
+import { toUnixTimestamp } from './protocol/payloads.js';
 import { createError, cpEisdirNotRecursive, cpTargetExists, cpSameSource, cpIntoSubdirectory, statusToError as _statusToError } from './errors.js';
 import { decodeStats as _decodeStats, decodeStatsBigInt as _decodeStatsBigInt } from './stats.js';
 import { constants } from './constants.js';
@@ -199,6 +205,66 @@ function assertCopyable(srcPath: string, destPath: string): void {
   if (destPath.startsWith(srcPrefix)) throw cpIntoSubdirectory(srcPath, destPath);
 }
 
+/**
+ * The bytes behind `openAsBlob`, with node's error for a file it could not open.
+ *
+ * Node does not surface the errno here. Its `createBlobFromFilePath` reports any failure to open
+ * as `TypeError: Unable to open file as blob` with `code: 'ERR_INVALID_ARG_VALUE'`, so a caller
+ * checking for `ENOENT` would never match — matching node means giving up the better error.
+ *
+ * The one thing not copied is *when*: node throws this synchronously, out of a function that
+ * otherwise returns a promise, so `fs.openAsBlob(missing).catch(…)` crashes rather than being
+ * caught. This rejects instead, which is the same for `await` and for `.catch()`, and is the
+ * same call made on `readFile(fd)`'s deferred error — see the readme's "Known divergences".
+ */
+async function _readFileAsBlobBytes(read: Promise<Uint8Array | string>): Promise<Uint8Array> {
+  let data: Uint8Array | string;
+  try {
+    data = await read;
+  } catch (err) {
+    const code = (err as { code?: string }).code;
+    if (code === 'ENOENT' || code === 'EACCES' || code === 'ENOTDIR' || code === 'ELOOP') {
+      throw Object.assign(new TypeError('Unable to open file as blob'), { code: 'ERR_INVALID_ARG_VALUE' });
+    }
+    throw err;
+  }
+  return data instanceof Uint8Array ? data : new TextEncoder().encode(data);
+}
+
+/**
+ * Every instance that has not been disposed.
+ *
+ * Exists so a host can release them all at once — see {@link disposeAll}. Kept as a plain module
+ * Set rather than a WeakSet because the point is to be able to *enumerate* them.
+ */
+const LIVE_KEY = '__componentorFsLiveInstances';
+/**
+ * Shared across every copy of this module on the origin.
+ *
+ * More than one copy legitimately coexists — a bundled build alongside a CDN one, or the library
+ * loaded from two different URLs in the same page — and each copy would otherwise keep its own
+ * registry, so {@link disposeAll} would release only the instances it happened to create. The
+ * resources at stake (OPFS handles, and the observer that makes Chromium abort if it outlives
+ * its page) are per-origin, not per-module.
+ */
+const liveInstances: Set<VFSFileSystem> =
+  ((globalThis as Record<string, unknown>)[LIVE_KEY] as Set<VFSFileSystem>) ??
+  ((globalThis as Record<string, unknown>)[LIVE_KEY] = new Set<VFSFileSystem>());
+
+/**
+ * Dispose every live filesystem instance.
+ *
+ * The reason this is worth an export: each instance owns an OPFS mirror worker holding a
+ * recursive `FileSystemObserver`, and an observer still attached when its page is torn down
+ * makes Chromium abort the **browser process** (`FATAL: Detected dangling raw_ptr`). `pagehide`
+ * is too late to detach reliably — it can post the message but not wait for it — so anything
+ * that controls the page lifecycle (a test harness, an app tearing down a route) should call
+ * this and await it while the page is still running.
+ */
+export async function disposeAll(): Promise<void> {
+  await Promise.all([...liveInstances].map((fs) => fs.dispose().catch(() => {})));
+}
+
 export class VFSFileSystem {
   /**
    * `fs.constants` — the flag/mode constants (`F_OK`, `O_CREAT`, `COPYFILE_EXCL`, …).
@@ -213,6 +279,47 @@ export class VFSFileSystem {
   get Stats() { return StatsClass; }
   get Dirent() { return DirentClass; }
   get Dir() { return VFSDir; }
+
+  /**
+   * `fs.Utf8Stream` — node 24's buffered append stream, the engine behind fast logging.
+   *
+   * Built per instance rather than exported as a module constant, because it writes through
+   * *this* filesystem; node's can be a free class because there is only one real one. Cached so
+   * `fs.Utf8Stream === fs.Utf8Stream` and `instanceof` behaves.
+   */
+  get Utf8Stream(): Utf8StreamConstructor {
+    return (this._utf8StreamClass ??= createUtf8StreamClass({
+      openSync: (p, flags, mode) => this.openSync(p, flags, mode),
+      writeSync: (fd, data) => this.writeSync(fd, data),
+      closeSync: (fd) => this.closeSync(fd),
+      fsyncSync: (fd) => this.fsyncSync(fd),
+      mkdirSync: (p, o) => { this.mkdirSync(p, o); },
+      dirname: pathDirname,
+    }));
+  }
+  /**
+   * TypeScript-private rather than a `#` field on purpose: the test harness builds an instance
+   * with `Object.create(VFSFileSystem.prototype)` and never runs the constructor, and a real
+   * private field would not exist on such an object — reading it throws rather than returning
+   * `undefined`.
+   */
+  private _utf8StreamClass?: Utf8StreamConstructor;
+
+  /**
+   * Node's internal time coercion, exposed under the same underscored name node uses.
+   *
+   * Reduces a `Date`, a number of seconds, or a numeric string to seconds since the epoch. A
+   * negative number means *now*, which is the part that surprises people — see
+   * {@link toUnixTimestamp}.
+   */
+  _toUnixTimestamp(time: Date | number | string, name = 'time'): number {
+    return toUnixTimestamp(time, name);
+  }
+  /**
+   * Not on node's `fs` — node keeps `BigIntStats` internal — but `stat({ bigint: true })` returns
+   * one, and there was no way to `instanceof` the result. Exposed for symmetry with `Stats`.
+   */
+  get BigIntStats() { return BigIntStatsClass; }
 
   // SAB for sync communication with sync relay worker (null when SAB unavailable)
   private sab!: SharedArrayBuffer;
@@ -245,6 +352,18 @@ export class VFSFileSystem {
   private closed = false;
   /** The `pagehide` handler, kept so {@link dispose} can unregister it. */
   private onPageHide: ((event: Event) => void) | null = null;
+  /**
+   * Watches real OPFS for changes made outside this library.
+   *
+   * Lives here, in the scope that owns the instance, rather than inside the mirror worker — the
+   * whole point is that `disconnect()` is reachable **synchronously** from the unload path. A
+   * recursive observer still attached when its page is torn down makes Chromium abort the entire
+   * browser process, and an observer inside a nested worker cannot be detached in time: the page
+   * can post a shutdown at `pagehide` but cannot wait for it.
+   *
+   * Only the detected records cross into the worker; the file I/O stays there.
+   */
+  private externalObserver: FileSystemObserver | null = null;
   /** True while a leader transition is in flight (promotion to leader, etc.).
    *  Cleared the moment the new sync-relay signals `ready`. Consumers can
    *  combine this with `isReady` to know when sync FS ops are safe again. */
@@ -359,7 +478,9 @@ export class VFSFileSystem {
     // Spawn workers
     this.syncWorker = this.spawnWorker('sync-relay');
     this.asyncWorker = this.spawnWorker('async-relay');
+    liveInstances.add(this);
     this.installUnloadTeardown();
+    void this.watchExternalChanges();
 
     // Handle messages from sync-relay
     this.syncWorker.onmessage = (e: MessageEvent) => {
@@ -750,8 +871,8 @@ export class VFSFileSystem {
     });
 
     // Terminate old workers
-    this.syncWorker.terminate();
-    this.asyncWorker.terminate();
+    terminateWorker(this.syncWorker);
+    terminateWorker(this.asyncWorker);
 
     // Allocate fresh SABs (only if available)
     const sabSize = this.config.sabSize;
@@ -826,11 +947,16 @@ export class VFSFileSystem {
   }
 
   /** Spawn an inline worker from bundled code */
-  private spawnWorker(name: string): Worker {
-    // In production, worker code is inlined as blob URLs at build time.
-    // For development, we use module workers.
-    const workerUrl = new URL(`./workers/${name}.worker.js`, import.meta.url);
-    return new Worker(workerUrl, { type: 'module' });
+  /**
+   * Start one of the relay workers from source embedded in this bundle.
+   *
+   * This used to resolve `new URL('./workers/<name>.worker.js', import.meta.url)`, which meant
+   * the package could not be loaded from a CDN at all (a cross-origin `new Worker()` is a
+   * `SecurityError`) and needed `optimizeDeps.exclude` under Vite, whose pre-bundling rewrites
+   * that URL. See [worker-blob.ts](./workers/worker-blob.ts).
+   */
+  private spawnWorker(name: 'sync-relay' | 'async-relay'): Worker {
+    return workerFromSource(name === 'sync-relay' ? syncRelaySource : asyncRelaySource, `vfs-${name}`);
   }
 
   // ========== Sync operation primitives ==========
@@ -1111,12 +1237,19 @@ export class VFSFileSystem {
   private _cpSyncInner(src: PathLike, dest: PathLike, options?: CpOptions): void {
     const srcPath = toPathString(src);
     const destPath = toPathString(dest);
+    // `filter` was declared nowhere and consulted nowhere, so every entry was copied.
+    if (options?.filter && !options.filter(srcPath, destPath)) return;
     const force = options?.force !== false;          // default true
     const errorOnExist = options?.errorOnExist ?? false;
     const dereference = options?.dereference ?? false;
     const preserveTimestamps = options?.preserveTimestamps ?? false;
 
-    const srcStat = dereference ? this.statSync(srcPath) : this.lstatSync(srcPath);
+    // Always `lstat` for the branch decision: `dereference` must not decide whether a symlink is
+    // *recognised* as one, or `statSync` follows it and the link is copied as a plain file.
+    // Node keeps links as links under `cp -r` whether or not `dereference` is set — see
+    // {@link CpOptions.dereference} for why chasing node's `dereference` further is not useful.
+    void dereference;
+    const srcStat = this.lstatSync(srcPath);
 
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
@@ -1133,7 +1266,7 @@ export class VFSFileSystem {
         const destChild = pathJoin(destPath, entry.name);
         this._cpSyncInner(srcChild, destChild, options);
       }
-    } else if (srcStat.isSymbolicLink() && !dereference) {
+    } else if (srcStat.isSymbolicLink()) {
       const target = this.readlinkSync(srcPath) as string;
       let destExists = false;
       try { this.lstatSync(destPath); destExists = true; } catch {}
@@ -1160,14 +1293,15 @@ export class VFSFileSystem {
   }
 
   private async _cpAsync(src: string, dest: string, options?: CpOptions): Promise<void> {
+    if (options?.filter && !options.filter(src, dest)) return;
     const force = options?.force !== false;
     const errorOnExist = options?.errorOnExist ?? false;
     const dereference = options?.dereference ?? false;
     const preserveTimestamps = options?.preserveTimestamps ?? false;
 
-    const srcStat = dereference
-      ? await this.promises.stat(src)
-      : await this.promises.lstat(src);
+    // See the sync path: the branch decision is always on the link itself.
+    void dereference;
+    const srcStat = await this.promises.lstat(src);
 
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
@@ -1184,7 +1318,7 @@ export class VFSFileSystem {
         const destChild = pathJoin(dest, entry.name);
         await this._cpAsync(srcChild, destChild, options);
       }
-    } else if (srcStat.isSymbolicLink() && !dereference) {
+    } else if (srcStat.isSymbolicLink()) {
       const target = await this.promises.readlink(src) as string;
       let destExists = false;
       try { await this.promises.lstat(dest); destExists = true; } catch {}
@@ -1226,9 +1360,14 @@ export class VFSFileSystem {
     _chmodSync(this._sync, toPathString(filePath), mode);
   }
 
-  /** Like chmodSync but operates on the symlink itself. In this VFS, delegates to chmodSync. */
+  /**
+   * `chmod` on the symlink itself rather than on what it points at.
+   *
+   * This used to delegate straight to `chmodSync`, which follows the link — so it changed the
+   * **target's** permissions, the one outcome the `l` prefix exists to rule out.
+   */
   lchmodSync(filePath: PathLike, mode: Mode): void {
-    _chmodSync(this._sync, toPathString(filePath), mode);
+    _chmodSync(this._sync, toPathString(filePath), mode, false);
   }
 
   /** chmod on an open file descriptor. Resolves the fd to its inode on the
@@ -1242,9 +1381,9 @@ export class VFSFileSystem {
     _chownSync(this._sync, toPathString(filePath), uid, gid);
   }
 
-  /** Like chownSync but operates on the symlink itself. In this VFS, delegates to chownSync. */
+  /** `chown` on the symlink itself rather than its target — see {@link lchmodSync}. */
   lchownSync(filePath: PathLike, uid: number, gid: number): void {
-    _chownSync(this._sync, toPathString(filePath), uid, gid);
+    _chownSync(this._sync, toPathString(filePath), uid, gid, false);
   }
 
   /** chown on an open file descriptor. Mutates the underlying inode's uid/gid. */
@@ -1261,9 +1400,9 @@ export class VFSFileSystem {
     _futimesSync(this._sync, fd, atime, mtime);
   }
 
-  /** Like utimesSync but operates on the symlink itself. In this VFS, delegates to utimesSync. */
+  /** Timestamps on the symlink itself rather than its target — see {@link lchmodSync}. */
   lutimesSync(filePath: PathLike, atime: Date | number, mtime: Date | number): void {
-    _utimesSync(this._sync, toPathString(filePath), atime, mtime);
+    _utimesSync(this._sync, toPathString(filePath), atime, mtime, false);
   }
 
   symlinkSync(target: PathLike, linkPath: PathLike, type?: string | null): void {
@@ -1285,8 +1424,9 @@ export class VFSFileSystem {
   /**
    * The stream constructors, exposed as properties the way `node:fs` exposes them, so
    * `x instanceof fs.ReadStream` and `fs.FileReadStream` resolve for code written against Node.
-   * `Stats`, `Dirent` and `Dir` are deliberately absent: they are structural interfaces here,
-   * not runtime classes, and a fake constructor would make `instanceof` lie.
+   * `Stats`, `Dirent` and `Dir` are exposed the same way — see the getters near the top of the
+   * class. They became real classes in 3.3.27; before that they were object literals and there
+   * was nothing for `instanceof` to test against.
    */
   get ReadStream(): typeof NodeReadable { return NodeReadable; }
   get WriteStream(): typeof NodeWritable { return NodeWritable; }
@@ -1353,7 +1493,8 @@ export class VFSFileSystem {
   }
 
   fsyncSync(fd: number): void {
-    _fdatasyncSync(this._sync, fd);
+    // Same call underneath — the syscall name only shapes the error message.
+    _fdatasyncSync(this._sync, fd, 'fsync');
   }
 
   // ---- Vector I/O methods ----
@@ -1434,8 +1575,8 @@ export class VFSFileSystem {
    * volume actually held — so code checking free space before a large write got an answer
    * unrelated to reality, and never saw a full disk coming.
    */
-  statfsSync(path: PathLike = '/'): StatFs {
-    return _statfsSync(this._sync, toPathString(path));
+  statfsSync(path: PathLike = '/', options?: StatFsOptions): StatFs | BigIntStatFs {
+    return _statfsSync(this._sync, toPathString(path), options);
   }
 
   statfs(path: string, callback: (err: Error | null, stats?: StatFs) => void): void;
@@ -1443,7 +1584,7 @@ export class VFSFileSystem {
   statfs(path: string = '/', callback?: (err: Error | null, stats?: StatFs) => void): Promise<StatFs> | void {
     // Route through the async transport rather than the sync one: the callback form must work
     // without crossOriginIsolated, where the sync path is unavailable.
-    const promise = _statfs(this._async, path);
+    const promise = _statfs(this._async, path) as Promise<StatFs>;
     if (callback) {
       this._validateCb(callback);
       return this._cb(promise, callback) as void;
@@ -1454,11 +1595,11 @@ export class VFSFileSystem {
   // ---- Watch methods ----
 
   watch(filePath: PathLike, options?: WatchOptions | Encoding | WatchListener, listener?: WatchListener): FSWatcher {
-    return _watch(this.ns, toPathString(filePath), options, listener);
+    return _watch(this.ns, this._sync, toPathString(filePath), options, listener);
   }
 
-  watchFile(filePath: PathLike, optionsOrListener?: WatchFileOptions | WatchFileListener, listener?: WatchFileListener): void {
-    _watchFile(this.ns, this._sync, toPathString(filePath), optionsOrListener, listener);
+  watchFile(filePath: PathLike, optionsOrListener?: WatchFileOptions | WatchFileListener, listener?: WatchFileListener): StatWatcher {
+    return _watchFile(this.ns, this._sync, toPathString(filePath), optionsOrListener, listener);
   }
 
   unwatchFile(filePath: PathLike, listener?: WatchFileListener): void {
@@ -1468,9 +1609,8 @@ export class VFSFileSystem {
   // ---- openAsBlob (Node.js 19+) ----
 
   async openAsBlob(filePath: string, options?: OpenAsBlobOptions): Promise<Blob> {
-    const data = await this.promises.readFile(filePath);
-    const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(data as string);
-    return new Blob([bytes as BlobPart], { type: options?.type ?? '' });
+    const data = await _readFileAsBlobBytes(this.promises.readFile(filePath));
+    return new Blob([data as BlobPart], { type: options?.type ?? '' });
   }
 
   // ---- Stream methods ----
@@ -1578,6 +1718,70 @@ export class VFSFileSystem {
   }
 
   /**
+   * Register the external-change observer, if this mode wants one and the browser has the API.
+   *
+   * Records are forwarded to the mirror worker, which reads the files and applies them; see
+   * `applyExternalRecords` in opfs-sync.worker.ts.
+   */
+  private async watchExternalChanges(): Promise<void> {
+    if (!this.config.opfsSync) return;
+    if (typeof FileSystemObserver === 'undefined') return;   // Chrome 129+ only
+
+    // A `FileSystemObserver` may only be created somewhere that can `disconnect()` it
+    // **synchronously** before that scope is destroyed. Chromium aborts the entire browser
+    // process on one that outlives its owner — `FATAL: Detected dangling raw_ptr`, a
+    // use-after-free in its own C++, which no amount of care on this side prevents.
+    //
+    // A page qualifies: `pagehide` runs synchronously before teardown. A worker does not — the
+    // page kills it outright, and a `postMessage` sent on the way out cannot be waited for. So a
+    // worker-hosted instance never creates one; it asks the main thread to observe on its behalf
+    // through the same bridge it already uses for the service worker, and the observer lives
+    // there. Without a bridge there is nowhere safe to put it, so the feature stays off rather
+    // than risking the browser.
+    // A worker cannot host one safely — the page kills it outright, with no chance to detach —
+    // so a worker-hosted instance does not watch for external changes. Mirroring outward is
+    // unaffected. Hosting the observer on the page on the worker's behalf was tried and measured
+    // *worse*: it is one more observer nothing reliably detaches.
+    if (typeof document === 'undefined') return;
+
+    try {
+      let dir = await navigator.storage.getDirectory();
+      const root = this.config.opfsSyncRoot ?? this.config.root;
+      for (const segment of (root ?? '/').split('/').filter(Boolean)) {
+        dir = await dir.getDirectoryHandle(segment, { create: true });
+      }
+      if (this.closed) return;   // disposed while we were awaiting
+
+      const observer = new FileSystemObserver((records) => {
+        this.forwardExternalRecords(records.map((record) => ({
+          kind: record.type,
+          path: '/' + record.relativePathComponents.join('/'),
+          from: record.relativePathMovedFrom ? '/' + record.relativePathMovedFrom.join('/') : undefined,
+          handle: record.changedHandle,
+        })));
+      });
+      await observer.observe(dir, { recursive: true });
+      if (this.closed) { try { observer.disconnect(); } catch { /* ignore */ } return; }
+      this.externalObserver = observer;
+    } catch (err) {
+      console.warn('[VFS] external-change watching unavailable:', (err as Error)?.message);
+    }
+  }
+
+  /** Hand detected records to the mirror worker, which does the file I/O. */
+  private forwardExternalRecords(records: unknown[]): void {
+    try { this.syncWorker?.postMessage({ type: 'external-records', records }); }
+    catch { /* relay already gone */ }
+  }
+
+  /** Detach the observer. Synchronous on purpose — the unload path cannot await. */
+  private stopWatchingExternalChanges(): void {
+    if (!this.externalObserver) return;
+    try { this.externalObserver.disconnect(); } catch { /* already gone */ }
+    this.externalObserver = null;
+  }
+
+  /**
    * Tear the workers down when the page goes away, without needing the caller to remember.
    *
    * The OPFS mirror worker holds a recursive `FileSystemObserver`, and Chromium aborts the
@@ -1597,8 +1801,22 @@ export class VFSFileSystem {
     if (typeof addEventListener !== 'function' || typeof document === 'undefined') return;
     this.onPageHide = (event: Event) => {
       if ((event as PageTransitionEvent).persisted) return;
-      try { this.syncWorker?.terminate(); } catch { /* already gone */ }
-      try { this.asyncWorker?.terminate(); } catch { /* already gone */ }
+      // Ask the relay to shut down rather than killing it outright.
+      //
+      // The relay owns the OPFS mirror worker, which holds a **recursive
+      // `FileSystemObserver`**. Terminating the relay leaves that observer attached while the
+      // page is torn down, and Chromium aborts the whole browser process on it —
+      // `FATAL: Detected dangling raw_ptr`. Confirmed by construction: with the observer
+      // disabled the crash disappears entirely, and with it it reproduces within a few specs.
+      //
+      // `postMessage` still reaches a live worker during `pagehide`, and the worker disconnects
+      // and calls `self.close()`. The workers are not terminated here: they die with the page
+      // anyway, and killing them is what removed the chance to detach first.
+      // Synchronous, and the reason the observer lives on this side: it is guaranteed detached
+      // before the page is destroyed, which is the state Chromium aborts on.
+      this.stopWatchingExternalChanges();
+      terminateWorker(this.syncWorker);
+      terminateWorker(this.asyncWorker);
     };
     addEventListener('pagehide', this.onPageHide);
   }
@@ -1642,13 +1860,15 @@ export class VFSFileSystem {
   async dispose(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
+    liveInstances.delete(this);
+    this.stopWatchingExternalChanges();
     if (this.onPageHide) {
       removeEventListener('pagehide', this.onPageHide);
       this.onPageHide = null;
     }
     await this.shutdownRelay();
-    try { this.syncWorker?.terminate(); } catch { /* already gone */ }
-    try { this.asyncWorker?.terminate(); } catch { /* already gone */ }
+    terminateWorker(this.syncWorker);
+    terminateWorker(this.asyncWorker);
     this.isReady = false;
   }
 
@@ -1686,8 +1906,8 @@ export class VFSFileSystem {
     // OPFS mirror worker it owns can detach its FileSystemObserver — terminating the relay
     // outright orphans that worker, and the observer with it.
     await this.shutdownRelay();
-    this.syncWorker.terminate();
-    this.asyncWorker.terminate();
+    terminateWorker(this.syncWorker);
+    terminateWorker(this.asyncWorker);
 
     const sabSize = this.config.sabSize;
     if (this.hasSAB) {
@@ -2197,7 +2417,9 @@ export class VFSFileSystem {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
-    return this._cb(this.promises.glob(pattern, opts), cb);
+    // Straight to the engine, not through `promises.glob` — that returns an async iterator now,
+    // as node's does, while the callback form hands back the whole array in one go.
+    return this._cb(_glob(this._async, pattern, opts), cb);
   }
 
   futimes(fd: number, atime: Date | number, mtime: Date | number, callback?: (err: Error | null) => void): void {
@@ -2286,8 +2508,20 @@ class VFSPromises {
     return _readdir(this._async, toPathString(filePath), options);
   }
 
-  async glob(pattern: string | string[], options?: GlobOptions): Promise<string[] | Dirent[]> {
-    return _glob(this._async, pattern, options);
+  /**
+   * `fsPromises.glob` — an **async iterator** of matches, which is what node returns.
+   *
+   * This used to be `async glob(): Promise<string[]>`, so the documented way to consume it —
+   * `for await (const p of fsp.glob(pattern))` — got a promise, which is not async-iterable, and
+   * silently produced nothing. `await`ing it worked, which is why it looked fine: the shape was
+   * only wrong for the usage node's own docs show.
+   *
+   * Matches are gathered before the first yield rather than streamed. Observably identical for a
+   * consumer, and the engine answers a glob in one round trip, so there is nothing to stream.
+   */
+  async *glob(pattern: string | string[], options?: GlobOptions): AsyncGenerator<string | Dirent> {
+    const matches = await _glob(this._async, pattern, options);
+    for (const match of matches) yield match;
   }
 
   stat(filePath: PathLike, options?: StatOptions & { throwIfNoEntry?: true }): Promise<Stats | BigIntStats>;
@@ -2325,14 +2559,15 @@ class VFSPromises {
   private async _cpInner(src: PathLike, dest: PathLike, options?: CpOptions): Promise<void> {
     const srcPath = toPathString(src);
     const destPath = toPathString(dest);
+    if (options?.filter && !options.filter(srcPath, destPath)) return;
     const force = options?.force !== false;
     const errorOnExist = options?.errorOnExist ?? false;
     const dereference = options?.dereference ?? false;
     const preserveTimestamps = options?.preserveTimestamps ?? false;
 
-    const srcStat = dereference
-      ? await this.stat(srcPath)
-      : await this.lstat(srcPath);
+    // See VFSFileSystem's sync path: the branch decision is always on the link itself.
+    void dereference;
+    const srcStat = await this.lstat(srcPath);
 
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
@@ -2349,7 +2584,7 @@ class VFSPromises {
         const destChild = pathJoin(destPath, entry.name);
         await this._cpInner(srcChild, destChild, options);
       }
-    } else if (srcStat.isSymbolicLink() && !dereference) {
+    } else if (srcStat.isSymbolicLink()) {
       const target = await this.readlink(srcPath) as string;
       let destExists = false;
       try { await this.lstat(destPath); destExists = true; } catch {}
@@ -2391,9 +2626,9 @@ class VFSPromises {
     return _chmod(this._async, toPathString(filePath), mode);
   }
 
-  /** Like chmod but operates on the symlink itself. In this VFS, delegates to chmod. */
+  /** `chmod` on the symlink itself — see {@link lchmodSync}. */
   async lchmod(filePath: PathLike, mode: Mode) {
-    return _chmod(this._async, toPathString(filePath), mode);
+    return _chmod(this._async, toPathString(filePath), mode, false);
   }
 
   /** chmod on an open file descriptor. Engine resolves fd → inode and
@@ -2406,9 +2641,9 @@ class VFSPromises {
     return _chown(this._async, toPathString(filePath), uid, gid);
   }
 
-  /** Like chown but operates on the symlink itself. In this VFS, delegates to chown. */
+  /** `chown` on the symlink itself rather than its target — see {@link lchmodSync}. */
   async lchown(filePath: PathLike, uid: number, gid: number) {
-    return _chown(this._async, toPathString(filePath), uid, gid);
+    return _chown(this._async, toPathString(filePath), uid, gid, false);
   }
 
   /** chown on an open file descriptor. Engine resolves fd → inode and
@@ -2427,9 +2662,9 @@ class VFSPromises {
     return _futimes(this._async, fd, atime, mtime);
   }
 
-  /** Like utimes but operates on the symlink itself. In this VFS, delegates to utimes. */
+  /** Timestamps on the symlink itself rather than its target — see {@link lchmodSync}. */
   async lutimes(filePath: PathLike, atime: Date | number, mtime: Date | number) {
-    return _utimes(this._async, toPathString(filePath), atime, mtime);
+    return _utimes(this._async, toPathString(filePath), atime, mtime, false);
   }
 
   async symlink(target: PathLike, linkPath: PathLike, type?: string | null) {
@@ -2467,14 +2702,13 @@ class VFSPromises {
   }
 
   async openAsBlob(filePath: string, options?: OpenAsBlobOptions): Promise<Blob> {
-    const data = await this.readFile(filePath);
-    const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(data as string);
-    return new Blob([bytes as BlobPart], { type: options?.type ?? '' });
+    const data = await _readFileAsBlobBytes(this.readFile(filePath));
+    return new Blob([data as BlobPart], { type: options?.type ?? '' });
   }
 
   /** Real volume statistics — see the note on `VFSFileSystem.statfsSync`. */
-  async statfs(path: PathLike = '/'): Promise<StatFs> {
-    return _statfs(this._async, toPathString(path));
+  async statfs(path: PathLike = '/', options?: StatFsOptions): Promise<StatFs | BigIntStatFs> {
+    return _statfs(this._async, toPathString(path), options);
   }
 
   async *watch(filePath: string, options?: WatchOptions): AsyncIterable<WatchEventType> {
@@ -2492,14 +2726,17 @@ class VFSPromises {
     if (status !== 0) throw _statusToError(status, 'ftruncate', String(fd));
   }
 
-  async fsync(_fd: number): Promise<void> {
-    await this._async(OP.FSYNC, '');
+  async fsync(fd: number): Promise<void> {
+    const { status } = await this._async(OP.FSYNC, '', 0, null, undefined, { fd });
+    if (status !== 0) throw _statusToError(status, 'fsync', String(fd));
   }
 
-  async fdatasync(_fd: number): Promise<void> {
-    await this._async(OP.FSYNC, '');
+  async fdatasync(fd: number): Promise<void> {
+    const { status } = await this._async(OP.FSYNC, '', 0, null, undefined, { fd });
+    if (status !== 0) throw _statusToError(status, 'fdatasync', String(fd));
   }
 
+  /** The volume-wide flush: no descriptor, so nothing to validate. */
   async flush(): Promise<void> {
     await this._async(OP.FSYNC, '');
   }

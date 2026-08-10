@@ -149,6 +149,21 @@ function joinPath(base: string, name: string): string {
   return base + '/' + name;
 }
 
+
+/**
+ * Reduce a matched absolute path to what node would report.
+ *
+ * Node's results are **relative to `cwd`** unless the pattern was itself absolute — `glob('*.txt',
+ * { cwd: '/src' })` yields `'a.txt'`, while `glob('/src/*.txt')` yields the full path. This
+ * returned absolute paths in every case, so a caller joining the result onto `cwd` got
+ * `/src//src/a.txt`.
+ */
+function toResultPath(fullPath: string, cwd: string, patternIsAbsolute: boolean): string {
+  if (patternIsAbsolute) return fullPath;
+  const base = cwd === '/' ? '/' : cwd.replace(/\/+$/, '') + '/';
+  return fullPath.startsWith(base) ? fullPath.slice(base.length) : fullPath;
+}
+
 function normalizeCwd(cwd: string | URL | undefined): string {
   if (!cwd) return '/';
   if (typeof cwd === 'string') return cwd || '/';
@@ -180,6 +195,7 @@ export function globSync(
   const cwd = normalizeCwd(options?.cwd);
   const exclude = options?.exclude as ((arg: string | Dirent) => boolean) | undefined;
   const withFileTypes = options?.withFileTypes === true;
+  const patternIsAbsolute = patterns.every((p) => p.startsWith('/'));
 
   const resultsSet = new Set<string>(); // dedupe across expanded patterns
   const resultsDirents: Dirent[] = [];
@@ -205,7 +221,7 @@ export function globSync(
       }
     } else {
       if (exclude && exclude(fullPath)) return;
-      resultsSet.add(fullPath);
+      resultsSet.add(toResultPath(fullPath, cwd, patternIsAbsolute));
     }
   };
 
@@ -294,6 +310,7 @@ export async function glob(
   const cwd = normalizeCwd(options?.cwd);
   const exclude = options?.exclude as ((arg: string | Dirent) => boolean) | undefined;
   const withFileTypes = options?.withFileTypes === true;
+  const patternIsAbsolute = patterns.every((p) => p.startsWith('/'));
 
   const resultsSet = new Set<string>();
   const resultsDirents: Dirent[] = [];
@@ -315,7 +332,7 @@ export async function glob(
       resultsDirents.push(dirent);
     } else {
       if (exclude && exclude(fullPath)) return;
-      resultsSet.add(fullPath);
+      resultsSet.add(toResultPath(fullPath, cwd, patternIsAbsolute));
     }
   };
 

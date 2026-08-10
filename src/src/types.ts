@@ -43,7 +43,19 @@ export interface RmOptions {
 }
 
 export interface CpOptions {
-  /** Dereference symlinks (default: false) */
+  /**
+   * Called with the absolute source and destination of every entry; return `false` to skip it.
+   * Skipping a directory skips its whole subtree, as in node. Was accepted and ignored.
+   */
+  filter?: (src: string, dest: string) => boolean;
+  /**
+   * Dereference symlinks (default: false).
+   *
+   * Node's own behaviour here is inconsistent — under `recursive` it keeps a symlink as a
+   * symlink whether or not this is set, and at the top level `cp(link, dst, { dereference: true })`
+   * throws `ERR_FS_EISDIR` for a link to an ordinary file. Links are copied as links either way
+   * here, which matches node's recursive case and the documented stance in the readme.
+   */
   dereference?: boolean;
   /** Throw if destination exists (default: false) */
   errorOnExist?: boolean;
@@ -161,12 +173,20 @@ export interface OpendirOptions {
 
 export interface StatFs {
   type: number;      // filesystem type (0x56465321 = "VFS!")
-  bsize: number;     // block size
+  bsize: number;     // preferred I/O block size
+  frsize: number;    // fragment size; equals bsize here, as on every modern filesystem
   blocks: number;    // total blocks
   bfree: number;     // free blocks
   bavail: number;    // available blocks (same as bfree)
   files: number;     // total inodes
   ffree: number;     // free inodes
+}
+
+/** `statfs` with `{ bigint: true }` — same fields, every one a `bigint`. */
+export type BigIntStatFs = { [K in keyof StatFs]: bigint };
+
+export interface StatFsOptions {
+  bigint?: boolean;
 }
 
 export interface GlobOptions {
@@ -303,7 +323,17 @@ export interface FileHandle {
   on(event: string, listener: (...args: never[]) => void): FileHandle;
   once(event: string, listener: (...args: never[]) => void): FileHandle;
   off(event: string, listener: (...args: never[]) => void): FileHandle;
+  addListener(event: string, listener: (...args: never[]) => void): FileHandle;
   removeListener(event: string, listener: (...args: never[]) => void): FileHandle;
+  removeAllListeners(event?: string): FileHandle;
+  prependListener(event: string, listener: (...args: never[]) => void): FileHandle;
+  prependOnceListener(event: string, listener: (...args: never[]) => void): FileHandle;
+  listeners(event: string): Function[];
+  rawListeners(event: string): Function[];
+  listenerCount(event: string): number;
+  eventNames(): string[];
+  setMaxListeners(n: number): FileHandle;
+  getMaxListeners(): number;
   emit(event: string, ...args: never[]): boolean;
 }
 
@@ -314,8 +344,40 @@ export interface Dir {
   [Symbol.asyncIterator](): AsyncIterableIterator<Dirent>;
 }
 
-export interface FSWatcher {
+/**
+ * The `EventEmitter` methods node's watchers carry.
+ *
+ * Declared here rather than imported from `node:events`, which does not exist in a browser —
+ * these are the members `SimpleEventEmitter` implements, which is what both watchers extend.
+ */
+export interface WatcherEvents {
+  on(event: string, listener: (...args: any[]) => void): this;
+  once(event: string, listener: (...args: any[]) => void): this;
+  off(event: string, listener: (...args: any[]) => void): this;
+  addListener(event: string, listener: (...args: any[]) => void): this;
+  removeListener(event: string, listener: (...args: any[]) => void): this;
+  removeAllListeners(event?: string): this;
+  prependListener(event: string, listener: (...args: any[]) => void): this;
+  prependOnceListener(event: string, listener: (...args: any[]) => void): this;
+  emit(event: string, ...args: any[]): boolean;
+  listenerCount(event: string): number;
+  listeners(event: string): Function[];
+  rawListeners(event: string): Function[];
+  eventNames(): string[];
+  setMaxListeners(n: number): this;
+  getMaxListeners(): number;
+}
+
+/** What `fs.watch` returns. Emits `'change'` (eventType, filename) and `'close'`. */
+export interface FSWatcher extends WatcherEvents {
   close(): void;
+  ref(): this;
+  unref(): this;
+}
+
+/** What `fs.watchFile` returns. Emits `'change'` (curr, prev), like node's `StatWatcher`. */
+export interface StatWatcher extends WatcherEvents {
+  stop(): void;
   ref(): this;
   unref(): this;
 }

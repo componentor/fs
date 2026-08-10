@@ -1222,21 +1222,7 @@ var VFSEngine = class _VFSEngine {
     const inode = this.readInode(idx);
     let nlink = inode.nlink;
     if (inode.type === INODE_TYPE.DIRECTORY) {
-      const path = this.readPath(inode.pathOffset, inode.pathLength);
-      const children = this.getDirectChildrenWithImplicit(path);
-      let subdirCount = 0;
-      for (const child of children) {
-        if (child.type === "implicit") {
-          subdirCount++;
-        } else {
-          const childIdx = this.pathIndex.get(child.path);
-          if (childIdx !== void 0) {
-            const childInode = this.readInode(childIdx);
-            if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
-          }
-        }
-      }
-      nlink = 2 + subdirCount;
+      nlink = 2 + this.countSubdirectories(this.readPath(inode.pathOffset, inode.pathLength));
     }
     const buf = new Uint8Array(53);
     const view = new DataView(buf.buffer);
@@ -1639,9 +1625,16 @@ var VFSEngine = class _VFSEngine {
     return { status: 0, data: encoder.encode(resolvedPath) };
   }
   // ---- CHMOD ----
-  chmod(path, mode) {
+  /**
+   * `follow: false` is `lchmod` — act on the symlink itself rather than what it points at.
+   *
+   * This used to have no such parameter and `lchmod` simply called `chmod`, so it changed the
+   * **target's** permissions: the one thing the `l` prefix exists to prevent. `resolvePathComponents`
+   * already distinguishes the two, exactly as `stat` and `lstat` do.
+   */
+  chmod(path, mode, follow = true) {
     path = this.normalizePath(path);
-    const idx = this.resolvePathComponents(path, true);
+    const idx = this.resolvePathComponents(path, follow);
     if (idx === void 0) return { status: this.resolveFailureStatus() };
     const inode = this.readInode(idx);
     inode.mode = inode.mode & S_IFMT | mode & 4095;
@@ -1650,9 +1643,10 @@ var VFSEngine = class _VFSEngine {
     return { status: 0 };
   }
   // ---- CHOWN ----
-  chown(path, uid, gid) {
+  /** `follow: false` is `lchown` — the link's own ownership, not its target's. */
+  chown(path, uid, gid, follow = true) {
     path = this.normalizePath(path);
-    const idx = this.resolvePathComponents(path, true);
+    const idx = this.resolvePathComponents(path, follow);
     if (idx === void 0) return { status: this.resolveFailureStatus() };
     const inode = this.readInode(idx);
     inode.uid = uid;
@@ -1662,9 +1656,10 @@ var VFSEngine = class _VFSEngine {
     return { status: 0 };
   }
   // ---- UTIMES ----
-  utimes(path, atime, mtime) {
+  /** `follow: false` is `lutimes` — timestamps on the symlink itself, not on its target. */
+  utimes(path, atime, mtime, follow = true) {
     path = this.normalizePath(path);
-    const idx = this.resolvePathComponents(path, true);
+    const idx = this.resolvePathComponents(path, follow);
     if (idx === void 0) return { status: this.resolveFailureStatus() };
     const inode = this.readInode(idx);
     inode.atime = atime;
@@ -1741,6 +1736,10 @@ var VFSEngine = class _VFSEngine {
         path = linkTarget;
         idx = this.resolvePathComponents(path, true);
       }
+    }
+    if (_VFSEngine.isWritable(flags)) {
+      const isDirectory = idx !== void 0 ? this.readInode(idx).type === INODE_TYPE.DIRECTORY : this.isImplicitDirectory(path);
+      if (isDirectory) return { status: CODE_TO_STATUS.EISDIR, data: null };
     }
     if (idx === void 0) {
       if (!hasCreate) return { status: this.resolveFailureStatus(), data: null };
@@ -1885,7 +1884,19 @@ var VFSEngine = class _VFSEngine {
     dv.setUint32(20, Math.max(0, this.inodeCount - usedInodes), true);
     return { status: 0, data: buf };
   }
-  fsync() {
+  /**
+   * fsync(2) / fdatasync(2).
+   *
+   * Everything here is committed to one backing handle, so there is nothing per-descriptor to
+   * flush — but the descriptor still has to be *checked*. `fs.fsyncSync(fd)` on a closed or
+   * never-opened fd answers EBADF in node, and reporting success instead turns a use-after-close
+   * into silence at the one call whose entire job is to confirm the data is safe.
+   *
+   * `fd` is optional because the volume-wide flush behind `promises.flush()` has no descriptor
+   * to name, and because a request encoded by an older worker carries no fd payload.
+   */
+  fsync(fd) {
+    if (fd !== void 0 && !this.fdTable.has(fd)) return { status: CODE_TO_STATUS.EBADF };
     this.commitPending();
     this.handle.flush();
     return { status: 0 };
@@ -1953,12 +1964,9 @@ var VFSEngine = class _VFSEngine {
   mkdtemp(prefix) {
     const suffix = Math.random().toString(36).substring(2, 8);
     const path = this.normalizePath(prefix + suffix);
-    const parentStatus = this.ensureParent(path);
-    if (parentStatus !== 0) {
-      const parentPath = path.substring(0, path.lastIndexOf("/"));
-      if (parentPath) {
-        this.mkdirRecursive(parentPath);
-      }
+    const parentPath = path.substring(0, path.lastIndexOf("/")) || "/";
+    if (parentPath !== "/" && this.resolvePathComponents(parentPath, true) === void 0 && !this.isImplicitDirectory(parentPath)) {
+      return { status: CODE_TO_STATUS.ENOENT, data: null };
     }
     this.createInode(path, INODE_TYPE.DIRECTORY, this.dirModeFor(448), 0);
     this.commitPending();
@@ -2143,6 +2151,29 @@ var VFSEngine = class _VFSEngine {
    * Returns unique child full paths. Each entry is tagged with whether it's a
    * real inode or an implicit directory.
    */
+  /**
+   * How many direct children of `dirPath` are directories — the `nlink` a directory reports
+   * (`2 + subdirectories`, as on a real filesystem).
+   *
+   * Counting through {@link getDirectChildrenWithImplicit} meant every `stat` on a directory
+   * allocated one object and one string per child, built an array, and then **sorted** it, all to
+   * arrive at a single integer. The sort in particular is entirely wasted: order cannot change a
+   * count. This walks the child index directly and allocates nothing per child beyond the lookup
+   * key, which is why `stat` on a directory was ~40× the cost of `stat` on a file.
+   */
+  countSubdirectories(dirPath) {
+    this.ensureChildIndex();
+    const names = this.childIndex.get(dirPath);
+    if (!names) return 0;
+    const prefix = dirPath === "/" ? "/" : dirPath + "/";
+    let subdirs = 0;
+    for (const name of names.keys()) {
+      const childIdx = this.pathIndex.get(prefix + name);
+      if (childIdx === void 0) subdirs++;
+      else if (this.readInode(childIdx).type === INODE_TYPE.DIRECTORY) subdirs++;
+    }
+    return subdirs;
+  }
   getDirectChildrenWithImplicit(dirPath) {
     this.ensureChildIndex();
     const names = this.childIndex.get(dirPath);
@@ -2164,20 +2195,7 @@ var VFSEngine = class _VFSEngine {
     this.rebuildImplicitDirs();
     const ts = this.implicitDirs.get(path) ?? Date.now();
     const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
-    const children = this.getDirectChildrenWithImplicit(path);
-    let subdirCount = 0;
-    for (const child of children) {
-      if (child.type === "implicit") {
-        subdirCount++;
-      } else {
-        const childIdx = this.pathIndex.get(child.path);
-        if (childIdx !== void 0) {
-          const childInode = this.readInode(childIdx);
-          if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
-        }
-      }
-    }
-    const nlink = 2 + subdirCount;
+    const nlink = 2 + this.countSubdirectories(path);
     const buf = new Uint8Array(53);
     const view = new DataView(buf.buffer);
     view.setUint8(0, INODE_TYPE.DIRECTORY);
@@ -2847,7 +2865,14 @@ var OPFSEngine = class {
     dv.setUint32(20, 0, true);
     return { status: 0, data: buf };
   }
-  async fsync() {
+  /**
+   * `fd` is optional: the volume-wide flush behind `flushSync()` names no descriptor. When one is
+   * given it is checked first, because node answers EBADF for a closed descriptor and reporting
+   * success instead turns a use-after-close into silence at the call whose job is to confirm the
+   * data is safe. Everything is flushed either way — the handles share no per-fd buffering.
+   */
+  async fsync(fd) {
+    if (fd !== void 0 && !this.fdTable.has(fd)) return { status: EBADF, data: null };
     for (const [, entry] of this.fdTable) {
       try {
         entry.handle.flush();
@@ -3270,6 +3295,7 @@ function decodeFutimesArgs(data) {
 var DEFAULT_MKDIR_MODE = 511;
 var DEFAULT_OPEN_MODE = 438;
 var EINVAL2 = CODE_TO_STATUS.EINVAL;
+var NOFOLLOW = 1;
 function decodeMode(data, fallback) {
   return decodeModeArg(data ?? null) ?? fallback;
 }
@@ -3311,25 +3337,30 @@ function dispatchOp(engine2, tabId2, op, flags, path, data) {
       return engine2.opendir(path, tabId2);
     case OP.MKDTEMP:
       return engine2.mkdtemp(path);
+    // The fd payload is optional: `promises.flush()` flushes the volume with no descriptor to
+    // name, and a request encoded by an older worker carries none. Absent means "no fd to check".
     case OP.FSYNC:
-      return engine2.fsync();
+      return engine2.fsync(decodeFdArg(data) ?? void 0);
     case OP.STATFS:
       return engine2.statfs(path);
     case OP.TRUNCATE: {
       const len = decodeTruncateArgs(data);
       return len === null ? { status: EINVAL2 } : engine2.truncate(path, len);
     }
+    // `flags & NOFOLLOW` is the lchmod/lchown form: act on the symlink, not its target. Carried
+    // in the existing flags word rather than as new opcodes, so a bundle built against an older
+    // worker keeps working — it ignores the bit and follows, which is the behaviour it had.
     case OP.CHMOD: {
       const mode = decodeModeArg(data);
-      return mode === null ? { status: EINVAL2 } : engine2.chmod(path, mode);
+      return mode === null ? { status: EINVAL2 } : engine2.chmod(path, mode, (flags & NOFOLLOW) === 0);
     }
     case OP.CHOWN: {
       const a = decodeChownArgs(data);
-      return a === null ? { status: EINVAL2 } : engine2.chown(path, a.uid, a.gid);
+      return a === null ? { status: EINVAL2 } : engine2.chown(path, a.uid, a.gid, (flags & NOFOLLOW) === 0);
     }
     case OP.UTIMES: {
       const a = decodeTimesArgs(data);
-      return a === null ? { status: EINVAL2 } : engine2.utimes(path, a.atime, a.mtime);
+      return a === null ? { status: EINVAL2 } : engine2.utimes(path, a.atime, a.mtime, (flags & NOFOLLOW) === 0);
     }
     case OP.SYMLINK:
       return engine2.symlink(data ? new TextDecoder().decode(data) : "", path);
@@ -3407,6 +3438,35 @@ var DISPATCHED_OPS = /* @__PURE__ */ new Set([
   OP.FUTIMES,
   OP.STATFS
 ]);
+
+// src/workers/worker-blob.ts
+var objectUrls = /* @__PURE__ */ new WeakMap();
+function workerFromSource(source, name) {
+  const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+  try {
+    const worker = new Worker(url, { type: "module", name });
+    objectUrls.set(worker, url);
+    return worker;
+  } catch (err) {
+    URL.revokeObjectURL(url);
+    throw err;
+  }
+}
+function terminateWorker(worker) {
+  if (!worker) return;
+  try {
+    worker.terminate();
+  } catch {
+  }
+  const url = objectUrls.get(worker);
+  if (url) {
+    URL.revokeObjectURL(url);
+    objectUrls.delete(worker);
+  }
+}
+
+// src/workers/inlined/opfs-sync.workertext
+var opfs_sync_default = 'function E(e){if(e.startsWith("/")||(e="/"+e),e.length===1)return e;const t=[];for(const r of e.split("/"))if(!(r===""||r===".")){if(r===".."){t.pop();continue}t.push(r)}return"/"+t.join("/")}function j(e,t){const r=E(t);for(let n=e.length-1;n>=0;n--){const a=e[n];if(E(a.path)!==r){if(a.op==="rename"&&a.newPath&&E(a.newPath)===r)return-1;continue}return a.op==="write"?n:-1}return-1}var h,m;function f(e){if(e.charCodeAt(0)!==47&&(e="/"+e),e.indexOf("//")!==-1&&(e=e.replace(/\\/\\/+/g,"/")),e.indexOf("/.")!==-1){const t=e.split("/"),r=[];for(const n of t)if(!(n==="."||n==="")){if(n===".."){r.pop();continue}r.push(n)}e="/"+r.join("/")}return e.length>1&&e.charCodeAt(e.length-1)===47&&(e=e.slice(0,-1)),e||"/"}function H(e){return f(e).split("/").filter(Boolean)}var D=new Set,p=new Map,M=new Map;function O(e){let t=2166136261;for(let r=0;r<e.length;r++)t^=e[r],t=Math.imul(t,16777619);return t>>>0^e.length}function P(e,t){if(e=f(e),D.has(e))return!0;const r=p.get(e);return!r||Date.now()-r>=A?!1:M.get(e)===O(t)}var A=3e3;function R(e){D.add(f(e))}function T(e){D.delete(f(e))}function z(e){p.set(f(e),Date.now())}function b(e,t=!1){e=f(e);const r=Date.now();if(D.has(e))return!0;const n=p.get(e);if(n&&r-n<A)return!0;if(t){let a=e;for(;;){const o=a.lastIndexOf("/");if(o<=0)break;if(a=a.substring(0,o),D.has(a))return!0;const i=p.get(a);if(i&&r-i<A)return!0}}return!1}setInterval(()=>{const e=Date.now()-A;for(const[t,r]of p)r<e&&(p.delete(t),M.delete(t))},5e3);var g=[],F=!1;function q(e){if(R(e.path),e.op==="rename"&&e.newPath&&R(e.newPath),e.op==="write"){const t=j(g,e.path);if(t!==-1){g[t].data=e.data,g[t].ts=e.ts;return}}g.push(e),F||I()}async function G(e){switch(e.op){case"write":e.data?await B(e.path,e.data):await B(e.path,new ArrayBuffer(0));break;case"delete":await K(e.path);break;case"mkdir":await X(e.path);break;case"rename":await J(e.path,e.newPath);break}}var C=4;async function I(){if(g.length===0){F=!1;return}F=!0;const e=g.shift();for(let t=1;t<=C;t++)try{await G(e);break}catch(r){if(t===C){console.warn("[opfs-sync] mirror failed after retries:",e.op,e.path,r);break}await new Promise(n=>setTimeout(n,10*t))}T(e.path),z(e.path),e.op==="rename"&&e.newPath&&(T(e.newPath),z(e.newPath)),I()}async function S(e){const t=H(e);t.pop();let r=m;for(const n of t)r=await r.getDirectoryHandle(n,{create:!0});return r}function y(e){const t=H(e);return t[t.length-1]||""}async function B(e,t){const r=await S(e),n=y(e),a=await r.getFileHandle(n,{create:!0}),o=new Uint8Array(t),i=await a.createSyncAccessHandle();try{i.truncate(0),i.write(o,{at:0}),i.flush()}finally{i.close()}M.set(f(e),O(o))}async function K(e){try{await(await x(e)).removeEntry(y(e),{recursive:!0})}catch{}}async function X(e){let t=m;for(const r of H(e))t=await t.getDirectoryHandle(r,{create:!0})}var U=2*1024*1024;async function J(e,t){let r=null,n=null,a,o,i=!1,u=null;for(let s=0;s<6;s++)try{a=await x(e),o=await a.getFileHandle(y(e)),i=!0;break}catch(d){u=d;const l=d?.message||"";if(d?.name==="TypeMismatchError"||l.includes("TypeMismatch")||l.includes("not a file")||l.includes("not an entry of requested type")){try{await W(e,t)}catch(c){console.warn("[opfs-sync] rename (dir) failed:",e,"\\u2192",t,c)}return}if(s<5){await new Promise(c=>setTimeout(c,8*(s+1)));continue}}if(!i){try{await W(e,t);return}catch{}console.warn("[opfs-sync] rename failed (source not found after retries):",e,"\\u2192",t,u);return}try{r=await o.createSyncAccessHandle();const s=r.getSize();if(n=await(await(await S(t)).getFileHandle(y(t),{create:!0})).createSyncAccessHandle(),n.truncate(0),s>0){const w=new Uint8Array(Math.min(s,U));let c=0;for(;c<s;){const k=Math.min(w.length,s-c),v=k===w.length?w:w.subarray(0,k);r.read(v,{at:c}),n.write(v,{at:c}),c+=k}}n.flush();try{n.close()}catch{}n=null;try{r.close()}catch{}r=null,await N(a,y(e))}catch(s){console.warn("[opfs-sync] rename failed:",e,"\\u2192",t,s)}finally{if(n)try{n.close()}catch{}if(r)try{r.close()}catch{}}}async function W(e,t){const r=await x(e),n=await r.getDirectoryHandle(y(e)),a=await S(t);try{await a.removeEntry(y(t),{recursive:!0})}catch(i){if(i?.name!=="NotFoundError")throw i}const o=await a.getDirectoryHandle(y(t),{create:!0});await _(n,o),await N(r,y(e),{recursive:!0})}async function N(e,t,r){let n=null;for(let a=0;a<4;a++)try{await e.removeEntry(t,r);return}catch(o){if(o?.name==="NotFoundError")return;n=o,await new Promise(i=>setTimeout(i,10*(a+1)))}throw n}async function _(e,t){for await(const[r,n]of e.entries())if(n.kind==="directory"){const a=await t.getDirectoryHandle(r,{create:!0});await _(n,a)}else{const a=n,o=await t.getFileHandle(r,{create:!0});let i=null,u=null;try{i=await a.createSyncAccessHandle(),u=await o.createSyncAccessHandle();const s=i.getSize();if(u.truncate(0),s>0){const d=new Uint8Array(Math.min(s,U));let l=0;for(;l<s;){const w=Math.min(d.length,s-l),c=w===d.length?d:d.subarray(0,w);i.read(c,{at:l}),u.write(c,{at:l}),l+=w}}u.flush()}finally{if(u)try{u.close()}catch{}if(i)try{i.close()}catch{}}}}async function x(e){const t=H(e);t.pop();let r=m;for(const n of t)r=await r.getDirectoryHandle(n);return r}function L(e){for(const t of e){const r=f(t.path);if(!(r==="/.vfs.bin"||r==="/.vfs"||r.startsWith("/.vfs")))switch(t.kind){case"appeared":case"modified":Q(r,t.handle??null);break;case"disappeared":if(b(r,!0))continue;V(r);break;case"moved":{const n=f(t.from);if(b(r)||b(n))continue;Y(n,r);break}}}}async function Q(e,t){try{if(!t||t.kind!=="file")return;const r=t;let n=await r.getFile().then(a=>a.arrayBuffer());if(P(e,new Uint8Array(n))||p.has(f(e))&&(n=await r.getFile().then(a=>a.arrayBuffer()),P(e,new Uint8Array(n))))return;h.postMessage({op:"external-write",path:e,data:n,ts:Date.now()},[n])}catch(r){console.warn("[opfs-sync] external change read failed:",e,r)}}function V(e){h.postMessage({op:"external-delete",path:e,ts:Date.now()})}function Y(e,t){h.postMessage({op:"external-rename",path:e,newPath:t,ts:Date.now()})}self.onmessage=async e=>{const t=e.data;if(t.type==="init"){if(h=e.ports[0],m=await navigator.storage.getDirectory(),t.root&&t.root!=="/"){const r=t.root.split("/").filter(Boolean);for(const n of r)m=await m.getDirectoryHandle(n,{create:!0})}console.log("[opfs-sync] initialized with root:",t.root||"/","mirrorRoot.name:",m.name||"(opfs-root)"),h.onmessage=r=>{if(r.data?.type==="external-records"){L(r.data.records);return}q(r.data)},h.start(),self.postMessage({type:"ready"});return}if(t.type==="shutdown"){try{h?.close()}catch{}self.postMessage({type:"shutdown-done"}),self.close();return}};\n';
 
 // src/protocol/mirror-plan.ts
 function sampleOpenPreState(engine2, flags, path) {
@@ -3838,7 +3898,7 @@ async function handleRequestOPFS(reqTabId, buffer) {
       break;
     }
     case OP.FSYNC:
-      result = await oe.fsync();
+      result = await oe.fsync(decodeFdArg(data) ?? void 0);
       break;
     case OP.STATFS:
       result = await oe.statfs();
@@ -4345,8 +4405,7 @@ async function initEngine(config) {
     opfsSyncPort = mc.port1;
     opfsSyncPort.onmessage = (e) => handleExternalChange(e.data);
     opfsSyncPort.start();
-    const workerUrl = new URL("./opfs-sync.worker.js", import.meta.url);
-    opfsSyncWorker = new Worker(workerUrl, { type: "module" });
+    opfsSyncWorker = workerFromSource(opfs_sync_default, "vfs-opfs-sync");
     opfsSyncWorker.postMessage(
       { type: "init", root: config.opfsSyncRoot ?? config.root },
       [mc.port2]
@@ -4728,6 +4787,10 @@ self.onmessage = async (e) => {
     removeClientPort(msg.tabId);
     return;
   }
+  if (msg.type === "external-records") {
+    opfsSyncPort?.postMessage({ type: "external-records", records: msg.records });
+    return;
+  }
   if (msg.type === "shutdown") {
     if (opfsSyncWorker) {
       const worker = opfsSyncWorker;
@@ -4735,7 +4798,7 @@ self.onmessage = async (e) => {
       await new Promise((resolve) => {
         const done = () => {
           clearTimeout(timer);
-          worker.terminate();
+          terminateWorker(worker);
           resolve();
         };
         const timer = setTimeout(done, 500);

@@ -65,6 +65,10 @@ describe('NodeWritable', () => {
 
   it('write() callback receives error on failure', async () => {
     const { stream } = createTestStream({ writeFail: true });
+    // An 'error' listener is required, not optional decoration: node emits 'error' for a failed
+    // write *as well as* calling the callback, and an unhandled 'error' takes the process down.
+    // This test used to omit it, which only worked while unhandled errors were being swallowed.
+    stream.on('error', () => {});
 
     const err = await new Promise<unknown>((resolve) => {
       stream.write('data', (e: unknown) => resolve(e));
@@ -191,6 +195,9 @@ describe('NodeWritable', () => {
 
   it('write after end returns false and calls callback with error', async () => {
     const { stream } = createTestStream();
+    // Same rule as a failed write: node emits 'error' for a write-after-end as well as calling
+    // the callback, and an unhandled 'error' is fatal. Required, not decoration.
+    stream.on('error', () => {});
 
     await new Promise<void>((resolve) => {
       stream.end(() => resolve());

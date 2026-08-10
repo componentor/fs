@@ -17,7 +17,7 @@
  * ```
  */
 
-export { VFSFileSystem } from './filesystem.js';
+export { VFSFileSystem, disposeAll } from './filesystem.js';
 // Fairness ticket lock over the control SAB — exported so a host that shares one
 // control SAB across several raw sync clients (e.g. multiple Web Workers) can
 // serialize them with the SAME lock the library's own `syncRequest` uses.

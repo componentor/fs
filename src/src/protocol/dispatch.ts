@@ -48,6 +48,9 @@ export const DEFAULT_OPEN_MODE = 0o666;
 
 const EINVAL = CODE_TO_STATUS.EINVAL;
 
+/** `flags` bit meaning "do not follow a final symlink" — the `l` in `lchmod`/`lchown`. */
+export const NOFOLLOW = 1;
+
 /**
  * Read a mode from a request payload, or `fallback` when the client sent none.
  *
@@ -91,7 +94,9 @@ export function dispatchOp(
     case OP.LINK: return engine.link(path, data ? decodeSecondPath(data) : '');
     case OP.OPENDIR: return engine.opendir(path, tabId);
     case OP.MKDTEMP: return engine.mkdtemp(path);
-    case OP.FSYNC: return engine.fsync();
+    // The fd payload is optional: `promises.flush()` flushes the volume with no descriptor to
+    // name, and a request encoded by an older worker carries none. Absent means "no fd to check".
+    case OP.FSYNC: return engine.fsync(decodeFdArg(data) ?? undefined);
     case OP.STATFS: return engine.statfs(path);
 
     case OP.TRUNCATE: {
@@ -99,19 +104,22 @@ export function dispatchOp(
       return len === null ? { status: EINVAL } : engine.truncate(path, len);
     }
 
+    // `flags & NOFOLLOW` is the lchmod/lchown form: act on the symlink, not its target. Carried
+    // in the existing flags word rather than as new opcodes, so a bundle built against an older
+    // worker keeps working — it ignores the bit and follows, which is the behaviour it had.
     case OP.CHMOD: {
       const mode = decodeModeArg(data);
-      return mode === null ? { status: EINVAL } : engine.chmod(path, mode);
+      return mode === null ? { status: EINVAL } : engine.chmod(path, mode, (flags & NOFOLLOW) === 0);
     }
 
     case OP.CHOWN: {
       const a = decodeChownArgs(data);
-      return a === null ? { status: EINVAL } : engine.chown(path, a.uid, a.gid);
+      return a === null ? { status: EINVAL } : engine.chown(path, a.uid, a.gid, (flags & NOFOLLOW) === 0);
     }
 
     case OP.UTIMES: {
       const a = decodeTimesArgs(data);
-      return a === null ? { status: EINVAL } : engine.utimes(path, a.atime, a.mtime);
+      return a === null ? { status: EINVAL } : engine.utimes(path, a.atime, a.mtime, (flags & NOFOLLOW) === 0);
     }
 
     case OP.SYMLINK:

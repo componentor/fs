@@ -1,0 +1,63 @@
+{
+  "name": "sync-opfs",
+  "version": "4.0.0",
+  "description": "Node's fs in the browser, including a real synchronous readFileSync/writeFileSync, stored in OPFS. Alias for @componentor/fs.",
+  "license": "MIT",
+  "author": "Componentor",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/componentor/fs.git",
+    "directory": "sync-opfs"
+  },
+  "homepage": "https://github.com/componentor/fs#readme",
+  "bugs": {
+    "url": "https://github.com/componentor/fs/issues"
+  },
+  "type": "module",
+  "main": "./index.js",
+  "module": "./index.js",
+  "types": "./index.d.ts",
+  "sideEffects": false,
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    },
+    "./drives": {
+      "types": "./drives.d.ts",
+      "import": "./drives.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "drives.js",
+    "drives.d.ts",
+    "readme.md"
+  ],
+  "dependencies": {
+    "@componentor/fs": "4.0.0"
+  },
+  "keywords": [
+    "opfs",
+    "origin-private-file-system",
+    "fs",
+    "filesystem",
+    "browser",
+    "sync",
+    "readfilesync",
+    "node-fs",
+    "polyfill",
+    "web-worker",
+    "shared-array-buffer",
+    "isomorphic-git",
+    "typescript",
+    "writefilesync",
+    "browser-filesystem",
+    "virtual-filesystem",
+    "sync-fs",
+    "in-browser",
+    "web-ide",
+    "storage"
+  ]
+}

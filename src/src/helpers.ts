@@ -15,6 +15,8 @@
  * createSyncAccessHandle for direct disk I/O (no RAM bloat).
  */
 
+import { workerFromSource, terminateWorker } from './workers/worker-blob.js';
+import repairSource from './workers/inlined/repair.workertext';
 import { VFSEngine } from './vfs/engine.js';
 import { INODE_TYPE } from './vfs/layout.js';
 
@@ -431,12 +433,11 @@ export async function repairVFS(root: string = '/', fs?: FsLike): Promise<Repair
  */
 function spawnRepairWorker<T>(msg: Record<string, unknown>): Promise<T> {
   return new Promise((resolve, reject) => {
-    const worker = new Worker(
-      new URL('./workers/repair.worker.js', import.meta.url),
-      { type: 'module' },
-    );
+    // Embedded source rather than a sibling URL, so this works from a CDN and under a bundler
+    // that rewrites `new URL(..., import.meta.url)`. See workers/worker-blob.ts.
+    const worker = workerFromSource(repairSource, 'vfs-repair');
     worker.onmessage = (event: MessageEvent) => {
-      worker.terminate();
+      terminateWorker(worker);
       if (event.data.error) {
         reject(new Error(event.data.error));
       } else {
@@ -444,7 +445,7 @@ function spawnRepairWorker<T>(msg: Record<string, unknown>): Promise<T> {
       }
     };
     worker.onerror = (event) => {
-      worker.terminate();
+      terminateWorker(worker);
       reject(new Error(event.message || 'Repair worker failed'));
     };
     worker.postMessage(msg);

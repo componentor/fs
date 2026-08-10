@@ -2,3 +2,6 @@ node_modules
 .npmrc
 playwright-report/
 test-results/
+
+# Worker bundles embedded into the entries at build time (see src/scripts/build.mjs).
+src/src/workers/inlined/

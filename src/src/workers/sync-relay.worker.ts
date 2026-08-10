@@ -38,6 +38,9 @@ self.addEventListener('unhandledrejection', (e) => {
 });
 import { VFS_MAGIC, VFS_VERSION, SUPERBLOCK, INODE_SIZE } from '../vfs/layout.js';
 import { dispatchOp } from '../protocol/dispatch.js';
+import { workerFromSource, terminateWorker } from './worker-blob.js';
+// The OPFS mirror worker, embedded so this relay can start it without a resolvable URL.
+import opfsSyncSource from './inlined/opfs-sync.workertext';
 import { planMirror, sampleOpenPreState } from '../protocol/mirror-plan.js';
 import {
   decodeModeArg, decodeTruncateArgs, decodeChownArgs, decodeTimesArgs, decodeFdArg,
@@ -474,7 +477,8 @@ async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise
       break;
     }
     case OP.FSYNC:
-      result = await oe.fsync();
+      // The fd is optional — `flushSync()` sends none — and is only there to be validated.
+      result = await oe.fsync(decodeFdArg(data) ?? undefined);
       break;
     case OP.STATFS:
       // No VFS superblock in this mode — the OPFS engine answers from the Storage API quota,
@@ -1253,10 +1257,13 @@ async function initEngine(config: {
     opfsSyncPort.onmessage = (e) => handleExternalChange(e.data);
     opfsSyncPort.start();
 
-    const workerUrl = new URL('./opfs-sync.worker.js', import.meta.url);
     // Held, not dropped: this used to be a local, so the worker — and the recursive
     // FileSystemObserver inside it — outlived every attempt to shut the filesystem down.
-    opfsSyncWorker = new Worker(workerUrl, { type: 'module' });
+    //
+    // Started from embedded source rather than a sibling URL. This relay is itself a blob worker
+    // now, so `import.meta.url` here would be a blob: URL and `./opfs-sync.worker.js` would not
+    // resolve to anything — a nested worker has to carry its child's source with it.
+    opfsSyncWorker = workerFromSource(opfsSyncSource, 'vfs-opfs-sync');
     opfsSyncWorker.postMessage(
       { type: 'init', root: config.opfsSyncRoot ?? config.root },
       [mc.port2],
@@ -1824,6 +1831,16 @@ self.onmessage = async (e: MessageEvent) => {
     return;
   }
 
+  // --- External-change records, detected by the owning instance ---
+  //
+  // Forwarded straight through to the mirror worker, which does the file I/O. The observer that
+  // produced them lives in the owner's scope so it can be disconnected synchronously on unload;
+  // see opfs-sync.worker.ts's applyExternalRecords.
+  if (msg.type === 'external-records') {
+    opfsSyncPort?.postMessage({ type: 'external-records', records: msg.records });
+    return;
+  }
+
   // --- Orderly shutdown ---
   //
   // Sent by `VFSFileSystem.close()`. The mirror worker has to be told to disconnect its
@@ -1835,7 +1852,7 @@ self.onmessage = async (e: MessageEvent) => {
       const worker = opfsSyncWorker;
       opfsSyncWorker = null;
       await new Promise<void>((resolve) => {
-        const done = () => { clearTimeout(timer); worker.terminate(); resolve(); };
+        const done = () => { clearTimeout(timer); terminateWorker(worker); resolve(); };
         const timer = setTimeout(done, 500); // don't hang a close on an unresponsive worker
         worker.onmessage = (ev: MessageEvent) => { if (ev.data?.type === 'shutdown-done') done(); };
       });

@@ -79,6 +79,7 @@ function encodeFdRequest(op: number, args: FdArgs): ArrayBuffer {
       return encodeRequest(op, '', 0, encodeFwritePayload(args.fd, args.position ?? -1, args.data ?? new Uint8Array(0)));
     case OP.FSTAT:
     case OP.CLOSE:
+    case OP.FSYNC:
       return encodeRequest(op, '', 0, encodeFdPayload(args.fd));
     case OP.FTRUNCATE:
       return encodeRequest(op, '', 0, encodeFtruncatePayload(args.fd, args.length ?? 0));

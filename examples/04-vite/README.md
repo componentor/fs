@@ -15,9 +15,9 @@ is `false` and the synchronous API is unavailable — the promises API still wor
 your production build needs the same two headers; a static host that cannot set headers cannot
 serve the sync API.
 
-**`optimizeDeps.exclude`.** The library locates its workers with
-`new URL('./workers/…​.worker.js', import.meta.url)`. Vite's dependency pre-bundling rewrites
-those URLs and the workers stop resolving, so the package is excluded from it.
+**No bundler configuration.** The worker bundles are embedded in the package, so there is
+nothing for Vite to resolve or rewrite — this used to need an `optimizeDeps.exclude` entry, and
+no longer does. Verified against both `vite dev` and `vite build`.
 
 **The service worker, if you need multiple tabs.** Service workers must be served as a real file
 at a URL whose scope covers your app, which a bundled chunk is not. Copy it into `public/` and

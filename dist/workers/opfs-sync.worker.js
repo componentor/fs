@@ -383,44 +383,27 @@ async function navigateToParent(path) {
   }
   return dir;
 }
-var observer = null;
-function setupObserver() {
-  if (typeof FileSystemObserver === "undefined") {
-    console.warn("[opfs-sync] FileSystemObserver not available \u2014 external changes will not be detected");
-    return;
-  }
-  console.log("[opfs-sync] Setting up FileSystemObserver on mirrorRoot:", mirrorRoot.name || "(opfs-root)");
-  observer = new FileSystemObserver((records) => {
-    for (const record of records) {
-      const path = normalizePath("/" + record.relativePathComponents.join("/"));
-      if (path === "/.vfs.bin" || path === "/.vfs" || path.startsWith("/.vfs")) continue;
-      switch (record.type) {
-        case "appeared":
-        case "modified":
-          syncExternalChange(path, record.changedHandle);
-          break;
-        case "disappeared":
-          if (isOurEcho(path, true)) continue;
-          syncExternalDelete(path);
-          break;
-        case "moved": {
-          const from = normalizePath("/" + record.relativePathMovedFrom.join("/"));
-          if (isOurEcho(path) || isOurEcho(from)) continue;
-          syncExternalRename(from, path);
-          break;
-        }
+function applyExternalRecords(records) {
+  for (const record of records) {
+    const path = normalizePath(record.path);
+    if (path === "/.vfs.bin" || path === "/.vfs" || path.startsWith("/.vfs")) continue;
+    switch (record.kind) {
+      case "appeared":
+      case "modified":
+        syncExternalChange(path, record.handle ?? null);
+        break;
+      case "disappeared":
+        if (isOurEcho(path, true)) continue;
+        syncExternalDelete(path);
+        break;
+      case "moved": {
+        const from = normalizePath(record.from);
+        if (isOurEcho(path) || isOurEcho(from)) continue;
+        syncExternalRename(from, path);
+        break;
       }
     }
-  });
-  observer.observe(mirrorRoot, { recursive: true });
-}
-function teardownObserver() {
-  if (!observer) return;
-  try {
-    observer.disconnect();
-  } catch {
   }
-  observer = null;
 }
 async function syncExternalChange(path, handle) {
   try {
@@ -469,17 +452,18 @@ self.onmessage = async (e) => {
       }
     }
     console.log("[opfs-sync] initialized with root:", msg.root || "/", "mirrorRoot.name:", mirrorRoot.name || "(opfs-root)");
-    setupObserver();
     serverPort.onmessage = (ev) => {
-      const event = ev.data;
-      enqueue(event);
+      if (ev.data?.type === "external-records") {
+        applyExternalRecords(ev.data.records);
+        return;
+      }
+      enqueue(ev.data);
     };
     serverPort.start();
     self.postMessage({ type: "ready" });
     return;
   }
   if (msg.type === "shutdown") {
-    teardownObserver();
     try {
       serverPort?.close();
     } catch {

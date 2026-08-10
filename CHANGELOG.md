@@ -1,5 +1,117 @@
 # Changelog
 
+## 4.0.0
+
+**The release that makes this library usable without installing it, and finishes `node:fs`.** Two headline
+changes: it can now be loaded straight from a CDN with no build step, and the `node:fs` surface is
+**complete — 134 of 134 functions, nothing excluded**. Nineteen real bugs were found and fixed along the way, eighteen of them by auditing every
+method — and then every option, and then every function on its own — against a live `node:fs`.
+
+**Upgrading:** the API you call is unchanged. Two small things can affect you — see Breaking.
+
+### Breaking
+
+- **`fsPromises.glob` returns an async iterator**, as node's does, instead of `Promise<string[]>`. If you were `await`ing it for an array, iterate it instead — or use the callback form, which still hands back the whole array:
+  ```js
+  for await (const path of fs.promises.glob('/src/**/*.ts')) { … }
+  ```
+- **`dist/index.js` grew from 327 KB to 460 KB** (+41%), the price of embedding the workers so CDN loading works. Paid by bundler users who never had the problem, to fix it for everyone else. Judged worth it: a library that cannot be tried without a build step mostly does not get tried.
+- **`dist/workers/server.worker.js` is gone** — 103 KB of the old architecture, superseded by the sync relay. Nothing spawned it: not one `import` or `new Worker` anywhere in the source, tests or built output, and it was never reachable through `exports`. Listed here only because a file that used to ship no longer does.
+- **An unhandled `'error'` event now throws**, as node's `EventEmitter` does, instead of being silently dropped. A stream error with no listener used to vanish and present as a hang with no diagnostic. It is emitted on a later tick, so `write()` still returns `false` rather than raising at the call site.
+
+### Install it without installing it
+
+- **Fixed: the package could not be loaded from a CDN at all.** Workers were located with `new URL('./workers/<name>.worker.js', import.meta.url)`, and `new Worker()` on a cross-origin URL is a `SecurityError` with no workaround available to the caller — so `import { VFSFileSystem } from 'https://esm.sh/@componentor/fs'` threw at construction. That is the lowest-friction way anyone tries a browser library, and it failed in a way that reads as "this library is broken" rather than "this package is mis-shipped". The worker bundles are embedded in the entry as source text and started as same-origin blobs ([worker-blob.ts](src/src/workers/worker-blob.ts)).
+- **Fixed: Vite needed `optimizeDeps.exclude` to work.** Dependency pre-bundling rewrote those same `new URL(...)` calls and the workers stopped resolving, so every Vite user had to know one undocumented incantation before anything ran. There is no URL left to rewrite — verified against `vite dev` *and* `vite build` with a config containing nothing but the isolation headers.
+- The **nested** worker needed the same treatment for a subtler reason: the sync relay starts the OPFS mirror worker, and now that the relay is itself a blob, `import.meta.url` inside it is a `blob:` URL that `./opfs-sync.worker.js` cannot resolve against. A nested worker has to carry its child's source, so the build runs in three stages — opfs-sync, then the relays with opfs-sync embedded, then the entries with the relays embedded ([build.mjs](src/scripts/build.mjs)).
+- **The service worker is deliberately not embedded.** Its scope is derived from the URL it was registered from, so it has to stay a real file; multi-tab setups still point at `dist/workers/service.worker.js` (or `swUrl`). Unchanged.
+- Pinned by [cross-origin-load.spec.ts](tests/benchmark/cross-origin-load.spec.ts), which serves `dist/` from a second origin and drives both the async **and the sync** path through it — the sync one matters, because only a running relay worker can answer it. A second test asserts the old URL form still throws `SecurityError`, so the first cannot quietly become vacuous.
+- Corrected a readme claim that had been wrong for a long time: it said workers "are inlined at build time", and a code comment said the same. Neither was true until now.
+
+### `node:fs` is complete: 134/134
+
+Every function `node:fs` and `node:fs/promises` export now exists here, with **no omissions list**.
+[api-surface.test.ts](src/tests/api-surface.test.ts) enumerates node's exports at runtime and
+fails in *both* directions, so neither a missing method nor a stale "intentionally absent" entry
+can survive a test run.
+
+- **Added `fs.Utf8Stream`** — node 24's buffered append stream, the engine behind fast logging. Six methods and twelve getters, with the defaults, event order (`write` → `ready` → `drain`, then `finish` → `close`) and option validation read off a live `fs.Utf8Stream` rather than the docs. Batching is the point of the class, so `minLength`, `maxLength` (with its `drop` event), `append`, `mkdir`, `fsync`, `periodicFlush`, `contentMode` and `reopen` are real rather than accepted-and-ignored.
+- **Added `fs._toUnixTimestamp`** — node's internal time coercion, under the same underscored name node uses.
+- **Completed `FileHandle`'s EventEmitter surface.** 3.3.28 said it "is an EventEmitter now"; it forwarded five methods and none of the other ten. The missing ones — `removeAllListeners`, `listenerCount`, `listeners`, `prependListener`, `eventNames`, … — are exactly what long-lived objects reach for at teardown, so the gap was invisible to short-lived tests.
+- **Added 15 missing `fs.constants`**, including the whole `UV_DIRENT_*` set that any code reading a `Dirent`'s type numerically depends on. The platform-only ones (`O_SYMLINK`, `UV_FS_O_FILEMAP`, `UV_FS_SYMLINK_*`) carry node's values so a bitmask read is never `undefined`, and are documented as having no behaviour behind them.
+- **Exposed `fs.BigIntStats`**, so a `stat({ bigint: true })` result has a constructor to be tested against, like `Stats`/`Dirent`/`Dir`.
+- Coverage against comparable libraries, measured the same way on the same denominator: **this 134/134 (100%)**, @zenfs/core 130/134 (97.0%), memfs 128/134 (95.5%).
+
+### Six more bugs, found by checking every method against a live `node:fs`
+
+Name parity was already asserted; [full-surface-parity.test.ts](src/tests/full-surface-parity.test.ts)
+drove each function with a real call and its common error path against `node:fs` on a temp
+directory, comparing return values, error `code`s and the resulting tree. Everything below was
+green before this release.
+
+- **`fsPromises.glob` returned the wrong type** — see Breaking. `for await (const p of fsp.glob(pattern))`, the form node's own documentation shows, iterated a promise and yielded **nothing**, silently. `await`ing it happened to work, which is exactly why it survived. An existing test asserted the old shape and was corrected rather than kept green.
+- **`statfs` was missing `frsize`.** Node reports eight fields and this returned seven, so `statfs().frsize` was `undefined` and arithmetic on it produced `NaN`. Derived from `bsize` — equal on every modern filesystem — so no wire-format change and older workers keep working.
+- **A negative time argument means "now", not a pre-epoch instant.** `fs.utimesSync(p, -1, -1)` stamps the current time in node; here it stamped one second *before* 1970. The rule is not in node's documentation — it surfaced from running `_toUnixTimestamp` against a live node across a table of inputs — and it reached every `utimes`, `futimes` and `lutimes` call.
+- **`readFileSync(p, 'utf16le')` replaced unpaired surrogates with U+FFFD.** It decoded through `TextDecoder`, which follows the WHATWG substitution rule; `Buffer.toString('utf16le')` hands the code unit back untouched, so a file holding a lone surrogate could not round-trip. The fast native path is kept and only re-decoded when a U+FFFD actually appears.
+- **`once()` was keyed by function rather than by registration.** `once('a', f)` plus `on('b', f)` — one handler on two events — meant firing `'b'` removed a listener meant to be permanent, and `once(e, f)` twice collapsed into one. Listeners are `{ fn, once }` records now, as node's are.
+- **An unhandled `'error'` event was silently dropped** — see Breaking.
+
+### `lchmod` and `lchown` were changing the wrong file
+
+- **Fixed: `lchmod`/`lchmodSync`/`lchown`/`lchownSync` followed the symlink.** All four delegated straight to their following siblings, with a comment saying so — so `lchmodSync(link, 0o600)` changed the **target's** permissions, the one outcome the `l` prefix exists to rule out. Node leaves the target untouched. The engine already distinguished the two cases (it is how `stat` and `lstat` differ); the flag is carried in the request's existing flags word rather than as new opcodes, so a bundle built against an older worker ignores the bit and behaves exactly as it did before.
+- Found by auditing the *coverage* rather than the code: five methods — `lchmodSync`, `lchownSync`, `fchown`, `lchmod` and `promises.lchmod` — had no differential test at all. They looked covered because their siblings were. [parity-coverage.test.ts](src/tests/parity-coverage.test.ts) now asserts that every one of the 134 exports is exercised against a live `node:fs`, so a method cannot again be implemented, typed, documented and never actually compared.
+
+### Five more, found by testing every *option* rather than every method
+
+Reachability is not depth: a method can be right in its default shape and wrong the moment an
+option is passed, and options are where the semantics live
+([option-matrix-parity.test.ts](src/tests/option-matrix-parity.test.ts)).
+
+- **Fixed: `cp`'s `filter` was accepted and ignored.** It was not even declared on `CpOptions`, so every entry was copied whatever the callback returned — a filtered copy silently copied everything.
+- **Fixed: `cp` turned symlinks into files when `dereference: true`.** The branch that recognises a link stat'd *through* it, so the link was never seen as a link. Node keeps links as links under `cp -r` either way; the branch decision is now always on the link itself.
+- **Fixed: `glob` returned absolute paths for relative patterns.** Node reports matches **relative to `cwd`** unless the pattern is itself absolute, so `glob('*.txt', { cwd: '/src' })` should give `a.txt`, not `/src/a.txt` — joining the result onto `cwd` produced `/src//src/a.txt`. Existing tests asserted the absolute form and were corrected.
+- **Fixed: `statfs`'s `bigint` option was ignored**, so `statfs(p, { bigint: true }).blocks` came back a `number` and mixing it with a real bigint threw `TypeError: Cannot mix BigInt and other types`.
+- **Fixed: `lutimes` wrote the *target's* timestamps, not the link's** — the same defect as `lchmod`/`lchown`, in the fourth member of that family. All four now use the `NOFOLLOW` path.
+- **Fixed: `mkdtemp` invented its parent directory.** `mkdtemp('/no/where/t-')` returned a path under a tree it had just created, where node answers `ENOENT` — so a typo'd prefix quietly produced a directory nobody would look in again.
+- One divergence was confirmed as *ours being right*: node 24.18's `glob` calls its `exclude` callback erratically (five times for an absolute pattern, once for a relative one, never with `cwd`) and ignores what it returns. We honour the documented contract, and the test asserts our behaviour rather than chasing node's.
+
+### Six more, found by giving every function its own differential test
+
+[parity-coverage.test.ts](src/tests/parity-coverage.test.ts) is one test per function — 102 on
+`node:fs`, 32 on `node:fs/promises` — with each case *written once and run twice*, against this
+filesystem and against a live `node:fs` on a temp directory, comparing what came back and what it
+did to the tree. Two sides that can never drift in what they were asked, because there is only
+one copy of the ask. The table is checked against `Object.keys(nodefs)` in both directions, so
+coverage is enforced rather than claimed.
+
+- **Fixed: `fsync`/`fdatasync` reported success on a closed descriptor.** All four spellings (and `FileHandle.sync`/`datasync`) flushed the volume and returned, where node answers `EBADF` — so a use-after-close was silent at the one call whose entire purpose is to confirm the data is safe. The descriptor now travels with the request and the engine checks it; the volume-wide `flushSync()` sends none and is unaffected.
+- **Fixed: a directory could be opened for writing.** `openSync(dir, 'w')` handed back a working descriptor instead of `EISDIR`. `O_TRUNC` *did* answer EISDIR internally, but the status was discarded — and for an implicit directory, one that exists only because it has children, `O_CREAT` created a file directly over it. Read-only opens still work, as in node, because `fstat` through the descriptor is the reason they exist.
+- **Fixed: `watch` on a path that does not exist returned a watcher.** Node throws `ENOENT`; registering silently is worse than it sounds, because the caller's watch appears to be running and a mistyped path looks like a filesystem that never changes.
+- **Fixed: the `FSWatcher` was not an `EventEmitter`.** `fs.watch(dir).on('change', …)` — the form node's documentation shows when the listener is not passed inline — died on `watcher.on is not a function`. It now emits `'change'` (eventType, filename) and `'close'`, with the listener argument registered for `'change'`, which is what node does with it too.
+- **Fixed: `watchFile` returned `undefined`.** Node hands back a `StatWatcher`, so `fs.watchFile(p, cb).unref()` threw and the `'change'` event had nowhere to be subscribed. The watcher rides alongside the listener rather than wrapping it, so `unwatchFile(path, listener)` still finds the entry by the function the caller passed.
+- **Fixed: `openAsBlob` on a file it cannot open reported the errno.** Node reports every such failure as `TypeError: Unable to open file as blob` with `code: 'ERR_INVALID_ARG_VALUE'` and no `path`, so code checking for `ENOENT` matched here and would not have in node. Not copied is *when*: node throws this synchronously out of a function that otherwise returns a promise, so `openAsBlob(missing).catch(…)` crashes rather than catching — this rejects, the same call made on `readFile(fd)`'s deferred error.
+
+### External-change watching moved to where it can be switched off
+
+- **The `FileSystemObserver` now lives in the scope that owns the instance**, not inside the mirror worker. Only the detected records cross into the worker, which still does the file I/O. The point is that `disconnect()` becomes a **synchronous** call on the unload path: an observer still attached when its scope is destroyed makes Chromium abort the **whole browser process** (`FATAL: Detected dangling raw_ptr`, a use-after-free in Chromium's own C++), and an observer inside a nested worker could never be detached in time — a page can post a shutdown at `pagehide` but cannot wait for it.
+- **A worker-hosted instance no longer watches for external changes.** There is nowhere safe to put the observer: the page kills the worker outright. Hosting it on the page on the worker's behalf was tried and measured *worse* — one more observer that nothing reliably detaches, since `pagehide` does not fire when a page is closed programmatically. Mirroring outward is unaffected in every mode.
+- **Added `disposeAll()`**, alongside the per-instance `fs.dispose()`. Its registry is shared across module copies via `globalThis`, because a page can legitimately load the library from two URLs (a bundle and a CDN) while the resources at stake — OPFS handles and observers — are per-origin. Worth calling from anything that owns the page lifecycle.
+- **Honest note on the crash:** this reduces it, it does not eliminate it. The browser suite still trips it about once per full run and keeps one retry. The only configuration measured as fully deterministic (three consecutive runs, retries off, zero crashes) was registering no observer at all, which is too high a price for a feature that works. It is a Chromium bug, not something this code can be careful enough to avoid.
+
+### `stat` on a directory is 3.3× faster
+
+- Computing a directory's `nlink` (`2 + subdirectories`) went through the helper `readdir` uses: it allocated an object and a string per child, built an array, and then **sorted** it — to produce one integer. Sorting cannot change a count. A counting-only path allocates nothing per child beyond the lookup key: **37.6k → 122.8k stats/s**, closing the gap with `stat` on a file from 42× to 13.6×, and the mixed list-and-stat workload is **1.33× faster** end to end.
+- The invariant is pinned directly rather than against the host, because directory `nlink` is filesystem-specific: the POSIX rule is `2 + subdirectories`, which ext4 and this VFS follow, while APFS answers 4 where ext4 answers 3.
+
+### Also in this release
+
+- **Published as [`sync-opfs`](https://www.npmjs.com/package/sync-opfs) too** — the same package under a name npm search can match. `@componentor/fs` cannot rank for "opfs", the word people actually type, because a scoped name is not matched by the term inside it. The alias re-exports this package and pins it exactly, so the two are always the same code at the same version.
+- **Four runnable examples** in [examples/](examples/), each loaded in a real browser by a test so a broken one fails the suite rather than the reader.
+- **`npm run release`** publishes both packages in the one order that works, after a preflight that refuses to start on a version mismatch, a missing changelog entry, or an already-published version. See [RELEASING.md](RELEASING.md), which also explains why every version gets published.
+- **Fixed: every filesystem instance leaked a worker and a `FileSystemObserver`.** Carried over from 3.3.29 for anyone skipping it: there is now `fs.dispose()` (and `Symbol.asyncDispose`), `setMode()` shuts the relay down properly, and instances tear down on `pagehide`.
+
+1863 Node tests pass across 88 files, plus 38 browser tests against real OPFS in Chromium.
+
 ## 3.3.29
 
 Five divergences in the stream layer added by 3.3.28, found reviewing it rather than by a failing test — the suite was green through all of them. Each is now pinned against a live `node:fs` in [stream-parity-fixes.test.ts](src/tests/stream-parity-fixes.test.ts).
@@ -231,7 +343,7 @@ Five divergences in the stream layer added by 3.3.28, found reviewing it rather 
 
 ## 3.3.6
 
-- **Fixed silent data loss in `truncate`/`ftruncate` on the server-worker path.** The method layer writes the length as a **float64** so files past the 4 GiB uint32 ceiling can be truncated; [server.worker.ts](src/src/workers/server.worker.ts) read it back as a **uint32**. That does not merely clamp — the low four bytes of a small float64 are all zero, so *every* non-zero length decoded as 0 and the file was **emptied instead of shortened**. `fs.truncateSync(p, 3)` on a 6-byte file produced an empty file. The sync relay (the default hybrid path) always decoded float64 correctly, so this was confined to the separately-published `dist/workers/server.worker.js` entry. The existing `truncate-large` tests missed it because they encoded *and* decoded with their own helper, so they only ever agreed with themselves.
+- **Fixed silent data loss in `truncate`/`ftruncate` on the server-worker path.** The method layer writes the length as a **float64** so files past the 4 GiB uint32 ceiling can be truncated; `server.worker.ts` (removed in 4.0.0) read it back as a **uint32**. That does not merely clamp — the low four bytes of a small float64 are all zero, so *every* non-zero length decoded as 0 and the file was **emptied instead of shortened**. `fs.truncateSync(p, 3)` on a 6-byte file produced an empty file. The sync relay (the default hybrid path) always decoded float64 correctly, so this was confined to the separately-published `dist/workers/server.worker.js` entry. The existing `truncate-large` tests missed it because they encoded *and* decoded with their own helper, so they only ever agreed with themselves.
 - **One dispatch, not two.** That bug existed because the server worker and the sync relay each carried a private, hand-maintained copy of the same ~200-line decode switch — the same duplication that made the 3.3.2/3.3.3 mode fixes need applying twice. Both payload layouts and their decoders now live in one place, [dispatch.ts](src/src/protocol/dispatch.ts), with every layout documented at the top; the server worker is now a thin wrapper and dropped from 437 to 224 lines. A test asserts every opcode in the protocol has a decoder, so an op added without one fails loudly instead of silently returning EINVAL. (The sync relay keeps its own switch for now — it interleaves mirror bookkeeping — and is correct; merging it is the next step.)
 - **Fixed: the server worker notified the OPFS mirror even when the operation had failed** — a rejected `mkdir` still told the mirror to create the directory. Mirror notifications are now gated on success.
 - **`append` is ~8.7× faster, and no longer O(file size).** [engine.ts](src/src/vfs/engine.ts) `append` relocated the **entire file** on every call: allocate a fresh block run for the new total, copy every existing byte, free the old run. Appending 64 bytes to a 10 MB log copied 10 MB, making a repeatedly-appended log O(n²) overall. Blocks are 4 KB and the run reserved for a file usually has room, so the new fast path just writes the bytes at the end and updates the inode — no allocation, no copy. Measured on a growing log against an in-memory handle: 15.3k → 132.5k appends/sec (8.7×). **That figure overstates the real-world win** — against real OPFS in Chromium the same workload goes 783 → 2238 appends/sec (2.9×), because actual storage cost dilutes the CPU saving. The gap widens with file size exactly as an O(size) term predicts: appending to a 512 KB file goes 516 → 2158 ops/sec (**4.2×**). Both browser figures are from [append-readdir.spec.ts](tests/benchmark/append-readdir.spec.ts), measured with the change reverted and re-applied. `fwrite` already took the in-place path, so the fd-based append route was always fast — this brings the single-op APPEND route in line. Growth across a block boundary still uses the chunked relocation that keeps peak allocation at 4 MB.

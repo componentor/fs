@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>@componentor/fs — a real synchronous fs in your browser</title>
+<meta name="description" content="Node's fs in the browser, including a readFileSync that actually blocks. Try it live against real OPFS storage." />
+
+<!-- Adds the isolation headers GitHub Pages will not, so the SYNC api works here. See the file. -->
+<script src="./coi-serviceworker.js"></script>
+
+<style>
+  :root {
+    --bg: #ffffff; --fg: #1a1a1a; --muted: #666; --line: #e3e3e3;
+    --accent: #6f42c1; --ok: #0a7d33; --bad: #c0392b; --code-bg: #f6f6f7;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #16161a; --fg: #e8e8ea; --muted: #9a9aa2; --line: #2c2c33;
+            --accent: #a97bff; --ok: #4ade80; --bad: #f87171; --code-bg: #1e1e24; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 15px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 60rem; margin: 0 auto; padding: 2.5rem 1.25rem 4rem; }
+  h1 { font-size: 1.65rem; margin: 0 0 .4rem; letter-spacing: -0.02em; }
+  .tag { color: var(--muted); margin: 0 0 1.5rem; font-size: 1.02rem; }
+  code, pre, textarea, .out { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .banner { padding: .7rem .9rem; border-radius: 8px; margin-bottom: 1.5rem; font-size: .9rem;
+            border: 1px solid var(--line); }
+  .banner.sync { border-color: var(--ok); }
+  .banner.async { border-color: #d19a00; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.25rem; }
+  @media (max-width: 780px) { .grid { grid-template-columns: 1fr; } }
+  .panel { border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+  .panel h2 { font-size: .82rem; margin: 0; padding: .6rem .85rem; background: var(--code-bg);
+              border-bottom: 1px solid var(--line); text-transform: uppercase;
+              letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+  textarea { width: 100%; border: 0; padding: .85rem; background: transparent; color: var(--fg);
+             font-size: 13px; resize: vertical; min-height: 15rem; outline: none; }
+  .out { padding: .85rem; font-size: 13px; white-space: pre-wrap; word-break: break-word;
+         min-height: 15rem; max-height: 32rem; overflow: auto; margin: 0; }
+  .err { color: var(--bad); }
+  .bar { display: flex; gap: .5rem; flex-wrap: wrap; align-items: center; margin: 1rem 0 1.25rem; }
+  button { font: inherit; font-size: .88rem; padding: .42rem .9rem; border-radius: 7px;
+           border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover { opacity: .9; color: #fff; }
+  .samples { display: flex; gap: .4rem; flex-wrap: wrap; margin-bottom: .6rem; }
+  .samples button { font-size: .8rem; padding: .28rem .6rem; }
+  footer { margin-top: 2.5rem; padding-top: 1.25rem; border-top: 1px solid var(--line);
+           color: var(--muted); font-size: .88rem; }
+  a { color: var(--accent); }
+  .tree { padding: .85rem; margin: 0; font-size: 13px; white-space: pre; overflow: auto; max-height: 14rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>@componentor/fs</h1>
+  <p class="tag">Node's <code>fs</code> in the browser — including a <code>readFileSync</code> that actually blocks.
+     This page is running the real library against your browser's real OPFS storage.</p>
+
+  <div id="banner" class="banner">Starting…</div>
+
+  <div class="samples" id="samples"></div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>Code — edit and run (<code>fs</code> is in scope)</h2>
+      <textarea id="code" spellcheck="false"></textarea>
+    </div>
+    <div class="panel">
+      <h2>Output</h2>
+      <pre class="out" id="out">—</pre>
+    </div>
+  </div>
+
+  <div class="bar">
+    <button class="primary" id="run">Run ▶</button>
+    <button id="reload">Reload page (data persists)</button>
+    <button id="wipe">Wipe volume</button>
+  </div>
+
+  <div class="panel">
+    <h2>Volume contents — persisted in OPFS, survives a refresh</h2>
+    <pre class="tree" id="tree">—</pre>
+  </div>
+
+  <footer>
+    <a href="https://github.com/componentor/fs">GitHub</a> ·
+    <a href="https://www.npmjs.com/package/@componentor/fs">npm</a> ·
+    <a href="https://github.com/componentor/fs#readme">Docs</a><br />
+    The two isolation headers the sync API needs are added here by a
+    <a href="./coi-serviceworker.js">service worker</a>, because GitHub Pages cannot send them —
+    the same trick works for your own static deploy.
+  </footer>
+</div>
+
+<script type="importmap">
+{ "imports": { "@componentor/fs": "./vendor/index.js" } }
+</script>
+
+<script type="module">
+import { VFSFileSystem } from '@componentor/fs';
+
+const $ = (id) => document.getElementById(id);
+const out = $('out'), banner = $('banner'), tree = $('tree');
+
+const SAMPLES = {
+  'Sync round-trip': `// The headline: this blocks and returns a value. No await.
+fs.mkdirSync('/notes', { recursive: true });
+fs.writeFileSync('/notes/hello.txt', 'Hello from OPFS!');
+
+const text = fs.readFileSync('/notes/hello.txt', 'utf8');
+log('readFileSync ->', JSON.stringify(text));
+log('existsSync   ->', fs.existsSync('/notes/hello.txt'));
+
+const st = fs.statSync('/notes/hello.txt');
+log('size', st.size, '| isFile', st.isFile(), '| mode 0o' + (st.mode & 0o777).toString(8));`,
+
+  'Promises API': `// Works with or without cross-origin isolation.
+await fs.promises.mkdir('/data', { recursive: true });
+await fs.promises.writeFile('/data/config.json', JSON.stringify({ hello: 'world' }, null, 2));
+
+log(await fs.promises.readFile('/data/config.json', 'utf8'));
+log('readdir ->', await fs.promises.readdir('/data'));`,
+
+  'Streams': `fs.writeFileSync('/big.txt', 'line one\\nline two\\nline three\\n');
+
+// Read streams are async-iterable, like node's.
+let seen = '';
+for await (const chunk of fs.createReadStream('/big.txt', 'utf8')) seen += chunk;
+log('streamed', seen.length, 'chars');
+
+// readLines follows node's readline: no empty final line.
+const h = await fs.promises.open('/big.txt', 'r');
+for await (const line of h.readLines()) log('line:', JSON.stringify(line));`,
+
+  'Directories & glob': `fs.mkdirSync('/src/pkg', { recursive: true });
+fs.writeFileSync('/src/index.js', 'export * from "./pkg/a.js";');
+fs.writeFileSync('/src/pkg/a.js', 'export const a = 1;');
+fs.writeFileSync('/src/readme.md', '# hi');
+
+fs.cpSync('/src', '/dist', { recursive: true });
+log('recursive readdir ->', fs.readdirSync('/dist', { recursive: true }).sort());
+log('glob **/*.js      ->', fs.globSync('/dist/**/*.js').sort());`,
+
+  'File descriptors': `const fd = fs.openSync('/fd.txt', 'w+');
+fs.writeSync(fd, 'abcdefghij');
+
+const buf = new Uint8Array(4);
+const n = fs.readSync(fd, buf, 0, 4, 2);   // read 4 bytes from offset 2
+log('read from offset 2 ->', JSON.stringify(new TextDecoder().decode(buf.subarray(0, n))));
+
+fs.ftruncateSync(fd, 5);
+fs.closeSync(fd);
+log('after truncate ->', JSON.stringify(fs.readFileSync('/fd.txt', 'utf8')));`,
+
+  'Errors match node': `try { fs.readFileSync('/does-not-exist'); }
+catch (e) { log('code:', e.code, '| syscall:', e.syscall); }
+
+fs.mkdirSync('/adir', { recursive: true });
+try { fs.readFileSync('/adir'); }
+catch (e) { log('reading a directory ->', e.code); }
+
+try { fs.rmSync('/adir'); }
+catch (e) { log('rm without recursive ->', e.code); }`,
+};
+
+let fs;
+
+function log(...args) {
+  const line = args.map((a) =>
+    typeof a === 'string' ? a
+    : a instanceof Uint8Array ? `Uint8Array(${a.length})`
+    : JSON.stringify(a, null, 2)).join(' ');
+  out.textContent += (out.textContent ? '\n' : '') + line;
+}
+
+async function refreshTree() {
+  try {
+    const walk = async (dir, depth) => {
+      let s = '';
+      const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+      for (const e of entries.sort((a, b) => a.name.localeCompare(b.name))) {
+        const full = (dir === '/' ? '' : dir) + '/' + e.name;
+        s += '  '.repeat(depth) + (e.isDirectory() ? '📁 ' : '📄 ') + e.name;
+        if (!e.isDirectory()) {
+          const st = await fs.promises.stat(full);
+          s += `  (${st.size} B)`;
+        }
+        s += '\n';
+        if (e.isDirectory()) s += await walk(full, depth + 1);
+      }
+      return s;
+    };
+    const listing = await walk('/', 0);
+    tree.textContent = listing || '(empty)';
+  } catch (e) {
+    tree.textContent = 'could not list: ' + e.message;
+  }
+}
+
+async function run() {
+  out.textContent = '';
+  const source = $('code').value;
+  try {
+    // Built as an async function so both `await` and plain sync calls work in the samples.
+    const fn = new Function('fs', 'log', `return (async () => {\n${source}\n})();`);
+    await fn(fs, log);
+  } catch (e) {
+    const line = document.createElement('span');
+    line.className = 'err';
+    line.textContent = '\n' + (e && e.code ? `${e.code}: ` : '') + (e && e.message ? e.message : String(e));
+    out.appendChild(line);
+  }
+  await refreshTree();
+}
+
+function pickSample(name) {
+  $('code').value = SAMPLES[name];
+}
+
+(async function start() {
+  for (const name of Object.keys(SAMPLES)) {
+    const b = document.createElement('button');
+    b.textContent = name;
+    b.onclick = () => pickSample(name);
+    $('samples').appendChild(b);
+  }
+  pickSample('Sync round-trip');
+
+  try {
+    fs = new VFSFileSystem({ root: '/demo' });
+    await fs.init();
+  } catch (e) {
+    banner.className = 'banner';
+    banner.innerHTML = `<strong>Failed to start:</strong> ${e.message}`;
+    return;
+  }
+
+  if (crossOriginIsolated) {
+    banner.className = 'banner sync';
+    banner.innerHTML = '<strong>Cross-origin isolated ✓</strong> — the full synchronous API is live '
+      + 'on this page. <code>fs.readFileSync</code> below really does block.';
+  } else {
+    banner.className = 'banner async';
+    banner.innerHTML = '<strong>Not cross-origin isolated</strong> — the async API works, the sync '
+      + 'samples will throw. Usually the service worker just needs one more reload; if it never '
+      + 'sticks, your browser is blocking it.';
+  }
+
+  $('run').onclick = run;
+  $('reload').onclick = () => location.reload();
+  $('wipe').onclick = async () => {
+    await fs.promises.rm('/', { recursive: true, force: true });
+    out.textContent = 'Volume wiped.';
+    await refreshTree();
+  };
+
+  await refreshTree();
+})();
+</script>
+</body>
+</html>

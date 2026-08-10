@@ -1482,21 +1482,7 @@ export class VFSEngine {
     // what readdir reports).
     let nlink = inode.nlink;
     if (inode.type === INODE_TYPE.DIRECTORY) {
-      const path = this.readPath(inode.pathOffset, inode.pathLength);
-      const children = this.getDirectChildrenWithImplicit(path);
-      let subdirCount = 0;
-      for (const child of children) {
-        if (child.type === 'implicit') {
-          subdirCount++;
-        } else {
-          const childIdx = this.pathIndex.get(child.path);
-          if (childIdx !== undefined) {
-            const childInode = this.readInode(childIdx);
-            if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
-          }
-        }
-      }
-      nlink = 2 + subdirCount;
+      nlink = 2 + this.countSubdirectories(this.readPath(inode.pathOffset, inode.pathLength));
     }
 
     // Encode stat into binary: type(1) + mode(4) + size(8) + mtime(8) + ctime(8) + atime(8) + uid(4) + gid(4) + ino(4) + nlink(4) = 53 bytes
@@ -2097,9 +2083,16 @@ export class VFSEngine {
   }
 
   // ---- CHMOD ----
-  chmod(path: string, mode: number): { status: number } {
+  /**
+   * `follow: false` is `lchmod` — act on the symlink itself rather than what it points at.
+   *
+   * This used to have no such parameter and `lchmod` simply called `chmod`, so it changed the
+   * **target's** permissions: the one thing the `l` prefix exists to prevent. `resolvePathComponents`
+   * already distinguishes the two, exactly as `stat` and `lstat` do.
+   */
+  chmod(path: string, mode: number, follow = true): { status: number } {
     path = this.normalizePath(path);
-    const idx = this.resolvePathComponents(path, true);
+    const idx = this.resolvePathComponents(path, follow);
     if (idx === undefined) return { status: this.resolveFailureStatus() };
 
     const inode = this.readInode(idx);
@@ -2112,9 +2105,10 @@ export class VFSEngine {
   }
 
   // ---- CHOWN ----
-  chown(path: string, uid: number, gid: number): { status: number } {
+  /** `follow: false` is `lchown` — the link's own ownership, not its target's. */
+  chown(path: string, uid: number, gid: number, follow = true): { status: number } {
     path = this.normalizePath(path);
-    const idx = this.resolvePathComponents(path, true);
+    const idx = this.resolvePathComponents(path, follow);
     if (idx === undefined) return { status: this.resolveFailureStatus() };
 
     const inode = this.readInode(idx);
@@ -2127,9 +2121,10 @@ export class VFSEngine {
   }
 
   // ---- UTIMES ----
-  utimes(path: string, atime: number, mtime: number): { status: number } {
+  /** `follow: false` is `lutimes` — timestamps on the symlink itself, not on its target. */
+  utimes(path: string, atime: number, mtime: number, follow = true): { status: number } {
     path = this.normalizePath(path);
-    const idx = this.resolvePathComponents(path, true);
+    const idx = this.resolvePathComponents(path, follow);
     if (idx === undefined) return { status: this.resolveFailureStatus() };
 
     const inode = this.readInode(idx);
@@ -2232,6 +2227,23 @@ export class VFSEngine {
         path = linkTarget;
         idx = this.resolvePathComponents(path, true);
       }
+    }
+
+    /**
+     * A directory opens read-only — node allows it, and `fstat` through the descriptor is the
+     * reason — but any write access is EISDIR.
+     *
+     * This is checked before the O_CREAT and O_TRUNC branches below, both of which get it wrong
+     * on their own: `truncate` does return EISDIR here, but its status was discarded, so
+     * `open(dir, 'w')` silently skipped the truncation and handed back a working descriptor; and
+     * an *implicit* directory — one that exists only because it has children — has no inode of
+     * its own, so O_CREAT created a file directly over it.
+     */
+    if (VFSEngine.isWritable(flags)) {
+      const isDirectory = idx !== undefined
+        ? this.readInode(idx).type === INODE_TYPE.DIRECTORY
+        : this.isImplicitDirectory(path);
+      if (isDirectory) return { status: CODE_TO_STATUS.EISDIR, data: null };
     }
 
     if (idx === undefined) {
@@ -2439,7 +2451,19 @@ export class VFSEngine {
     return { status: 0, data: buf };
   }
 
-  fsync(): { status: number } {
+  /**
+   * fsync(2) / fdatasync(2).
+   *
+   * Everything here is committed to one backing handle, so there is nothing per-descriptor to
+   * flush — but the descriptor still has to be *checked*. `fs.fsyncSync(fd)` on a closed or
+   * never-opened fd answers EBADF in node, and reporting success instead turns a use-after-close
+   * into silence at the one call whose entire job is to confirm the data is safe.
+   *
+   * `fd` is optional because the volume-wide flush behind `promises.flush()` has no descriptor
+   * to name, and because a request encoded by an older worker carries no fd payload.
+   */
+  fsync(fd?: number): { status: number } {
+    if (fd !== undefined && !this.fdTable.has(fd)) return { status: CODE_TO_STATUS.EBADF };
     this.commitPending();
     this.handle.flush();
     return { status: 0 };
@@ -2520,14 +2544,14 @@ export class VFSEngine {
     const suffix = Math.random().toString(36).substring(2, 8);
     const path = this.normalizePath(prefix + suffix);
 
-    // Ensure parent directories exist
-    const parentStatus = this.ensureParent(path);
-    if (parentStatus !== 0) {
-      // Auto-create parent directories for mkdtemp
-      const parentPath = path.substring(0, path.lastIndexOf('/'));
-      if (parentPath) {
-        this.mkdirRecursive(parentPath);
-      }
+    // The parent must already exist. This used to create it — `mkdtemp('/no/where/t-')` happily
+    // returned a path under a directory tree it had invented, where node reports ENOENT. A
+    // temp-directory helper silently building the path it was handed is the sort of thing that
+    // turns a typo'd prefix into a directory nobody looks in again.
+    const parentPath = path.substring(0, path.lastIndexOf('/')) || '/';
+    if (parentPath !== '/' && this.resolvePathComponents(parentPath, true) === undefined
+        && !this.isImplicitDirectory(parentPath)) {
+      return { status: CODE_TO_STATUS.ENOENT, data: null };
     }
 
     // mkdtemp(3) creates the directory with mkdir(path, S_IRWXU) — a PRIVATE 0700 directory, not
@@ -2743,6 +2767,33 @@ export class VFSEngine {
    * Returns unique child full paths. Each entry is tagged with whether it's a
    * real inode or an implicit directory.
    */
+  /**
+   * How many direct children of `dirPath` are directories — the `nlink` a directory reports
+   * (`2 + subdirectories`, as on a real filesystem).
+   *
+   * Counting through {@link getDirectChildrenWithImplicit} meant every `stat` on a directory
+   * allocated one object and one string per child, built an array, and then **sorted** it, all to
+   * arrive at a single integer. The sort in particular is entirely wasted: order cannot change a
+   * count. This walks the child index directly and allocates nothing per child beyond the lookup
+   * key, which is why `stat` on a directory was ~40× the cost of `stat` on a file.
+   */
+  private countSubdirectories(dirPath: string): number {
+    this.ensureChildIndex();
+    const names = this.childIndex.get(dirPath);
+    if (!names) return 0;
+
+    const prefix = dirPath === '/' ? '/' : dirPath + '/';
+    let subdirs = 0;
+    for (const name of names.keys()) {
+      const childIdx = this.pathIndex.get(prefix + name);
+      // No pathIndex entry means the child exists only because deeper descendants pass through
+      // it — an implicit directory, which counts.
+      if (childIdx === undefined) subdirs++;
+      else if (this.readInode(childIdx).type === INODE_TYPE.DIRECTORY) subdirs++;
+    }
+    return subdirs;
+  }
+
   private getDirectChildrenWithImplicit(dirPath: string): { path: string; type: 'real' | 'implicit' }[] {
     this.ensureChildIndex();
     const names = this.childIndex.get(dirPath);
@@ -2771,21 +2822,7 @@ export class VFSEngine {
     const ts = this.implicitDirs.get(path) ?? Date.now();
     const mode = DEFAULT_DIR_MODE & ~(this.umask & 0o777);
 
-    // Count implicit subdirectories for nlink
-    const children = this.getDirectChildrenWithImplicit(path);
-    let subdirCount = 0;
-    for (const child of children) {
-      if (child.type === 'implicit') {
-        subdirCount++;
-      } else {
-        const childIdx = this.pathIndex.get(child.path);
-        if (childIdx !== undefined) {
-          const childInode = this.readInode(childIdx);
-          if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
-        }
-      }
-    }
-    const nlink = 2 + subdirCount;
+    const nlink = 2 + this.countSubdirectories(path);
 
     // Encode stat: type(1) + mode(4) + size(8) + mtime(8) + ctime(8) + atime(8) + uid(4) + gid(4) + ino(4) + nlink(4) = 53 bytes
     const buf = new Uint8Array(53);

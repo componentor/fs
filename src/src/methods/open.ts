@@ -191,13 +191,22 @@ export function ftruncateSync(
   if (status !== 0) throw statusToError(status, 'ftruncate', String(fd));
 }
 
+/**
+ * Both `fsync` and `fdatasync`: everything lives in one backing handle, so there is no
+ * data-versus-metadata distinction to make.
+ *
+ * The descriptor is sent even though the flush is volume-wide, because the engine has to answer
+ * EBADF for one that is closed or was never opened — as node does — rather than reporting
+ * success for a flush the caller has no descriptor to have asked for.
+ */
 export function fdatasyncSync(
   syncRequest: SyncRequestFn,
-  fd: number
+  fd: number,
+  syscall: 'fsync' | 'fdatasync' = 'fdatasync'
 ): void {
-  const buf = encodeRequest(OP.FSYNC, '');
+  const buf = encodeRequest(OP.FSYNC, '', 0, encodeFdPayload(fd));
   const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, 'fdatasync', String(fd));
+  if (status !== 0) throw statusToError(status, syscall, String(fd));
 }
 
 // ========== Async FileHandle ==========
@@ -386,11 +395,13 @@ export function createFileHandle(fd: number, asyncRequest: AsyncRequestFn): File
     },
 
     async sync() {
-      await asyncRequest(OP.FSYNC, '');
+      const { status } = await asyncRequest(OP.FSYNC, '', 0, null, undefined, { fd });
+      if (status !== 0) throw statusToError(status, 'fsync', String(fd));
     },
 
     async datasync() {
-      await asyncRequest(OP.FSYNC, '');
+      const { status } = await asyncRequest(OP.FSYNC, '', 0, null, undefined, { fd });
+      if (status !== 0) throw statusToError(status, 'fdatasync', String(fd));
     },
 
     async close() {
@@ -428,10 +439,28 @@ export function createFileHandle(fd: number, asyncRequest: AsyncRequestFn): File
     },
 
     // ---- EventEmitter surface ----
+    //
+    // All of it, not the five methods this used to forward. Node's `FileHandle` is a real
+    // `EventEmitter`, so code that keeps a handle around and calls `removeAllListeners()` on
+    // teardown, or `listenerCount('close')` to decide whether to wire something up, hits an
+    // "is not a function" on a partial implementation — and the missing ones were the
+    // housekeeping methods, which is exactly what long-lived objects use.
     on(event: string, listener: (...args: never[]) => void) { events.on(event, listener as never); return this; },
+    addListener(event: string, listener: (...args: never[]) => void) { events.on(event, listener as never); return this; },
     once(event: string, listener: (...args: never[]) => void) { events.once(event, listener as never); return this; },
     off(event: string, listener: (...args: never[]) => void) { events.off(event, listener as never); return this; },
     removeListener(event: string, listener: (...args: never[]) => void) { events.off(event, listener as never); return this; },
+    removeAllListeners(event?: string) { events.removeAllListeners(event); return this; },
+    prependListener(event: string, listener: (...args: never[]) => void) { events.prependListener(event, listener as never); return this; },
+    prependOnceListener(event: string, listener: (...args: never[]) => void) { events.prependOnceListener(event, listener as never); return this; },
+    listeners(event: string) { return events.rawListeners(event); },
+    rawListeners(event: string) { return events.rawListeners(event); },
+    listenerCount(event: string) { return events.listenerCount(event); },
+    eventNames() { return events.eventNames(); },
+    // Node caps listeners per emitter and warns past the limit. There is no limit here — a
+    // handle emits one event, `'close'` — so these keep the shape without inventing a cap.
+    setMaxListeners(_n: number) { return this; },
+    getMaxListeners() { return 0; },
     emit(event: string, ...args: never[]) { return events.emit(event, ...args); },
   };
 

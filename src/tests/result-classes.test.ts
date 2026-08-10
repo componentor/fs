@@ -160,7 +160,13 @@ describe('recursive readdir entries survive the prototype move', () => {
 
 describe('glob entries are the same shape as readdir entries', () => {
   it('carries `path` too, which the hand-written literal omitted', async () => {
-    const entries = await fs.promises.glob('/d/*', { withFileTypes: true }) as unknown as Dirent[];
+    // Consumed by iteration, not by `await`: `fsPromises.glob` returns an async iterator in node
+    // and does so here as of 4.0.0. This assertion used to `await` it, which is what let the
+    // wrong return type survive — the test agreed with the bug.
+    const entries: Dirent[] = [];
+    for await (const e of fs.promises.glob('/d/*', { withFileTypes: true }) as AsyncIterable<Dirent>) {
+      entries.push(e);
+    }
     expect(entries.length).toBeGreaterThan(0);
     for (const e of entries) {
       expect(e).toBeInstanceOf(Dirent);

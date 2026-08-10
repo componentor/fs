@@ -556,6 +556,8 @@ describe('VFSEngine', () => {
 
   describe('mkdtemp', () => {
     it('should create a temp directory with prefix', () => {
+      // mkdtemp does not invent its parent — node answers ENOENT — so create it first.
+      engine.mkdir('/tmp', 0, 0o755);
       const result = engine.mkdtemp('/tmp/test-');
       expect(result.status).toBe(0);
       const path = new TextDecoder().decode(result.data!);

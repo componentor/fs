@@ -16,7 +16,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { dispatchOp } from '../src/protocol/dispatch.js';
+import { NOFOLLOW, dispatchOp } from '../src/protocol/dispatch.js';
 import { OP } from '../src/protocol/opcodes.js';
 import type { VFSEngine } from '../src/vfs/engine.js';
 import {
@@ -47,13 +47,22 @@ function spyEngine() {
 let engine: ReturnType<typeof spyEngine>;
 const run = (op: number, data: Uint8Array) =>
   dispatchOp(engine as unknown as VFSEngine, 'tab', op, 0, '/p', data);
+const runFlags = (op: number, flags: number, data: Uint8Array) =>
+  dispatchOp(engine as unknown as VFSEngine, 'tab', op, flags, '/p', data);
 
 beforeEach(() => { engine = spyEngine(); });
 
 describe('path-op payloads', () => {
-  it('chmod carries the mode', () => {
+  it('chmod carries the mode, and follows symlinks by default', () => {
     run(OP.CHMOD, encodeModePayload(0o4755));
-    expect(engine.chmod).toHaveBeenCalledWith('/p', 0o4755);
+    expect(engine.chmod).toHaveBeenCalledWith('/p', 0o4755, true);
+  });
+
+  it('chmod with NOFOLLOW is lchmod — the link, not its target', () => {
+    // The flag lives in the request's existing flags word, so an older worker that does not know
+    // about it ignores the bit and follows, which is the behaviour it always had.
+    runFlags(OP.CHMOD, NOFOLLOW, encodeModePayload(0o600));
+    expect(engine.chmod).toHaveBeenCalledWith('/p', 0o600, false);
   });
 
   it.each([0, 1, 4095, 0xffffffff, 4294967296, 8589934592, Number.MAX_SAFE_INTEGER])(
@@ -63,16 +72,21 @@ describe('path-op payloads', () => {
     }
   );
 
-  it('chown carries uid and gid in order', () => {
+  it('chown carries uid and gid in order, and follows symlinks by default', () => {
     run(OP.CHOWN, encodeChownPayload(501, 20));
-    expect(engine.chown).toHaveBeenCalledWith('/p', 501, 20);
+    expect(engine.chown).toHaveBeenCalledWith('/p', 501, 20, true);
+  });
+
+  it('chown with NOFOLLOW is lchown', () => {
+    runFlags(OP.CHOWN, NOFOLLOW, encodeChownPayload(1000, 2000));
+    expect(engine.chown).toHaveBeenCalledWith('/p', 1000, 2000, false);
   });
 
   it('utimes carries both timestamps with millisecond precision', () => {
     const a = 1_600_000_000_123;
     const m = 1_700_000_000_456;
     run(OP.UTIMES, encodeTimesPayload(a, m));
-    expect(engine.utimes).toHaveBeenCalledWith('/p', a, m);
+    expect(engine.utimes).toHaveBeenCalledWith('/p', a, m, true);
   });
 
   it('toEpochMs reads numbers as seconds, matching Node', () => {

@@ -720,7 +720,14 @@ export class OPFSEngine {
     return { status: 0, data: buf };
   }
 
-  async fsync(): Promise<OPFSResult> {
+  /**
+   * `fd` is optional: the volume-wide flush behind `flushSync()` names no descriptor. When one is
+   * given it is checked first, because node answers EBADF for a closed descriptor and reporting
+   * success instead turns a use-after-close into silence at the call whose job is to confirm the
+   * data is safe. Everything is flushed either way — the handles share no per-fd buffering.
+   */
+  async fsync(fd?: number): Promise<OPFSResult> {
+    if (fd !== undefined && !this.fdTable.has(fd)) return { status: EBADF, data: null };
     for (const [, entry] of this.fdTable) {
       try { entry.handle.flush(); } catch {}
     }

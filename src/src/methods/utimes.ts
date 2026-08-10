@@ -2,18 +2,20 @@ import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { OP, encodeRequest } from '../protocol/opcodes.js';
 import { statusToError } from '../errors.js';
 import { toEpochMs } from '../protocol/payloads.js';
+import { NOFOLLOW } from '../protocol/dispatch.js';
 
 export function utimesSync(
   syncRequest: SyncRequestFn,
   filePath: string,
   atime: Date | number,
-  mtime: Date | number
+  mtime: Date | number,
+  follow = true
 ): void {
   const timesBuf = new Uint8Array(16);
   const dv = new DataView(timesBuf.buffer);
   dv.setFloat64(0, toEpochMs(atime, 'atime'), true);
   dv.setFloat64(8, toEpochMs(mtime, 'mtime'), true);
-  const buf = encodeRequest(OP.UTIMES, filePath, 0, timesBuf);
+  const buf = encodeRequest(OP.UTIMES, filePath, follow ? 0 : NOFOLLOW, timesBuf);
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'utimes', filePath);
 }
@@ -22,13 +24,14 @@ export async function utimes(
   asyncRequest: AsyncRequestFn,
   filePath: string,
   atime: Date | number,
-  mtime: Date | number
+  mtime: Date | number,
+  follow = true
 ): Promise<void> {
   const buf = new Uint8Array(16);
   const dv = new DataView(buf.buffer);
   dv.setFloat64(0, toEpochMs(atime, 'atime'), true);
   dv.setFloat64(8, toEpochMs(mtime, 'mtime'), true);
-  const { status } = await asyncRequest(OP.UTIMES, filePath, 0, buf);
+  const { status } = await asyncRequest(OP.UTIMES, filePath, follow ? 0 : NOFOLLOW, buf);
   if (status !== 0) throw statusToError(status, 'utimes', filePath);
 }
 

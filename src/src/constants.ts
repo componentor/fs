@@ -53,6 +53,36 @@ export const constants = {
   S_IROTH: 0o004,
   S_IWOTH: 0o002,
   S_IXOTH: 0o001,
+
+  // ---- libuv-level constants Node re-exports ----
+  //
+  // Node exposes libuv's own numbering on `fs.constants`, and the `UV_DIRENT_*` set is the part
+  // real code reads: a `Dirent`'s type is one of these numbers, so anything comparing types
+  // numerically rather than calling `isFile()`/`isDirectory()` needs them to exist. The rest are
+  // included for completeness, with the values taken from a live `node:fs`.
+  UV_DIRENT_UNKNOWN: 0,
+  UV_DIRENT_FILE: 1,
+  UV_DIRENT_DIR: 2,
+  UV_DIRENT_LINK: 3,
+  UV_DIRENT_FIFO: 4,
+  UV_DIRENT_SOCKET: 5,
+  UV_DIRENT_CHAR: 6,
+  UV_DIRENT_BLOCK: 7,
+
+  // Windows-only in Node; defined so a cross-platform `constants.X` read does not come back
+  // `undefined` and silently change a bitmask.
+  UV_FS_SYMLINK_DIR: 1,
+  UV_FS_SYMLINK_JUNCTION: 2,
+  UV_FS_O_FILEMAP: 0,
+
+  // macOS-only in Node. We have no O_SYMLINK behaviour to offer, but the value is here so the
+  // flag can be tested for rather than crashing on a missing property.
+  O_SYMLINK: 0o10000000,
+
+  // The `UV_`-prefixed spellings of the copyfile flags; identical values to `COPYFILE_*` above.
+  UV_FS_COPYFILE_EXCL: 1,
+  UV_FS_COPYFILE_FICLONE: 2,
+  UV_FS_COPYFILE_FICLONE_FORCE: 4,
 } as const;
 
 export type Constants = typeof constants;

@@ -5,23 +5,20 @@ export default defineConfig({
   fullyParallel: false, // Run tests sequentially to avoid conflicts
   forbidOnly: !!process.env.CI,
   /**
-   * One retry locally, because Chromium can take itself down mid-suite.
+   * One local retry: Chromium can still abort the browser process mid-suite.
    *
-   * Playwright's `chrome-headless-shell` ships with PartitionAlloc's dangling-`raw_ptr` detector
-   * enabled. After the heaviest specs it fires `FATAL: Detected dangling raw_ptr in unretained`
-   * while tearing down a page that used OPFS, which aborts the **browser process** — so the next
-   * test in line dies with "Target page, context or browser has been closed", and which test
-   * that is moves around between runs.
+   * `FATAL: Detected dangling raw_ptr` is a use-after-free in Chromium's own C++, triggered by a
+   * recursive `FileSystemObserver` that is still attached when its scope is destroyed. Proven by
+   * construction — disabling the observer removes the crash from a full run entirely, restoring
+   * it brings it back within a few specs — and it reproduces on both `chrome-headless-shell` and
+   * the full Chrome for Testing binary. `--disable-features=PartitionAllocDanglingPtr` does not
+   * switch the detector off.
    *
-   * That is a use-after-free in Chromium's own C++. JavaScript cannot create one, so it is a
-   * browser bug this workload happens to trigger, not a defect here — confirmed two ways: a page
-   * that deliberately leaks a recursive `FileSystemObserver` and closes does *not* trip it, and
-   * fixing the library's genuine observer/worker leak (3.3.29) did not stop it either. Release
-   * Chrome ships the detector off, so no user meets it. `--disable-features=PartitionAllocDanglingPtr`
-   * does not turn it off in this binary.
-   *
-   * A retry gets a freshly launched browser and passes, which is the honest handling: re-run the
-   * test the crash stole, rather than pretend the crash did not happen.
+   * 4.0.0 moved detection into the scope that owns the instance, where `disconnect()` is
+   * synchronous on the unload path, and the fixture releases every filesystem on every page
+   * before teardown. That covers page-hosted instances. It does **not** cover a *worker-hosted*
+   * instance: its observer lives in a worker the page cannot reach synchronously, and the worker
+   * is killed outright when the page goes. Until that case has an answer, the retry stays.
    */
   retries: process.env.CI ? 2 : 1,
   workers: 1, // Single worker for benchmark consistency
@@ -38,6 +35,11 @@ export default defineConfig({
       name: 'chromium',
       use: {
         ...devices['Desktop Chrome'],
+        // The full Chromium binary in new headless mode, not `chrome-headless-shell`.
+        // See the `retries` note above: the shell ships with PartitionAlloc's dangling-`raw_ptr`
+        // detector compiled in and aborts the whole browser process after the heaviest OPFS
+        // specs. This binary is what real users run.
+        channel: 'chromium',
         // Enable features needed for OPFS
         launchOptions: {
           args: [

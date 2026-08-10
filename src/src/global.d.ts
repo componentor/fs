@@ -35,3 +35,15 @@ interface FileSystemSyncAccessHandle {
 interface FileSystemFileHandle {
   createSyncAccessHandle(): Promise<FileSystemSyncAccessHandle>;
 }
+
+/**
+ * A worker bundle imported as source text.
+ *
+ * `scripts/build.mjs` writes these next to the workers; esbuild's `text` loader turns the import
+ * into a string literal, which `workerFromSource` starts as a same-origin blob. Declared as a
+ * wildcard module so `tsc --noEmit` type-checks a clean checkout without needing a build first.
+ */
+declare module '*.workertext' {
+  const source: string;
+  export default source;
+}

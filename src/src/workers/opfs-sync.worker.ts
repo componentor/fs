@@ -8,6 +8,16 @@
 
 import { coalesceWriteIndex } from './opfs-sync-plan.js';
 
+/** One external change, as detected by the owner and forwarded here. */
+interface ExternalRecord {
+  kind: 'appeared' | 'modified' | 'disappeared' | 'moved';
+  path: string;
+  /** Present for 'moved' — the path it came from. */
+  from?: string;
+  /** The changed file's handle, cloned across the message boundary. */
+  handle?: FileSystemHandle;
+}
+
 interface SyncEvent {
   op: 'write' | 'delete' | 'mkdir' | 'rename';
   path: string;
@@ -526,65 +536,47 @@ async function navigateToParent(path: string): Promise<FileSystemDirectoryHandle
 // ========== FileSystemObserver for external changes ==========
 
 /**
- * The live observer, kept so it can be disconnected again.
+ * Apply external-change records detected by the instance that owns this worker.
  *
- * It used to be a local in `setupObserver`, which meant nothing could ever stop it: a recursive
- * `FileSystemObserver` stayed registered on the origin's OPFS for as long as the worker lived,
- * and nothing terminated the worker either. Chromium detects a dangling `raw_ptr` and **aborts
- * the whole browser process** when a page is torn down with observers still attached, which is
- * how a leak with no visible symptom turned into a crash partway through a long test run.
+ * The `FileSystemObserver` used to live here. It cannot: a recursive observer still attached
+ * when its page is torn down makes Chromium abort the **whole browser process**, and nothing on
+ * the page can detach an observer that lives inside a nested worker — a `postMessage` at
+ * `pagehide` can be sent but not waited for. Detection therefore happens in the owner's scope,
+ * where `disconnect()` is a synchronous call on the unload path, and only the *records* are
+ * forwarded here, where the file I/O belongs.
+ *
+ * The `changedHandle` survives the trip: `FileSystemHandle` is structured-cloneable.
  */
-let observer: FileSystemObserver | null = null;
+function applyExternalRecords(records: ExternalRecord[]): void {
+  for (const record of records) {
+    const path = normalizePath(record.path);
 
-function setupObserver(): void {
-  if (typeof FileSystemObserver === 'undefined') {
-    console.warn('[opfs-sync] FileSystemObserver not available — external changes will not be detected');
-    return;
-  }
+    // Skip the VFS binary and other internal files.
+    if (path === '/.vfs.bin' || path === '/.vfs' || path.startsWith('/.vfs')) continue;
 
-  console.log('[opfs-sync] Setting up FileSystemObserver on mirrorRoot:', mirrorRoot.name || '(opfs-root)');
-
-  observer = new FileSystemObserver((records) => {
-    //console.log(`[opfs-sync] observer fired: ${records.length} record(s), pending=${pendingPaths.size}, completed=${completedPaths.size}`);
-    for (const record of records) {
-      const path = normalizePath('/' + record.relativePathComponents.join('/'));
-
-      // Skip VFS binary file and internal files
-      if (path === '/.vfs.bin' || path === '/.vfs' || path.startsWith('/.vfs')) continue;
-
-      switch (record.type) {
-        case 'appeared':
-        case 'modified':
-          // Echo check is CONTENT-based and happens inside syncExternalChange
-          // (after reading the file), so a genuine external write within the
-          // grace window is no longer mistaken for our own echo.
-          syncExternalChange(path, record.changedHandle);
-          break;
-        case 'disappeared':
-          // No content to compare for a delete — fall back to the time-based
-          // echo check (incl. the parent walk for recursive-delete cascades).
-          if (isOurEcho(path, true)) continue;
-          syncExternalDelete(path);
-          break;
-        case 'moved': {
-          const from = normalizePath('/' + record.relativePathMovedFrom!.join('/'));
-          if (isOurEcho(path) || isOurEcho(from)) continue;
-          syncExternalRename(from, path);
-          break;
-        }
+    switch (record.kind) {
+      case 'appeared':
+      case 'modified':
+        // Echo check is CONTENT-based and happens inside syncExternalChange (after reading the
+        // file), so a genuine external write inside the grace window is not mistaken for ours.
+        syncExternalChange(path, record.handle ?? null);
+        break;
+      case 'disappeared':
+        // No content to compare for a delete — fall back to the time-based echo check
+        // (including the parent walk for recursive-delete cascades).
+        if (isOurEcho(path, true)) continue;
+        syncExternalDelete(path);
+        break;
+      case 'moved': {
+        const from = normalizePath(record.from!);
+        if (isOurEcho(path) || isOurEcho(from)) continue;
+        syncExternalRename(from, path);
+        break;
       }
     }
-  });
-
-  observer.observe(mirrorRoot, { recursive: true });
+  }
 }
 
-/** Detach the observer. Safe to call more than once, and safe if none was ever created. */
-function teardownObserver(): void {
-  if (!observer) return;
-  try { observer.disconnect(); } catch { /* already gone */ }
-  observer = null;
-}
 
 async function syncExternalChange(path: string, handle: FileSystemHandle | null): Promise<void> {
   try {
@@ -658,13 +650,17 @@ self.onmessage = async (e: MessageEvent) => {
 
     console.log('[opfs-sync] initialized with root:', msg.root || '/', 'mirrorRoot.name:', mirrorRoot.name || '(opfs-root)');
 
-    // Set up FileSystemObserver
-    setupObserver();
+    // Detection lives in the owner's scope now — see applyExternalRecords.
 
     // Listen for events from server
     serverPort.onmessage = (ev: MessageEvent) => {
-      const event = ev.data as SyncEvent;
-      enqueue(event);
+      // Two kinds arrive on this port: mutations we made (queued and mirrored outward), and
+      // external-change records the owner's observer detected (applied inward).
+      if (ev.data?.type === 'external-records') {
+        applyExternalRecords(ev.data.records as ExternalRecord[]);
+        return;
+      }
+      enqueue(ev.data as SyncEvent);
     };
     serverPort.start();
 
@@ -676,7 +672,6 @@ self.onmessage = async (e: MessageEvent) => {
   // away is the point: terminating a worker that still holds a recursive observer is exactly the
   // shape Chromium aborts on.
   if (msg.type === 'shutdown') {
-    teardownObserver();
     try { serverPort?.close(); } catch { /* already closed */ }
     (self as unknown as Worker).postMessage({ type: 'shutdown-done' });
     self.close();

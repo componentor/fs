@@ -3,6 +3,10 @@ import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { OP, encodeRequest, encodeRequestU32 } from '../protocol/opcodes.js';
 import { statusToError } from '../errors.js';
 import { parseFileMode, encodeMode } from './mode.js';
+import { NOFOLLOW } from '../protocol/dispatch.js';
+
+/** The flags word for a chmod/chown: `lchmod`/`lchown` set NOFOLLOW so the *link* is changed. */
+const followFlag = (follow: boolean) => (follow ? 0 : NOFOLLOW);
 
 /**
  * chmod's mode is required — passing no `def` makes `undefined` a type error rather than
@@ -15,10 +19,11 @@ function requireMode(mode: Mode): number {
 export function chmodSync(
   syncRequest: SyncRequestFn,
   filePath: string,
-  mode: Mode
+  mode: Mode,
+  follow = true
 ): void {
   // Zero-allocation encode: the mode goes straight into the request buffer.
-  const buf = encodeRequestU32(OP.CHMOD, filePath, 0, requireMode(mode));
+  const buf = encodeRequestU32(OP.CHMOD, filePath, followFlag(follow), requireMode(mode));
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, 'chmod', filePath);
 }
@@ -26,10 +31,11 @@ export function chmodSync(
 export async function chmod(
   asyncRequest: AsyncRequestFn,
   filePath: string,
-  mode: Mode
+  mode: Mode,
+  follow = true
 ): Promise<void> {
   // Async path posts to a relay worker, so it needs a real (and per-call fresh) Uint8Array.
-  const { status } = await asyncRequest(OP.CHMOD, filePath, 0, encodeMode(requireMode(mode)));
+  const { status } = await asyncRequest(OP.CHMOD, filePath, followFlag(follow), encodeMode(requireMode(mode)));
   if (status !== 0) throw statusToError(status, 'chmod', filePath);
 }
 

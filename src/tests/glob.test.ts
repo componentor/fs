@@ -169,29 +169,31 @@ const mockFs: MockFS = {
 describe('globSync', () => {
   const syncRequest = createMockSyncRequest(mockFs);
 
+  // Node reports matches **relative to `cwd`** unless the pattern itself is absolute. These
+  // expectations were absolute, which is what the implementation used to return.
   it('should match *.txt in cwd /', () => {
     const results = globSync(syncRequest, '*.txt');
-    expect(results.sort()).toEqual(['/a.txt']);
+    expect(results.sort()).toEqual(['a.txt']);
   });
 
   it('should match **/*.txt for nested files', () => {
     const results = globSync(syncRequest, '**/*.txt');
     expect(results.sort()).toEqual([
-      '/a.txt',
-      '/dir/c.txt',
-      '/dir/d.txt',
-      '/dir/sub/e.txt',
+      'a.txt',
+      'dir/c.txt',
+      'dir/d.txt',
+      'dir/sub/e.txt',
     ]);
   });
 
   it('should match dir/? for single-char names', () => {
     const results = globSync(syncRequest, 'dir/sub/?');
-    expect(results.sort()).toEqual(['/dir/sub/x', '/dir/sub/y']);
+    expect(results.sort()).toEqual(['dir/sub/x', 'dir/sub/y']);
   });
 
   it('should respect cwd option', () => {
     const results = globSync(syncRequest, '*.txt', { cwd: '/dir' });
-    expect(results.sort()).toEqual(['/dir/c.txt', '/dir/d.txt']);
+    expect(results.sort()).toEqual(['c.txt', 'd.txt']);
   });
 
   it('should respect exclude option', () => {
@@ -208,7 +210,7 @@ describe('globSync', () => {
 
   it('should match dir/*.txt', () => {
     const results = globSync(syncRequest, 'dir/*.txt');
-    expect(results.sort()).toEqual(['/dir/c.txt', '/dir/d.txt']);
+    expect(results.sort()).toEqual(['dir/c.txt', 'dir/d.txt']);
   });
 });
 
@@ -217,16 +219,16 @@ describe('glob (async)', () => {
 
   it('should match *.txt in cwd /', async () => {
     const results = await glob(asyncRequest, '*.txt');
-    expect(results.sort()).toEqual(['/a.txt']);
+    expect(results.sort()).toEqual(['a.txt']);
   });
 
   it('should match **/*.txt for nested files', async () => {
     const results = await glob(asyncRequest, '**/*.txt');
     expect(results.sort()).toEqual([
-      '/a.txt',
-      '/dir/c.txt',
-      '/dir/d.txt',
-      '/dir/sub/e.txt',
+      'a.txt',
+      'dir/c.txt',
+      'dir/d.txt',
+      'dir/sub/e.txt',
     ]);
   });
 
@@ -237,7 +239,7 @@ describe('glob (async)', () => {
 
   it('should respect cwd option', async () => {
     const results = await glob(asyncRequest, '*.txt', { cwd: '/dir' });
-    expect(results.sort()).toEqual(['/dir/c.txt', '/dir/d.txt']);
+    expect(results.sort()).toEqual(['c.txt', 'd.txt']);
   });
 
   it('should respect exclude option', async () => {
@@ -245,9 +247,9 @@ describe('glob (async)', () => {
       exclude: (p) => p.includes('/dir/sub/'),
     });
     expect(results.sort()).toEqual([
-      '/a.txt',
-      '/dir/c.txt',
-      '/dir/d.txt',
+      'a.txt',
+      'dir/c.txt',
+      'dir/d.txt',
     ]);
   });
 });

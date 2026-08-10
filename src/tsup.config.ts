@@ -1,33 +1,22 @@
 import { defineConfig } from 'tsup';
 
-const jsExtension = () => ({ js: '.js' });
-
-export default defineConfig([
-  {
-    entry: ['src/index.ts', 'src/drives-entry.ts'],
-    outDir: '../dist',
-    format: ['esm'],
-    outExtension: jsExtension,
-    dts: true,
-    splitting: false,
-    sourcemap: true,
-    treeshake: true,
-    minify: false,
+/**
+ * Stage 3: the public entries, with the worker bundles embedded as text.
+ *
+ * Run `npm run build` (scripts/build.mjs) rather than `tsup` directly — the `.workertext` files
+ * this imports are produced by the earlier stages.
+ */
+export default defineConfig({
+  entry: ['src/index.ts', 'src/drives-entry.ts'],
+  outDir: '../dist',
+  format: ['esm'],
+  outExtension: () => ({ js: '.js' }),
+  dts: true,
+  splitting: false,
+  sourcemap: true,
+  treeshake: true,
+  minify: false,
+  esbuildOptions(options) {
+    options.loader = { ...options.loader, '.workertext': 'text' };
   },
-  {
-    entry: [
-      'src/workers/server.worker.ts',
-      'src/workers/sync-relay.worker.ts',
-      'src/workers/async-relay.worker.ts',
-      'src/workers/service.worker.ts',
-      'src/workers/opfs-sync.worker.ts',
-      'src/workers/repair.worker.ts',
-    ],
-    outDir: '../dist/workers',
-    format: ['esm'],
-    outExtension: jsExtension,
-    splitting: false,
-    sourcemap: true,
-    minify: false,
-  },
-]);
+});

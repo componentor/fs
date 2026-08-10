@@ -17,7 +17,8 @@ export default defineConfig({
   server: { headers: isolation },
   preview: { headers: isolation },
 
-  // Vite pre-bundles dependencies for dev, which rewrites the `new URL('./workers/…', import.meta.url)`
-  // the library uses to find its workers. Excluding it keeps those URLs intact.
-  optimizeDeps: { exclude: ['@componentor/fs'] },
+  // No `optimizeDeps.exclude` needed. Until 4.0 the library located its workers with
+  // `new URL('./workers/…', import.meta.url)`, which Vite's dependency pre-bundling rewrote,
+  // and the workers stopped resolving. The worker bundles are embedded in the package now, so
+  // there is no URL left to rewrite — dev and build both work with no configuration at all.
 });

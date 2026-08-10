@@ -280,9 +280,23 @@ function decodeBuffer(data, encoding) {
       for (let i = 0; i < data.length; i++) hex += data[i].toString(16).padStart(2, "0");
       return hex;
     }
-    case "utf16le":
-      return utf16Decoder.decode(data.length & 1 ? data.subarray(0, data.length - 1) : data);
+    case "utf16le": {
+      const even = data.length & 1 ? data.subarray(0, data.length - 1) : data;
+      const decoded = utf16Decoder.decode(even);
+      return decoded.includes("\uFFFD") ? utf16leRaw(even) : decoded;
+    }
   }
+}
+function utf16leRaw(data) {
+  const units = new Uint16Array(data.length >> 1);
+  for (let i = 0; i < units.length; i++) units[i] = data[i * 2] | data[i * 2 + 1] << 8;
+  const CHUNK = 8192;
+  if (units.length <= CHUNK) return String.fromCharCode(...units);
+  let out = "";
+  for (let i = 0; i < units.length; i += CHUNK) {
+    out += String.fromCharCode(...units.subarray(i, i + CHUNK));
+  }
+  return out;
 }
 function createStringDecoder(encoding) {
   const canonical = assertEncoding(encoding);
@@ -356,29 +370,58 @@ function encodeString(str, encoding) {
 
 // src/node-streams.ts
 var SimpleEventEmitter = class {
+  /**
+   * Listeners as `{ fn, once }` records rather than bare functions.
+   *
+   * `once`-ness used to live in a `WeakSet` keyed by the function alone, which is wrong in two
+   * ways that both show up with ordinary code. Sharing one handler across two events —
+   * `once('a', f)` plus `on('b', f)` — meant firing `'b'` found `f` in the set and removed a
+   * listener that was supposed to be permanent. And registering the same function twice with
+   * `once` collapsed to one set entry, so the second registration was silently promoted to
+   * permanent. Node wraps each registration separately; these records do the same.
+   */
   _listeners = /* @__PURE__ */ new Map();
-  _onceSet = /* @__PURE__ */ new WeakSet();
   on(event, fn) {
-    let arr = this._listeners.get(event);
-    if (!arr) {
-      arr = [];
-      this._listeners.set(event, arr);
-    }
-    arr.push(fn);
-    return this;
+    return this._add(event, fn, false, false);
   }
   addListener(event, fn) {
     return this.on(event, fn);
   }
   once(event, fn) {
-    this._onceSet.add(fn);
-    return this.on(event, fn);
+    return this._add(event, fn, true, false);
+  }
+  prependListener(event, fn) {
+    return this._add(event, fn, false, true);
+  }
+  prependOnceListener(event, fn) {
+    return this._add(event, fn, true, true);
+  }
+  /**
+   * The single registration path. `protected` because `NodeReadable` hooks it to start flowing
+   * when a `'data'` listener appears — it used to override `on()`, which `once()` reached by
+   * delegating to it. Now that `once`/`prepend*` build their records directly, overriding `on()`
+   * would miss them, and `stream.once('data', …)` would never start the stream.
+   */
+  _add(event, fn, once, prepend) {
+    let arr = this._listeners.get(event);
+    if (!arr) {
+      arr = [];
+      this._listeners.set(event, arr);
+    }
+    const entry = { fn, once };
+    if (prepend) arr.unshift(entry);
+    else arr.push(entry);
+    return this;
   }
   off(event, fn) {
     const arr = this._listeners.get(event);
     if (arr) {
-      const idx = arr.indexOf(fn);
-      if (idx !== -1) arr.splice(idx, 1);
+      for (let i = arr.length - 1; i >= 0; i--) {
+        if (arr[i].fn === fn) {
+          arr.splice(i, 1);
+          break;
+        }
+      }
     }
     return this;
   }
@@ -386,44 +429,45 @@ var SimpleEventEmitter = class {
     return this.off(event, fn);
   }
   removeAllListeners(event) {
-    if (event !== void 0) {
-      this._listeners.delete(event);
-    } else {
-      this._listeners.clear();
-    }
+    if (event !== void 0) this._listeners.delete(event);
+    else this._listeners.clear();
     return this;
   }
   emit(event, ...args) {
     const arr = this._listeners.get(event);
-    if (!arr || arr.length === 0) return false;
-    const copy = arr.slice();
-    for (const fn of copy) {
-      if (this._onceSet.has(fn)) {
-        this._onceSet.delete(fn);
-        this.off(event, fn);
+    if (!arr || arr.length === 0) {
+      if (event === "error") {
+        const err = args[0];
+        if (err instanceof Error) throw err;
+        throw Object.assign(new Error(`Unhandled error. (${String(err)})`), { code: "ERR_UNHANDLED_ERROR" });
       }
-      fn(...args);
+      return false;
+    }
+    const copy = arr.slice();
+    for (const entry of copy) {
+      if (entry.once) {
+        const idx = arr.indexOf(entry);
+        if (idx !== -1) arr.splice(idx, 1);
+      }
+      entry.fn(...args);
     }
     return true;
   }
   listenerCount(event) {
     return this._listeners.get(event)?.length ?? 0;
   }
-  rawListeners(event) {
-    return [...this._listeners.get(event) ?? []];
+  listeners(event) {
+    return (this._listeners.get(event) ?? []).map((e) => e.fn);
   }
-  prependListener(event, fn) {
-    const arr = this._listeners.get(event) ?? [];
-    arr.unshift(fn);
-    this._listeners.set(event, arr);
+  rawListeners(event) {
+    return this.listeners(event);
+  }
+  /** Node caps listeners per emitter and warns past it; there is no cap here. Shape only. */
+  setMaxListeners(_n) {
     return this;
   }
-  prependOnceListener(event, fn) {
-    const wrapper = (...args) => {
-      this.off(event, wrapper);
-      fn(...args);
-    };
-    return this.prependListener(event, wrapper);
+  getMaxListeners() {
+    return 0;
   }
   eventNames() {
     return [...this._listeners.keys()].filter((k) => (this._listeners.get(k)?.length ?? 0) > 0);
@@ -457,8 +501,8 @@ var NodeReadable = class extends SimpleEventEmitter {
   /** Optional cleanup callback invoked on destroy (e.g. close file handle). */
   _destroyFn = null;
   // ---- Flow control (override on to auto-resume) ----
-  on(event, fn) {
-    super.on(event, fn);
+  _add(event, fn, once, prepend) {
+    super._add(event, fn, once, prepend);
     if (event === "data" && this._paused) {
       this.resume();
     }
@@ -693,13 +737,31 @@ var NodeWritable = class extends SimpleEventEmitter {
   uncork() {
     this._corked = false;
   }
+  /**
+   * Emit `'error'` from inside the internal write chain.
+   *
+   * `emit('error')` throws when nothing is listening, which is node's rule — but thrown from a
+   * `.then` handler it becomes an unhandled *rejection* of this stream's own chain: quieter than
+   * node, and it strands the chain. Node raises an uncaught exception instead (verified against a
+   * real `Writable`: a failing write with a callback but no `'error'` listener calls the callback
+   * and *then* crashes). Rethrowing out of band reproduces that and leaves the chain intact.
+   */
+  _emitError(err) {
+    if (this.listenerCount("error") > 0) {
+      this.emit("error", err);
+      return;
+    }
+    setTimeout(() => {
+      throw err;
+    }, 0);
+  }
   write(chunk, encodingOrCb, cb) {
     const callback = typeof encodingOrCb === "function" ? encodingOrCb : cb;
     const encoding = typeof encodingOrCb === "string" ? encodingOrCb : this._defaultEncoding;
     if (this._destroyed || this._finished || this._ending) {
       const err = streamWriteAfterEnd();
       if (callback) callback(err);
-      this.emit("error", err);
+      queueMicrotask(() => this._emitError(err));
       return false;
     }
     const data = typeof chunk === "string" ? encodeString(chunk, encoding) : chunk;
@@ -714,7 +776,7 @@ var NodeWritable = class extends SimpleEventEmitter {
       (err) => {
         this._writing = false;
         if (callback) callback(err);
-        this.emit("error", err);
+        this._emitError(err);
       }
     );
     return true;
@@ -747,8 +809,8 @@ var NodeWritable = class extends SimpleEventEmitter {
         this.emit("close");
         if (callback) callback();
       }).catch((err) => {
-        this.emit("error", err);
         if (callback) callback(err);
+        this._emitError(err);
       });
     };
     if (finalChunk !== void 0 && finalChunk !== null) {
@@ -984,12 +1046,17 @@ function writeU32(buf, at, value) {
   buf[at + 3] = value >>> 24;
 }
 function toEpochMs(time, name = "time") {
-  if (time instanceof Date) return time.getTime();
-  const seconds = typeof time === "string" ? Number(time) : time;
-  if (typeof seconds !== "number" || !Number.isFinite(seconds)) {
-    throw invalidArgType(name, "number | string | Date", time);
+  return toUnixTimestamp(time, name) * 1e3;
+}
+function toUnixTimestamp(time, name = "time") {
+  if (typeof time === "string" && String(Number(time)) === time.trim() && time.trim() !== "") {
+    return Number(time);
   }
-  return seconds * 1e3;
+  if (typeof time === "number" && Number.isFinite(time)) {
+    return time < 0 ? Date.now() / 1e3 : time;
+  }
+  if (time instanceof Date) return time.getTime() / 1e3;
+  throw invalidArgType(name, "number | string | Date", time);
 }
 
 // src/methods/mode.ts
@@ -1607,7 +1674,33 @@ var constants = {
   S_IRWXO: 7,
   S_IROTH: 4,
   S_IWOTH: 2,
-  S_IXOTH: 1
+  S_IXOTH: 1,
+  // ---- libuv-level constants Node re-exports ----
+  //
+  // Node exposes libuv's own numbering on `fs.constants`, and the `UV_DIRENT_*` set is the part
+  // real code reads: a `Dirent`'s type is one of these numbers, so anything comparing types
+  // numerically rather than calling `isFile()`/`isDirectory()` needs them to exist. The rest are
+  // included for completeness, with the values taken from a live `node:fs`.
+  UV_DIRENT_UNKNOWN: 0,
+  UV_DIRENT_FILE: 1,
+  UV_DIRENT_DIR: 2,
+  UV_DIRENT_LINK: 3,
+  UV_DIRENT_FIFO: 4,
+  UV_DIRENT_SOCKET: 5,
+  UV_DIRENT_CHAR: 6,
+  UV_DIRENT_BLOCK: 7,
+  // Windows-only in Node; defined so a cross-platform `constants.X` read does not come back
+  // `undefined` and silently change a bitmask.
+  UV_FS_SYMLINK_DIR: 1,
+  UV_FS_SYMLINK_JUNCTION: 2,
+  UV_FS_O_FILEMAP: 0,
+  // macOS-only in Node. We have no O_SYMLINK behaviour to offer, but the value is here so the
+  // flag can be tested for rather than crashing on a missing property.
+  O_SYMLINK: 2097152,
+  // The `UV_`-prefixed spellings of the copyfile flags; identical values to `COPYFILE_*` above.
+  UV_FS_COPYFILE_EXCL: 1,
+  UV_FS_COPYFILE_FICLONE: 2,
+  UV_FS_COPYFILE_FICLONE_FORCE: 4
 };
 
 // src/methods/open.ts
@@ -1727,10 +1820,10 @@ function ftruncateSync(syncRequest, fd, len = 0) {
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "ftruncate", String(fd));
 }
-function fdatasyncSync(syncRequest, fd) {
-  const buf = encodeRequest(OP.FSYNC, "");
+function fdatasyncSync(syncRequest, fd, syscall = "fdatasync") {
+  const buf = encodeRequest(OP.FSYNC, "", 0, encodeFdPayload(fd));
   const { status } = syncRequest(buf);
-  if (status !== 0) throw statusToError(status, "fdatasync", String(fd));
+  if (status !== 0) throw statusToError(status, syscall, String(fd));
 }
 async function open(asyncRequest, filePath, flags, mode) {
   const numFlags = typeof flags === "string" ? parseFlags(flags ?? "r") : flags ?? 0;
@@ -1875,10 +1968,12 @@ function createFileHandle(fd, asyncRequest) {
       if (status !== 0) throw statusToError(status, "futimes", String(fd));
     },
     async sync() {
-      await asyncRequest(OP.FSYNC, "");
+      const { status } = await asyncRequest(OP.FSYNC, "", 0, null, void 0, { fd });
+      if (status !== 0) throw statusToError(status, "fsync", String(fd));
     },
     async datasync() {
-      await asyncRequest(OP.FSYNC, "");
+      const { status } = await asyncRequest(OP.FSYNC, "", 0, null, void 0, { fd });
+      if (status !== 0) throw statusToError(status, "fdatasync", String(fd));
     },
     async close() {
       const { status } = await asyncRequest(OP.CLOSE, "", 0, null, void 0, { fd });
@@ -1907,7 +2002,17 @@ function createFileHandle(fd, asyncRequest) {
       return webStreamFromHandle(handleSource(void 0));
     },
     // ---- EventEmitter surface ----
+    //
+    // All of it, not the five methods this used to forward. Node's `FileHandle` is a real
+    // `EventEmitter`, so code that keeps a handle around and calls `removeAllListeners()` on
+    // teardown, or `listenerCount('close')` to decide whether to wire something up, hits an
+    // "is not a function" on a partial implementation — and the missing ones were the
+    // housekeeping methods, which is exactly what long-lived objects use.
     on(event, listener) {
+      events.on(event, listener);
+      return this;
+    },
+    addListener(event, listener) {
       events.on(event, listener);
       return this;
     },
@@ -1922,6 +2027,38 @@ function createFileHandle(fd, asyncRequest) {
     removeListener(event, listener) {
       events.off(event, listener);
       return this;
+    },
+    removeAllListeners(event) {
+      events.removeAllListeners(event);
+      return this;
+    },
+    prependListener(event, listener) {
+      events.prependListener(event, listener);
+      return this;
+    },
+    prependOnceListener(event, listener) {
+      events.prependOnceListener(event, listener);
+      return this;
+    },
+    listeners(event) {
+      return events.rawListeners(event);
+    },
+    rawListeners(event) {
+      return events.rawListeners(event);
+    },
+    listenerCount(event) {
+      return events.listenerCount(event);
+    },
+    eventNames() {
+      return events.eventNames();
+    },
+    // Node caps listeners per emitter and warns past the limit. There is no limit here — a
+    // handle emits one event, `'close'` — so these keep the shape without inventing a cap.
+    setMaxListeners(_n) {
+      return this;
+    },
+    getMaxListeners() {
+      return 0;
     },
     emit(event, ...args) {
       return events.emit(event, ...args);
@@ -2541,18 +2678,20 @@ async function realpath(asyncRequest, filePath, options) {
   if (status !== 0) throw statusToError(status, "realpath", filePath);
   return decodePath(data, options);
 }
+var NOFOLLOW = 1;
 
 // src/methods/chmod.ts
+var followFlag = (follow) => follow ? 0 : NOFOLLOW;
 function requireMode(mode) {
   return parseFileMode(mode, "mode");
 }
-function chmodSync(syncRequest, filePath, mode) {
-  const buf = encodeRequestU32(OP.CHMOD, filePath, 0, requireMode(mode));
+function chmodSync(syncRequest, filePath, mode, follow = true) {
+  const buf = encodeRequestU32(OP.CHMOD, filePath, followFlag(follow), requireMode(mode));
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "chmod", filePath);
 }
-async function chmod(asyncRequest, filePath, mode) {
-  const { status } = await asyncRequest(OP.CHMOD, filePath, 0, encodeMode(requireMode(mode)));
+async function chmod(asyncRequest, filePath, mode, follow = true) {
+  const { status } = await asyncRequest(OP.CHMOD, filePath, followFlag(follow), encodeMode(requireMode(mode)));
   if (status !== 0) throw statusToError(status, "chmod", filePath);
 }
 function fchmodSync(syncRequest, fd, mode) {
@@ -2578,21 +2717,21 @@ function encodeFdMode(fd, mode) {
 }
 
 // src/methods/chown.ts
-function chownSync(syncRequest, filePath, uid, gid) {
+function chownSync(syncRequest, filePath, uid, gid, follow = true) {
   const ownerBuf = new Uint8Array(8);
   const dv = new DataView(ownerBuf.buffer);
   dv.setUint32(0, uid, true);
   dv.setUint32(4, gid, true);
-  const buf = encodeRequest(OP.CHOWN, filePath, 0, ownerBuf);
+  const buf = encodeRequest(OP.CHOWN, filePath, follow ? 0 : NOFOLLOW, ownerBuf);
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "chown", filePath);
 }
-async function chown(asyncRequest, filePath, uid, gid) {
+async function chown(asyncRequest, filePath, uid, gid, follow = true) {
   const buf = new Uint8Array(8);
   const dv = new DataView(buf.buffer);
   dv.setUint32(0, uid, true);
   dv.setUint32(4, gid, true);
-  const { status } = await asyncRequest(OP.CHOWN, filePath, 0, buf);
+  const { status } = await asyncRequest(OP.CHOWN, filePath, follow ? 0 : NOFOLLOW, buf);
   if (status !== 0) throw statusToError(status, "chown", filePath);
 }
 function fchownSync(syncRequest, fd, uid, gid) {
@@ -2616,21 +2755,21 @@ async function fchown(asyncRequest, fd, uid, gid) {
 }
 
 // src/methods/utimes.ts
-function utimesSync(syncRequest, filePath, atime, mtime) {
+function utimesSync(syncRequest, filePath, atime, mtime, follow = true) {
   const timesBuf = new Uint8Array(16);
   const dv = new DataView(timesBuf.buffer);
   dv.setFloat64(0, toEpochMs(atime, "atime"), true);
   dv.setFloat64(8, toEpochMs(mtime, "mtime"), true);
-  const buf = encodeRequest(OP.UTIMES, filePath, 0, timesBuf);
+  const buf = encodeRequest(OP.UTIMES, filePath, follow ? 0 : NOFOLLOW, timesBuf);
   const { status } = syncRequest(buf);
   if (status !== 0) throw statusToError(status, "utimes", filePath);
 }
-async function utimes(asyncRequest, filePath, atime, mtime) {
+async function utimes(asyncRequest, filePath, atime, mtime, follow = true) {
   const buf = new Uint8Array(16);
   const dv = new DataView(buf.buffer);
   dv.setFloat64(0, toEpochMs(atime, "atime"), true);
   dv.setFloat64(8, toEpochMs(mtime, "mtime"), true);
-  const { status } = await asyncRequest(OP.UTIMES, filePath, 0, buf);
+  const { status } = await asyncRequest(OP.UTIMES, filePath, follow ? 0 : NOFOLLOW, buf);
   if (status !== 0) throw statusToError(status, "utimes", filePath);
 }
 function futimesSync(syncRequest, fd, atime, mtime) {
@@ -2725,9 +2864,11 @@ async function mkdtemp(asyncRequest, prefix, options) {
 function decodeStatFs(data) {
   const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
   const bfree = dv.getUint32(12, true);
+  const bsize = dv.getUint32(4, true);
   return {
     type: dv.getUint32(0, true),
-    bsize: dv.getUint32(4, true),
+    bsize,
+    frsize: bsize,
     blocks: dv.getUint32(8, true),
     bfree,
     bavail: bfree,
@@ -2735,15 +2876,22 @@ function decodeStatFs(data) {
     ffree: dv.getUint32(20, true)
   };
 }
-function statfsSync(syncRequest, path = "/") {
+function asBigInt(s) {
+  const out = {};
+  for (const [k, v] of Object.entries(s)) out[k] = BigInt(Math.trunc(v));
+  return out;
+}
+function statfsSync(syncRequest, path = "/", options) {
   const { status, data } = syncRequest(encodeRequest(OP.STATFS, path));
   if (status !== 0) throw statusToError(status, "statfs", path);
-  return decodeStatFs(data);
+  const stats = decodeStatFs(data);
+  return options?.bigint ? asBigInt(stats) : stats;
 }
-async function statfs(asyncRequest, path = "/") {
+async function statfs(asyncRequest, path = "/", options) {
   const { status, data } = await asyncRequest(OP.STATFS, path);
   if (status !== 0) throw statusToError(status, "statfs", path);
-  return decodeStatFs(data);
+  const stats = decodeStatFs(data);
+  return options?.bigint ? asBigInt(stats) : stats;
 }
 
 // src/dir.ts
@@ -2812,6 +2960,38 @@ async function opendir(asyncRequest, filePath, options) {
     if (closeStatus !== 0) throw statusToError(closeStatus, "close", String(fd));
   });
 }
+
+// src/workers/worker-blob.ts
+var objectUrls = /* @__PURE__ */ new WeakMap();
+function workerFromSource(source, name) {
+  const url = URL.createObjectURL(new Blob([source], { type: "text/javascript" }));
+  try {
+    const worker = new Worker(url, { type: "module", name });
+    objectUrls.set(worker, url);
+    return worker;
+  } catch (err) {
+    URL.revokeObjectURL(url);
+    throw err;
+  }
+}
+function terminateWorker(worker) {
+  if (!worker) return;
+  try {
+    worker.terminate();
+  } catch {
+  }
+  const url = objectUrls.get(worker);
+  if (url) {
+    URL.revokeObjectURL(url);
+    objectUrls.delete(worker);
+  }
+}
+
+// src/workers/inlined/sync-relay.workertext
+var sync_relay_default = 'var lt=1447449377,Tt=1,At=4096,xt=1e5,P=64,b={SIZE:64,MAGIC:0,VERSION:4,INODE_COUNT:8,BLOCK_SIZE:12,TOTAL_BLOCKS:16,FREE_BLOCKS:20,INODE_OFFSET:24,PATH_OFFSET:32,DATA_OFFSET:40,BITMAP_OFFSET:48,PATH_USED:56,CRC32:60},E={TYPE:0,FLAGS:1,PATH_OFFSET:4,PATH_LENGTH:8,NLINK:10,MODE:12,SIZE:16,FIRST_BLOCK:24,BLOCK_COUNT:28,MTIME:32,CTIME:40,ATIME:48,UID:56,GID:60},p={FREE:0,FILE:1,DIRECTORY:2,SYMLINK:3},Re=33188,Qt=16877,ve=41471,Xt=18,jt=61440,Ue=32768,xe=16384,Pt=40,Jt=256*1024,Lt=1024,te=4e6;function Pe(i=xt,t=At,e=Lt,s=te){const n=b.SIZE,r=i*P,a=n+r,o=Jt,u=a+o,f=Math.ceil(s/8),h=Math.ceil(e/8),d=Math.ceil((u+f)/t)*t,m=d+e*t;return{inodeTableOffset:n,inodeTableSize:r,pathTableOffset:a,pathTableSize:o,bitmapOffset:u,bitmapSize:h,bitmapRegionSize:f,dataOffset:d,totalSize:m,totalBlocks:e}}var Le=(()=>{const i=new Uint32Array(256);for(let t=0;t<256;t++){let e=t;for(let s=0;s<8;s++)e=e&1?3988292384^e>>>1:e>>>1;i[t]=e>>>0}return i})();function ee(i,t=0,e=i.byteLength){let s=4294967295;for(let n=t;n<e;n++)s=Le[(s^i[n])&255]^s>>>8;return(s^4294967295)>>>0}var y={OK:0,ENOENT:1,EEXIST:2,EISDIR:3,ENOTDIR:4,ENOTEMPTY:5,EACCES:6,EINVAL:7,EBADF:8,ELOOP:9,ENOSPC:10,EIO:11,ENOTSUP:12},V=new TextEncoder,Mt=16384,ut=new TextDecoder,Me=class St{handle;pathIndex=new Map;inodeCount=0;blockSize=At;totalBlocks=0;freeBlocks=0;inodeTableOffset=0;pathTableOffset=0;pathTableUsed=0;pathTableSize=0;bitmapOffset=0;dataOffset=0;umask=Xt;processUid=0;processGid=0;strictPermissions=!1;debug=!1;fdTable=new Map;nextFd=3;static isReadable(t){const e=t&3;return e===0||e===2}static isWritable(t){const e=t&3;return e===1||e===2}inodeBuf=new Uint8Array(P);inodeView=new DataView(this.inodeBuf.buffer);inodeCache=new Map;superblockBuf=new Uint8Array(b.SIZE);superblockView=new DataView(this.superblockBuf.buffer);bitmap=null;bitmapDirtyLo=1/0;bitmapDirtyHi=-1;superblockDirty=!1;freeInodeHint=0;implicitDirs=new Map;implicitDirsGen=-1;pathIndexGen=0;descCount=new Map;descCountGen=0;childIndex=new Map;childIndexGen=0;allocCursor=0;symlinkLoopDetected=!1;resolveFailureStatus(){return this.symlinkLoopDetected?y.ELOOP:y.ENOENT}maxInodes=4e6;maxBlocks=te;maxPathTable=256*1024*1024;maxVFSSize=100*1024*1024*1024;init(t,e){if(this.handle=t,this.processUid=e?.uid??0,this.processGid=e?.gid??0,this.umask=e?.umask??Xt,this.strictPermissions=e?.strictPermissions??!1,this.debug=e?.debug??!1,e?.limits&&(e.limits.maxInodes!=null&&(this.maxInodes=e.limits.maxInodes),e.limits.maxBlocks!=null&&(this.maxBlocks=e.limits.maxBlocks),e.limits.maxPathTable!=null&&(this.maxPathTable=e.limits.maxPathTable),e.limits.maxVFSSize!=null&&(this.maxVFSSize=e.limits.maxVFSSize)),t.getSize()===0)this.format();else try{this.mount()}catch(n){const r=n.message??String(n);throw r.startsWith("Corrupt VFS:")?n:new Error(`Corrupt VFS: ${r}`)}}closeHandle(){try{this.handle?.close()}catch{}}format(){const t=Pe(xt,At,Lt,this.maxBlocks);this.inodeCount=xt,this.blockSize=At,this.totalBlocks=t.totalBlocks,this.freeBlocks=t.totalBlocks,this.inodeTableOffset=t.inodeTableOffset,this.pathTableOffset=t.pathTableOffset,this.pathTableSize=t.pathTableSize,this.pathTableUsed=0,this.bitmapOffset=t.bitmapOffset,this.dataOffset=t.dataOffset,this.handle.truncate(t.totalSize),this.writeSuperblock();const e=new Uint8Array(t.inodeTableSize);this.handle.write(e,{at:this.inodeTableOffset}),this.bitmap=new Uint8Array(t.bitmapSize),this.handle.write(this.bitmap,{at:this.bitmapOffset}),this.createInode("/",p.DIRECTORY,Qt,0),this.writeSuperblock(),this.handle.flush()}mount(){const t=this.handle.getSize();if(t<b.SIZE)throw new Error(`Corrupt VFS: file too small (${t} bytes, need at least ${b.SIZE})`);this.handle.read(this.superblockBuf,{at:0});const e=this.superblockView,s=e.getUint32(b.MAGIC,!0);if(s!==lt)throw new Error(`Corrupt VFS: bad magic 0x${s.toString(16)} (expected 0x${lt.toString(16)})`);const n=e.getUint32(b.VERSION,!0);if(n!==Tt)throw new Error(`Corrupt VFS: unsupported version ${n} (expected ${Tt})`);const r=e.getUint32(b.CRC32,!0);if(r!==0){const R=ee(this.superblockBuf,0,b.CRC32);if(R!==r)throw new Error(`Corrupt VFS: superblock checksum mismatch (stored 0x${r.toString(16)}, computed 0x${R.toString(16)})`)}const a=e.getUint32(b.INODE_COUNT,!0),o=e.getUint32(b.BLOCK_SIZE,!0),u=e.getUint32(b.TOTAL_BLOCKS,!0),f=e.getUint32(b.FREE_BLOCKS,!0),h=e.getFloat64(b.INODE_OFFSET,!0),d=e.getFloat64(b.PATH_OFFSET,!0),m=e.getFloat64(b.DATA_OFFSET,!0),w=e.getFloat64(b.BITMAP_OFFSET,!0),l=e.getUint32(b.PATH_USED,!0);if(o===0||(o&o-1)!==0)throw new Error(`Corrupt VFS: invalid block size ${o} (must be power of 2)`);if(a===0)throw new Error("Corrupt VFS: inode count is 0");if(f>u)throw new Error(`Corrupt VFS: free blocks (${f}) exceeds total blocks (${u})`);if(a>this.maxInodes)throw new Error(`Corrupt VFS: inode count ${a} exceeds maximum ${this.maxInodes}`);if(u>this.maxBlocks)throw new Error(`Corrupt VFS: total blocks ${u} exceeds maximum ${this.maxBlocks}`);if(t>this.maxVFSSize)throw new Error(`Corrupt VFS: file size ${t} exceeds maximum ${this.maxVFSSize}`);if(!Number.isFinite(h)||h<0||!Number.isFinite(d)||d<0||!Number.isFinite(w)||w<0||!Number.isFinite(m)||m<0)throw new Error("Corrupt VFS: non-finite or negative section offset");if(h!==b.SIZE)throw new Error(`Corrupt VFS: inode table offset ${h} (expected ${b.SIZE})`);const I=h+a*P;if(d!==I)throw new Error(`Corrupt VFS: path table offset ${d} (expected ${I})`);if(w<=d)throw new Error(`Corrupt VFS: bitmap offset ${w} must be after path table ${d}`);if(m<=w)throw new Error(`Corrupt VFS: data offset ${m} must be after bitmap ${w}`);if(u>(m-w)*8)throw new Error(`Corrupt VFS: total blocks (${u}) exceed bitmap region capacity (${(m-w)*8})`);const T=w-d;if(l>T)throw new Error(`Corrupt VFS: path used (${l}) exceeds path table size (${T})`);if(T>this.maxPathTable)throw new Error(`Corrupt VFS: path table size ${T} exceeds maximum ${this.maxPathTable}`);const F=m+u*o;if(F>this.maxVFSSize)throw new Error(`Corrupt VFS: computed layout size ${F} exceeds maximum ${this.maxVFSSize}`);if(t<F)throw new Error(`Corrupt VFS: file size ${t} too small for layout (need ${F})`);this.inodeCount=a,this.blockSize=o,this.totalBlocks=u,this.freeBlocks=f,this.inodeTableOffset=h,this.pathTableOffset=d,this.dataOffset=m,this.bitmapOffset=w,this.pathTableUsed=l,this.pathTableSize=T;const C=Math.ceil(this.totalBlocks/8);if(this.bitmap=new Uint8Array(C),this.handle.read(this.bitmap,{at:this.bitmapOffset}),this.rebuildIndex(),!this.pathIndex.has("/"))throw new Error(\'Corrupt VFS: root directory "/" not found in inode table\')}writeSuperblock(){const t=this.superblockView;t.setUint32(b.MAGIC,lt,!0),t.setUint32(b.VERSION,Tt,!0),t.setUint32(b.INODE_COUNT,this.inodeCount,!0),t.setUint32(b.BLOCK_SIZE,this.blockSize,!0),t.setUint32(b.TOTAL_BLOCKS,this.totalBlocks,!0),t.setUint32(b.FREE_BLOCKS,this.freeBlocks,!0),t.setFloat64(b.INODE_OFFSET,this.inodeTableOffset,!0),t.setFloat64(b.PATH_OFFSET,this.pathTableOffset,!0),t.setFloat64(b.DATA_OFFSET,this.dataOffset,!0),t.setFloat64(b.BITMAP_OFFSET,this.bitmapOffset,!0),t.setUint32(b.PATH_USED,this.pathTableUsed,!0),t.setUint32(b.CRC32,ee(this.superblockBuf,0,b.CRC32),!0),this.handle.write(this.superblockBuf,{at:0})}markBitmapDirty(t,e){t<this.bitmapDirtyLo&&(this.bitmapDirtyLo=t),e>this.bitmapDirtyHi&&(this.bitmapDirtyHi=e)}commitPending(){if(this.blocksFreedsinceTrim&&(this.trimTrailingBlocks(),this.blocksFreedsinceTrim=!1),this.bitmapDirtyHi>=0){const t=this.bitmapDirtyLo,e=this.bitmapDirtyHi;this.handle.write(this.bitmap.subarray(t,e+1),{at:this.bitmapOffset+t}),this.bitmapDirtyLo=1/0,this.bitmapDirtyHi=-1}this.superblockDirty&&(this.writeSuperblock(),this.superblockDirty=!1)}findLastUsedBlock(){const t=this.bitmap;for(let e=Math.ceil(this.totalBlocks/8)-1;e>=0;e--)if(t[e]!==0)for(let s=7;s>=0;s--){const n=e*8+s;if(n<this.totalBlocks&&t[e]&1<<s)return n}return-1}trimTrailingBlocks(){const t=this.findLastUsedBlock(),e=Math.max(t+1+Mt,Lt);if(e>=this.totalBlocks)return;this.handle.truncate(this.dataOffset+e*this.blockSize);const s=Math.ceil(e/8);this.bitmap=this.bitmap.slice(0,s);const n=this.totalBlocks-e;this.freeBlocks-=n,this.totalBlocks=e,this.superblockDirty=!0,this.bitmapDirtyLo=0,this.bitmapDirtyHi=s-1}lastPreGrowCheck=0;maybePreGrow(t=!1){if(!this.bitmap)return!1;const e=Date.now();if(!t&&e-this.lastPreGrowCheck<250)return!1;this.lastPreGrowCheck=e;const s=this.totalBlocks-(this.findLastUsedBlock()+1);if(s>=Mt)return!1;const n=Math.min(this.maxBlocks,this.bitmapCapacityBlocks()),r=Math.ceil((Mt-s)/8)*8,a=Math.min(r,n-this.totalBlocks);if(a<=0)return!1;const o=this.totalBlocks+a;this.handle.truncate(this.dataOffset+o*this.blockSize);const u=Math.ceil(o/8);if(u>this.bitmap.byteLength){const f=new Uint8Array(u);f.set(this.bitmap),this.bitmap=f}return this.totalBlocks=o,this.freeBlocks+=a,this.superblockDirty=!0,this.commitPending(),!0}rebuildIndex(){this.pathIndex.clear(),this.inodeCache.clear();const t=this.inodeCount*P,e=new Uint8Array(t);this.handle.read(e,{at:this.inodeTableOffset});const s=new DataView(e.buffer),n=this.pathTableUsed>0?new Uint8Array(this.pathTableUsed):null;n&&this.handle.read(n,{at:this.pathTableOffset});for(let r=0;r<this.inodeCount;r++){const a=r*P,o=s.getUint8(a+E.TYPE);if(o===p.FREE)continue;if(o<p.FILE||o>p.SYMLINK)throw new Error(`Corrupt VFS: inode ${r} has invalid type ${o}`);const u=s.getUint32(a+E.PATH_OFFSET,!0),f=s.getUint16(a+E.PATH_LENGTH,!0),h=s.getFloat64(a+E.SIZE,!0),d=s.getUint32(a+E.FIRST_BLOCK,!0),m=s.getUint32(a+E.BLOCK_COUNT,!0);if(f===0||u+f>this.pathTableUsed)throw new Error(`Corrupt VFS: inode ${r} path out of bounds (offset=${u}, len=${f}, tableUsed=${this.pathTableUsed})`);if(o!==p.DIRECTORY){if(h<0||!isFinite(h))throw new Error(`Corrupt VFS: inode ${r} has invalid size ${h}`);if(m>0&&d+m>this.totalBlocks)throw new Error(`Corrupt VFS: inode ${r} data blocks out of range (first=${d}, count=${m}, total=${this.totalBlocks})`)}const w={type:o,pathOffset:u,pathLength:f,nlink:s.getUint16(a+E.NLINK,!0)||1,mode:s.getUint32(a+E.MODE,!0),size:h,firstBlock:d,blockCount:m,mtime:s.getFloat64(a+E.MTIME,!0),ctime:s.getFloat64(a+E.CTIME,!0),atime:s.getFloat64(a+E.ATIME,!0),uid:s.getUint32(a+E.UID,!0),gid:s.getUint32(a+E.GID,!0)};this.inodeCache.set(r,w);let l;if(n?l=ut.decode(n.subarray(w.pathOffset,w.pathOffset+w.pathLength)):l=this.readPath(w.pathOffset,w.pathLength),!l.startsWith("/")||l.includes("\\0"))throw new Error(`Corrupt VFS: inode ${r} has invalid path "${l.substring(0,50)}"`);this.setPathIndex(l,r)}this.pathIndexGen++}readInode(t){const e=this.inodeCache.get(t);if(e)return e;const s=this.inodeTableOffset+t*P;this.handle.read(this.inodeBuf,{at:s});const n=this.inodeView,r={type:n.getUint8(E.TYPE),pathOffset:n.getUint32(E.PATH_OFFSET,!0),pathLength:n.getUint16(E.PATH_LENGTH,!0),nlink:n.getUint16(E.NLINK,!0)||1,mode:n.getUint32(E.MODE,!0),size:n.getFloat64(E.SIZE,!0),firstBlock:n.getUint32(E.FIRST_BLOCK,!0),blockCount:n.getUint32(E.BLOCK_COUNT,!0),mtime:n.getFloat64(E.MTIME,!0),ctime:n.getFloat64(E.CTIME,!0),atime:n.getFloat64(E.ATIME,!0),uid:n.getUint32(E.UID,!0),gid:n.getUint32(E.GID,!0)};return this.inodeCache.set(t,r),r}writeInode(t,e){e.type===p.FREE?this.inodeCache.delete(t):this.inodeCache.set(t,e);const s=this.inodeView;s.setUint8(E.TYPE,e.type),s.setUint8(E.FLAGS,0),s.setUint8(E.FLAGS+1,0),s.setUint8(E.FLAGS+2,0),s.setUint32(E.PATH_OFFSET,e.pathOffset,!0),s.setUint16(E.PATH_LENGTH,e.pathLength,!0),s.setUint16(E.NLINK,e.nlink,!0),s.setUint32(E.MODE,e.mode,!0),s.setFloat64(E.SIZE,e.size,!0),s.setUint32(E.FIRST_BLOCK,e.firstBlock,!0),s.setUint32(E.BLOCK_COUNT,e.blockCount,!0),s.setFloat64(E.MTIME,e.mtime,!0),s.setFloat64(E.CTIME,e.ctime,!0),s.setFloat64(E.ATIME,e.atime,!0),s.setUint32(E.UID,e.uid,!0),s.setUint32(E.GID,e.gid,!0);const n=this.inodeTableOffset+t*P;this.handle.write(this.inodeBuf,{at:n})}readPath(t,e){const s=new Uint8Array(e);return this.handle.read(s,{at:this.pathTableOffset+t}),ut.decode(s)}appendPath(t){const e=V.encode(t),s=this.pathTableUsed;return s+e.byteLength>this.pathTableSize&&this.growPathTable(s+e.byteLength),this.handle.write(e,{at:this.pathTableOffset+s}),this.pathTableUsed+=e.byteLength,this.superblockDirty=!0,{offset:s,length:e.byteLength}}growPathTable(t){const e=Math.max(this.pathTableSize*2,t+Jt),s=e-this.pathTableSize,n=this.handle.getSize()+s;this.handle.truncate(n);const r=this.totalBlocks*this.blockSize,a=4*1024*1024,o=new Uint8Array(Math.min(a,Math.max(r,1)));let u=r;for(;u>0;){const d=Math.min(u,a),m=this.dataOffset+(u-d),w=this.dataOffset+s+(u-d),l=d<o.length?o.subarray(0,d):o;this.handle.read(l,{at:m}),this.handle.write(l,{at:w}),u-=d}const f=this.bitmapOffset+s,h=this.dataOffset+s;this.handle.write(this.bitmap,{at:f}),this.pathTableSize=e,this.bitmapOffset=f,this.dataOffset=h,this.superblockDirty=!0}zeroFileRange(t,e){if(e<=0)return;const s=4*1024*1024,n=new Uint8Array(Math.min(e,s));let r=0;for(;r<e;){const a=Math.min(s,e-r),o=a<n.length?n.subarray(0,a):n;this.handle.write(o,{at:t+r}),r+=a}}allocateBlocks(t){if(t===0)return 0;let e=this.scanForRun(this.allocCursor,this.totalBlocks,t);if(e<0&&this.allocCursor>0){const r=Math.min(this.allocCursor+t-1,this.totalBlocks);e=this.scanForRun(0,r,t)}if(e<0)return this.growAndAllocate(t);const s=e+t-1,n=this.bitmap;for(let r=e;r<=s;r++)n[r>>>3]|=1<<(r&7);return this.markBitmapDirty(e>>>3,s>>>3),this.freeBlocks-=t,this.superblockDirty=!0,this.allocCursor=s+1>=this.totalBlocks?0:s+1,e}scanForRun(t,e,s){const n=this.bitmap;let r=0,a=t;for(let o=t;o<e;o++){if(r===0&&(o&7)===0&&n[o>>>3]===255){o+=7,a=o+1;continue}if(n[o>>>3]>>>(o&7)&1)r=0,a=o+1;else if(++r===s)return a}return-1}bitmapCapacityBlocks(){return(this.dataOffset-this.bitmapOffset)*8}growAndAllocate(t){const e=this.totalBlocks,s=Math.min(this.maxBlocks,this.bitmapCapacityBlocks());let n=Math.max(e*2,e+t);if(n>s&&(n=s),n<e+t)throw new Error(`ENOSPC: cannot allocate ${t} blocks (total ${e}, ceiling ${s})`);const r=n-e,a=this.dataOffset+n*this.blockSize;this.handle.truncate(a);const o=Math.ceil(n/8),u=new Uint8Array(o);u.set(this.bitmap),this.bitmap=u,this.totalBlocks=n,this.freeBlocks+=r;const f=e;for(let h=f;h<f+t;h++){const d=h>>>3,m=h&7;this.bitmap[d]|=1<<m}return this.markBitmapDirty(f>>>3,f+t-1>>>3),this.freeBlocks-=t,this.superblockDirty=!0,f}blocksFreedsinceTrim=!1;freeBlockRange(t,e){if(e===0)return;const s=this.bitmap;for(let n=t;n<t+e;n++){const r=n>>>3,a=n&7;s[r]&=~(1<<a)}this.markBitmapDirty(t>>>3,t+e-1>>>3),this.freeBlocks+=e,this.superblockDirty=!0,this.blocksFreedsinceTrim=!0}findFreeInode(){for(let e=this.freeInodeHint;e<this.inodeCount;e++){if(this.inodeCache.has(e))continue;const s=this.inodeTableOffset+e*P,n=new Uint8Array(1);if(this.handle.read(n,{at:s}),n[0]===p.FREE)return this.freeInodeHint=e+1,e}const t=this.growInodeTable();return this.freeInodeHint=t+1,t}growInodeTable(){const t=this.inodeCount,e=t*2,s=(e-t)*P,n=this.inodeTableOffset+t*P,r=this.handle.getSize(),a=r-n;this.handle.truncate(r+s);const o=8*1024*1024;if(a>0){const d=new Uint8Array(Math.min(o,a));let m=a;for(;m>0;){const w=Math.min(o,m),l=n+m-w,I=w===d.length?d:d.subarray(0,w);this.handle.read(I,{at:l}),this.handle.write(I,{at:l+s}),m-=w}}const u=new Uint8Array(Math.min(o,s));let f=s,h=n;for(;f>0;){const d=Math.min(o,f);this.handle.write(d===u.length?u:u.subarray(0,d),{at:h}),h+=d,f-=d}return this.pathTableOffset+=s,this.bitmapOffset+=s,this.dataOffset+=s,this.inodeCount=e,this.superblockDirty=!0,t}readData(t,e,s){const n=new Uint8Array(s),r=this.dataOffset+t*this.blockSize;return this.handle.read(n,{at:r}),n}writeData(t,e){const s=this.dataOffset+t*this.blockSize;this.handle.write(e,{at:s})}resolvePath(t,e=0){if(e===0&&(this.symlinkLoopDetected=!1),e>Pt){this.symlinkLoopDetected=!0;return}const s=this.pathIndex.get(t);if(s===void 0)return this.resolvePathComponents(t,!0,e);const n=this.readInode(s);if(n.type===p.SYMLINK){const r=ut.decode(this.readData(n.firstBlock,n.blockCount,n.size)),a=r.startsWith("/")?r:this.resolveRelative(t,r);return this.resolvePath(a,e+1)}return s}resolvePathComponents(t,e=!0,s=0){return this.resolvePathFull(t,e,s)?.idx}resolvePathFull(t,e=!0,s=0){if(s===0&&(this.symlinkLoopDetected=!1),s>Pt){this.symlinkLoopDetected=!0;return}const n=t.split("/").filter(Boolean);let r="/";for(let o=0;o<n.length;o++){const u=o===n.length-1;r=r==="/"?"/"+n[o]:r+"/"+n[o];const f=this.pathIndex.get(r);if(f===void 0)return;const h=this.readInode(f);if(h.type===p.SYMLINK&&(!u||e)){const d=ut.decode(this.readData(h.firstBlock,h.blockCount,h.size)),m=d.startsWith("/")?d:this.resolveRelative(r,d);if(u)return this.resolvePathFull(m,!0,s+1);const w=n.slice(o+1).join("/"),l=m+(w?"/"+w:"");return this.resolvePathFull(l,e,s+1)}}const a=this.pathIndex.get(r);if(a!==void 0)return{idx:a,resolvedPath:r}}resolveDanglingLink(t,e=0){if(e>Pt)return null;const s=this.pathIndex.get(t);if(s===void 0)return t;const n=this.readInode(s);if(n.type!==p.SYMLINK)return t;const r=ut.decode(this.readData(n.firstBlock,n.blockCount,n.size)),a=r.startsWith("/")?r:this.resolveRelative(t,r);return this.resolveDanglingLink(a,e+1)}resolveRelative(t,e){const n=((t.substring(0,t.lastIndexOf("/"))||"/")+"/"+e).split("/").filter(Boolean),r=[];for(const a of n)if(a!=="."){if(a===".."){r.pop();continue}r.push(a)}return"/"+r.join("/")}createInode(t,e,s,n,r){const a=this.findFreeInode(),{offset:o,length:u}=this.appendPath(t),f=Date.now();let h=0,d=0;r&&r.byteLength>0&&(d=Math.ceil(r.byteLength/this.blockSize),h=this.allocateBlocks(d),this.writeData(h,r));const m={type:e,pathOffset:o,pathLength:u,nlink:e===p.DIRECTORY?2:1,mode:s,size:n,firstBlock:h,blockCount:d,mtime:f,ctime:f,atime:f,uid:this.processUid,gid:this.processGid};return this.writeInode(a,m),this.setPathIndex(t,a),this.pathIndexGen++,a}normalizePath(t){if(t.charCodeAt(0)!==47&&(t="/"+t),t.length===1||t.indexOf("/.")===-1&&t.indexOf("//")===-1&&t.charCodeAt(t.length-1)!==47)return t;const e=t.split("/").filter(Boolean),s=[];for(const n of e)if(n!=="."){if(n===".."){s.pop();continue}s.push(n)}return"/"+s.join("/")}read(t){const e=this.debug?performance.now():0;t=this.normalizePath(t);let s=this.pathIndex.get(t);if(s!==void 0){const a=this.inodeCache.get(s);if(a)if(a.type===p.SYMLINK)s=this.resolvePathComponents(t,!0);else{if(a.type===p.DIRECTORY)return{status:y.EISDIR,data:null};{const o=a.size>0?this.readData(a.firstBlock,a.blockCount,a.size):new Uint8Array(0);if(this.debug){const u=performance.now();console.log(`[VFS read] path=${t} size=${a.size} TOTAL=${(u-e).toFixed(3)}ms (fast)`)}return{status:0,data:o}}}}if(s===void 0&&(s=this.resolvePathComponents(t,!0)),s===void 0)return{status:this.resolveFailureStatus(),data:null};const n=this.readInode(s);if(n.type===p.DIRECTORY)return{status:y.EISDIR,data:null};const r=n.size>0?this.readData(n.firstBlock,n.blockCount,n.size):new Uint8Array(0);if(this.debug){const a=performance.now();console.log(`[VFS read] path=${t} size=${n.size} TOTAL=${(a-e).toFixed(3)}ms (slow path)`)}return{status:0,data:r}}write(t,e,s=0){const n=this.debug?performance.now():0;t=this.normalizePath(t);const r=this.debug?performance.now():0,a=this.ensureParent(t);if(a!==0)return{status:a};const o=this.debug?performance.now():0;let u=this.resolvePathComponents(t,!0);if(u===void 0){const l=this.resolveDanglingLink(t);if(l===null)return{status:y.ELOOP};if(l!==t){t=l;const I=this.ensureParent(t);if(I!==0)return{status:I};u=this.resolvePathComponents(t,!0)}}const f=this.debug?performance.now():0;let h=f,d=f,m=f;if(u!==void 0){const l=this.readInode(u);if(l.type===p.DIRECTORY)return{status:y.EISDIR};const I=Math.ceil(e.byteLength/this.blockSize);if(I<=l.blockCount)h=this.debug?performance.now():0,this.writeData(l.firstBlock,e),d=this.debug?performance.now():0,I<l.blockCount&&this.freeBlockRange(l.firstBlock+I,l.blockCount-I);else{this.freeBlockRange(l.firstBlock,l.blockCount);const T=this.allocateBlocks(I);h=this.debug?performance.now():0,this.writeData(T,e),d=this.debug?performance.now():0,l.firstBlock=T}l.size=e.byteLength,l.blockCount=I,l.mtime=Date.now(),this.writeInode(u,l),m=this.debug?performance.now():0}else{if(this.isImplicitDirectory(t))return{status:y.EISDIR};const l=Re&~(this.umask&511);this.createInode(t,p.FILE,l,e.byteLength,e),h=this.debug?performance.now():0,d=h,m=h}this.commitPending(),s&1&&this.handle.flush();const w=this.debug?performance.now():0;if(this.debug){const l=u!==void 0;console.log(`[VFS write] path=${t} size=${e.byteLength} ${l?"UPDATE":"CREATE"} normalize=${(r-n).toFixed(3)}ms parent=${(o-r).toFixed(3)}ms resolve=${(f-o).toFixed(3)}ms alloc=${(h-f).toFixed(3)}ms data=${(d-h).toFixed(3)}ms inode=${(m-d).toFixed(3)}ms flush=${(w-m).toFixed(3)}ms TOTAL=${(w-n).toFixed(3)}ms`)}return{status:0}}append(t,e){t=this.normalizePath(t);const s=this.resolvePathComponents(t,!0);if(s===void 0)return this.write(t,e);const n=this.readInode(s);if(n.type===p.DIRECTORY)return{status:y.EISDIR};const r=n.size+e.byteLength,a=Math.ceil(r/this.blockSize);if(a<=n.blockCount)return this.handle.write(e,{at:this.dataOffset+n.firstBlock*this.blockSize+n.size}),n.size=r,n.mtime=Date.now(),this.writeInode(s,n),this.commitPending(),{status:0};const o=this.allocateBlocks(a),u=this.dataOffset+o*this.blockSize;if(n.size>0){const f=this.dataOffset+n.firstBlock*this.blockSize,h=4*1024*1024,d=new Uint8Array(Math.min(h,n.size));let m=0;for(;m<n.size;){const w=Math.min(h,n.size-m),l=w<d.length?d.subarray(0,w):d;this.handle.read(l,{at:f+m}),this.handle.write(l,{at:u+m}),m+=w}}return this.freeBlockRange(n.firstBlock,n.blockCount),this.handle.write(e,{at:u+n.size}),n.firstBlock=o,n.blockCount=a,n.size=r,n.mtime=Date.now(),this.writeInode(s,n),this.commitPending(),{status:0}}unlink(t){t=this.normalizePath(t);const e=this.pathIndex.get(t);if(e===void 0)return{status:y.ENOENT};const s=this.readInode(e);return s.type===p.DIRECTORY?{status:y.EISDIR}:(s.nlink=Math.max(0,s.nlink-1),this.freeBlockRange(s.firstBlock,s.blockCount),s.type=p.FREE,this.writeInode(e,s),this.deletePathIndex(t),this.pathIndexGen++,e<this.freeInodeHint&&(this.freeInodeHint=e),this.commitPending(),{status:0})}stat(t){t=this.normalizePath(t);const e=this.resolvePathComponents(t,!0);if(e===void 0){const s=this.resolveFailureStatus();return this.isImplicitDirectory(t)?this.encodeImplicitDirStatResponse(t):{status:s,data:null}}return this.encodeStatResponse(e)}lstat(t){t=this.normalizePath(t);let e=this.resolvePathComponents(t,!1);return e===void 0&&(e=this.resolvePathComponents(t,!0),e===void 0)?this.isImplicitDirectory(t)?this.encodeImplicitDirStatResponse(t):{status:y.ENOENT,data:null}:this.encodeStatResponse(e)}encodeStatResponse(t){const e=this.readInode(t);let s=e.nlink;e.type===p.DIRECTORY&&(s=2+this.countSubdirectories(this.readPath(e.pathOffset,e.pathLength)));const n=new Uint8Array(53),r=new DataView(n.buffer);return r.setUint8(0,e.type),r.setUint32(1,e.mode,!0),r.setFloat64(5,e.size,!0),r.setFloat64(13,e.mtime,!0),r.setFloat64(21,e.ctime,!0),r.setFloat64(29,e.atime,!0),r.setUint32(37,e.uid,!0),r.setUint32(41,e.gid,!0),r.setUint32(45,t,!0),r.setUint32(49,s,!0),{status:0,data:n}}mkdir(t,e=0,s=511){if(t=this.normalizePath(t),(e&1)!==0)return this.mkdirRecursive(t,s);if(this.pathIndex.has(t)||this.isImplicitDirectory(t))return{status:y.EEXIST,data:null};const r=this.ensureParent(t);return r!==0?{status:r,data:null}:(this.createInode(t,p.DIRECTORY,this.dirModeFor(s),0),this.commitPending(),{status:0,data:null})}dirModeFor(t){return xe|t&4095&~(this.umask&511)}fileModeFor(t){return Ue|t&4095&~(this.umask&511)}mkdirRecursive(t,e=511){const s=t.split("/").filter(Boolean);let n="",r=null;for(const o of s){if(n+="/"+o,this.pathIndex.has(n)){const u=this.pathIndex.get(n);if(this.readInode(u).type!==p.DIRECTORY)return{status:y.ENOTDIR,data:null};continue}this.createInode(n,p.DIRECTORY,this.dirModeFor(e),0),r||(r=n)}return this.commitPending(),{status:0,data:(r?V.encode(r):void 0)??null}}rmdir(t,e=0){t=this.normalizePath(t);const s=(e&1)!==0,n=this.pathIndex.get(t);if(n===void 0){if(this.isImplicitDirectory(t)){if(this.getDirectChildrenWithImplicit(t).length>0){if(!s)return{status:y.ENOTEMPTY};for(const u of this.getAllDescendants(t)){const f=this.pathIndex.get(u),h=this.readInode(f);this.freeBlockRange(h.firstBlock,h.blockCount),h.type=p.FREE,this.writeInode(f,h),this.deletePathIndex(u)}this.pathIndexGen++,this.commitPending()}return{status:0}}return{status:y.ENOENT}}const r=this.readInode(n);if(r.type!==p.DIRECTORY)return{status:y.ENOTDIR};if(this.getDirectChildren(t).length>0){if(!s)return{status:y.ENOTEMPTY};for(const o of this.getAllDescendants(t)){const u=this.pathIndex.get(o),f=this.readInode(u);this.freeBlockRange(f.firstBlock,f.blockCount),f.type=p.FREE,this.writeInode(u,f),this.deletePathIndex(o)}}return t==="/"?(this.pathIndexGen++,this.commitPending(),{status:0}):(r.type=p.FREE,this.writeInode(n,r),this.deletePathIndex(t),this.pathIndexGen++,n<this.freeInodeHint&&(this.freeInodeHint=n),this.commitPending(),{status:0})}readdir(t,e=0){t=this.normalizePath(t);const s=this.resolvePathFull(t,!0);let n;if(s){if(this.readInode(s.idx).type!==p.DIRECTORY)return{status:y.ENOTDIR,data:null};n=s.resolvedPath}else if(this.isImplicitDirectory(t))n=t;else return{status:y.ENOENT,data:null};if((e&1)!==0){this.ensureChildIndex();const m=this.childIndex.get(n);if(!m)return{status:0,data:new Uint8Array([0,0,0,0])};const w=[...m.keys()].sort(),l=n==="/"?"/":n+"/";let I=4;for(const R of w)I+=3+R.length*3;const T=new Uint8Array(I),F=new DataView(T.buffer);F.setUint32(0,w.length,!0);let C=4;for(const R of w){const{written:$}=V.encodeInto(R,T.subarray(C+2));F.setUint16(C,$,!0),C+=2+$;const Zt=this.pathIndex.get(l+R);T[C++]=Zt===void 0?p.DIRECTORY:this.readInode(Zt).type}return{status:0,data:T.subarray(0,C)}}this.ensureChildIndex();const a=this.childIndex.get(n);if(!a)return{status:0,data:new Uint8Array([0,0,0,0])};const o=[...a.keys()].sort();let u=4;for(const m of o)u+=2+m.length*3;const f=new Uint8Array(u),h=new DataView(f.buffer);h.setUint32(0,o.length,!0);let d=4;for(const m of o){const{written:w}=V.encodeInto(m,f.subarray(d+2));h.setUint16(d,w,!0),d+=2+w}return{status:0,data:f.subarray(0,d)}}rename(t,e){t=this.normalizePath(t),e=this.normalizePath(e);const s=this.pathIndex.get(t);if(s===void 0)return{status:y.ENOENT};if(t===e)return{status:0};const n=this.ensureParent(e);if(n!==0)return{status:n};const r=this.pathIndex.get(e),a=r===void 0&&this.isImplicitDirectory(e);if(r!==void 0||a){const h=this.readInode(s).type===p.DIRECTORY,d=a||r!==void 0&&this.readInode(r).type===p.DIRECTORY;if(h&&!d)return{status:y.ENOTDIR};if(!h&&d)return{status:y.EISDIR}}if(r!==void 0||a){let h=a;if(r!==void 0){const d=this.readInode(r);h=d.type===p.DIRECTORY,this.freeBlockRange(d.firstBlock,d.blockCount),d.type=p.FREE,this.writeInode(r,d),this.deletePathIndex(e),r<this.freeInodeHint&&(this.freeInodeHint=r)}if(h)for(const d of this.getAllDescendants(e)){const m=this.pathIndex.get(d),w=this.readInode(m);this.freeBlockRange(w.firstBlock,w.blockCount),w.type=p.FREE,this.writeInode(m,w),this.deletePathIndex(d),m<this.freeInodeHint&&(this.freeInodeHint=m)}}const o=this.readInode(s),{offset:u,length:f}=this.appendPath(e);if(o.pathOffset=u,o.pathLength=f,o.mtime=Date.now(),this.writeInode(s,o),this.deletePathIndex(t),this.setPathIndex(e,s),this.pathIndexGen++,o.type===p.DIRECTORY){const h=t==="/"?"/":t+"/",d=[];for(const[m,w]of this.pathIndex)m.startsWith(h)&&d.push([m,w]);for(const[m,w]of d){const l=m.substring(t.length),I=e+l,T=this.readInode(w),{offset:F,length:C}=this.appendPath(I);T.pathOffset=F,T.pathLength=C,this.writeInode(w,T),this.deletePathIndex(m),this.setPathIndex(I,w)}}return this.commitPending(),{status:0}}exists(t){t=this.normalizePath(t);const e=this.resolvePathComponents(t,!0),s=new Uint8Array(1);return s[0]=e!==void 0||this.isImplicitDirectory(t)?1:0,{status:0,data:s}}truncate(t,e=0){t=this.normalizePath(t);const s=this.resolvePathComponents(t,!0);if(s===void 0)return{status:this.resolveFailureStatus()};const n=this.readInode(s);if(n.type===p.DIRECTORY)return{status:y.EISDIR};if(e===0)this.freeBlockRange(n.firstBlock,n.blockCount),n.firstBlock=0,n.blockCount=0,n.size=0;else if(e<n.size){const r=Math.ceil(e/this.blockSize);r<n.blockCount&&this.freeBlockRange(n.firstBlock+r,n.blockCount-r),n.blockCount=r,n.size=e}else if(e>n.size){const r=Math.ceil(e/this.blockSize);if(r>n.blockCount){const a=this.allocateBlocks(r),o=this.dataOffset+a*this.blockSize;if(n.size>0){const u=this.dataOffset+n.firstBlock*this.blockSize,f=4*1024*1024,h=new Uint8Array(Math.min(f,n.size));let d=0;for(;d<n.size;){const m=Math.min(f,n.size-d),w=m<h.length?h.subarray(0,m):h;this.handle.read(w,{at:u+d}),this.handle.write(w,{at:o+d}),d+=m}}this.freeBlockRange(n.firstBlock,n.blockCount),this.zeroFileRange(o+n.size,e-n.size),n.firstBlock=a}else this.zeroFileRange(this.dataOffset+n.firstBlock*this.blockSize+n.size,e-n.size);n.blockCount=r,n.size=e}return n.mtime=Date.now(),this.writeInode(s,n),this.commitPending(),{status:0}}copy(t,e,s=0){t=this.normalizePath(t),e=this.normalizePath(e);const n=this.resolvePathComponents(t,!0);if(n===void 0)return{status:this.resolveFailureStatus()};const r=this.readInode(n);if(r.type===p.DIRECTORY)return{status:y.ENOTSUP};if(s&1&&(this.pathIndex.has(e)||this.isImplicitDirectory(e)))return{status:y.EEXIST};if(t===e)return{status:0};const a=r.size,o=r.firstBlock,u=r.mode,f=this.write(e,new Uint8Array(0));if(f.status!==0)return f;if(a===0){const R=this.resolvePathComponents(e,!0);if(R!==void 0){const $=this.readInode(R);$.mode=$.mode&-4096|u&4095,this.writeInode(R,$),this.commitPending()}return{status:0}}const h=this.resolvePathComponents(e,!0);if(h===void 0)return{status:y.EIO};const d=this.readInode(h),m=Math.ceil(a/this.blockSize),w=this.allocateBlocks(m),l=this.dataOffset+w*this.blockSize,I=this.dataOffset+o*this.blockSize,T=4*1024*1024,F=new Uint8Array(Math.min(T,a));let C=0;for(;C<a;){const R=Math.min(T,a-C),$=R<F.length?F.subarray(0,R):F;this.handle.read($,{at:I+C}),this.handle.write($,{at:l+C}),C+=R}return d.firstBlock=w,d.blockCount=m,d.size=a,d.mtime=Date.now(),d.mode=d.mode&-4096|u&4095,this.writeInode(h,d),this.commitPending(),{status:0}}access(t,e=0){t=this.normalizePath(t);const s=this.resolvePathComponents(t,!0);if(s===void 0){const a=this.resolveFailureStatus();return this.isImplicitDirectory(t)?{status:0}:{status:a}}if(e===0)return{status:0};if(!this.strictPermissions)return{status:0};const n=this.readInode(s),r=this.getEffectivePermission(n);return e&4&&!(r&4)?{status:y.EACCES}:e&2&&!(r&2)?{status:y.EACCES}:e&1&&!(r&1)?{status:y.EACCES}:{status:0}}getEffectivePermission(t){const e=t.mode&511;return this.processUid===t.uid?e>>>6&7:this.processGid===t.gid?e>>>3&7:e&7}realpath(t){t=this.normalizePath(t);const e=this.resolvePathComponents(t,!0);if(e===void 0){const r=this.resolveFailureStatus();return this.isImplicitDirectory(t)?{status:0,data:V.encode(t)}:{status:r,data:null}}const s=this.readInode(e),n=this.readPath(s.pathOffset,s.pathLength);return{status:0,data:V.encode(n)}}chmod(t,e,s=!0){t=this.normalizePath(t);const n=this.resolvePathComponents(t,s);if(n===void 0)return{status:this.resolveFailureStatus()};const r=this.readInode(n);return r.mode=r.mode&jt|e&4095,r.ctime=Date.now(),this.writeInode(n,r),{status:0}}chown(t,e,s,n=!0){t=this.normalizePath(t);const r=this.resolvePathComponents(t,n);if(r===void 0)return{status:this.resolveFailureStatus()};const a=this.readInode(r);return a.uid=e,a.gid=s,a.ctime=Date.now(),this.writeInode(r,a),{status:0}}utimes(t,e,s,n=!0){t=this.normalizePath(t);const r=this.resolvePathComponents(t,n);if(r===void 0)return{status:this.resolveFailureStatus()};const a=this.readInode(r);return a.atime=e,a.mtime=s,a.ctime=Date.now(),this.writeInode(r,a),{status:0}}symlink(t,e){if(e=this.normalizePath(e),this.pathIndex.has(e)||this.isImplicitDirectory(e))return{status:y.EEXIST};const s=this.ensureParent(e);if(s!==0)return{status:s};const n=V.encode(t);return this.createInode(e,p.SYMLINK,ve,n.byteLength,n),this.commitPending(),{status:0}}readlink(t){t=this.normalizePath(t);const e=this.pathIndex.get(t);if(e===void 0)return{status:y.ENOENT,data:null};const s=this.readInode(e);return s.type!==p.SYMLINK?{status:y.EINVAL,data:null}:{status:0,data:this.readData(s.firstBlock,s.blockCount,s.size)}}link(t,e){t=this.normalizePath(t),e=this.normalizePath(e);const s=this.resolvePathComponents(t,!0);if(s===void 0)return{status:this.resolveFailureStatus()};const n=this.readInode(s);if(n.type===p.DIRECTORY)return{status:y.EPERM};if(this.pathIndex.has(e)||this.isImplicitDirectory(e))return{status:y.EEXIST};const r=this.copy(t,e);if(r.status!==0)return r;n.nlink++,this.writeInode(s,n);const a=this.pathIndex.get(e);if(a!==void 0){const o=this.readInode(a);o.nlink=n.nlink,this.writeInode(a,o)}return{status:0}}open(t,e,s,n=438){t=this.normalizePath(t);const r=(e&64)!==0,a=(e&512)!==0,o=(e&128)!==0;let u=this.resolvePathComponents(t,!0);if(u===void 0){const d=this.resolveDanglingLink(t);if(d===null)return{status:y.ELOOP,data:null};d!==t&&(t=d,u=this.resolvePathComponents(t,!0))}if(St.isWritable(e)&&(u!==void 0?this.readInode(u).type===p.DIRECTORY:this.isImplicitDirectory(t)))return{status:y.EISDIR,data:null};if(u===void 0){if(!r)return{status:this.resolveFailureStatus(),data:null};const d=this.ensureParent(t);if(d!==0)return{status:d,data:null};u=this.createInode(t,p.FILE,this.fileModeFor(n),0)}else if(o&&r)return{status:y.EEXIST,data:null};a&&this.truncate(t,0);const f=this.nextFd++;this.fdTable.set(f,{tabId:s,inodeIdx:u,position:0,flags:e});const h=new Uint8Array(4);return new DataView(h.buffer).setUint32(0,f,!0),{status:0,data:h}}close(t){return this.fdTable.has(t)?(this.fdTable.delete(t),{status:0}):{status:y.EBADF}}fread(t,e,s){const n=this.fdTable.get(t);if(!n)return{status:y.EBADF,data:null};if(!St.isReadable(n.flags))return{status:y.EBADF,data:null};const r=this.readInode(n.inodeIdx);if(r.type===p.DIRECTORY)return{status:y.EISDIR,data:null};const a=s??n.position,o=Math.min(e,r.size-a);if(o<=0)return{status:0,data:new Uint8Array(0)};const u=this.dataOffset+r.firstBlock*this.blockSize+a,f=new Uint8Array(o);return this.handle.read(f,{at:u}),s===null&&(n.position+=o),{status:0,data:f}}fwrite(t,e,s){const n=this.fdTable.get(t);if(!n)return{status:y.EBADF,data:null};if(!St.isWritable(n.flags))return{status:y.EBADF,data:null};const r=this.readInode(n.inodeIdx),o=(n.flags&1024)!==0?r.size:s??n.position,u=o+e.byteLength;if(u>r.size){const h=Math.ceil(u/this.blockSize);if(h>r.blockCount){const d=this.allocateBlocks(h),m=this.dataOffset+d*this.blockSize,w=this.dataOffset+r.firstBlock*this.blockSize;if(r.size>0){const I=new Uint8Array(Math.min(4194304,r.size));let T=0;for(;T<r.size;){const F=Math.min(4194304,r.size-T),C=F<I.length?I.subarray(0,F):I;this.handle.read(C,{at:w+T}),this.handle.write(C,{at:m+T}),T+=F}}this.freeBlockRange(r.firstBlock,r.blockCount),o>r.size&&this.zeroFileRange(m+r.size,o-r.size),this.handle.write(e,{at:m+o}),r.firstBlock=d,r.blockCount=h}else{o>r.size&&this.zeroFileRange(this.dataOffset+r.firstBlock*this.blockSize+r.size,o-r.size);const d=this.dataOffset+r.firstBlock*this.blockSize+o;this.handle.write(e,{at:d})}r.size=u}else{const h=this.dataOffset+r.firstBlock*this.blockSize+o;this.handle.write(e,{at:h})}r.mtime=Date.now(),this.writeInode(n.inodeIdx,r),s===null&&(n.position=u),this.commitPending();const f=new Uint8Array(4);return new DataView(f.buffer).setUint32(0,e.byteLength,!0),{status:0,data:f}}fstat(t){const e=this.fdTable.get(t);return e?e.implicitPath?this.encodeImplicitDirStatResponse(e.implicitPath):this.encodeStatResponse(e.inodeIdx):{status:y.EBADF,data:null}}ftruncate(t,e=0){const s=this.fdTable.get(t);if(!s)return{status:y.EBADF};if(!St.isWritable(s.flags))return{status:y.EINVAL};const n=this.readInode(s.inodeIdx),r=this.readPath(n.pathOffset,n.pathLength);return this.truncate(r,e)}statfs(t="/"){if(t=this.normalizePath(t),this.resolvePathComponents(t,!0)===void 0&&!this.isImplicitDirectory(t))return{status:this.resolveFailureStatus(),data:null};const e=new Set(this.pathIndex.values()).size,s=new Uint8Array(24),n=new DataView(s.buffer);return n.setUint32(0,lt,!0),n.setUint32(4,this.blockSize,!0),n.setUint32(8,this.totalBlocks,!0),n.setUint32(12,this.freeBlocks,!0),n.setUint32(16,this.inodeCount,!0),n.setUint32(20,Math.max(0,this.inodeCount-e),!0),{status:0,data:s}}fsync(t){return t!==void 0&&!this.fdTable.has(t)?{status:y.EBADF}:(this.commitPending(),this.handle.flush(),{status:0})}fchmod(t,e){const s=this.fdTable.get(t);if(!s)return{status:y.EBADF};if(s.implicitPath)return{status:0};const n=this.readInode(s.inodeIdx);return n.mode=n.mode&jt|e&4095,n.ctime=Date.now(),this.writeInode(s.inodeIdx,n),{status:0}}fchown(t,e,s){const n=this.fdTable.get(t);if(!n)return{status:y.EBADF};if(n.implicitPath)return{status:0};const r=this.readInode(n.inodeIdx);return r.uid=e,r.gid=s,r.ctime=Date.now(),this.writeInode(n.inodeIdx,r),{status:0}}futimes(t,e,s){const n=this.fdTable.get(t);if(!n)return{status:y.EBADF};if(n.implicitPath)return{status:0};const r=this.readInode(n.inodeIdx);return r.atime=e,r.mtime=s,r.ctime=Date.now(),this.writeInode(n.inodeIdx,r),{status:0}}opendir(t,e){t=this.normalizePath(t);const s=this.resolvePathComponents(t,!0);if(s===void 0){if(this.isImplicitDirectory(t)){const o=this.nextFd++;this.fdTable.set(o,{tabId:e,inodeIdx:-1,position:0,flags:0,implicitPath:t});const u=new Uint8Array(4);return new DataView(u.buffer).setUint32(0,o,!0),{status:0,data:u}}return{status:y.ENOENT,data:null}}if(this.readInode(s).type!==p.DIRECTORY)return{status:y.ENOTDIR,data:null};const r=this.nextFd++;this.fdTable.set(r,{tabId:e,inodeIdx:s,position:0,flags:0});const a=new Uint8Array(4);return new DataView(a.buffer).setUint32(0,r,!0),{status:0,data:a}}mkdtemp(t){const e=Math.random().toString(36).substring(2,8),s=this.normalizePath(t+e),n=s.substring(0,s.lastIndexOf("/"))||"/";return n!=="/"&&this.resolvePathComponents(n,!0)===void 0&&!this.isImplicitDirectory(n)?{status:y.ENOENT,data:null}:(this.createInode(s,p.DIRECTORY,this.dirModeFor(448),0),this.commitPending(),{status:0,data:V.encode(s)})}getDirectChildren(t){this.ensureChildIndex();const e=this.childIndex.get(t);if(!e)return[];const s=t==="/"?"/":t+"/",n=[];for(const r of e.keys()){const a=s+r;this.pathIndex.has(a)&&n.push(a)}return n.sort()}rebuildImplicitDirs(){if(this.implicitDirsGen===this.pathIndexGen)return;const t=Date.now(),e=this.implicitDirs;this.implicitDirs=new Map;for(const s of this.pathIndex.keys()){let n=s.length;for(;n=s.lastIndexOf("/",n-1),!(n<=0);){const r=s.substring(0,n);if(this.implicitDirs.has(r))break;this.pathIndex.has(r)||this.implicitDirs.set(r,e.get(r)??t)}}this.implicitDirsGen=this.pathIndexGen}isImplicitDirectory(t){return t==="/"||this.pathIndex.has(t)?!1:(this.descCountGen<this.pathIndexGen&&this.rebuildDescCount(),(this.descCount.get(t)??0)>0)}rebuildDescCount(){this.descCount.clear();for(const t of this.pathIndex.keys())this.bumpDescCount(t);this.descCountGen=this.pathIndexGen}setPathIndex(t,e){const s=this.pathIndex.has(t);this.pathIndex.set(t,e),s||(this.bumpDescCount(t),this.bumpChildIndex(t)),this.descCountGen=this.pathIndexGen+1,this.childIndexGen=this.pathIndexGen+1}deletePathIndex(t){const e=this.pathIndex.delete(t);return e&&(this.decDescCount(t),this.decChildIndex(t)),this.descCountGen=this.pathIndexGen+1,this.childIndexGen=this.pathIndexGen+1,e}bumpDescCount(t){let e=t.length;for(;e=t.lastIndexOf("/",e-1),!(e<=0);){const s=t.substring(0,e);this.descCount.set(s,(this.descCount.get(s)??0)+1)}}decDescCount(t){let e=t.length;for(;e=t.lastIndexOf("/",e-1),!(e<=0);){const s=t.substring(0,e),n=this.descCount.get(s);if(n===void 0)break;n<=1?this.descCount.delete(s):this.descCount.set(s,n-1)}}bumpChildIndex(t){if(t==="/"||t.length===0)return;let e="/",s=1;for(;s<=t.length;){let n=t.indexOf("/",s);n===-1&&(n=t.length);const r=t.substring(s,n);if(r.length>0){let a=this.childIndex.get(e);a||(a=new Map,this.childIndex.set(e,a)),a.set(r,(a.get(r)??0)+1),e=e==="/"?"/"+r:e+"/"+r}s=n+1}}decChildIndex(t){if(t==="/"||t.length===0)return;let e="/",s=1;for(;s<=t.length;){let n=t.indexOf("/",s);n===-1&&(n=t.length);const r=t.substring(s,n);if(r.length>0){const a=this.childIndex.get(e);if(!a)break;const o=a.get(r);if(o===void 0)break;o<=1?(a.delete(r),a.size===0&&this.childIndex.delete(e)):a.set(r,o-1),e=e==="/"?"/"+r:e+"/"+r}s=n+1}}ensureChildIndex(){if(!(this.childIndexGen>=this.pathIndexGen)){this.childIndex.clear();for(const t of this.pathIndex.keys())this.bumpChildIndex(t);this.childIndexGen=this.pathIndexGen}}countSubdirectories(t){this.ensureChildIndex();const e=this.childIndex.get(t);if(!e)return 0;const s=t==="/"?"/":t+"/";let n=0;for(const r of e.keys()){const a=this.pathIndex.get(s+r);(a===void 0||this.readInode(a).type===p.DIRECTORY)&&n++}return n}getDirectChildrenWithImplicit(t){this.ensureChildIndex();const e=this.childIndex.get(t);if(!e)return[];const s=t==="/"?"/":t+"/",n=[];for(const r of e.keys()){const a=s+r;n.push({path:a,type:this.pathIndex.has(a)?"real":"implicit"})}return n.sort((r,a)=>r.path<a.path?-1:r.path>a.path?1:0),n}encodeImplicitDirStatResponse(t){this.rebuildImplicitDirs();const e=this.implicitDirs.get(t)??Date.now(),s=Qt&~(this.umask&511),n=2+this.countSubdirectories(t),r=new Uint8Array(53),a=new DataView(r.buffer);return a.setUint8(0,p.DIRECTORY),a.setUint32(1,s,!0),a.setFloat64(5,0,!0),a.setFloat64(13,e,!0),a.setFloat64(21,e,!0),a.setFloat64(29,e,!0),a.setUint32(37,this.processUid,!0),a.setUint32(41,this.processGid,!0),a.setUint32(45,0,!0),a.setUint32(49,n,!0),{status:0,data:r}}getAllDescendants(t){const e=t==="/"?"/":t+"/",s=[];for(const n of this.pathIndex.keys())n!==t&&n.startsWith(e)&&s.push(n);return s.sort((n,r)=>{const a=n.split("/").length;return r.split("/").length-a})}ensureParent(t){const e=t.lastIndexOf("/");if(e<=0)return 0;const s=t.substring(0,e),n=this.pathIndex.get(s);return n===void 0?this.isImplicitDirectory(s)?0:y.ENOENT:this.readInode(n).type!==p.DIRECTORY?y.ENOTDIR:0}cleanupTab(t){for(const[e,s]of this.fdTable)s.tabId===t&&this.fdTable.delete(e)}getAllFiles(){const t=[];for(const[e,s]of this.pathIndex)t.push({path:e,idx:s});return t}getPathForFd(t){const e=this.fdTable.get(t);if(!e)return null;const s=this.readInode(e.inodeIdx);return this.readPath(s.pathOffset,s.pathLength)}getInodeData(t){const e=this.readInode(t),s=e.size>0?this.readData(e.firstBlock,e.blockCount,e.size):new Uint8Array(0);return{type:e.type,data:s,mtime:e.mtime}}exportAll(){const t=[];for(const[e,s]of this.pathIndex){const n=this.readInode(s);let r=null;(n.type===p.FILE||n.type===p.SYMLINK)&&(r=n.size>0?this.readData(n.firstBlock,n.blockCount,n.size):new Uint8Array(0)),t.push({path:e,type:n.type,data:r,mode:n.mode,mtime:n.mtime})}return t.sort((e,s)=>e.type===p.DIRECTORY&&s.type!==p.DIRECTORY?-1:e.type!==p.DIRECTORY&&s.type===p.DIRECTORY?1:e.path.localeCompare(s.path)),t}flush(){this.handle.flush()}},kt=new TextEncoder,Ne=1447449377,se=1,ne=2,g=0,O=1,Nt=2,Be=5,Bt=7,K=8,ze=class{rootDir;fdTable=new Map;nextFd=3;nextIno=1;processUid=0;processGid=0;async init(i,t){this.rootDir=i,this.processUid=t?.uid??0,this.processGid=t?.gid??0}cleanupTab(i){for(const[t,e]of this.fdTable){try{e.handle.close()}catch{}this.fdTable.delete(t)}}getPathForFd(i){return this.fdTable.get(i)?.path??null}normalizePath(i){for(i.startsWith("/")||(i="/"+i);i.length>1&&i.endsWith("/");)i=i.slice(0,-1);const t=i.split("/"),e=[];for(const s of t)if(!(s===""||s===".")){if(s===".."){e.pop();continue}e.push(s)}return"/"+e.join("/")}async navigateToParent(i){const t=i.split("/").filter(Boolean);if(t.length===0)return null;const e=t.pop();let s=this.rootDir;for(const n of t)try{s=await s.getDirectoryHandle(n)}catch{return null}return{dir:s,name:e}}async navigateToDir(i){if(i==="/")return this.rootDir;const t=i.split("/").filter(Boolean);let e=this.rootDir;for(const s of t)try{e=await e.getDirectoryHandle(s)}catch{return null}return e}async getEntry(i){if(i==="/")return{handle:this.rootDir,kind:"directory"};const t=await this.navigateToParent(i);if(!t)return null;try{return{handle:await t.dir.getFileHandle(t.name),kind:"file"}}catch{try{return{handle:await t.dir.getDirectoryHandle(t.name),kind:"directory"}}catch{return null}}}async ensureParent(i){const t=i.split("/").filter(Boolean);t.pop();let e=this.rootDir;for(const s of t)try{e=await e.getDirectoryHandle(s,{create:!0})}catch{return null}return e}encodeStat(i,t,e,s){const n=new Uint8Array(53),r=new DataView(n.buffer);return r.setUint8(0,i==="file"?se:ne),r.setUint32(1,i==="file"?33188:16877,!0),r.setFloat64(5,t,!0),r.setFloat64(13,e,!0),r.setFloat64(21,e,!0),r.setFloat64(29,e,!0),r.setUint32(37,this.processUid,!0),r.setUint32(41,this.processGid,!0),r.setUint32(45,s,!0),r.setUint32(49,i==="directory"?2:1,!0),n}async read(i){i=this.normalizePath(i);const t=await this.navigateToParent(i);if(!t)return{status:O,data:null};try{const s=await(await t.dir.getFileHandle(t.name)).createSyncAccessHandle();try{const n=s.getSize(),r=new Uint8Array(n);return n>0&&s.read(r,{at:0}),{status:g,data:r}}finally{s.close()}}catch{return{status:O,data:null}}}async write(i,t,e){i=this.normalizePath(i);const s=await this.ensureParent(i);if(!s)return{status:O,data:null};const n=i.split("/").filter(Boolean).pop();try{const a=await(await s.getFileHandle(n,{create:!0})).createSyncAccessHandle();try{a.truncate(0),t.byteLength>0&&a.write(t,{at:0}),a.flush()}finally{a.close()}return{status:g,data:null}}catch{return{status:O,data:null}}}async append(i,t){i=this.normalizePath(i);const e=await this.ensureParent(i);if(!e)return{status:O,data:null};const s=i.split("/").filter(Boolean).pop();try{const r=await(await e.getFileHandle(s,{create:!0})).createSyncAccessHandle();try{const a=r.getSize();r.write(t,{at:a}),r.flush()}finally{r.close()}return{status:g,data:null}}catch{return{status:O,data:null}}}async unlink(i){i=this.normalizePath(i);const t=await this.navigateToParent(i);if(!t)return{status:O,data:null};try{return await t.dir.getFileHandle(t.name),await t.dir.removeEntry(t.name),{status:g,data:null}}catch{return{status:O,data:null}}}async stat(i){i=this.normalizePath(i);const t=await this.getEntry(i);if(!t)return{status:O,data:null};if(t.kind==="file"){const e=await t.handle.getFile();return{status:g,data:this.encodeStat("file",e.size,e.lastModified,this.nextIno++)}}return{status:g,data:this.encodeStat("directory",0,Date.now(),this.nextIno++)}}async lstat(i){return this.stat(i)}async mkdir(i,t=0,e=511){if(i=this.normalizePath(i),(t&1)!==0){const r=i.split("/").filter(Boolean);let a=this.rootDir,o=null,u="";for(const f of r){u+="/"+f;let h=!0;try{a=await a.getDirectoryHandle(f)}catch{h=!1,a=await a.getDirectoryHandle(f,{create:!0})}!h&&!o&&(o=u)}return{status:g,data:o?kt.encode(o):null}}const n=await this.navigateToParent(i);if(!n)return{status:O,data:null};try{try{return await n.dir.getDirectoryHandle(n.name),{status:Nt,data:null}}catch{}return await n.dir.getDirectoryHandle(n.name,{create:!0}),{status:g,data:null}}catch{return{status:O,data:null}}}async rmdir(i,t=0){if(i=this.normalizePath(i),i==="/")return{status:Bt,data:null};const e=(t&1)!==0,s=await this.navigateToParent(i);if(!s)return{status:O,data:null};try{return await s.dir.getDirectoryHandle(s.name),await s.dir.removeEntry(s.name,{recursive:e}),{status:g,data:null}}catch(n){return n.name==="InvalidModificationError"?{status:Be,data:null}:{status:O,data:null}}}async readdir(i,t=0){i=this.normalizePath(i);const e=await this.navigateToDir(i);if(!e)return{status:O,data:null};const s=(t&1)!==0,n=[];for await(const[h,d]of e.entries())n.push({name:h,kind:d.kind});if(s){let h=4;const d=[];for(const I of n){const T=kt.encode(I.name);d.push({nameBytes:T,type:I.kind==="file"?se:ne}),h+=2+T.byteLength+1}const m=new Uint8Array(h),w=new DataView(m.buffer);w.setUint32(0,d.length,!0);let l=4;for(const I of d)w.setUint16(l,I.nameBytes.byteLength,!0),l+=2,m.set(I.nameBytes,l),l+=I.nameBytes.byteLength,m[l++]=I.type;return{status:g,data:m}}let r=4;const a=[];for(const h of n){const d=kt.encode(h.name);a.push(d),r+=2+d.byteLength}const o=new Uint8Array(r),u=new DataView(o.buffer);u.setUint32(0,a.length,!0);let f=4;for(const h of a)u.setUint16(f,h.byteLength,!0),f+=2,o.set(h,f),f+=h.byteLength;return{status:g,data:o}}async rename(i,t){if(i=this.normalizePath(i),t=this.normalizePath(t),i===t)return{status:g,data:null};const e=await this.getEntry(i);if(!e)return{status:O,data:null};if(e.kind==="file"){const n=await e.handle.getFile(),r=new Uint8Array(await n.arrayBuffer()),a=await this.write(t,r);if(a.status!==g)return a;const o=await this.removeSourceWithRetry(()=>this.unlink(i));if(o.status!==g)return o}else{const s=await this.getEntry(t);if(s){const a=s.kind==="directory"?await this.rmdir(t,1):await this.unlink(t);if(a.status!==g)return a}const n=await this.mkdir(t,1);if(n.status!==g&&n.status!==Nt)return n;await this.copyDirectoryContents(i,t);const r=await this.removeSourceWithRetry(()=>this.rmdir(i,1));if(r.status!==g)return r}return{status:g,data:null}}async removeSourceWithRetry(i){let t=await i();for(let e=0;e<3&&t.status!==g;e++)await new Promise(s=>setTimeout(s,10*(e+1))),t=await i();return t}async copyDirectoryContents(i,t){const e=await this.navigateToDir(i);if(e)for await(const[s,n]of e.entries()){const r=i==="/"?`/${s}`:`${i}/${s}`,a=t==="/"?`/${s}`:`${t}/${s}`;if(n.kind==="directory")await this.mkdir(a,1),await this.copyDirectoryContents(r,a);else{const o=await n.getFile(),u=new Uint8Array(await o.arrayBuffer());await this.write(a,u)}}}async exists(i){i=this.normalizePath(i);const t=await this.getEntry(i);return{status:g,data:new Uint8Array([t?1:0])}}async truncate(i,t){i=this.normalizePath(i);const e=await this.navigateToParent(i);if(!e)return{status:O,data:null};try{const n=await(await e.dir.getFileHandle(e.name)).createSyncAccessHandle();try{n.truncate(t),n.flush()}finally{n.close()}return{status:g,data:null}}catch{return{status:O,data:null}}}async copy(i,t,e){i=this.normalizePath(i),t=this.normalizePath(t);const s=await this.read(i);return s.status!==g?s:this.write(t,s.data??new Uint8Array(0))}async access(i,t){return i=this.normalizePath(i),await this.getEntry(i)?{status:g,data:null}:{status:O,data:null}}async realpath(i){return i=this.normalizePath(i),await this.getEntry(i)?{status:g,data:kt.encode(i)}:{status:O,data:null}}async chmod(i,t){return i=this.normalizePath(i),await this.getEntry(i)?{status:g,data:null}:{status:O,data:null}}async chown(i,t,e){return i=this.normalizePath(i),await this.getEntry(i)?{status:g,data:null}:{status:O,data:null}}async utimes(i,t,e){return i=this.normalizePath(i),await this.getEntry(i)?{status:g,data:null}:{status:O,data:null}}async fchmod(i,t){return this.fdTable.has(i)?{status:g,data:null}:{status:K,data:null}}async fchown(i,t,e){return this.fdTable.has(i)?{status:g,data:null}:{status:K,data:null}}async futimes(i,t,e){return this.fdTable.has(i)?{status:g,data:null}:{status:K,data:null}}async symlink(i,t){return{status:Bt,data:null}}async readlink(i){return{status:Bt,data:null}}async link(i,t){return this.copy(i,t)}async open(i,t,e,s=438){i=this.normalizePath(i);const n=(t&64)!==0,r=(t&512)!==0,a=(t&128)!==0,o=await this.ensureParent(i);if(!o)return{status:O,data:null};const u=i.split("/").filter(Boolean).pop();try{let f=!0;try{await o.getFileHandle(u)}catch{f=!1}if(!f&&!n)return{status:O,data:null};if(f&&a&&n)return{status:Nt,data:null};const d=await(await o.getFileHandle(u,{create:n})).createSyncAccessHandle();r&&(d.truncate(0),d.flush());const m=this.nextFd++;this.fdTable.set(m,{handle:d,path:i,position:0,flags:t});const w=new Uint8Array(4);return new DataView(w.buffer).setUint32(0,m,!0),{status:g,data:w}}catch{return{status:O,data:null}}}async close(i){const t=this.fdTable.get(i);if(!t)return{status:K,data:null};try{t.handle.close()}catch{}return this.fdTable.delete(i),{status:g,data:null}}async fread(i,t,e){const s=this.fdTable.get(i);if(!s)return{status:K,data:null};const n=e??s.position,r=s.handle.getSize(),a=Math.min(t,r-n);if(a<=0)return{status:g,data:new Uint8Array(0)};const o=new Uint8Array(a);return s.handle.read(o,{at:n}),e===null&&(s.position+=a),{status:g,data:o}}async fwrite(i,t,e){const s=this.fdTable.get(i);if(!s)return{status:K,data:null};const r=(s.flags&1024)!==0?s.handle.getSize():e??s.position;s.handle.write(t,{at:r}),e===null&&(s.position=r+t.byteLength);const a=new Uint8Array(4);return new DataView(a.buffer).setUint32(0,t.byteLength,!0),{status:g,data:a}}async fstat(i){const t=this.fdTable.get(i);if(!t)return{status:K,data:null};const e=t.handle.getSize();return{status:g,data:this.encodeStat("file",e,Date.now(),i)}}async ftruncate(i,t=0){const e=this.fdTable.get(i);return e?(e.handle.truncate(t),e.handle.flush(),{status:g,data:null}):{status:K,data:null}}async statfs(){let t=0,e=0;try{const o=await navigator.storage.estimate();t=o.quota??0,e=o.usage??0}catch{}const s=Math.floor(t/4096),n=Math.max(0,Math.floor((t-e)/4096)),r=new Uint8Array(24),a=new DataView(r.buffer);return a.setUint32(0,Ne,!0),a.setUint32(4,4096,!0),a.setUint32(8,Math.min(s,4294967295),!0),a.setUint32(12,Math.min(n,4294967295),!0),a.setUint32(16,0,!0),a.setUint32(20,0,!0),{status:0,data:r}}async fsync(i){if(i!==void 0&&!this.fdTable.has(i))return{status:K,data:null};for(const[,t]of this.fdTable)try{t.handle.flush()}catch{}return{status:g,data:null}}async opendir(i,t){return this.readdir(i,1)}async mkdtemp(i){const t=Math.random().toString(36).substring(2,8),e=this.normalizePath(i+t);return this.mkdir(e,1)}},c={READ:1,WRITE:2,UNLINK:3,STAT:4,LSTAT:5,MKDIR:6,RMDIR:7,READDIR:8,RENAME:9,EXISTS:10,TRUNCATE:11,APPEND:12,COPY:13,ACCESS:14,REALPATH:15,CHMOD:16,CHOWN:17,UTIMES:18,SYMLINK:19,READLINK:20,LINK:21,OPEN:22,CLOSE:23,FREAD:24,FWRITE:25,FSTAT:26,FTRUNCATE:27,FSYNC:28,OPENDIR:29,MKDTEMP:30,FCHMOD:31,FCHOWN:32,FUTIMES:33,STATFS:34},Y={OK:0,ENOENT:1,EEXIST:2,EISDIR:3,ENOTDIR:4,ENOTEMPTY:5,EACCES:6,EINVAL:7,EBADF:8,ELOOP:9,ENOSPC:10,EIO:11},j={CONTROL:0,TICKET_NEXT:4,TICKET_SERVING:8,OPCODE:4,STATUS:8,CHUNK_LEN:12,TOTAL_LEN:16,CHUNK_IDX:24,HEARTBEAT:28,HEADER_SIZE:32},S={IDLE:0,REQUEST:1,RESPONSE:2,CHUNK:3,CHUNK_ACK:4},Rs=new TextEncoder,ie=new TextDecoder;function re(i){if(i.byteLength<16)throw new Error(`Request buffer too small: ${i.byteLength} < 16 bytes (possible SAB race)`);const t=new DataView(i),e=t.getUint32(0,!0),s=t.getUint32(4,!0),n=t.getUint32(8,!0),r=t.getUint32(12,!0),a=16+n+r;if(i.byteLength<a)throw new Error(`Request buffer truncated: ${i.byteLength} < ${a} bytes (op=${e}, pathLen=${n}, dataLen=${r})`);const o=new Uint8Array(i),u=ie.decode(o.subarray(16,16+n)),f=r>0?o.subarray(16+n,16+n+r):null;return{op:e,flags:s,path:u,data:f}}function W(i,t){const e=t?t.byteLength:0,s=new ArrayBuffer(8+e),n=new DataView(s);return n.setUint32(0,i,!0),n.setUint32(4,e,!0),t&&new Uint8Array(s).set(t,8),s}function G(i){const e=new DataView(i.buffer,i.byteOffset,i.byteLength).getUint32(0,!0);return ie.decode(i.subarray(4,4+e))}var _e=1e4,He=class Fe{constructor(t,e=_e){this.getTabId=t,this.deadlineMs=e}port=null;pendingResolve=null;pendingSeq=0;pendingAbandoned=!1;seqCounter=0;timer=null;get hasPort(){return this.port!==null}setPort(t){this.port&&this.port!==t&&(this.port.close(),this.abortPending()),this.port=t}postRaw(t,e){this.port?.postMessage(t,e)}portSuspectUntil=0;static SUSPECT_WINDOW_MS=3e4;get portSuspect(){return Date.now()<this.portSuspectUntil}forward(t,e=!1){return e&&this.portSuspect?Promise.resolve(W(Y.EIO)):(this.pendingResolve&&this.abortPending(),new Promise(s=>{const n=++this.seqCounter;this.pendingSeq=n,this.pendingAbandoned=!1,this.pendingResolve=s;const r=t.buffer.byteLength===t.byteLength?t.buffer:t.slice().buffer;this.port.postMessage({id:n,tabId:this.getTabId(),buffer:r},[r]),this.timer=setTimeout(()=>{if(this.timer=null,this.pendingSeq===n&&this.pendingResolve){const a=this.pendingResolve;this.pendingResolve=null,this.pendingAbandoned=!0,this.portSuspectUntil=Date.now()+Fe.SUSPECT_WINDOW_MS,a(W(Y.EIO))}},this.deadlineMs)}))}handleResponse(t,e){if(this.portSuspectUntil=0,t===this.pendingSeq){if(this.pendingResolve){this.clearTimer();const s=this.pendingResolve;return this.pendingResolve=null,s(e),!0}if(this.pendingAbandoned)return this.pendingAbandoned=!1,!0}return!1}abortPending(){if(this.clearTimer(),this.pendingResolve){const t=this.pendingResolve;this.pendingResolve=null,this.pendingAbandoned=!1,t(W(Y.EIO))}}clearTimer(){this.timer!==null&&(clearTimeout(this.timer),this.timer=null)}},ae=12e4,$e=1e3,Ke=class extends Error{constructor(i){super(`SAB protocol wait timed out: ${i}`),this.name="SabWaitTimeoutError"}};function oe(i,t,e,s,n=$e){for(;Atomics.load(i,0)===t;){const r=e-Date.now();if(r<=0)throw new Ke(s);Atomics.wait(i,0,t,Math.min(n,r))}}function Ve(i,t,e,s){try{const n=i.read(e);if(n.status===0){const r=[],a=[];if(n.data&&n.data.byteLength>0){const o=n.data.buffer.byteLength===n.data.byteLength?n.data.buffer:n.data.slice().buffer;r.push({op:"write",path:e,data:o,ts:s}),a.push(o)}else r.push({op:"write",path:e,data:new ArrayBuffer(0),ts:s});return r.push({op:"delete",path:t,ts:s}),{messages:r,transfers:a}}}catch{}return{messages:[{op:"rename",path:t,newPath:e,ts:s}],transfers:[]}}function Ye(i,t,e){const s=t.endsWith("/")?t:t+"/",n=e.endsWith("/")?e:e+"/",r=[];for(const a of i)a.startsWith(s)&&r.push({from:a,to:n+a.slice(s.length)});return r}function ce(i){if(i.startsWith("/")||(i="/"+i),i.length===1)return i;const t=[];for(const e of i.split("/"))if(!(e===""||e===".")){if(e===".."){t.pop();continue}t.push(e)}return"/"+t.join("/")}function We(i,t){if(t.startsWith("/"))return ce(t);const e=i.lastIndexOf("/"),s=e<=0?"/":i.slice(0,e);return ce(s+"/"+t)}function Ge(i,t,e,s){Dt(i,t,e),t.set(e,s);let n=i.get(s);n||(n=new Set,i.set(s,n)),n.add(e)}function Dt(i,t,e){const s=t.get(e);if(s===void 0)return;t.delete(e);const n=i.get(s);n&&(n.delete(e),n.size===0&&i.delete(s))}function zt(i,t){const e=t.endsWith("/")?t:t+"/",s=[];for(const n of i)(n===t||n.startsWith(e))&&s.push(n);return s}var L=i=>new DataView(i.buffer,i.byteOffset,i.byteLength),M=(i,t)=>!i||i.byteLength<t;function _t(i){return M(i,4)?null:L(i).getUint32(0,!0)}function le(i){return M(i,8)?null:L(i).getFloat64(0,!0)}function ue(i){if(M(i,8))return null;const t=L(i);return{uid:t.getUint32(0,!0),gid:t.getUint32(4,!0)}}function de(i){if(M(i,16))return null;const t=L(i);return{atime:t.getFloat64(0,!0),mtime:t.getFloat64(8,!0)}}function J(i){return M(i,4)?null:L(i).getUint32(0,!0)}function fe(i){if(M(i,16))return null;const t=L(i),e=t.getFloat64(8,!0);return{fd:t.getUint32(0,!0),length:t.getUint32(4,!0),position:e===-1?null:e}}function he(i){if(M(i,12))return null;const t=L(i),e=t.getFloat64(4,!0);return{fd:t.getUint32(0,!0),position:e===-1?null:e,bytes:i.subarray(12)}}function me(i){if(M(i,12))return null;const t=L(i);return{fd:t.getUint32(0,!0),len:t.getFloat64(4,!0)}}function we(i){if(M(i,8))return null;const t=L(i);return{fd:t.getUint32(0,!0),mode:t.getUint32(4,!0)}}function ye(i){if(M(i,12))return null;const t=L(i);return{fd:t.getUint32(0,!0),uid:t.getUint32(4,!0),gid:t.getUint32(8,!0)}}function pe(i){if(M(i,24))return null;const t=L(i);return{fd:t.getUint32(0,!0),atime:t.getFloat64(8,!0),mtime:t.getFloat64(16,!0)}}var qe=511,Ze=438,U=y.EINVAL,Ht=1;function be(i,t){return _t(i??null)??t}function Qe(i,t,e,s,n,r){switch(e){case c.READ:return i.read(n);case c.WRITE:return i.write(n,r??new Uint8Array(0),s);case c.APPEND:return i.append(n,r??new Uint8Array(0));case c.UNLINK:return i.unlink(n);case c.STAT:return i.stat(n);case c.LSTAT:return i.lstat(n);case c.MKDIR:return i.mkdir(n,s,be(r,qe));case c.RMDIR:return i.rmdir(n,s);case c.READDIR:return i.readdir(n,s);case c.RENAME:return i.rename(n,r?G(r):"");case c.EXISTS:return i.exists(n);case c.COPY:return i.copy(n,r?G(r):"",s);case c.ACCESS:return i.access(n,s);case c.REALPATH:return i.realpath(n);case c.READLINK:return i.readlink(n);case c.LINK:return i.link(n,r?G(r):"");case c.OPENDIR:return i.opendir(n,t);case c.MKDTEMP:return i.mkdtemp(n);case c.FSYNC:return i.fsync(J(r)??void 0);case c.STATFS:return i.statfs(n);case c.TRUNCATE:{const a=le(r);return a===null?{status:U}:i.truncate(n,a)}case c.CHMOD:{const a=_t(r);return a===null?{status:U}:i.chmod(n,a,(s&Ht)===0)}case c.CHOWN:{const a=ue(r);return a===null?{status:U}:i.chown(n,a.uid,a.gid,(s&Ht)===0)}case c.UTIMES:{const a=de(r);return a===null?{status:U}:i.utimes(n,a.atime,a.mtime,(s&Ht)===0)}case c.SYMLINK:return i.symlink(r?new TextDecoder().decode(r):"",n);case c.OPEN:return i.open(n,s,t,be(r,Ze));case c.CLOSE:{const a=J(r);return a===null?{status:U}:i.close(a)}case c.FREAD:{const a=fe(r);return a===null?{status:U}:i.fread(a.fd,a.length,a.position)}case c.FWRITE:{const a=he(r);return a===null?{status:U}:i.fwrite(a.fd,a.bytes,a.position)}case c.FSTAT:{const a=J(r);return a===null?{status:U}:i.fstat(a)}case c.FTRUNCATE:{const a=me(r);return a===null?{status:U}:i.ftruncate(a.fd,a.len)}case c.FCHMOD:{const a=we(r);return a===null?{status:U}:i.fchmod(a.fd,a.mode)}case c.FCHOWN:{const a=ye(r);return a===null?{status:U}:i.fchown(a.fd,a.uid,a.gid)}case c.FUTIMES:{const a=pe(r);return a===null?{status:U}:i.futimes(a.fd,a.atime,a.mtime)}default:return{status:U}}}var vs=new Set([c.READ,c.WRITE,c.APPEND,c.UNLINK,c.STAT,c.LSTAT,c.MKDIR,c.RMDIR,c.READDIR,c.RENAME,c.EXISTS,c.TRUNCATE,c.COPY,c.ACCESS,c.REALPATH,c.CHMOD,c.CHOWN,c.UTIMES,c.SYMLINK,c.READLINK,c.LINK,c.OPEN,c.CLOSE,c.FREAD,c.FWRITE,c.FSTAT,c.FTRUNCATE,c.FSYNC,c.OPENDIR,c.MKDTEMP,c.FCHMOD,c.FCHOWN,c.FUTIMES,c.STATFS]),$t=new WeakMap;function Xe(i,t){const e=URL.createObjectURL(new Blob([i],{type:"text/javascript"}));try{const s=new Worker(e,{type:"module",name:t});return $t.set(s,e),s}catch(s){throw URL.revokeObjectURL(e),s}}function je(i){if(!i)return;try{i.terminate()}catch{}const t=$t.get(i);t&&(URL.revokeObjectURL(t),$t.delete(i))}var Je=`function E(e){if(e.startsWith("/")||(e="/"+e),e.length===1)return e;const t=[];for(const r of e.split("/"))if(!(r===""||r===".")){if(r===".."){t.pop();continue}t.push(r)}return"/"+t.join("/")}function j(e,t){const r=E(t);for(let n=e.length-1;n>=0;n--){const a=e[n];if(E(a.path)!==r){if(a.op==="rename"&&a.newPath&&E(a.newPath)===r)return-1;continue}return a.op==="write"?n:-1}return-1}var h,m;function f(e){if(e.charCodeAt(0)!==47&&(e="/"+e),e.indexOf("//")!==-1&&(e=e.replace(/\\\\/\\\\/+/g,"/")),e.indexOf("/.")!==-1){const t=e.split("/"),r=[];for(const n of t)if(!(n==="."||n==="")){if(n===".."){r.pop();continue}r.push(n)}e="/"+r.join("/")}return e.length>1&&e.charCodeAt(e.length-1)===47&&(e=e.slice(0,-1)),e||"/"}function H(e){return f(e).split("/").filter(Boolean)}var D=new Set,p=new Map,M=new Map;function O(e){let t=2166136261;for(let r=0;r<e.length;r++)t^=e[r],t=Math.imul(t,16777619);return t>>>0^e.length}function P(e,t){if(e=f(e),D.has(e))return!0;const r=p.get(e);return!r||Date.now()-r>=A?!1:M.get(e)===O(t)}var A=3e3;function R(e){D.add(f(e))}function T(e){D.delete(f(e))}function z(e){p.set(f(e),Date.now())}function b(e,t=!1){e=f(e);const r=Date.now();if(D.has(e))return!0;const n=p.get(e);if(n&&r-n<A)return!0;if(t){let a=e;for(;;){const o=a.lastIndexOf("/");if(o<=0)break;if(a=a.substring(0,o),D.has(a))return!0;const i=p.get(a);if(i&&r-i<A)return!0}}return!1}setInterval(()=>{const e=Date.now()-A;for(const[t,r]of p)r<e&&(p.delete(t),M.delete(t))},5e3);var g=[],F=!1;function q(e){if(R(e.path),e.op==="rename"&&e.newPath&&R(e.newPath),e.op==="write"){const t=j(g,e.path);if(t!==-1){g[t].data=e.data,g[t].ts=e.ts;return}}g.push(e),F||I()}async function G(e){switch(e.op){case"write":e.data?await B(e.path,e.data):await B(e.path,new ArrayBuffer(0));break;case"delete":await K(e.path);break;case"mkdir":await X(e.path);break;case"rename":await J(e.path,e.newPath);break}}var C=4;async function I(){if(g.length===0){F=!1;return}F=!0;const e=g.shift();for(let t=1;t<=C;t++)try{await G(e);break}catch(r){if(t===C){console.warn("[opfs-sync] mirror failed after retries:",e.op,e.path,r);break}await new Promise(n=>setTimeout(n,10*t))}T(e.path),z(e.path),e.op==="rename"&&e.newPath&&(T(e.newPath),z(e.newPath)),I()}async function S(e){const t=H(e);t.pop();let r=m;for(const n of t)r=await r.getDirectoryHandle(n,{create:!0});return r}function y(e){const t=H(e);return t[t.length-1]||""}async function B(e,t){const r=await S(e),n=y(e),a=await r.getFileHandle(n,{create:!0}),o=new Uint8Array(t),i=await a.createSyncAccessHandle();try{i.truncate(0),i.write(o,{at:0}),i.flush()}finally{i.close()}M.set(f(e),O(o))}async function K(e){try{await(await x(e)).removeEntry(y(e),{recursive:!0})}catch{}}async function X(e){let t=m;for(const r of H(e))t=await t.getDirectoryHandle(r,{create:!0})}var U=2*1024*1024;async function J(e,t){let r=null,n=null,a,o,i=!1,u=null;for(let s=0;s<6;s++)try{a=await x(e),o=await a.getFileHandle(y(e)),i=!0;break}catch(d){u=d;const l=d?.message||"";if(d?.name==="TypeMismatchError"||l.includes("TypeMismatch")||l.includes("not a file")||l.includes("not an entry of requested type")){try{await W(e,t)}catch(c){console.warn("[opfs-sync] rename (dir) failed:",e,"\\\\u2192",t,c)}return}if(s<5){await new Promise(c=>setTimeout(c,8*(s+1)));continue}}if(!i){try{await W(e,t);return}catch{}console.warn("[opfs-sync] rename failed (source not found after retries):",e,"\\\\u2192",t,u);return}try{r=await o.createSyncAccessHandle();const s=r.getSize();if(n=await(await(await S(t)).getFileHandle(y(t),{create:!0})).createSyncAccessHandle(),n.truncate(0),s>0){const w=new Uint8Array(Math.min(s,U));let c=0;for(;c<s;){const k=Math.min(w.length,s-c),v=k===w.length?w:w.subarray(0,k);r.read(v,{at:c}),n.write(v,{at:c}),c+=k}}n.flush();try{n.close()}catch{}n=null;try{r.close()}catch{}r=null,await N(a,y(e))}catch(s){console.warn("[opfs-sync] rename failed:",e,"\\\\u2192",t,s)}finally{if(n)try{n.close()}catch{}if(r)try{r.close()}catch{}}}async function W(e,t){const r=await x(e),n=await r.getDirectoryHandle(y(e)),a=await S(t);try{await a.removeEntry(y(t),{recursive:!0})}catch(i){if(i?.name!=="NotFoundError")throw i}const o=await a.getDirectoryHandle(y(t),{create:!0});await _(n,o),await N(r,y(e),{recursive:!0})}async function N(e,t,r){let n=null;for(let a=0;a<4;a++)try{await e.removeEntry(t,r);return}catch(o){if(o?.name==="NotFoundError")return;n=o,await new Promise(i=>setTimeout(i,10*(a+1)))}throw n}async function _(e,t){for await(const[r,n]of e.entries())if(n.kind==="directory"){const a=await t.getDirectoryHandle(r,{create:!0});await _(n,a)}else{const a=n,o=await t.getFileHandle(r,{create:!0});let i=null,u=null;try{i=await a.createSyncAccessHandle(),u=await o.createSyncAccessHandle();const s=i.getSize();if(u.truncate(0),s>0){const d=new Uint8Array(Math.min(s,U));let l=0;for(;l<s;){const w=Math.min(d.length,s-l),c=w===d.length?d:d.subarray(0,w);i.read(c,{at:l}),u.write(c,{at:l}),l+=w}}u.flush()}finally{if(u)try{u.close()}catch{}if(i)try{i.close()}catch{}}}}async function x(e){const t=H(e);t.pop();let r=m;for(const n of t)r=await r.getDirectoryHandle(n);return r}function L(e){for(const t of e){const r=f(t.path);if(!(r==="/.vfs.bin"||r==="/.vfs"||r.startsWith("/.vfs")))switch(t.kind){case"appeared":case"modified":Q(r,t.handle??null);break;case"disappeared":if(b(r,!0))continue;V(r);break;case"moved":{const n=f(t.from);if(b(r)||b(n))continue;Y(n,r);break}}}}async function Q(e,t){try{if(!t||t.kind!=="file")return;const r=t;let n=await r.getFile().then(a=>a.arrayBuffer());if(P(e,new Uint8Array(n))||p.has(f(e))&&(n=await r.getFile().then(a=>a.arrayBuffer()),P(e,new Uint8Array(n))))return;h.postMessage({op:"external-write",path:e,data:n,ts:Date.now()},[n])}catch(r){console.warn("[opfs-sync] external change read failed:",e,r)}}function V(e){h.postMessage({op:"external-delete",path:e,ts:Date.now()})}function Y(e,t){h.postMessage({op:"external-rename",path:e,newPath:t,ts:Date.now()})}self.onmessage=async e=>{const t=e.data;if(t.type==="init"){if(h=e.ports[0],m=await navigator.storage.getDirectory(),t.root&&t.root!=="/"){const r=t.root.split("/").filter(Boolean);for(const n of r)m=await m.getDirectoryHandle(n,{create:!0})}console.log("[opfs-sync] initialized with root:",t.root||"/","mirrorRoot.name:",m.name||"(opfs-root)"),h.onmessage=r=>{if(r.data?.type==="external-records"){L(r.data.records);return}q(r.data)},h.start(),self.postMessage({type:"ready"});return}if(t.type==="shutdown"){try{h?.close()}catch{}self.postMessage({type:"shutdown-done"}),self.close();return}};\n`;function ts(i,t,e){const s=(t&64)!==0,n=(t&512)!==0,r=s&&!n?i.exists(e).data?.[0]===1:!1;return{willCreate:s,willTrunc:n,existedBefore:r}}var Ot=(i,t)=>new DataView(i.buffer,i.byteOffset,i.byteLength).getUint32(t,!0);function es(i,t,e,s,n,r){if(n.status!==0)return null;switch(t){case c.WRITE:case c.APPEND:case c.UNLINK:case c.MKDIR:case c.RMDIR:case c.TRUNCATE:case c.CHMOD:case c.CHOWN:case c.UTIMES:case c.SYMLINK:return{op:t,path:e};case c.RENAME:return{op:t,path:e,newPath:s?G(s):""};case c.COPY:case c.LINK:return{op:t,path:s?G(s):""};case c.OPEN:return r&&(r.willTrunc||r.willCreate&&!r.existedBefore)?{op:c.WRITE,path:e}:null;case c.MKDTEMP:return n.data instanceof Uint8Array?{op:t,path:new TextDecoder().decode(n.data)}:null;case c.FWRITE:case c.FTRUNCATE:return s&&s.byteLength>=4?{op:t,path:i.getPathForFd(Ot(s,0))??void 0}:null;case c.FCHMOD:return s&&s.byteLength>=4?{op:c.CHMOD,path:i.getPathForFd(Ot(s,0))??void 0}:null;case c.FCHOWN:return s&&s.byteLength>=4?{op:c.CHOWN,path:i.getPathForFd(Ot(s,0))??void 0}:null;case c.FUTIMES:return s&&s.byteLength>=4?{op:c.UTIMES,path:i.getPathForFd(Ot(s,0))??void 0}:null;default:return null}}self.addEventListener("error",i=>{console.error("[sync-relay] uncaught error:",i.message,i.filename,i.lineno)}),self.addEventListener("unhandledrejection",i=>{const t=i.reason;console.error("[sync-relay] unhandled rejection:",t?.message??String(t),t?.stack??"")});var D=new Me;function Ie(i,t){return!i||i.byteLength<4?t:new DataView(i.buffer,i.byteOffset,i.byteLength).getUint32(0,!0)}var Ct=null,tt=!1,q=!1,Z=!1,B=!1,Ft=!1,v=null,Kt=!1,dt=null,ft=null,x,A,et,z,_=null,k=null,N="",H=j.HEADER_SIZE,ss=j.HEARTBEAT>>2,ns=1e3,Ee=null;function Vt(){Ee!==null||!A||(Ee=setInterval(()=>{Atomics.add(A,ss,1)},ns))}var ht=new Map,Q=[],ge=typeof navigator<"u"&&navigator.userAgent||"",is=/AppleWebKit/.test(ge)&&!/Chrome|Chromium|Android|Edg|OPR/.test(ge),Se=void 0;function mt(){const i=self.__fs_force_spin??Se;return i===void 0?is:!!i}var Yt=new MessageChannel;Yt.port2.start();function wt(){return new Promise(i=>{let t=!1,e=null;const s=()=>{t||(t=!0,e!==null&&clearTimeout(e),i())};Yt.port2.onmessage=s,Yt.port1.postMessage(null),mt()&&(e=setTimeout(s,1))})}function yt(i,t){try{return fs(i,t)}catch(e){return console.error("[sync-relay] handleRequest threw:",e?.message,e?.stack),{status:Y.EIO}}}async function pt(i,t){try{return await hs(i,t)}catch(e){return console.error("[sync-relay] handleRequestOPFS threw:",e?.message,e?.stack),{status:Y.EIO}}}function rs(i,t){t.onmessage=async e=>{if(e.data.buffer instanceof ArrayBuffer)if(Ft)Q.push({port:t,tabId:i,id:e.data.id,buffer:e.data.buffer});else{const s=tt?await pt(i,e.data.buffer):yt(i,e.data.buffer),n=W(s.status,s.data);t.postMessage({id:e.data.id,buffer:n},[n]),!tt&&s._op!==void 0&&gt(s._op,s._path,s._newPath)}},t.start(),ht.set(i,t)}function as(i){const t=ht.get(i);t&&(t.close(),ht.delete(i)),tt?Ct?.cleanupTab(i):D.cleanupTab(i)}function os(){for(;Q.length>0;){const i=Q.shift(),t=yt(i.tabId,i.buffer),e=W(t.status,t.data);i.port.postMessage({id:i.id,buffer:e},[e]),t._op!==void 0&&gt(t._op,t._path,t._newPath)}}async function cs(){for(;Q.length>0;){const i=Q.shift(),t=await pt(i.tabId,i.buffer),e=W(t.status,t.data);i.port.postMessage({id:i.id,buffer:e},[e])}}var st=new He(()=>N),Wt=null;function ls(i){return st.forward(i)}function us(i){if(i.data.buffer instanceof ArrayBuffer){if(st.handleResponse(i.data.id,i.data.buffer))return;Wt&&Wt.postMessage({id:i.data.id,buffer:i.data.buffer},[i.data.buffer])}}var ds={1:"READ",2:"WRITE",3:"UNLINK",4:"STAT",5:"LSTAT",6:"MKDIR",7:"RMDIR",8:"READDIR",9:"RENAME",10:"EXISTS",11:"TRUNCATE",12:"APPEND",13:"COPY",14:"ACCESS",15:"REALPATH",16:"CHMOD",17:"CHOWN",18:"UTIMES",19:"SYMLINK",20:"READLINK",21:"LINK",22:"OPEN",23:"CLOSE",24:"FREAD",25:"FWRITE",26:"FSTAT",27:"FTRUNCATE",28:"FSYNC",29:"OPENDIR",30:"MKDTEMP"};function fs(i,t){const e=B?performance.now():0;let s,n,r,a;try{({op:s,flags:n,path:r,data:a}=re(t))}catch(I){return console.error(`[sync-relay] decodeRequest failed (bufLen=${t.byteLength}): ${I.message}`),{status:-1}}const o=B?performance.now():0,u=s===c.OPEN?ts(D,n,r):void 0,f=Qe(D,i,s,n,r,a),h=es(D,s,r,a,f,u),d=h?.op,m=h?.path,w=h?.newPath;if(B){const I=performance.now();console.log(`[sync-relay] op=${ds[s]??s} path=${r} decode=${(o-e).toFixed(3)}ms engine=${(I-o).toFixed(3)}ms TOTAL=${(I-e).toFixed(3)}ms`)}const l={status:f.status,data:f.data instanceof Uint8Array?f.data:void 0};return d!==void 0&&m&&(l._op=d,l._path=m,l._newPath=w,It(d,m,w)),l}async function hs(i,t){const e=Ct;let s,n,r,a;try{({op:s,flags:n,path:r,data:a}=re(t))}catch(l){return console.error(`[sync-relay] decodeRequest failed in OPFS handler (bufLen=${t.byteLength}): ${l.message}`),{status:-1}}let o,u,f;switch(s){case c.READ:o=await e.read(r);break;case c.WRITE:o=await e.write(r,a??new Uint8Array(0),n),u=r;break;case c.APPEND:o=await e.append(r,a??new Uint8Array(0)),u=r;break;case c.UNLINK:o=await e.unlink(r),u=r;break;case c.STAT:o=await e.stat(r);break;case c.LSTAT:o=await e.lstat(r);break;case c.MKDIR:o=await e.mkdir(r,n,Ie(a,511)),u=r;break;case c.RMDIR:o=await e.rmdir(r,n),u=r;break;case c.READDIR:o=await e.readdir(r,n);break;case c.RENAME:{const l=a?G(a):"";o=await e.rename(r,l),u=r,f=l;break}case c.EXISTS:o=await e.exists(r);break;case c.TRUNCATE:{const l=le(a);if(l===null){o={status:7};break}o=await e.truncate(r,l),u=r;break}case c.COPY:{const l=a?G(a):"";o=await e.copy(r,l,n),u=l;break}case c.ACCESS:o=await e.access(r,n);break;case c.REALPATH:o=await e.realpath(r);break;case c.CHMOD:{const l=_t(a)??0;o=await e.chmod(r,l);break}case c.CHOWN:{const l=ue(a);if(l===null){o={status:7};break}o=await e.chown(r,l.uid,l.gid);break}case c.UTIMES:{const l=de(a);if(l===null){o={status:7};break}o=await e.utimes(r,l.atime,l.mtime);break}case c.SYMLINK:{const l=a?new TextDecoder().decode(a):"";o=await e.symlink(l,r);break}case c.READLINK:o=await e.readlink(r);break;case c.LINK:{const l=a?G(a):"";o=await e.link(r,l),u=l;break}case c.OPEN:o=await e.open(r,n,i,Ie(a,438));break;case c.CLOSE:{const l=J(a);if(l===null){o={status:7};break}o=await e.close(l);break}case c.FREAD:{const l=fe(a);if(l===null){o={status:7};break}o=await e.fread(l.fd,l.length,l.position);break}case c.FWRITE:{const l=he(a);if(l===null){o={status:7};break}o=await e.fwrite(l.fd,l.bytes,l.position),u=e.getPathForFd(l.fd)??void 0;break}case c.FSTAT:{const l=J(a);if(l===null){o={status:7};break}o=await e.fstat(l);break}case c.FTRUNCATE:{const l=me(a);if(l===null){o={status:7};break}o=await e.ftruncate(l.fd,l.len),u=e.getPathForFd(l.fd)??void 0;break}case c.FSYNC:o=await e.fsync(J(a)??void 0);break;case c.STATFS:o=await e.statfs();break;case c.OPENDIR:o=await e.opendir(r,i);break;case c.MKDTEMP:o=await e.mkdtemp(r),o.status===0&&o.data&&(u=new TextDecoder().decode(o.data instanceof Uint8Array?o.data:new Uint8Array(0)));break;case c.FCHMOD:{const l=we(a);if(l===null){o={status:7};break}o=await e.fchmod(l.fd,l.mode);break}case c.FCHOWN:{const l=ye(a);if(l===null){o={status:7};break}o=await e.fchown(l.fd,l.uid,l.gid);break}case c.FUTIMES:{const l=pe(a);if(l===null){o={status:7};break}o=await e.futimes(l.fd,l.atime,l.mtime);break}default:o={status:7}}const h=1,d=[c.READ,c.STAT,c.LSTAT,c.READDIR,c.EXISTS,c.ACCESS,c.REALPATH,c.READLINK],m=s===c.EXISTS&&o.status===0&&o.data instanceof Uint8Array&&o.data[0]===0;if((o.status===h||m)&&d.includes(s)){const l=(()=>{switch(s){case c.READ:return D.read(r);case c.STAT:return D.stat(r);case c.LSTAT:return D.lstat(r);case c.READDIR:return D.readdir(r,n);case c.EXISTS:return D.exists(r);case c.ACCESS:return D.access(r,n);case c.REALPATH:return D.realpath(r);case c.READLINK:return D.readlink(r);default:return null}})();l&&l.status!==h&&(o=l)}const w={status:o.status,data:o.data instanceof Uint8Array?o.data:void 0};return o.status===0&&u&&It(s,u,f),w}function nt(i,t){const e=new BigUint64Array(i,j.TOTAL_LEN,1),s=i.byteLength-H,n=Atomics.load(t,3),r=Number(Atomics.load(e,0));if(n<=0||n>s)return console.error(`[sync-relay] readPayload: invalid chunkLen=${n} (maxChunk=${s}, totalLen=${r})`),new Uint8Array(0);if(r<=s)return new Uint8Array(i,H,n).slice();if(r>bt.maxPayload||r<=0)return console.error(`[sync-relay] readPayload: totalLen=${r} exceeds limit (${bt.maxPayload}) or invalid`),new Uint8Array(0);const a=new Uint8Array(r);let o=0;a.set(new Uint8Array(i,H,n),o),o+=n;const u=Date.now()+ae;for(;o<r;){Atomics.store(t,0,S.CHUNK_ACK),Atomics.notify(t,0),oe(t,S.CHUNK_ACK,u,"request chunk from caller",50);const f=Atomics.load(t,3);if(f<=0||f>s)return console.error(`[sync-relay] readPayload: invalid nextLen=${f} at offset=${o}`),a.slice(0,o);a.set(new Uint8Array(i,H,f),o),o+=f}return a}function it(i,t,e,s){const n=s?s.byteLength:0,r=8+n,a=i.byteLength-H;if(r<=a){const o=new DataView(i,H,8);o.setUint32(0,e,!0),o.setUint32(4,n,!0),s&&n>0&&new Uint8Array(i,H+8,n).set(s),Atomics.store(t,3,r);const u=new BigUint64Array(i,j.TOTAL_LEN,1);Atomics.store(u,0,BigInt(r)),Atomics.store(t,0,S.RESPONSE),Atomics.notify(t,0)}else{const o=W(e,s);Gt(i,t,new Uint8Array(o))}}function Gt(i,t,e){const s=i.byteLength-H;if(e.byteLength<=s){new Uint8Array(i,H,e.byteLength).set(e),Atomics.store(t,3,e.byteLength);const n=new BigUint64Array(i,j.TOTAL_LEN,1);Atomics.store(n,0,BigInt(e.byteLength)),Atomics.store(t,0,S.RESPONSE),Atomics.notify(t,0)}else{const n=new BigUint64Array(i,j.TOTAL_LEN,1);Atomics.store(n,0,BigInt(e.byteLength));let r=0;for(;r<e.byteLength;){const a=Math.min(s,e.byteLength-r);new Uint8Array(i,H,a).set(e.subarray(r,r+a)),Atomics.store(t,3,a),Atomics.store(t,6,Math.floor(r/s));const o=r+a>=e.byteLength;Atomics.store(t,0,o?S.RESPONSE:S.CHUNK),Atomics.notify(t,0),o||oe(t,S.CHUNK,Date.now()+ae,"response chunk ack from caller",50),r+=a}}}var ms=25,Rt=0;function ws(){if(mt())try{if(Date.now()-Rt<ms||Atomics.load(A,0)===S.REQUEST||k&&Atomics.load(k,0)===S.REQUEST)return;D.maybePreGrow(!0)}catch(i){console.error("[sync-relay] pre-grow failed:",i?.message)}}function rt(i,t){if(!mt())return Atomics.wait(i,0,S.RESPONSE,t),Atomics.load(i,0)!==S.RESPONSE;const e=Date.now()+t;for(;Atomics.load(i,0)===S.RESPONSE;){const s=e-Date.now();if(s<=0)return!1;Atomics.wait(i,0,S.RESPONSE,Math.min(5,s))}return!0}var ys=0,ps=5;function qt(i,t){i().catch(e=>{Ft=!1,console.error(`[sync-relay] ${t} crashed:`,e?.message,e?.stack);try{A&&Atomics.load(A,0)===S.REQUEST&&it(x,A,Y.EIO),k&&Atomics.load(k,0)===S.REQUEST&&it(_,k,Y.EIO)}catch{}++ys<=ps?qt(i,t):self.postMessage({type:"leader-loop-fatal",error:e?.message??String(e)})})}async function bs(){for(Ft=!0;;){let i=!0,t=0;for(;i;){if(i=!1,++t>=100&&(t=0,await wt()),Atomics.load(A,0)===S.REQUEST){const e=B?performance.now():0,s=nt(x,A),n=B?performance.now():0,r=yt(N,s.buffer),a=B?performance.now():0;it(x,A,r.status,r.data),r._op!==void 0&&gt(r._op,r._path,r._newPath);const o=B?performance.now():0;B&&console.log(`[leaderLoop] readPayload=${(n-e).toFixed(3)}ms handleRequest=${(a-n).toFixed(3)}ms writeResponse=${(o-a).toFixed(3)}ms TOTAL=${(o-e).toFixed(3)}ms`),rt(A,100)||Atomics.store(A,0,S.IDLE),Rt=Date.now(),i=!0;continue}if(k&&Atomics.load(k,0)===S.REQUEST){const e=nt(_,k),s=yt(N,e.buffer);it(_,k,s.status,s.data),s._op!==void 0&&gt(s._op,s._path,s._newPath),rt(k,5e3),Rt=Date.now(),i=!0;continue}if(Q.length>0){os(),i=!0;continue}if(mt()&&Date.now()-Rt<20){const e=performance.now();for(;performance.now()-e<.25;)if(Atomics.load(A,0)===S.REQUEST||k!==null&&Atomics.load(k,0)===S.REQUEST){i=!0;break}}}if(await wt(),ws(),ht.size===0){const e=Atomics.load(A,0),s=k!==null&&Atomics.load(k,0)===S.REQUEST;e!==S.REQUEST&&!s&&Atomics.wait(A,0,e,Kt?5:50)}}}async function Is(){for(Ft=!0;;){let i=!0,t=0;for(;i;){if(i=!1,++t>=100&&(t=0,await wt()),Atomics.load(A,0)===S.REQUEST){const e=nt(x,A),s=await pt(N,e.buffer);it(x,A,s.status,s.data),rt(A,100)||Atomics.store(A,0,S.IDLE),i=!0;continue}if(k&&Atomics.load(k,0)===S.REQUEST){const e=nt(_,k),s=await pt(N,e.buffer);it(_,k,s.status,s.data),rt(k,100)||Atomics.store(k,0,S.IDLE),i=!0;continue}if(Q.length>0){await cs(),i=!0;continue}}if(await wt(),ht.size===0){const e=Atomics.load(A,0),s=k!==null&&Atomics.load(k,0)===S.REQUEST;e!==S.REQUEST&&!s&&Atomics.wait(A,0,e,50)}}}async function Es(){for(;;){if(Atomics.load(A,0)===S.REQUEST){const t=nt(x,A),e=await st.forward(t,!0);Gt(x,A,new Uint8Array(e)),rt(A,100)||Atomics.store(A,0,S.IDLE);continue}if(k&&Atomics.load(k,0)===S.REQUEST){const t=nt(_,k),e=await ls(t);Gt(_,k,new Uint8Array(e)),rt(k,100)||Atomics.store(k,0,S.IDLE);continue}Atomics.wait(A,0,S.IDLE,50)==="timed-out"&&await wt()}}var gs=new Set([".vfs.bin",".vfs.bin.tmp"]),Ss=2*1024*1024;async function Te(i,t){const e=[],s=[];for await(const[n,r]of i.entries())t===""&&gs.has(n)||(r.kind==="directory"?e.push({name:n,handle:r}):s.push({name:n,handle:r}));for(const{name:n}of e){const r=t?`${t}/${n}`:`/${n}`;D.mkdir(r,1,493)}for(const{name:n,handle:r}of s){const a=t?`${t}/${n}`:`/${n}`;let o=null;try{o=await r.createSyncAccessHandle();const u=o.getSize();if(D.write(a,new Uint8Array(0)),u>0){const f=new Uint8Array(Math.min(u,Ss));let h=0;for(;h<u;){const d=Math.min(f.length,u-h),m=d===f.length?f:f.subarray(0,d);o.read(m,{at:h}),D.append(a,m),h+=d}}}finally{if(o)try{o.close()}catch{}}}for(const{name:n,handle:r}of e){const a=t?`${t}/${n}`:`/${n}`;await Te(r,a)}}var Ae={maxInodes:4e6,maxBlocks:4e6,maxPathTable:256*1024*1024,maxVFSSize:100*1024*1024*1024,maxPayload:2*1024*1024*1024};function Ts(i){return{...Ae,...i}}var bt={...Ae};function As(i,t,e){if(t<b.SIZE)return`file too small (${t} bytes)`;const s=new Uint8Array(b.SIZE);i.read(s,{at:0});const n=new DataView(s.buffer),r=n.getUint32(b.MAGIC,!0);if(r!==lt)return`bad magic 0x${r.toString(16)}`;const a=n.getUint32(b.VERSION,!0);if(a!==Tt)return`unsupported version ${a}`;const o=n.getUint32(b.INODE_COUNT,!0),u=n.getUint32(b.BLOCK_SIZE,!0),f=n.getUint32(b.TOTAL_BLOCKS,!0),h=n.getUint32(b.FREE_BLOCKS,!0),d=n.getFloat64(b.INODE_OFFSET,!0),m=n.getFloat64(b.PATH_OFFSET,!0),w=n.getFloat64(b.DATA_OFFSET,!0),l=n.getFloat64(b.BITMAP_OFFSET,!0),I=n.getUint32(b.PATH_USED,!0);if(u===0||(u&u-1)!==0)return`invalid block size ${u}`;if(o===0)return"inode count is 0";if(o>e.maxInodes)return`inode count ${o} exceeds maximum ${e.maxInodes}`;if(f>e.maxBlocks)return`total blocks ${f} exceeds maximum ${e.maxBlocks}`;if(h>f)return`free blocks (${h}) exceeds total (${f})`;if(!Number.isFinite(d)||d<0||!Number.isFinite(m)||m<0||!Number.isFinite(l)||l<0||!Number.isFinite(w)||w<0)return"non-finite or negative section offset";if(d!==b.SIZE)return`inode table offset ${d} (expected ${b.SIZE})`;const T=d+o*P;if(m!==T)return`path table offset ${m} (expected ${T})`;if(l<=m)return"bitmap offset must be after path table";if(w<=l)return"data offset must be after bitmap";const F=l-m;if(I>F)return`path used (${I}) exceeds path table size (${F})`;if(F>e.maxPathTable)return`path table size ${F} exceeds maximum ${e.maxPathTable}`;const C=w+f*u;return C>e.maxVFSSize?`computed layout size ${C} exceeds maximum ${e.maxVFSSize}`:t<C?`file size ${t} too small for layout (need ${C})`:null}async function ks(i){B=i.debug??!1,Se=i.forceSpin,bt=Ts(i.limits);let t=await navigator.storage.getDirectory();if(i.root&&i.root!=="/"){const a=i.root.split("/").filter(Boolean);for(const o of a)t=await t.getDirectoryHandle(o,{create:!0})}const s=await(await t.getFileHandle(".vfs.bin",{create:!0})).createSyncAccessHandle(),n=s.getSize();if(n>0){const a=As(s,n,bt);if(a){try{s.close()}catch{}throw new Error(`Corrupt VFS: ${a}`)}}const r=n===0;try{D.init(s,{uid:i.uid,gid:i.gid,umask:i.umask,strictPermissions:i.strictPermissions,debug:i.debug,limits:bt})}catch(a){try{s.close()}catch{}throw a}if(r&&(await Te(t,""),D.flush()),i.opfsSync){Kt=!0;const a=new MessageChannel;v=a.port1,v.onmessage=o=>Fs(o.data),v.start(),dt=Xe(Je,"vfs-opfs-sync"),dt.postMessage({type:"init",root:i.opfsSyncRoot??i.root},[a.port2])}if(mt())try{D.maybePreGrow(!0)}catch(a){console.error("[sync-relay] init pre-grow failed:",a?.message)}ft=new BroadcastChannel(`${i.ns}-watch`)}async function Ds(i){B=i.debug??!1,tt=!0;let t=await navigator.storage.getDirectory();if(i.root&&i.root!=="/"){const e=i.root.split("/").filter(Boolean);for(const s of e)t=await t.getDirectoryHandle(s,{create:!0})}Ct=new ze,await Ct.init(t,{uid:i.uid,gid:i.gid}),ft=new BroadcastChannel(`${i.ns}-watch`)}function It(i,t,e){if(!ft)return;let s;switch(i){case c.WRITE:case c.APPEND:case c.TRUNCATE:case c.FWRITE:case c.FTRUNCATE:case c.CHMOD:case c.CHOWN:case c.UTIMES:case c.COPY:s="change";break;case c.UNLINK:case c.RMDIR:case c.RENAME:case c.MKDIR:case c.MKDTEMP:case c.SYMLINK:case c.LINK:s="rename";break;default:return}ft.postMessage({eventType:s,path:t}),i===c.RENAME&&e&&ft.postMessage({eventType:"rename",path:e})}var at=new Map,Os=50,ot=new Map,ct=new Map;function ke(i){const t=D.readlink(i);if(t.status!==0||!t.data)return;const e=We(i,new TextDecoder().decode(t.data));Ge(ot,ct,i,e)}function Cs(i){if(at.delete(i),!!v)try{const t=D.read(i);if(t.status!==0){D.readlink(i).status===0&&v.postMessage({op:"write",path:i,data:new ArrayBuffer(0),ts:Date.now()});return}const e=Date.now();if(t.data&&t.data.byteLength>0){const s=t.data.buffer.byteLength===t.data.byteLength?t.data.buffer:t.data.slice().buffer;v.postMessage({op:"write",path:i,data:s,ts:e},[s])}else v.postMessage({op:"write",path:i,data:new ArrayBuffer(0),ts:e});Et(i)}catch{}}function Et(i){const t=ot.get(i);if(t)for(const e of t)Ut(e)}function vt(i){Et(i);for(const t of zt(ot.keys(),i))t!==i&&Et(t)}function X(i){const t=at.get(i);t&&(clearTimeout(t),at.delete(i))}function De(i,t){for(const{from:e,to:s}of Ye(at.keys(),i,t))X(e),Ut(s)}function Oe(i,t){for(const e of zt(ct.keys(),i))Dt(ot,ct,e),ke(e===i?t:t+e.slice(i.length))}function Ce(i,t){if(t)for(const e of zt(ct.keys(),i))Dt(ot,ct,e);else Dt(ot,ct,i)}function Ut(i){const t=at.get(i);t&&clearTimeout(t),at.set(i,setTimeout(()=>Cs(i),Os))}function gt(i,t,e){if(!v)return;const s=Date.now();switch(i){case c.WRITE:case c.APPEND:case c.TRUNCATE:case c.FWRITE:case c.FTRUNCATE:case c.COPY:case c.LINK:{Ut(t),Et(t);break}case c.SYMLINK:{ke(t),Ut(t);break}case c.UNLINK:case c.RMDIR:{X(t),Ce(t,i===c.RMDIR),v.postMessage({op:"delete",path:t,ts:s}),vt(t);break}case c.MKDIR:case c.MKDTEMP:v.postMessage({op:"mkdir",path:t,ts:s});break;case c.RENAME:if(e){X(t),X(e),De(t,e),Oe(t,e);const n=Ve(D,t,e,s);for(const r of n.messages)r.op==="write"&&n.transfers.includes(r.data)?v.postMessage(r,[r.data]):v.postMessage(r);vt(t)}break}}function Fs(i){switch(i.op){case"external-write":{let t=D.write(i.path,new Uint8Array(i.data),0);t.status===Y.EISDIR&&(D.rmdir(i.path,1),t=D.write(i.path,new Uint8Array(i.data),0)),t.status===0&&(Et(i.path),It(c.WRITE,i.path)),console.log("[sync-relay] external-write:",i.path,`${i.data?.byteLength??0}B`,`status=${t.status}`);break}case"external-delete":{X(i.path);let t=!1,e=D.unlink(i.path).status===0;e||(e=D.rmdir(i.path,1).status===0,t=e),e&&(Ce(i.path,t),vt(i.path),It(t?c.RMDIR:c.UNLINK,i.path)),console.log("[sync-relay] external-delete:",i.path,`dir=${t}`,`ok=${e}`);break}case"external-rename":if(i.newPath){const t=D.rename(i.path,i.newPath);t.status===0&&(X(i.path),X(i.newPath),De(i.path,i.newPath),Oe(i.path,i.newPath),vt(i.path),It(c.RENAME,i.path,i.newPath)),console.log("[sync-relay] external-rename:",i.path,"\\u2192",i.newPath,`status=${t.status}`)}break}}self.onmessage=async i=>{const t=i.data;if(t.type==="async-port"){const e=t.port??i.ports[0];e&&(Wt=e,e.onmessage=async s=>{if(s.data.buffer instanceof ArrayBuffer){if(q){const n=tt?await pt(N||"nosab",s.data.buffer):yt(N||"nosab",s.data.buffer),r=W(n.status,n.data);e.postMessage({id:s.data.id,buffer:r},[r]),!tt&&n._op!==void 0&&gt(n._op,n._path,n._newPath)}else if(st.hasPort){const n=s.data.buffer;st.postRaw({id:s.data.id,tabId:N,buffer:n},[n])}}},e.start());return}if(t.type==="init-leader"){if(q)return;q=!0,N=t.tabId;const e=t.sab!=null;e&&(x=t.sab,et=t.readySab,A=new Int32Array(x,0,8),z=new Int32Array(et,0,1),Vt()),t.asyncSab&&(_=t.asyncSab,k=new Int32Array(t.asyncSab,0,8));try{await ks(t.config)}catch(s){q=!1,self.postMessage({type:"init-failed",error:s.message});return}Z||(Z=!0,e&&(Atomics.store(z,0,1),Atomics.notify(z,0)),self.postMessage({type:"ready"})),e&&qt(bs,"leaderLoop");return}if(t.type==="init-opfs"){q=!0,Z=!1,N=t.tabId;const e=t.sab!=null;e&&(x=t.sab,et=t.readySab,A=new Int32Array(x,0,8),z=new Int32Array(et,0,1),Vt()),t.asyncSab&&(_=t.asyncSab,k=new Int32Array(t.asyncSab,0,8));try{await Ds(t.config)}catch(s){q=!1,self.postMessage({type:"init-failed",error:s.message});return}Z||(Z=!0,e&&(Atomics.store(z,0,1),Atomics.notify(z,0)),self.postMessage({type:"ready",mode:"opfs"})),e&&qt(Is,"leaderLoopOPFS");return}if(t.type==="init-follower"){N=t.tabId,t.sab!=null&&(x=t.sab,et=t.readySab,A=new Int32Array(x,0,8),z=new Int32Array(et,0,1),Vt()),t.asyncSab&&(_=t.asyncSab,k=new Int32Array(t.asyncSab,0,8));return}if(t.type==="leader-port"){if(q)return;const e=t.port??i.ports[0];if(!e)return;st.setPort(e),e.onmessage=us,e.start(),Z||(Z=!0,z&&(Atomics.store(z,0,1),Atomics.notify(z,0)),self.postMessage({type:"ready"}),A&&Es());return}if(t.type==="client-port"){rs(t.tabId,t.port??i.ports[0]);return}if(t.type==="client-lost"){as(t.tabId);return}if(t.type==="external-records"){v?.postMessage({type:"external-records",records:t.records});return}if(t.type==="shutdown"){if(dt){const e=dt;dt=null,await new Promise(s=>{const n=()=>{clearTimeout(r),je(e),s()},r=setTimeout(n,500);e.onmessage=a=>{a.data?.type==="shutdown-done"&&n()}})}try{v?.close()}catch{}v=null,Kt=!1,self.postMessage({type:"shutdown-done"});return}};\n';
+
+// src/workers/inlined/async-relay.workertext
+var async_relay_default = 'var d={READ:1,WRITE:2,UNLINK:3,STAT:4,LSTAT:5,MKDIR:6,RMDIR:7,READDIR:8,RENAME:9,EXISTS:10,TRUNCATE:11,APPEND:12,COPY:13,ACCESS:14,REALPATH:15,CHMOD:16,CHOWN:17,UTIMES:18,SYMLINK:19,READLINK:20,LINK:21,OPEN:22,CLOSE:23,FREAD:24,FWRITE:25,FSTAT:26,FTRUNCATE:27,FSYNC:28,OPENDIR:29,MKDTEMP:30,FCHMOD:31,FCHOWN:32,FUTIMES:33,STATFS:34},b={OK:0,ENOENT:1,EEXIST:2,EISDIR:3,ENOTDIR:4,ENOTEMPTY:5,EACCES:6,EINVAL:7,EBADF:8,ELOOP:9,ENOSPC:10,EIO:11},N={CONTROL:0,TICKET_NEXT:4,TICKET_SERVING:8,OPCODE:4,STATUS:8,CHUNK_LEN:12,TOTAL_LEN:16,CHUNK_IDX:24,HEARTBEAT:28,HEADER_SIZE:32},u={IDLE:0,REQUEST:1,RESPONSE:2,CHUNK:3,CHUNK_ACK:4},m=new TextEncoder,Q=new TextDecoder;function w(e,t,r=0,n){const s=m.encode(t),i=n?n.byteLength:0,f=16+s.byteLength+i,A=new ArrayBuffer(f),c=new DataView(A);c.setUint32(0,e,!0),c.setUint32(4,r,!0),c.setUint32(8,s.byteLength,!0),c.setUint32(12,i,!0);const o=new Uint8Array(A);return o.set(s,16),n&&o.set(n,16+s.byteLength),A}function R(e){const t=new DataView(e),r=t.getUint32(0,!0),n=t.getUint32(4,!0),s=n>0?new Uint8Array(e,8,n):null;return{status:r,data:s}}function p(e,t,r,n=0){const s=m.encode(r),i=new Uint8Array(4+s.byteLength);return new DataView(i.buffer).setUint32(0,s.byteLength,!0),i.set(s,4),w(e,t,n,i)}function g(e){const t=new Uint8Array(4);return K(t,0,e),t}function O(e,t,r){const n=new Uint8Array(16),s=new DataView(n.buffer);return s.setUint32(0,e,!0),s.setUint32(4,t,!0),s.setFloat64(8,r??-1,!0),n}function v(e,t,r){const n=new Uint8Array(12+r.byteLength),s=new DataView(n.buffer);return s.setUint32(0,e,!0),s.setFloat64(4,t??-1,!0),n.set(r,12),n}function F(e,t){const r=new Uint8Array(12),n=new DataView(r.buffer);return n.setUint32(0,e,!0),n.setFloat64(4,t,!0),r}function K(e,t,r){e[t]=r,e[t+1]=r>>>8,e[t+2]=r>>>16,e[t+3]=r>>>24}var P=12e4,C=1e3,h=class extends Error{constructor(e){super(`SAB protocol wait timed out: ${e}`),this.name="SabWaitTimeoutError"}};function I(e,t,r,n,s=C){for(;Atomics.load(e,0)===t;){const i=r-Date.now();if(i<=0)throw new h(n);Atomics.wait(e,0,t,Math.min(s,i))}}function M(e,t,r,n){for(;;){const s=Atomics.load(e,0);if(t.includes(s))return s;const i=r-Date.now();if(i<=0)throw new h(n);Atomics.wait(e,0,s,Math.min(C,i))}}var H=new TextEncoder,T=N.HEADER_SIZE,l=null,a=null,S=null;function _(e){const t=Date.now()+P;try{return B(e,t)}catch(r){if(r instanceof h)return Atomics.store(a,0,u.IDLE),{status:b.EIO,data:null};throw r}}function B(e,t){const r=l.byteLength-T,n=new Uint8Array(e),s=new BigUint64Array(l,N.TOTAL_LEN,1);if(n.byteLength<=r)new Uint8Array(l,T,n.byteLength).set(n),Atomics.store(a,3,n.byteLength),Atomics.store(s,0,BigInt(n.byteLength)),Atomics.store(a,0,u.REQUEST),Atomics.notify(a,0),S&&Atomics.notify(S,0);else{let o=0;for(;o<n.byteLength;){const E=Math.min(r,n.byteLength-o);new Uint8Array(l,T,E).set(n.subarray(o,o+E)),Atomics.store(a,3,E),Atomics.store(s,0,BigInt(n.byteLength)),Atomics.store(a,6,Math.floor(o/r)),o===0?Atomics.store(a,0,u.REQUEST):Atomics.store(a,0,u.CHUNK),Atomics.notify(a,0),o===0&&S&&Atomics.notify(S,0),o+=E,o<n.byteLength&&I(a,o===E?u.REQUEST:u.CHUNK,t,"request chunk ack")}I(a,u.CHUNK,t,"last request chunk ack")}const i=M(a,[u.RESPONSE,u.CHUNK],t,"response"),f=Atomics.load(a,3),A=Number(Atomics.load(s,0));let c;if(i===u.RESPONSE&&A<=r)c=new Uint8Array(l,T,f).slice();else{c=new Uint8Array(A);let o=0;for(c.set(new Uint8Array(l,T,f),0),o+=f;o<A;){Atomics.store(a,0,u.CHUNK_ACK),Atomics.notify(a,0),I(a,u.CHUNK_ACK,t,"response chunk");const E=Atomics.load(a,3);c.set(new Uint8Array(l,T,E),o),o+=E}}return Atomics.store(a,0,u.IDLE),Atomics.notify(a,0),R(c.buffer)}var y=null,U=new Map,q=0;function k(){return"a"+q++}function W(e){return new Promise(t=>{const r=k();U.set(r,n=>{t(R(n))}),y.postMessage({id:r,buffer:e},[e])})}async function V(e){return l?_(e):y?W(e):{status:7,data:null}}self.onmessage=async e=>{const t=e.data;if(t.type==="init-leader"){l=t.asyncSab,a=new Int32Array(t.asyncSab,0,8),t.wakeSab&&(S=new Int32Array(t.wakeSab,0,1));return}if(t.type==="init-port"){const r=t.port??e.ports[0];r&&(y=r,y.onmessage=n=>{const{id:s,buffer:i}=n.data,f=U.get(s);f&&(U.delete(s),f(i))},y.start());return}if(t.type!=="init-follower"){if(t.type==="leader-port"){y=t.port,y.onmessage=r=>{const{id:n,buffer:s}=r.data,i=U.get(n);i&&(U.delete(n),i(s))},y.start();return}if(t.type==="request"){const{callId:r,op:n,path:s,data:i,flags:f,path2:A,fdArgs:c}=t;try{let o;if(A!==void 0)o=p(n,s,A,f??0);else if(c)o=Y(n,c);else{const D=x(i);o=w(n,s??"",f??0,D??void 0)}const{status:E,data:L}=await V(o);self.postMessage({type:"response",callId:r,status:E,data:L},L?[L.buffer]:[])}catch(o){self.postMessage({type:"response",callId:r,status:7,data:null,error:o.message})}}}};function x(e){return e==null?null:e instanceof Uint8Array?e:e instanceof ArrayBuffer?new Uint8Array(e):typeof e=="string"?H.encode(e):null}function Y(e,t){switch(e){case d.FREAD:return w(e,"",0,O(t.fd,t.length??0,t.position??-1));case d.FWRITE:return w(e,"",0,v(t.fd,t.position??-1,t.data??new Uint8Array(0)));case d.FSTAT:case d.CLOSE:case d.FSYNC:return w(e,"",0,g(t.fd));case d.FTRUNCATE:return w(e,"",0,F(t.fd,t.length??0));default:return w(e,"",0)}}\n';
 
 // src/path.ts
 var path_exports = {};
@@ -3006,19 +3186,70 @@ function matchWatcher(entry, mutatedPath) {
   if (recursive) return relativePath;
   return relativePath.indexOf("/") === -1 ? relativePath : null;
 }
-function watch(ns, filePath, options, listener) {
+var VFSWatcher = class extends SimpleEventEmitter {
+  #stop;
+  #closed = false;
+  constructor(stop) {
+    super();
+    this.#stop = stop;
+  }
+  close() {
+    if (this.#closed) return;
+    this.#closed = true;
+    this.#stop();
+    this.emit("close");
+  }
+  /**
+   * Node's watchers hold the event loop open and `ref`/`unref` say whether they should. There is
+   * no loop to hold open in a browser, so these keep the chainable shape and do nothing.
+   */
+  ref() {
+    return this;
+  }
+  unref() {
+    return this;
+  }
+};
+var VFSStatWatcher = class extends SimpleEventEmitter {
+  #stop;
+  constructor(stop) {
+    super();
+    this.#stop = stop;
+  }
+  /** `stop()` is `unwatchFile` for this listener alone — see node's `StatWatcher#stop`. */
+  stop() {
+    this.#stop();
+  }
+  ref() {
+    return this;
+  }
+  unref() {
+    return this;
+  }
+};
+function watch(ns, syncRequest, filePath, options, listener) {
   const listenerInOptions = typeof options === "function";
-  const cb = (listenerInOptions ? options : listener) ?? (() => {
-  });
+  const cb = listenerInOptions ? options : listener;
   const opts = typeof options === "string" ? { encoding: options } : listenerInOptions || options == null ? {} : options;
   const absPath = resolve(filePath);
   const signal = opts.signal;
   const asBuffer = opts.encoding === "buffer";
+  try {
+    statSync(syncRequest, absPath);
+  } catch (err) {
+    const code = err.code;
+    throw code ? createError(code, "watch", filePath) : err;
+  }
+  const watcher = new VFSWatcher(() => {
+    watchers.delete(entry);
+    releaseBc(ns);
+  });
+  if (cb) watcher.on("change", cb);
   const entry = {
     ns,
     absPath,
     recursive: opts.recursive ?? false,
-    listener: cb,
+    listener: (eventType, filename) => watcher.emit("change", eventType, filename),
     signal,
     asBuffer,
     pendingEvents: null
@@ -3037,18 +3268,6 @@ function watch(ns, filePath, options, listener) {
       signal.addEventListener("abort", onAbort);
     }
   }
-  const watcher = {
-    close() {
-      watchers.delete(entry);
-      releaseBc(ns);
-    },
-    ref() {
-      return watcher;
-    },
-    unref() {
-      return watcher;
-    }
-  };
   return watcher;
 }
 function watchFile(ns, syncRequest, filePath, optionsOrListener, listener) {
@@ -3061,18 +3280,21 @@ function watchFile(ns, syncRequest, filePath, optionsOrListener, listener) {
     opts = optionsOrListener ?? {};
     cb = listener;
   }
-  if (!cb) return;
   const absPath = resolve(filePath);
+  if (!cb) return new VFSStatWatcher(() => {
+  });
   const interval = opts.interval ?? 5007;
   let prevStats = null;
   try {
     prevStats = statSync(syncRequest, absPath);
   } catch {
   }
+  const watcher = new VFSStatWatcher(() => unwatchFile(ns, filePath, cb));
   const entry = {
     ns,
     absPath,
     listener: cb,
+    watcher,
     interval,
     prevStats,
     syncRequest,
@@ -3086,6 +3308,7 @@ function watchFile(ns, syncRequest, filePath, optionsOrListener, listener) {
   }
   set.add(entry);
   entry.timerId = setInterval(() => triggerWatchFile(entry), interval);
+  return watcher;
 }
 function unwatchFile(ns, filePath, listener) {
   const absPath = resolve(filePath);
@@ -3121,6 +3344,10 @@ function triggerWatchFile(entry) {
     entry.prevStats = currStats;
     try {
       entry.listener(curr, prev);
+    } catch {
+    }
+    try {
+      entry.watcher?.emit("change", curr, prev);
     } catch {
     }
   }
@@ -3288,6 +3515,11 @@ function joinPath(base, name) {
   if (base === "/") return "/" + name;
   return base + "/" + name;
 }
+function toResultPath(fullPath, cwd, patternIsAbsolute) {
+  if (patternIsAbsolute) return fullPath;
+  const base = cwd === "/" ? "/" : cwd.replace(/\/+$/, "") + "/";
+  return fullPath.startsWith(base) ? fullPath.slice(base.length) : fullPath;
+}
 function normalizeCwd(cwd) {
   if (!cwd) return "/";
   if (typeof cwd === "string") return cwd || "/";
@@ -3302,6 +3534,7 @@ function globSync(syncRequest, pattern, options) {
   const cwd = normalizeCwd(options?.cwd);
   const exclude = options?.exclude;
   const withFileTypes = options?.withFileTypes === true;
+  const patternIsAbsolute = patterns.every((p) => p.startsWith("/"));
   const resultsSet = /* @__PURE__ */ new Set();
   const resultsDirents = [];
   const pushResult = (fullPath) => {
@@ -3326,7 +3559,7 @@ function globSync(syncRequest, pattern, options) {
       }
     } else {
       if (exclude && exclude(fullPath)) return;
-      resultsSet.add(fullPath);
+      resultsSet.add(toResultPath(fullPath, cwd, patternIsAbsolute));
     }
   };
   function walk(dir, segments, segIdx) {
@@ -3396,6 +3629,7 @@ async function glob(asyncRequest, pattern, options) {
   const cwd = normalizeCwd(options?.cwd);
   const exclude = options?.exclude;
   const withFileTypes = options?.withFileTypes === true;
+  const patternIsAbsolute = patterns.every((p) => p.startsWith("/"));
   const resultsSet = /* @__PURE__ */ new Set();
   const resultsDirents = [];
   const pushResult = async (fullPath) => {
@@ -3419,7 +3653,7 @@ async function glob(asyncRequest, pattern, options) {
       resultsDirents.push(dirent);
     } else {
       if (exclude && exclude(fullPath)) return;
-      resultsSet.add(fullPath);
+      resultsSet.add(toResultPath(fullPath, cwd, patternIsAbsolute));
     }
   };
   async function walk(dir, segments, segIdx) {
@@ -3483,6 +3717,221 @@ async function glob(asyncRequest, pattern, options) {
   return withFileTypes ? resultsDirents : Array.from(resultsSet);
 }
 
+// src/utf8-stream.ts
+function createUtf8StreamClass(host) {
+  return class Utf8Stream extends SimpleEventEmitter {
+    #fd = -1;
+    #file;
+    #buffer = [];
+    #pending = 0;
+    #writing = false;
+    #destroyed = false;
+    #ended = false;
+    #timer = null;
+    #minLength;
+    #maxLength;
+    #append;
+    #mode;
+    #mkdir;
+    #sync;
+    #fsync;
+    #periodicFlush;
+    #contentMode;
+    constructor(options = {}) {
+      super();
+      if (typeof options !== "object" || options === null) {
+        throw invalidArgType("options", "object", options);
+      }
+      const { dest, fd, contentMode = "utf8" } = options;
+      if (contentMode !== "utf8" && contentMode !== "buffer") {
+        throw invalidArgValue("contentMode", contentMode, "must be 'utf8' or 'buffer'");
+      }
+      if (dest === void 0 && fd === void 0) {
+        throw invalidArgValue("options", options, "must contain either dest or fd");
+      }
+      this.#minLength = options.minLength ?? 0;
+      this.#maxLength = options.maxLength ?? 0;
+      this.#append = options.append ?? true;
+      this.#mode = options.mode;
+      this.#mkdir = options.mkdir ?? false;
+      this.#sync = options.sync ?? false;
+      this.#fsync = options.fsync ?? false;
+      this.#periodicFlush = options.periodicFlush ?? 0;
+      this.#contentMode = contentMode;
+      if (fd !== void 0) {
+        this.#fd = fd;
+      } else {
+        this.#file = dest;
+        this.#open();
+      }
+      if (this.#periodicFlush > 0) {
+        this.#timer = setInterval(() => this.flush(), this.#periodicFlush);
+        this.#timer.unref?.();
+      }
+      queueMicrotask(() => {
+        if (!this.#destroyed) this.emit("ready");
+      });
+    }
+    #open() {
+      const file = this.#file;
+      try {
+        if (this.#mkdir) host.mkdirSync(host.dirname(file), { recursive: true });
+        this.#fd = host.openSync(file, this.#append ? "a" : "w", this.#mode);
+      } catch (err) {
+        queueMicrotask(() => this.emit("error", err));
+      }
+    }
+    // ---- getters, all read-only, matching node's ----
+    get fd() {
+      return this.#fd;
+    }
+    get file() {
+      return this.#file;
+    }
+    get minLength() {
+      return this.#minLength;
+    }
+    get maxLength() {
+      return this.#maxLength;
+    }
+    get writing() {
+      return this.#writing;
+    }
+    get sync() {
+      return this.#sync;
+    }
+    get fsync() {
+      return this.#fsync;
+    }
+    get append() {
+      return this.#append;
+    }
+    get mode() {
+      return this.#mode;
+    }
+    get mkdir() {
+      return this.#mkdir;
+    }
+    get periodicFlush() {
+      return this.#periodicFlush;
+    }
+    get contentMode() {
+      return this.#contentMode;
+    }
+    /**
+     * Queue a chunk. Returns `false` once `maxLength` is exceeded, as a Node writable does when
+     * its buffer is full — and, like node's, the over-limit chunk is **dropped** rather than
+     * queued, with a `drop` event.
+     */
+    write(chunk) {
+      if (this.#destroyed) throw new Error("Utf8Stream destroyed");
+      if (this.#ended) throw new Error("Utf8Stream ended");
+      if (this.#contentMode === "utf8" && typeof chunk !== "string") {
+        throw invalidArgType("chunk", "string", chunk);
+      }
+      if (this.#contentMode === "buffer" && typeof chunk === "string") {
+        throw invalidArgType("chunk", "Uint8Array", chunk);
+      }
+      const bytes = typeof chunk === "string" ? new TextEncoder().encode(chunk) : chunk;
+      if (this.#maxLength > 0 && this.#pending + bytes.byteLength > this.#maxLength) {
+        this.emit("drop", chunk);
+        return false;
+      }
+      this.#buffer.push(bytes);
+      this.#pending += bytes.byteLength;
+      if (this.#pending >= this.#minLength) this.#drain();
+      return true;
+    }
+    #drain() {
+      if (this.#buffer.length === 0 || this.#fd < 0) return;
+      const payload = this.#join();
+      this.#buffer = [];
+      this.#pending = 0;
+      this.#writing = true;
+      try {
+        const written = host.writeSync(this.#fd, payload);
+        if (this.#fsync) host.fsyncSync(this.#fd);
+        this.#writing = false;
+        this.emit("write", written);
+        this.emit("drain");
+      } catch (err) {
+        this.#writing = false;
+        this.emit("error", err);
+      }
+    }
+    #join() {
+      if (this.#buffer.length === 1) return this.#buffer[0];
+      const out = new Uint8Array(this.#pending);
+      let at = 0;
+      for (const part of this.#buffer) {
+        out.set(part, at);
+        at += part.byteLength;
+      }
+      return out;
+    }
+    /** Flush buffered bytes, calling back when they have reached the file. */
+    flush(callback) {
+      try {
+        this.#drain();
+        if (callback) queueMicrotask(() => callback(null));
+      } catch (err) {
+        if (callback) queueMicrotask(() => callback(err));
+        else this.emit("error", err);
+      }
+    }
+    /** Flush synchronously. Everything here is synchronous already; this forces the batch out. */
+    flushSync() {
+      this.#drain();
+    }
+    /** Close the current descriptor and open the destination again — log rotation. */
+    reopen(dest) {
+      if (this.#destroyed) throw new Error("Utf8Stream destroyed");
+      this.#drain();
+      if (this.#fd >= 0 && this.#file !== void 0) {
+        try {
+          host.closeSync(this.#fd);
+        } catch {
+        }
+      }
+      if (dest !== void 0) this.#file = dest;
+      if (this.#file === void 0) throw invalidArgValue("dest", dest, "is required to reopen an fd-backed stream");
+      this.#open();
+      this.emit("ready");
+    }
+    /** Flush, close, then emit `finish` and `close`. */
+    end() {
+      if (this.#ended || this.#destroyed) return;
+      this.#ended = true;
+      this.#drain();
+      this.#close();
+      this.emit("finish");
+      this.emit("close");
+    }
+    /** Drop everything without flushing. */
+    destroy() {
+      if (this.#destroyed) return;
+      this.#destroyed = true;
+      this.#buffer = [];
+      this.#pending = 0;
+      this.#close();
+      this.emit("close");
+    }
+    #close() {
+      if (this.#timer) {
+        clearInterval(this.#timer);
+        this.#timer = null;
+      }
+      if (this.#fd >= 0 && this.#file !== void 0) {
+        try {
+          host.closeSync(this.#fd);
+        } catch {
+        }
+      }
+      this.#fd = -1;
+    }
+  };
+}
+
 // src/filesystem.ts
 new TextEncoder();
 var DEFAULT_SAB_SIZE = 2 * 1024 * 1024;
@@ -3537,6 +3986,25 @@ function assertCopyable(srcPath, destPath) {
   const srcPrefix = srcPath.endsWith("/") ? srcPath : srcPath + "/";
   if (destPath.startsWith(srcPrefix)) throw cpIntoSubdirectory(srcPath, destPath);
 }
+async function _readFileAsBlobBytes(read) {
+  let data;
+  try {
+    data = await read;
+  } catch (err) {
+    const code = err.code;
+    if (code === "ENOENT" || code === "EACCES" || code === "ENOTDIR" || code === "ELOOP") {
+      throw Object.assign(new TypeError("Unable to open file as blob"), { code: "ERR_INVALID_ARG_VALUE" });
+    }
+    throw err;
+  }
+  return data instanceof Uint8Array ? data : new TextEncoder().encode(data);
+}
+var LIVE_KEY = "__componentorFsLiveInstances";
+var liveInstances = globalThis[LIVE_KEY] ?? (globalThis[LIVE_KEY] = /* @__PURE__ */ new Set());
+async function disposeAll() {
+  await Promise.all([...liveInstances].map((fs) => fs.dispose().catch(() => {
+  })));
+}
 var VFSFileSystem = class {
   /**
    * `fs.constants` — the flag/mode constants (`F_OK`, `O_CREAT`, `COPYFILE_EXCL`, …).
@@ -3557,6 +4025,49 @@ var VFSFileSystem = class {
   }
   get Dir() {
     return Dir;
+  }
+  /**
+   * `fs.Utf8Stream` — node 24's buffered append stream, the engine behind fast logging.
+   *
+   * Built per instance rather than exported as a module constant, because it writes through
+   * *this* filesystem; node's can be a free class because there is only one real one. Cached so
+   * `fs.Utf8Stream === fs.Utf8Stream` and `instanceof` behaves.
+   */
+  get Utf8Stream() {
+    return this._utf8StreamClass ??= createUtf8StreamClass({
+      openSync: (p, flags, mode) => this.openSync(p, flags, mode),
+      writeSync: (fd, data) => this.writeSync(fd, data),
+      closeSync: (fd) => this.closeSync(fd),
+      fsyncSync: (fd) => this.fsyncSync(fd),
+      mkdirSync: (p, o) => {
+        this.mkdirSync(p, o);
+      },
+      dirname
+    });
+  }
+  /**
+   * TypeScript-private rather than a `#` field on purpose: the test harness builds an instance
+   * with `Object.create(VFSFileSystem.prototype)` and never runs the constructor, and a real
+   * private field would not exist on such an object — reading it throws rather than returning
+   * `undefined`.
+   */
+  _utf8StreamClass;
+  /**
+   * Node's internal time coercion, exposed under the same underscored name node uses.
+   *
+   * Reduces a `Date`, a number of seconds, or a numeric string to seconds since the epoch. A
+   * negative number means *now*, which is the part that surprises people — see
+   * {@link toUnixTimestamp}.
+   */
+  _toUnixTimestamp(time, name = "time") {
+    return toUnixTimestamp(time, name);
+  }
+  /**
+   * Not on node's `fs` — node keeps `BigIntStats` internal — but `stat({ bigint: true })` returns
+   * one, and there was no way to `instanceof` the result. Exposed for symmetry with `Stats`.
+   */
+  get BigIntStats() {
+    return BigIntStats;
   }
   // SAB for sync communication with sync relay worker (null when SAB unavailable)
   sab;
@@ -3583,6 +4094,18 @@ var VFSFileSystem = class {
   closed = false;
   /** The `pagehide` handler, kept so {@link dispose} can unregister it. */
   onPageHide = null;
+  /**
+   * Watches real OPFS for changes made outside this library.
+   *
+   * Lives here, in the scope that owns the instance, rather than inside the mirror worker — the
+   * whole point is that `disconnect()` is reachable **synchronously** from the unload path. A
+   * recursive observer still attached when its page is torn down makes Chromium abort the entire
+   * browser process, and an observer inside a nested worker cannot be detached in time: the page
+   * can post a shutdown at `pagehide` but cannot wait for it.
+   *
+   * Only the detected records cross into the worker; the file I/O stays there.
+   */
+  externalObserver = null;
   /** True while a leader transition is in flight (promotion to leader, etc.).
    *  Cleared the moment the new sync-relay signals `ready`. Consumers can
    *  combine this with `isReady` to know when sync FS ops are safe again. */
@@ -3671,7 +4194,9 @@ var VFSFileSystem = class {
     }
     this.syncWorker = this.spawnWorker("sync-relay");
     this.asyncWorker = this.spawnWorker("async-relay");
+    liveInstances.add(this);
     this.installUnloadTeardown();
+    void this.watchExternalChanges();
     this.syncWorker.onmessage = (e) => {
       const msg = e.data;
       if (msg.type === "ready") {
@@ -3981,8 +4506,8 @@ var VFSFileSystem = class {
       this.resolveReady = resolve2;
       this.rejectReady = reject;
     });
-    this.syncWorker.terminate();
-    this.asyncWorker.terminate();
+    terminateWorker(this.syncWorker);
+    terminateWorker(this.asyncWorker);
     const sabSize = this.config.sabSize;
     if (this.hasSAB) {
       this.sab = new SharedArrayBuffer(sabSize);
@@ -4044,9 +4569,16 @@ var VFSFileSystem = class {
     }
   }
   /** Spawn an inline worker from bundled code */
+  /**
+   * Start one of the relay workers from source embedded in this bundle.
+   *
+   * This used to resolve `new URL('./workers/<name>.worker.js', import.meta.url)`, which meant
+   * the package could not be loaded from a CDN at all (a cross-origin `new Worker()` is a
+   * `SecurityError`) and needed `optimizeDeps.exclude` under Vite, whose pre-bundling rewrites
+   * that URL. See [worker-blob.ts](./workers/worker-blob.ts).
+   */
   spawnWorker(name) {
-    const workerUrl = new URL(`./workers/${name}.worker.js`, import.meta.url);
-    return new Worker(workerUrl, { type: "module" });
+    return workerFromSource(name === "sync-relay" ? sync_relay_default : async_relay_default, `vfs-${name}`);
   }
   // ========== Sync operation primitives ==========
   /** Block until workers are ready */
@@ -4240,11 +4772,12 @@ var VFSFileSystem = class {
   _cpSyncInner(src, dest, options) {
     const srcPath = toPathString(src);
     const destPath = toPathString(dest);
+    if (options?.filter && !options.filter(srcPath, destPath)) return;
     const force = options?.force !== false;
     const errorOnExist = options?.errorOnExist ?? false;
-    const dereference = options?.dereference ?? false;
+    options?.dereference ?? false;
     const preserveTimestamps = options?.preserveTimestamps ?? false;
-    const srcStat = dereference ? this.statSync(srcPath) : this.lstatSync(srcPath);
+    const srcStat = this.lstatSync(srcPath);
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
         throw cpEisdirNotRecursive(srcPath);
@@ -4260,7 +4793,7 @@ var VFSFileSystem = class {
         const destChild = join(destPath, entry.name);
         this._cpSyncInner(srcChild, destChild, options);
       }
-    } else if (srcStat.isSymbolicLink() && !dereference) {
+    } else if (srcStat.isSymbolicLink()) {
       const target = this.readlinkSync(srcPath);
       let destExists = false;
       try {
@@ -4293,11 +4826,12 @@ var VFSFileSystem = class {
     }
   }
   async _cpAsync(src, dest, options) {
+    if (options?.filter && !options.filter(src, dest)) return;
     const force = options?.force !== false;
     const errorOnExist = options?.errorOnExist ?? false;
-    const dereference = options?.dereference ?? false;
+    options?.dereference ?? false;
     const preserveTimestamps = options?.preserveTimestamps ?? false;
-    const srcStat = dereference ? await this.promises.stat(src) : await this.promises.lstat(src);
+    const srcStat = await this.promises.lstat(src);
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
         throw cpEisdirNotRecursive(src);
@@ -4313,7 +4847,7 @@ var VFSFileSystem = class {
         const destChild = join(dest, entry.name);
         await this._cpAsync(srcChild, destChild, options);
       }
-    } else if (srcStat.isSymbolicLink() && !dereference) {
+    } else if (srcStat.isSymbolicLink()) {
       const target = await this.promises.readlink(src);
       let destExists = false;
       try {
@@ -4357,9 +4891,14 @@ var VFSFileSystem = class {
   chmodSync(filePath, mode) {
     chmodSync(this._sync, toPathString(filePath), mode);
   }
-  /** Like chmodSync but operates on the symlink itself. In this VFS, delegates to chmodSync. */
+  /**
+   * `chmod` on the symlink itself rather than on what it points at.
+   *
+   * This used to delegate straight to `chmodSync`, which follows the link — so it changed the
+   * **target's** permissions, the one outcome the `l` prefix exists to rule out.
+   */
   lchmodSync(filePath, mode) {
-    chmodSync(this._sync, toPathString(filePath), mode);
+    chmodSync(this._sync, toPathString(filePath), mode, false);
   }
   /** chmod on an open file descriptor. Resolves the fd to its inode on the
    *  server side and mutates the inode's mode bits directly, matching what
@@ -4370,9 +4909,9 @@ var VFSFileSystem = class {
   chownSync(filePath, uid, gid) {
     chownSync(this._sync, toPathString(filePath), uid, gid);
   }
-  /** Like chownSync but operates on the symlink itself. In this VFS, delegates to chownSync. */
+  /** `chown` on the symlink itself rather than its target — see {@link lchmodSync}. */
   lchownSync(filePath, uid, gid) {
-    chownSync(this._sync, toPathString(filePath), uid, gid);
+    chownSync(this._sync, toPathString(filePath), uid, gid, false);
   }
   /** chown on an open file descriptor. Mutates the underlying inode's uid/gid. */
   fchownSync(fd, uid, gid) {
@@ -4385,9 +4924,9 @@ var VFSFileSystem = class {
   futimesSync(fd, atime, mtime) {
     futimesSync(this._sync, fd, atime, mtime);
   }
-  /** Like utimesSync but operates on the symlink itself. In this VFS, delegates to utimesSync. */
+  /** Timestamps on the symlink itself rather than its target — see {@link lchmodSync}. */
   lutimesSync(filePath, atime, mtime) {
-    utimesSync(this._sync, toPathString(filePath), atime, mtime);
+    utimesSync(this._sync, toPathString(filePath), atime, mtime, false);
   }
   symlinkSync(target, linkPath, type) {
     symlinkSync(this._sync, toPathString(target), toPathString(linkPath));
@@ -4404,8 +4943,9 @@ var VFSFileSystem = class {
   /**
    * The stream constructors, exposed as properties the way `node:fs` exposes them, so
    * `x instanceof fs.ReadStream` and `fs.FileReadStream` resolve for code written against Node.
-   * `Stats`, `Dirent` and `Dir` are deliberately absent: they are structural interfaces here,
-   * not runtime classes, and a fake constructor would make `instanceof` lie.
+   * `Stats`, `Dirent` and `Dir` are exposed the same way — see the getters near the top of the
+   * class. They became real classes in 3.3.27; before that they were object literals and there
+   * was nothing for `instanceof` to test against.
    */
   get ReadStream() {
     return NodeReadable;
@@ -4460,7 +5000,7 @@ var VFSFileSystem = class {
     fdatasyncSync(this._sync, fd);
   }
   fsyncSync(fd) {
-    fdatasyncSync(this._sync, fd);
+    fdatasyncSync(this._sync, fd, "fsync");
   }
   // ---- Vector I/O methods ----
   readvSync(fd, buffers, position) {
@@ -4530,8 +5070,8 @@ var VFSFileSystem = class {
    * volume actually held — so code checking free space before a large write got an answer
    * unrelated to reality, and never saw a full disk coming.
    */
-  statfsSync(path = "/") {
-    return statfsSync(this._sync, toPathString(path));
+  statfsSync(path = "/", options) {
+    return statfsSync(this._sync, toPathString(path), options);
   }
   statfs(path = "/", callback) {
     const promise = statfs(this._async, path);
@@ -4543,19 +5083,18 @@ var VFSFileSystem = class {
   }
   // ---- Watch methods ----
   watch(filePath, options, listener) {
-    return watch(this.ns, toPathString(filePath), options, listener);
+    return watch(this.ns, this._sync, toPathString(filePath), options, listener);
   }
   watchFile(filePath, optionsOrListener, listener) {
-    watchFile(this.ns, this._sync, toPathString(filePath), optionsOrListener, listener);
+    return watchFile(this.ns, this._sync, toPathString(filePath), optionsOrListener, listener);
   }
   unwatchFile(filePath, listener) {
     unwatchFile(this.ns, toPathString(filePath), listener);
   }
   // ---- openAsBlob (Node.js 19+) ----
   async openAsBlob(filePath, options) {
-    const data = await this.promises.readFile(filePath);
-    const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(data);
-    return new Blob([bytes], { type: options?.type ?? "" });
+    const data = await _readFileAsBlobBytes(this.promises.readFile(filePath));
+    return new Blob([data], { type: options?.type ?? "" });
   }
   // ---- Stream methods ----
   createReadStream(filePath, options) {
@@ -4644,6 +5183,60 @@ var VFSFileSystem = class {
     }
   }
   /**
+   * Register the external-change observer, if this mode wants one and the browser has the API.
+   *
+   * Records are forwarded to the mirror worker, which reads the files and applies them; see
+   * `applyExternalRecords` in opfs-sync.worker.ts.
+   */
+  async watchExternalChanges() {
+    if (!this.config.opfsSync) return;
+    if (typeof FileSystemObserver === "undefined") return;
+    if (typeof document === "undefined") return;
+    try {
+      let dir = await navigator.storage.getDirectory();
+      const root = this.config.opfsSyncRoot ?? this.config.root;
+      for (const segment of (root ?? "/").split("/").filter(Boolean)) {
+        dir = await dir.getDirectoryHandle(segment, { create: true });
+      }
+      if (this.closed) return;
+      const observer = new FileSystemObserver((records) => {
+        this.forwardExternalRecords(records.map((record) => ({
+          kind: record.type,
+          path: "/" + record.relativePathComponents.join("/"),
+          from: record.relativePathMovedFrom ? "/" + record.relativePathMovedFrom.join("/") : void 0,
+          handle: record.changedHandle
+        })));
+      });
+      await observer.observe(dir, { recursive: true });
+      if (this.closed) {
+        try {
+          observer.disconnect();
+        } catch {
+        }
+        return;
+      }
+      this.externalObserver = observer;
+    } catch (err) {
+      console.warn("[VFS] external-change watching unavailable:", err?.message);
+    }
+  }
+  /** Hand detected records to the mirror worker, which does the file I/O. */
+  forwardExternalRecords(records) {
+    try {
+      this.syncWorker?.postMessage({ type: "external-records", records });
+    } catch {
+    }
+  }
+  /** Detach the observer. Synchronous on purpose — the unload path cannot await. */
+  stopWatchingExternalChanges() {
+    if (!this.externalObserver) return;
+    try {
+      this.externalObserver.disconnect();
+    } catch {
+    }
+    this.externalObserver = null;
+  }
+  /**
    * Tear the workers down when the page goes away, without needing the caller to remember.
    *
    * The OPFS mirror worker holds a recursive `FileSystemObserver`, and Chromium aborts the
@@ -4663,14 +5256,9 @@ var VFSFileSystem = class {
     if (typeof addEventListener !== "function" || typeof document === "undefined") return;
     this.onPageHide = (event) => {
       if (event.persisted) return;
-      try {
-        this.syncWorker?.terminate();
-      } catch {
-      }
-      try {
-        this.asyncWorker?.terminate();
-      } catch {
-      }
+      this.stopWatchingExternalChanges();
+      terminateWorker(this.syncWorker);
+      terminateWorker(this.asyncWorker);
     };
     addEventListener("pagehide", this.onPageHide);
   }
@@ -4717,19 +5305,15 @@ var VFSFileSystem = class {
   async dispose() {
     if (this.closed) return;
     this.closed = true;
+    liveInstances.delete(this);
+    this.stopWatchingExternalChanges();
     if (this.onPageHide) {
       removeEventListener("pagehide", this.onPageHide);
       this.onPageHide = null;
     }
     await this.shutdownRelay();
-    try {
-      this.syncWorker?.terminate();
-    } catch {
-    }
-    try {
-      this.asyncWorker?.terminate();
-    } catch {
-    }
+    terminateWorker(this.syncWorker);
+    terminateWorker(this.asyncWorker);
     this.isReady = false;
   }
   /** `await using` support, so an instance can be scoped to a block. */
@@ -4758,8 +5342,8 @@ var VFSFileSystem = class {
       this.rejectReady = reject;
     });
     await this.shutdownRelay();
-    this.syncWorker.terminate();
-    this.asyncWorker.terminate();
+    terminateWorker(this.syncWorker);
+    terminateWorker(this.asyncWorker);
     const sabSize = this.config.sabSize;
     if (this.hasSAB) {
       this.sab = new SharedArrayBuffer(sabSize);
@@ -5156,7 +5740,7 @@ var VFSFileSystem = class {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
-    return this._cb(this.promises.glob(pattern, opts), cb);
+    return this._cb(glob(this._async, pattern, opts), cb);
   }
   futimes(fd, atime, mtime, callback) {
     this._validateCb(callback);
@@ -5227,8 +5811,20 @@ var VFSPromises = class {
   async readdir(filePath, options) {
     return readdir(this._async, toPathString(filePath), options);
   }
-  async glob(pattern, options) {
-    return glob(this._async, pattern, options);
+  /**
+   * `fsPromises.glob` — an **async iterator** of matches, which is what node returns.
+   *
+   * This used to be `async glob(): Promise<string[]>`, so the documented way to consume it —
+   * `for await (const p of fsp.glob(pattern))` — got a promise, which is not async-iterable, and
+   * silently produced nothing. `await`ing it worked, which is why it looked fine: the shape was
+   * only wrong for the usage node's own docs show.
+   *
+   * Matches are gathered before the first yield rather than streamed. Observably identical for a
+   * consumer, and the engine answers a glob in one round trip, so there is nothing to stream.
+   */
+  async *glob(pattern, options) {
+    const matches = await glob(this._async, pattern, options);
+    for (const match of matches) yield match;
   }
   async stat(filePath, options) {
     return stat(this._async, toPathString(filePath), options);
@@ -5253,11 +5849,12 @@ var VFSPromises = class {
   async _cpInner(src, dest, options) {
     const srcPath = toPathString(src);
     const destPath = toPathString(dest);
+    if (options?.filter && !options.filter(srcPath, destPath)) return;
     const force = options?.force !== false;
     const errorOnExist = options?.errorOnExist ?? false;
-    const dereference = options?.dereference ?? false;
+    options?.dereference ?? false;
     const preserveTimestamps = options?.preserveTimestamps ?? false;
-    const srcStat = dereference ? await this.stat(srcPath) : await this.lstat(srcPath);
+    const srcStat = await this.lstat(srcPath);
     if (srcStat.isDirectory()) {
       if (!options?.recursive) {
         throw cpEisdirNotRecursive(srcPath);
@@ -5273,7 +5870,7 @@ var VFSPromises = class {
         const destChild = join(destPath, entry.name);
         await this._cpInner(srcChild, destChild, options);
       }
-    } else if (srcStat.isSymbolicLink() && !dereference) {
+    } else if (srcStat.isSymbolicLink()) {
       const target = await this.readlink(srcPath);
       let destExists = false;
       try {
@@ -5317,9 +5914,9 @@ var VFSPromises = class {
   async chmod(filePath, mode) {
     return chmod(this._async, toPathString(filePath), mode);
   }
-  /** Like chmod but operates on the symlink itself. In this VFS, delegates to chmod. */
+  /** `chmod` on the symlink itself — see {@link lchmodSync}. */
   async lchmod(filePath, mode) {
-    return chmod(this._async, toPathString(filePath), mode);
+    return chmod(this._async, toPathString(filePath), mode, false);
   }
   /** chmod on an open file descriptor. Engine resolves fd → inode and
    *  mutates the mode bits directly. */
@@ -5329,9 +5926,9 @@ var VFSPromises = class {
   async chown(filePath, uid, gid) {
     return chown(this._async, toPathString(filePath), uid, gid);
   }
-  /** Like chown but operates on the symlink itself. In this VFS, delegates to chown. */
+  /** `chown` on the symlink itself rather than its target — see {@link lchmodSync}. */
   async lchown(filePath, uid, gid) {
-    return chown(this._async, toPathString(filePath), uid, gid);
+    return chown(this._async, toPathString(filePath), uid, gid, false);
   }
   /** chown on an open file descriptor. Engine resolves fd → inode and
    *  mutates uid/gid directly. */
@@ -5346,9 +5943,9 @@ var VFSPromises = class {
   async futimes(fd, atime, mtime) {
     return futimes(this._async, fd, atime, mtime);
   }
-  /** Like utimes but operates on the symlink itself. In this VFS, delegates to utimes. */
+  /** Timestamps on the symlink itself rather than its target — see {@link lchmodSync}. */
   async lutimes(filePath, atime, mtime) {
-    return utimes(this._async, toPathString(filePath), atime, mtime);
+    return utimes(this._async, toPathString(filePath), atime, mtime, false);
   }
   async symlink(target, linkPath, type) {
     return symlink(this._async, toPathString(target), toPathString(linkPath));
@@ -5378,13 +5975,12 @@ var VFSPromises = class {
     return mkdtemp(this._async, toPathString(prefix), options);
   }
   async openAsBlob(filePath, options) {
-    const data = await this.readFile(filePath);
-    const bytes = data instanceof Uint8Array ? data : new TextEncoder().encode(data);
-    return new Blob([bytes], { type: options?.type ?? "" });
+    const data = await _readFileAsBlobBytes(this.readFile(filePath));
+    return new Blob([data], { type: options?.type ?? "" });
   }
   /** Real volume statistics — see the note on `VFSFileSystem.statfsSync`. */
-  async statfs(path = "/") {
-    return statfs(this._async, toPathString(path));
+  async statfs(path = "/", options) {
+    return statfs(this._async, toPathString(path), options);
   }
   async *watch(filePath, options) {
     yield* watchAsync(this._ns, this._async, filePath, options);
@@ -5398,12 +5994,15 @@ var VFSPromises = class {
     const { status } = await this._async(OP.FTRUNCATE, "", 0, null, void 0, { fd, length: len });
     if (status !== 0) throw statusToError(status, "ftruncate", String(fd));
   }
-  async fsync(_fd) {
-    await this._async(OP.FSYNC, "");
+  async fsync(fd) {
+    const { status } = await this._async(OP.FSYNC, "", 0, null, void 0, { fd });
+    if (status !== 0) throw statusToError(status, "fsync", String(fd));
   }
-  async fdatasync(_fd) {
-    await this._async(OP.FSYNC, "");
+  async fdatasync(fd) {
+    const { status } = await this._async(OP.FSYNC, "", 0, null, void 0, { fd });
+    if (status !== 0) throw statusToError(status, "fdatasync", String(fd));
   }
+  /** The volume-wide flush: no descriptor, so nothing to validate. */
   async flush() {
     await this._async(OP.FSYNC, "");
   }
@@ -5457,6 +6056,9 @@ function createServiceWorkerBridge(bridgePort, opts) {
     bridgePort.close();
   };
 }
+
+// src/workers/inlined/repair.workertext
+var repair_default = 'var V=1447449377,G=1,U=4096,P=1e5,T=64,b={SIZE:64,MAGIC:0,VERSION:4,INODE_COUNT:8,BLOCK_SIZE:12,TOTAL_BLOCKS:16,FREE_BLOCKS:20,INODE_OFFSET:24,PATH_OFFSET:32,DATA_OFFSET:40,BITMAP_OFFSET:48,PATH_USED:56,CRC32:60},p={TYPE:0,FLAGS:1,PATH_OFFSET:4,PATH_LENGTH:8,NLINK:10,MODE:12,SIZE:16,FIRST_BLOCK:24,BLOCK_COUNT:28,MTIME:32,CTIME:40,ATIME:48,UID:56,GID:60},f={FREE:0,FILE:1,DIRECTORY:2,SYMLINK:3},It=33188,rt=16877,pt=41471,ot=18,at=61440,bt=32768,wt=16384,W=40,lt=256*1024,L=1024,ct=4e6;function X(S=P,t=U,e=L,s=ct){const i=b.SIZE,n=S*T,r=i+n,o=lt,l=r+o,h=Math.ceil(s/8),c=Math.ceil(e/8),a=Math.ceil((l+h)/t)*t,d=a+e*t;return{inodeTableOffset:i,inodeTableSize:n,pathTableOffset:r,pathTableSize:o,bitmapOffset:l,bitmapSize:c,bitmapRegionSize:h,dataOffset:a,totalSize:d,totalBlocks:e}}var gt=(()=>{const S=new Uint32Array(256);for(let t=0;t<256;t++){let e=t;for(let s=0;s<8;s++)e=e&1?3988292384^e>>>1:e>>>1;S[t]=e>>>0}return S})();function j(S,t=0,e=S.byteLength){let s=4294967295;for(let i=t;i<e;i++)s=gt[(s^S[i])&255]^s>>>8;return(s^4294967295)>>>0}var I={OK:0,ENOENT:1,EEXIST:2,EISDIR:3,ENOTDIR:4,ENOTEMPTY:5,EACCES:6,EINVAL:7,EBADF:8,ELOOP:9,ENOSPC:10,EIO:11,ENOTSUP:12},R=new TextEncoder,J=16384,$=new TextDecoder,Q=class H{handle;pathIndex=new Map;inodeCount=0;blockSize=U;totalBlocks=0;freeBlocks=0;inodeTableOffset=0;pathTableOffset=0;pathTableUsed=0;pathTableSize=0;bitmapOffset=0;dataOffset=0;umask=ot;processUid=0;processGid=0;strictPermissions=!1;debug=!1;fdTable=new Map;nextFd=3;static isReadable(t){const e=t&3;return e===0||e===2}static isWritable(t){const e=t&3;return e===1||e===2}inodeBuf=new Uint8Array(T);inodeView=new DataView(this.inodeBuf.buffer);inodeCache=new Map;superblockBuf=new Uint8Array(b.SIZE);superblockView=new DataView(this.superblockBuf.buffer);bitmap=null;bitmapDirtyLo=1/0;bitmapDirtyHi=-1;superblockDirty=!1;freeInodeHint=0;implicitDirs=new Map;implicitDirsGen=-1;pathIndexGen=0;descCount=new Map;descCountGen=0;childIndex=new Map;childIndexGen=0;allocCursor=0;symlinkLoopDetected=!1;resolveFailureStatus(){return this.symlinkLoopDetected?I.ELOOP:I.ENOENT}maxInodes=4e6;maxBlocks=ct;maxPathTable=256*1024*1024;maxVFSSize=100*1024*1024*1024;init(t,e){if(this.handle=t,this.processUid=e?.uid??0,this.processGid=e?.gid??0,this.umask=e?.umask??ot,this.strictPermissions=e?.strictPermissions??!1,this.debug=e?.debug??!1,e?.limits&&(e.limits.maxInodes!=null&&(this.maxInodes=e.limits.maxInodes),e.limits.maxBlocks!=null&&(this.maxBlocks=e.limits.maxBlocks),e.limits.maxPathTable!=null&&(this.maxPathTable=e.limits.maxPathTable),e.limits.maxVFSSize!=null&&(this.maxVFSSize=e.limits.maxVFSSize)),t.getSize()===0)this.format();else try{this.mount()}catch(i){const n=i.message??String(i);throw n.startsWith("Corrupt VFS:")?i:new Error(`Corrupt VFS: ${n}`)}}closeHandle(){try{this.handle?.close()}catch{}}format(){const t=X(P,U,L,this.maxBlocks);this.inodeCount=P,this.blockSize=U,this.totalBlocks=t.totalBlocks,this.freeBlocks=t.totalBlocks,this.inodeTableOffset=t.inodeTableOffset,this.pathTableOffset=t.pathTableOffset,this.pathTableSize=t.pathTableSize,this.pathTableUsed=0,this.bitmapOffset=t.bitmapOffset,this.dataOffset=t.dataOffset,this.handle.truncate(t.totalSize),this.writeSuperblock();const e=new Uint8Array(t.inodeTableSize);this.handle.write(e,{at:this.inodeTableOffset}),this.bitmap=new Uint8Array(t.bitmapSize),this.handle.write(this.bitmap,{at:this.bitmapOffset}),this.createInode("/",f.DIRECTORY,rt,0),this.writeSuperblock(),this.handle.flush()}mount(){const t=this.handle.getSize();if(t<b.SIZE)throw new Error(`Corrupt VFS: file too small (${t} bytes, need at least ${b.SIZE})`);this.handle.read(this.superblockBuf,{at:0});const e=this.superblockView,s=e.getUint32(b.MAGIC,!0);if(s!==V)throw new Error(`Corrupt VFS: bad magic 0x${s.toString(16)} (expected 0x${V.toString(16)})`);const i=e.getUint32(b.VERSION,!0);if(i!==G)throw new Error(`Corrupt VFS: unsupported version ${i} (expected ${G})`);const n=e.getUint32(b.CRC32,!0);if(n!==0){const O=j(this.superblockBuf,0,b.CRC32);if(O!==n)throw new Error(`Corrupt VFS: superblock checksum mismatch (stored 0x${n.toString(16)}, computed 0x${O.toString(16)})`)}const r=e.getUint32(b.INODE_COUNT,!0),o=e.getUint32(b.BLOCK_SIZE,!0),l=e.getUint32(b.TOTAL_BLOCKS,!0),h=e.getUint32(b.FREE_BLOCKS,!0),c=e.getFloat64(b.INODE_OFFSET,!0),a=e.getFloat64(b.PATH_OFFSET,!0),d=e.getFloat64(b.DATA_OFFSET,!0),u=e.getFloat64(b.BITMAP_OFFSET,!0),m=e.getUint32(b.PATH_USED,!0);if(o===0||(o&o-1)!==0)throw new Error(`Corrupt VFS: invalid block size ${o} (must be power of 2)`);if(r===0)throw new Error("Corrupt VFS: inode count is 0");if(h>l)throw new Error(`Corrupt VFS: free blocks (${h}) exceeds total blocks (${l})`);if(r>this.maxInodes)throw new Error(`Corrupt VFS: inode count ${r} exceeds maximum ${this.maxInodes}`);if(l>this.maxBlocks)throw new Error(`Corrupt VFS: total blocks ${l} exceeds maximum ${this.maxBlocks}`);if(t>this.maxVFSSize)throw new Error(`Corrupt VFS: file size ${t} exceeds maximum ${this.maxVFSSize}`);if(!Number.isFinite(c)||c<0||!Number.isFinite(a)||a<0||!Number.isFinite(u)||u<0||!Number.isFinite(d)||d<0)throw new Error("Corrupt VFS: non-finite or negative section offset");if(c!==b.SIZE)throw new Error(`Corrupt VFS: inode table offset ${c} (expected ${b.SIZE})`);const w=c+r*T;if(a!==w)throw new Error(`Corrupt VFS: path table offset ${a} (expected ${w})`);if(u<=a)throw new Error(`Corrupt VFS: bitmap offset ${u} must be after path table ${a}`);if(d<=u)throw new Error(`Corrupt VFS: data offset ${d} must be after bitmap ${u}`);if(l>(d-u)*8)throw new Error(`Corrupt VFS: total blocks (${l}) exceed bitmap region capacity (${(d-u)*8})`);const E=u-a;if(m>E)throw new Error(`Corrupt VFS: path used (${m}) exceeds path table size (${E})`);if(E>this.maxPathTable)throw new Error(`Corrupt VFS: path table size ${E} exceeds maximum ${this.maxPathTable}`);const y=d+l*o;if(y>this.maxVFSSize)throw new Error(`Corrupt VFS: computed layout size ${y} exceeds maximum ${this.maxVFSSize}`);if(t<y)throw new Error(`Corrupt VFS: file size ${t} too small for layout (need ${y})`);this.inodeCount=r,this.blockSize=o,this.totalBlocks=l,this.freeBlocks=h,this.inodeTableOffset=c,this.pathTableOffset=a,this.dataOffset=d,this.bitmapOffset=u,this.pathTableUsed=m,this.pathTableSize=E;const C=Math.ceil(this.totalBlocks/8);if(this.bitmap=new Uint8Array(C),this.handle.read(this.bitmap,{at:this.bitmapOffset}),this.rebuildIndex(),!this.pathIndex.has("/"))throw new Error(\'Corrupt VFS: root directory "/" not found in inode table\')}writeSuperblock(){const t=this.superblockView;t.setUint32(b.MAGIC,V,!0),t.setUint32(b.VERSION,G,!0),t.setUint32(b.INODE_COUNT,this.inodeCount,!0),t.setUint32(b.BLOCK_SIZE,this.blockSize,!0),t.setUint32(b.TOTAL_BLOCKS,this.totalBlocks,!0),t.setUint32(b.FREE_BLOCKS,this.freeBlocks,!0),t.setFloat64(b.INODE_OFFSET,this.inodeTableOffset,!0),t.setFloat64(b.PATH_OFFSET,this.pathTableOffset,!0),t.setFloat64(b.DATA_OFFSET,this.dataOffset,!0),t.setFloat64(b.BITMAP_OFFSET,this.bitmapOffset,!0),t.setUint32(b.PATH_USED,this.pathTableUsed,!0),t.setUint32(b.CRC32,j(this.superblockBuf,0,b.CRC32),!0),this.handle.write(this.superblockBuf,{at:0})}markBitmapDirty(t,e){t<this.bitmapDirtyLo&&(this.bitmapDirtyLo=t),e>this.bitmapDirtyHi&&(this.bitmapDirtyHi=e)}commitPending(){if(this.blocksFreedsinceTrim&&(this.trimTrailingBlocks(),this.blocksFreedsinceTrim=!1),this.bitmapDirtyHi>=0){const t=this.bitmapDirtyLo,e=this.bitmapDirtyHi;this.handle.write(this.bitmap.subarray(t,e+1),{at:this.bitmapOffset+t}),this.bitmapDirtyLo=1/0,this.bitmapDirtyHi=-1}this.superblockDirty&&(this.writeSuperblock(),this.superblockDirty=!1)}findLastUsedBlock(){const t=this.bitmap;for(let e=Math.ceil(this.totalBlocks/8)-1;e>=0;e--)if(t[e]!==0)for(let s=7;s>=0;s--){const i=e*8+s;if(i<this.totalBlocks&&t[e]&1<<s)return i}return-1}trimTrailingBlocks(){const t=this.findLastUsedBlock(),e=Math.max(t+1+J,L);if(e>=this.totalBlocks)return;this.handle.truncate(this.dataOffset+e*this.blockSize);const s=Math.ceil(e/8);this.bitmap=this.bitmap.slice(0,s);const i=this.totalBlocks-e;this.freeBlocks-=i,this.totalBlocks=e,this.superblockDirty=!0,this.bitmapDirtyLo=0,this.bitmapDirtyHi=s-1}lastPreGrowCheck=0;maybePreGrow(t=!1){if(!this.bitmap)return!1;const e=Date.now();if(!t&&e-this.lastPreGrowCheck<250)return!1;this.lastPreGrowCheck=e;const s=this.totalBlocks-(this.findLastUsedBlock()+1);if(s>=J)return!1;const i=Math.min(this.maxBlocks,this.bitmapCapacityBlocks()),n=Math.ceil((J-s)/8)*8,r=Math.min(n,i-this.totalBlocks);if(r<=0)return!1;const o=this.totalBlocks+r;this.handle.truncate(this.dataOffset+o*this.blockSize);const l=Math.ceil(o/8);if(l>this.bitmap.byteLength){const h=new Uint8Array(l);h.set(this.bitmap),this.bitmap=h}return this.totalBlocks=o,this.freeBlocks+=r,this.superblockDirty=!0,this.commitPending(),!0}rebuildIndex(){this.pathIndex.clear(),this.inodeCache.clear();const t=this.inodeCount*T,e=new Uint8Array(t);this.handle.read(e,{at:this.inodeTableOffset});const s=new DataView(e.buffer),i=this.pathTableUsed>0?new Uint8Array(this.pathTableUsed):null;i&&this.handle.read(i,{at:this.pathTableOffset});for(let n=0;n<this.inodeCount;n++){const r=n*T,o=s.getUint8(r+p.TYPE);if(o===f.FREE)continue;if(o<f.FILE||o>f.SYMLINK)throw new Error(`Corrupt VFS: inode ${n} has invalid type ${o}`);const l=s.getUint32(r+p.PATH_OFFSET,!0),h=s.getUint16(r+p.PATH_LENGTH,!0),c=s.getFloat64(r+p.SIZE,!0),a=s.getUint32(r+p.FIRST_BLOCK,!0),d=s.getUint32(r+p.BLOCK_COUNT,!0);if(h===0||l+h>this.pathTableUsed)throw new Error(`Corrupt VFS: inode ${n} path out of bounds (offset=${l}, len=${h}, tableUsed=${this.pathTableUsed})`);if(o!==f.DIRECTORY){if(c<0||!isFinite(c))throw new Error(`Corrupt VFS: inode ${n} has invalid size ${c}`);if(d>0&&a+d>this.totalBlocks)throw new Error(`Corrupt VFS: inode ${n} data blocks out of range (first=${a}, count=${d}, total=${this.totalBlocks})`)}const u={type:o,pathOffset:l,pathLength:h,nlink:s.getUint16(r+p.NLINK,!0)||1,mode:s.getUint32(r+p.MODE,!0),size:c,firstBlock:a,blockCount:d,mtime:s.getFloat64(r+p.MTIME,!0),ctime:s.getFloat64(r+p.CTIME,!0),atime:s.getFloat64(r+p.ATIME,!0),uid:s.getUint32(r+p.UID,!0),gid:s.getUint32(r+p.GID,!0)};this.inodeCache.set(n,u);let m;if(i?m=$.decode(i.subarray(u.pathOffset,u.pathOffset+u.pathLength)):m=this.readPath(u.pathOffset,u.pathLength),!m.startsWith("/")||m.includes("\\0"))throw new Error(`Corrupt VFS: inode ${n} has invalid path "${m.substring(0,50)}"`);this.setPathIndex(m,n)}this.pathIndexGen++}readInode(t){const e=this.inodeCache.get(t);if(e)return e;const s=this.inodeTableOffset+t*T;this.handle.read(this.inodeBuf,{at:s});const i=this.inodeView,n={type:i.getUint8(p.TYPE),pathOffset:i.getUint32(p.PATH_OFFSET,!0),pathLength:i.getUint16(p.PATH_LENGTH,!0),nlink:i.getUint16(p.NLINK,!0)||1,mode:i.getUint32(p.MODE,!0),size:i.getFloat64(p.SIZE,!0),firstBlock:i.getUint32(p.FIRST_BLOCK,!0),blockCount:i.getUint32(p.BLOCK_COUNT,!0),mtime:i.getFloat64(p.MTIME,!0),ctime:i.getFloat64(p.CTIME,!0),atime:i.getFloat64(p.ATIME,!0),uid:i.getUint32(p.UID,!0),gid:i.getUint32(p.GID,!0)};return this.inodeCache.set(t,n),n}writeInode(t,e){e.type===f.FREE?this.inodeCache.delete(t):this.inodeCache.set(t,e);const s=this.inodeView;s.setUint8(p.TYPE,e.type),s.setUint8(p.FLAGS,0),s.setUint8(p.FLAGS+1,0),s.setUint8(p.FLAGS+2,0),s.setUint32(p.PATH_OFFSET,e.pathOffset,!0),s.setUint16(p.PATH_LENGTH,e.pathLength,!0),s.setUint16(p.NLINK,e.nlink,!0),s.setUint32(p.MODE,e.mode,!0),s.setFloat64(p.SIZE,e.size,!0),s.setUint32(p.FIRST_BLOCK,e.firstBlock,!0),s.setUint32(p.BLOCK_COUNT,e.blockCount,!0),s.setFloat64(p.MTIME,e.mtime,!0),s.setFloat64(p.CTIME,e.ctime,!0),s.setFloat64(p.ATIME,e.atime,!0),s.setUint32(p.UID,e.uid,!0),s.setUint32(p.GID,e.gid,!0);const i=this.inodeTableOffset+t*T;this.handle.write(this.inodeBuf,{at:i})}readPath(t,e){const s=new Uint8Array(e);return this.handle.read(s,{at:this.pathTableOffset+t}),$.decode(s)}appendPath(t){const e=R.encode(t),s=this.pathTableUsed;return s+e.byteLength>this.pathTableSize&&this.growPathTable(s+e.byteLength),this.handle.write(e,{at:this.pathTableOffset+s}),this.pathTableUsed+=e.byteLength,this.superblockDirty=!0,{offset:s,length:e.byteLength}}growPathTable(t){const e=Math.max(this.pathTableSize*2,t+lt),s=e-this.pathTableSize,i=this.handle.getSize()+s;this.handle.truncate(i);const n=this.totalBlocks*this.blockSize,r=4*1024*1024,o=new Uint8Array(Math.min(r,Math.max(n,1)));let l=n;for(;l>0;){const a=Math.min(l,r),d=this.dataOffset+(l-a),u=this.dataOffset+s+(l-a),m=a<o.length?o.subarray(0,a):o;this.handle.read(m,{at:d}),this.handle.write(m,{at:u}),l-=a}const h=this.bitmapOffset+s,c=this.dataOffset+s;this.handle.write(this.bitmap,{at:h}),this.pathTableSize=e,this.bitmapOffset=h,this.dataOffset=c,this.superblockDirty=!0}zeroFileRange(t,e){if(e<=0)return;const s=4*1024*1024,i=new Uint8Array(Math.min(e,s));let n=0;for(;n<e;){const r=Math.min(s,e-n),o=r<i.length?i.subarray(0,r):i;this.handle.write(o,{at:t+n}),n+=r}}allocateBlocks(t){if(t===0)return 0;let e=this.scanForRun(this.allocCursor,this.totalBlocks,t);if(e<0&&this.allocCursor>0){const n=Math.min(this.allocCursor+t-1,this.totalBlocks);e=this.scanForRun(0,n,t)}if(e<0)return this.growAndAllocate(t);const s=e+t-1,i=this.bitmap;for(let n=e;n<=s;n++)i[n>>>3]|=1<<(n&7);return this.markBitmapDirty(e>>>3,s>>>3),this.freeBlocks-=t,this.superblockDirty=!0,this.allocCursor=s+1>=this.totalBlocks?0:s+1,e}scanForRun(t,e,s){const i=this.bitmap;let n=0,r=t;for(let o=t;o<e;o++){if(n===0&&(o&7)===0&&i[o>>>3]===255){o+=7,r=o+1;continue}if(i[o>>>3]>>>(o&7)&1)n=0,r=o+1;else if(++n===s)return r}return-1}bitmapCapacityBlocks(){return(this.dataOffset-this.bitmapOffset)*8}growAndAllocate(t){const e=this.totalBlocks,s=Math.min(this.maxBlocks,this.bitmapCapacityBlocks());let i=Math.max(e*2,e+t);if(i>s&&(i=s),i<e+t)throw new Error(`ENOSPC: cannot allocate ${t} blocks (total ${e}, ceiling ${s})`);const n=i-e,r=this.dataOffset+i*this.blockSize;this.handle.truncate(r);const o=Math.ceil(i/8),l=new Uint8Array(o);l.set(this.bitmap),this.bitmap=l,this.totalBlocks=i,this.freeBlocks+=n;const h=e;for(let c=h;c<h+t;c++){const a=c>>>3,d=c&7;this.bitmap[a]|=1<<d}return this.markBitmapDirty(h>>>3,h+t-1>>>3),this.freeBlocks-=t,this.superblockDirty=!0,h}blocksFreedsinceTrim=!1;freeBlockRange(t,e){if(e===0)return;const s=this.bitmap;for(let i=t;i<t+e;i++){const n=i>>>3,r=i&7;s[n]&=~(1<<r)}this.markBitmapDirty(t>>>3,t+e-1>>>3),this.freeBlocks+=e,this.superblockDirty=!0,this.blocksFreedsinceTrim=!0}findFreeInode(){for(let e=this.freeInodeHint;e<this.inodeCount;e++){if(this.inodeCache.has(e))continue;const s=this.inodeTableOffset+e*T,i=new Uint8Array(1);if(this.handle.read(i,{at:s}),i[0]===f.FREE)return this.freeInodeHint=e+1,e}const t=this.growInodeTable();return this.freeInodeHint=t+1,t}growInodeTable(){const t=this.inodeCount,e=t*2,s=(e-t)*T,i=this.inodeTableOffset+t*T,n=this.handle.getSize(),r=n-i;this.handle.truncate(n+s);const o=8*1024*1024;if(r>0){const a=new Uint8Array(Math.min(o,r));let d=r;for(;d>0;){const u=Math.min(o,d),m=i+d-u,w=u===a.length?a:a.subarray(0,u);this.handle.read(w,{at:m}),this.handle.write(w,{at:m+s}),d-=u}}const l=new Uint8Array(Math.min(o,s));let h=s,c=i;for(;h>0;){const a=Math.min(o,h);this.handle.write(a===l.length?l:l.subarray(0,a),{at:c}),c+=a,h-=a}return this.pathTableOffset+=s,this.bitmapOffset+=s,this.dataOffset+=s,this.inodeCount=e,this.superblockDirty=!0,t}readData(t,e,s){const i=new Uint8Array(s),n=this.dataOffset+t*this.blockSize;return this.handle.read(i,{at:n}),i}writeData(t,e){const s=this.dataOffset+t*this.blockSize;this.handle.write(e,{at:s})}resolvePath(t,e=0){if(e===0&&(this.symlinkLoopDetected=!1),e>W){this.symlinkLoopDetected=!0;return}const s=this.pathIndex.get(t);if(s===void 0)return this.resolvePathComponents(t,!0,e);const i=this.readInode(s);if(i.type===f.SYMLINK){const n=$.decode(this.readData(i.firstBlock,i.blockCount,i.size)),r=n.startsWith("/")?n:this.resolveRelative(t,n);return this.resolvePath(r,e+1)}return s}resolvePathComponents(t,e=!0,s=0){return this.resolvePathFull(t,e,s)?.idx}resolvePathFull(t,e=!0,s=0){if(s===0&&(this.symlinkLoopDetected=!1),s>W){this.symlinkLoopDetected=!0;return}const i=t.split("/").filter(Boolean);let n="/";for(let o=0;o<i.length;o++){const l=o===i.length-1;n=n==="/"?"/"+i[o]:n+"/"+i[o];const h=this.pathIndex.get(n);if(h===void 0)return;const c=this.readInode(h);if(c.type===f.SYMLINK&&(!l||e)){const a=$.decode(this.readData(c.firstBlock,c.blockCount,c.size)),d=a.startsWith("/")?a:this.resolveRelative(n,a);if(l)return this.resolvePathFull(d,!0,s+1);const u=i.slice(o+1).join("/"),m=d+(u?"/"+u:"");return this.resolvePathFull(m,e,s+1)}}const r=this.pathIndex.get(n);if(r!==void 0)return{idx:r,resolvedPath:n}}resolveDanglingLink(t,e=0){if(e>W)return null;const s=this.pathIndex.get(t);if(s===void 0)return t;const i=this.readInode(s);if(i.type!==f.SYMLINK)return t;const n=$.decode(this.readData(i.firstBlock,i.blockCount,i.size)),r=n.startsWith("/")?n:this.resolveRelative(t,n);return this.resolveDanglingLink(r,e+1)}resolveRelative(t,e){const i=((t.substring(0,t.lastIndexOf("/"))||"/")+"/"+e).split("/").filter(Boolean),n=[];for(const r of i)if(r!=="."){if(r===".."){n.pop();continue}n.push(r)}return"/"+n.join("/")}createInode(t,e,s,i,n){const r=this.findFreeInode(),{offset:o,length:l}=this.appendPath(t),h=Date.now();let c=0,a=0;n&&n.byteLength>0&&(a=Math.ceil(n.byteLength/this.blockSize),c=this.allocateBlocks(a),this.writeData(c,n));const d={type:e,pathOffset:o,pathLength:l,nlink:e===f.DIRECTORY?2:1,mode:s,size:i,firstBlock:c,blockCount:a,mtime:h,ctime:h,atime:h,uid:this.processUid,gid:this.processGid};return this.writeInode(r,d),this.setPathIndex(t,r),this.pathIndexGen++,r}normalizePath(t){if(t.charCodeAt(0)!==47&&(t="/"+t),t.length===1||t.indexOf("/.")===-1&&t.indexOf("//")===-1&&t.charCodeAt(t.length-1)!==47)return t;const e=t.split("/").filter(Boolean),s=[];for(const i of e)if(i!=="."){if(i===".."){s.pop();continue}s.push(i)}return"/"+s.join("/")}read(t){const e=this.debug?performance.now():0;t=this.normalizePath(t);let s=this.pathIndex.get(t);if(s!==void 0){const r=this.inodeCache.get(s);if(r)if(r.type===f.SYMLINK)s=this.resolvePathComponents(t,!0);else{if(r.type===f.DIRECTORY)return{status:I.EISDIR,data:null};{const o=r.size>0?this.readData(r.firstBlock,r.blockCount,r.size):new Uint8Array(0);if(this.debug){const l=performance.now();console.log(`[VFS read] path=${t} size=${r.size} TOTAL=${(l-e).toFixed(3)}ms (fast)`)}return{status:0,data:o}}}}if(s===void 0&&(s=this.resolvePathComponents(t,!0)),s===void 0)return{status:this.resolveFailureStatus(),data:null};const i=this.readInode(s);if(i.type===f.DIRECTORY)return{status:I.EISDIR,data:null};const n=i.size>0?this.readData(i.firstBlock,i.blockCount,i.size):new Uint8Array(0);if(this.debug){const r=performance.now();console.log(`[VFS read] path=${t} size=${i.size} TOTAL=${(r-e).toFixed(3)}ms (slow path)`)}return{status:0,data:n}}write(t,e,s=0){const i=this.debug?performance.now():0;t=this.normalizePath(t);const n=this.debug?performance.now():0,r=this.ensureParent(t);if(r!==0)return{status:r};const o=this.debug?performance.now():0;let l=this.resolvePathComponents(t,!0);if(l===void 0){const m=this.resolveDanglingLink(t);if(m===null)return{status:I.ELOOP};if(m!==t){t=m;const w=this.ensureParent(t);if(w!==0)return{status:w};l=this.resolvePathComponents(t,!0)}}const h=this.debug?performance.now():0;let c=h,a=h,d=h;if(l!==void 0){const m=this.readInode(l);if(m.type===f.DIRECTORY)return{status:I.EISDIR};const w=Math.ceil(e.byteLength/this.blockSize);if(w<=m.blockCount)c=this.debug?performance.now():0,this.writeData(m.firstBlock,e),a=this.debug?performance.now():0,w<m.blockCount&&this.freeBlockRange(m.firstBlock+w,m.blockCount-w);else{this.freeBlockRange(m.firstBlock,m.blockCount);const E=this.allocateBlocks(w);c=this.debug?performance.now():0,this.writeData(E,e),a=this.debug?performance.now():0,m.firstBlock=E}m.size=e.byteLength,m.blockCount=w,m.mtime=Date.now(),this.writeInode(l,m),d=this.debug?performance.now():0}else{if(this.isImplicitDirectory(t))return{status:I.EISDIR};const m=It&~(this.umask&511);this.createInode(t,f.FILE,m,e.byteLength,e),c=this.debug?performance.now():0,a=c,d=c}this.commitPending(),s&1&&this.handle.flush();const u=this.debug?performance.now():0;if(this.debug){const m=l!==void 0;console.log(`[VFS write] path=${t} size=${e.byteLength} ${m?"UPDATE":"CREATE"} normalize=${(n-i).toFixed(3)}ms parent=${(o-n).toFixed(3)}ms resolve=${(h-o).toFixed(3)}ms alloc=${(c-h).toFixed(3)}ms data=${(a-c).toFixed(3)}ms inode=${(d-a).toFixed(3)}ms flush=${(u-d).toFixed(3)}ms TOTAL=${(u-i).toFixed(3)}ms`)}return{status:0}}append(t,e){t=this.normalizePath(t);const s=this.resolvePathComponents(t,!0);if(s===void 0)return this.write(t,e);const i=this.readInode(s);if(i.type===f.DIRECTORY)return{status:I.EISDIR};const n=i.size+e.byteLength,r=Math.ceil(n/this.blockSize);if(r<=i.blockCount)return this.handle.write(e,{at:this.dataOffset+i.firstBlock*this.blockSize+i.size}),i.size=n,i.mtime=Date.now(),this.writeInode(s,i),this.commitPending(),{status:0};const o=this.allocateBlocks(r),l=this.dataOffset+o*this.blockSize;if(i.size>0){const h=this.dataOffset+i.firstBlock*this.blockSize,c=4*1024*1024,a=new Uint8Array(Math.min(c,i.size));let d=0;for(;d<i.size;){const u=Math.min(c,i.size-d),m=u<a.length?a.subarray(0,u):a;this.handle.read(m,{at:h+d}),this.handle.write(m,{at:l+d}),d+=u}}return this.freeBlockRange(i.firstBlock,i.blockCount),this.handle.write(e,{at:l+i.size}),i.firstBlock=o,i.blockCount=r,i.size=n,i.mtime=Date.now(),this.writeInode(s,i),this.commitPending(),{status:0}}unlink(t){t=this.normalizePath(t);const e=this.pathIndex.get(t);if(e===void 0)return{status:I.ENOENT};const s=this.readInode(e);return s.type===f.DIRECTORY?{status:I.EISDIR}:(s.nlink=Math.max(0,s.nlink-1),this.freeBlockRange(s.firstBlock,s.blockCount),s.type=f.FREE,this.writeInode(e,s),this.deletePathIndex(t),this.pathIndexGen++,e<this.freeInodeHint&&(this.freeInodeHint=e),this.commitPending(),{status:0})}stat(t){t=this.normalizePath(t);const e=this.resolvePathComponents(t,!0);if(e===void 0){const s=this.resolveFailureStatus();return this.isImplicitDirectory(t)?this.encodeImplicitDirStatResponse(t):{status:s,data:null}}return this.encodeStatResponse(e)}lstat(t){t=this.normalizePath(t);let e=this.resolvePathComponents(t,!1);return e===void 0&&(e=this.resolvePathComponents(t,!0),e===void 0)?this.isImplicitDirectory(t)?this.encodeImplicitDirStatResponse(t):{status:I.ENOENT,data:null}:this.encodeStatResponse(e)}encodeStatResponse(t){const e=this.readInode(t);let s=e.nlink;e.type===f.DIRECTORY&&(s=2+this.countSubdirectories(this.readPath(e.pathOffset,e.pathLength)));const i=new Uint8Array(53),n=new DataView(i.buffer);return n.setUint8(0,e.type),n.setUint32(1,e.mode,!0),n.setFloat64(5,e.size,!0),n.setFloat64(13,e.mtime,!0),n.setFloat64(21,e.ctime,!0),n.setFloat64(29,e.atime,!0),n.setUint32(37,e.uid,!0),n.setUint32(41,e.gid,!0),n.setUint32(45,t,!0),n.setUint32(49,s,!0),{status:0,data:i}}mkdir(t,e=0,s=511){if(t=this.normalizePath(t),(e&1)!==0)return this.mkdirRecursive(t,s);if(this.pathIndex.has(t)||this.isImplicitDirectory(t))return{status:I.EEXIST,data:null};const n=this.ensureParent(t);return n!==0?{status:n,data:null}:(this.createInode(t,f.DIRECTORY,this.dirModeFor(s),0),this.commitPending(),{status:0,data:null})}dirModeFor(t){return wt|t&4095&~(this.umask&511)}fileModeFor(t){return bt|t&4095&~(this.umask&511)}mkdirRecursive(t,e=511){const s=t.split("/").filter(Boolean);let i="",n=null;for(const o of s){if(i+="/"+o,this.pathIndex.has(i)){const l=this.pathIndex.get(i);if(this.readInode(l).type!==f.DIRECTORY)return{status:I.ENOTDIR,data:null};continue}this.createInode(i,f.DIRECTORY,this.dirModeFor(e),0),n||(n=i)}return this.commitPending(),{status:0,data:(n?R.encode(n):void 0)??null}}rmdir(t,e=0){t=this.normalizePath(t);const s=(e&1)!==0,i=this.pathIndex.get(t);if(i===void 0){if(this.isImplicitDirectory(t)){if(this.getDirectChildrenWithImplicit(t).length>0){if(!s)return{status:I.ENOTEMPTY};for(const l of this.getAllDescendants(t)){const h=this.pathIndex.get(l),c=this.readInode(h);this.freeBlockRange(c.firstBlock,c.blockCount),c.type=f.FREE,this.writeInode(h,c),this.deletePathIndex(l)}this.pathIndexGen++,this.commitPending()}return{status:0}}return{status:I.ENOENT}}const n=this.readInode(i);if(n.type!==f.DIRECTORY)return{status:I.ENOTDIR};if(this.getDirectChildren(t).length>0){if(!s)return{status:I.ENOTEMPTY};for(const o of this.getAllDescendants(t)){const l=this.pathIndex.get(o),h=this.readInode(l);this.freeBlockRange(h.firstBlock,h.blockCount),h.type=f.FREE,this.writeInode(l,h),this.deletePathIndex(o)}}return t==="/"?(this.pathIndexGen++,this.commitPending(),{status:0}):(n.type=f.FREE,this.writeInode(i,n),this.deletePathIndex(t),this.pathIndexGen++,i<this.freeInodeHint&&(this.freeInodeHint=i),this.commitPending(),{status:0})}readdir(t,e=0){t=this.normalizePath(t);const s=this.resolvePathFull(t,!0);let i;if(s){if(this.readInode(s.idx).type!==f.DIRECTORY)return{status:I.ENOTDIR,data:null};i=s.resolvedPath}else if(this.isImplicitDirectory(t))i=t;else return{status:I.ENOENT,data:null};if((e&1)!==0){this.ensureChildIndex();const d=this.childIndex.get(i);if(!d)return{status:0,data:new Uint8Array([0,0,0,0])};const u=[...d.keys()].sort(),m=i==="/"?"/":i+"/";let w=4;for(const O of u)w+=3+O.length*3;const E=new Uint8Array(w),y=new DataView(E.buffer);y.setUint32(0,u.length,!0);let C=4;for(const O of u){const{written:D}=R.encodeInto(O,E.subarray(C+2));y.setUint16(C,D,!0),C+=2+D;const B=this.pathIndex.get(m+O);E[C++]=B===void 0?f.DIRECTORY:this.readInode(B).type}return{status:0,data:E.subarray(0,C)}}this.ensureChildIndex();const r=this.childIndex.get(i);if(!r)return{status:0,data:new Uint8Array([0,0,0,0])};const o=[...r.keys()].sort();let l=4;for(const d of o)l+=2+d.length*3;const h=new Uint8Array(l),c=new DataView(h.buffer);c.setUint32(0,o.length,!0);let a=4;for(const d of o){const{written:u}=R.encodeInto(d,h.subarray(a+2));c.setUint16(a,u,!0),a+=2+u}return{status:0,data:h.subarray(0,a)}}rename(t,e){t=this.normalizePath(t),e=this.normalizePath(e);const s=this.pathIndex.get(t);if(s===void 0)return{status:I.ENOENT};if(t===e)return{status:0};const i=this.ensureParent(e);if(i!==0)return{status:i};const n=this.pathIndex.get(e),r=n===void 0&&this.isImplicitDirectory(e);if(n!==void 0||r){const c=this.readInode(s).type===f.DIRECTORY,a=r||n!==void 0&&this.readInode(n).type===f.DIRECTORY;if(c&&!a)return{status:I.ENOTDIR};if(!c&&a)return{status:I.EISDIR}}if(n!==void 0||r){let c=r;if(n!==void 0){const a=this.readInode(n);c=a.type===f.DIRECTORY,this.freeBlockRange(a.firstBlock,a.blockCount),a.type=f.FREE,this.writeInode(n,a),this.deletePathIndex(e),n<this.freeInodeHint&&(this.freeInodeHint=n)}if(c)for(const a of this.getAllDescendants(e)){const d=this.pathIndex.get(a),u=this.readInode(d);this.freeBlockRange(u.firstBlock,u.blockCount),u.type=f.FREE,this.writeInode(d,u),this.deletePathIndex(a),d<this.freeInodeHint&&(this.freeInodeHint=d)}}const o=this.readInode(s),{offset:l,length:h}=this.appendPath(e);if(o.pathOffset=l,o.pathLength=h,o.mtime=Date.now(),this.writeInode(s,o),this.deletePathIndex(t),this.setPathIndex(e,s),this.pathIndexGen++,o.type===f.DIRECTORY){const c=t==="/"?"/":t+"/",a=[];for(const[d,u]of this.pathIndex)d.startsWith(c)&&a.push([d,u]);for(const[d,u]of a){const m=d.substring(t.length),w=e+m,E=this.readInode(u),{offset:y,length:C}=this.appendPath(w);E.pathOffset=y,E.pathLength=C,this.writeInode(u,E),this.deletePathIndex(d),this.setPathIndex(w,u)}}return this.commitPending(),{status:0}}exists(t){t=this.normalizePath(t);const e=this.resolvePathComponents(t,!0),s=new Uint8Array(1);return s[0]=e!==void 0||this.isImplicitDirectory(t)?1:0,{status:0,data:s}}truncate(t,e=0){t=this.normalizePath(t);const s=this.resolvePathComponents(t,!0);if(s===void 0)return{status:this.resolveFailureStatus()};const i=this.readInode(s);if(i.type===f.DIRECTORY)return{status:I.EISDIR};if(e===0)this.freeBlockRange(i.firstBlock,i.blockCount),i.firstBlock=0,i.blockCount=0,i.size=0;else if(e<i.size){const n=Math.ceil(e/this.blockSize);n<i.blockCount&&this.freeBlockRange(i.firstBlock+n,i.blockCount-n),i.blockCount=n,i.size=e}else if(e>i.size){const n=Math.ceil(e/this.blockSize);if(n>i.blockCount){const r=this.allocateBlocks(n),o=this.dataOffset+r*this.blockSize;if(i.size>0){const l=this.dataOffset+i.firstBlock*this.blockSize,h=4*1024*1024,c=new Uint8Array(Math.min(h,i.size));let a=0;for(;a<i.size;){const d=Math.min(h,i.size-a),u=d<c.length?c.subarray(0,d):c;this.handle.read(u,{at:l+a}),this.handle.write(u,{at:o+a}),a+=d}}this.freeBlockRange(i.firstBlock,i.blockCount),this.zeroFileRange(o+i.size,e-i.size),i.firstBlock=r}else this.zeroFileRange(this.dataOffset+i.firstBlock*this.blockSize+i.size,e-i.size);i.blockCount=n,i.size=e}return i.mtime=Date.now(),this.writeInode(s,i),this.commitPending(),{status:0}}copy(t,e,s=0){t=this.normalizePath(t),e=this.normalizePath(e);const i=this.resolvePathComponents(t,!0);if(i===void 0)return{status:this.resolveFailureStatus()};const n=this.readInode(i);if(n.type===f.DIRECTORY)return{status:I.ENOTSUP};if(s&1&&(this.pathIndex.has(e)||this.isImplicitDirectory(e)))return{status:I.EEXIST};if(t===e)return{status:0};const r=n.size,o=n.firstBlock,l=n.mode,h=this.write(e,new Uint8Array(0));if(h.status!==0)return h;if(r===0){const O=this.resolvePathComponents(e,!0);if(O!==void 0){const D=this.readInode(O);D.mode=D.mode&-4096|l&4095,this.writeInode(O,D),this.commitPending()}return{status:0}}const c=this.resolvePathComponents(e,!0);if(c===void 0)return{status:I.EIO};const a=this.readInode(c),d=Math.ceil(r/this.blockSize),u=this.allocateBlocks(d),m=this.dataOffset+u*this.blockSize,w=this.dataOffset+o*this.blockSize,E=4*1024*1024,y=new Uint8Array(Math.min(E,r));let C=0;for(;C<r;){const O=Math.min(E,r-C),D=O<y.length?y.subarray(0,O):y;this.handle.read(D,{at:w+C}),this.handle.write(D,{at:m+C}),C+=O}return a.firstBlock=u,a.blockCount=d,a.size=r,a.mtime=Date.now(),a.mode=a.mode&-4096|l&4095,this.writeInode(c,a),this.commitPending(),{status:0}}access(t,e=0){t=this.normalizePath(t);const s=this.resolvePathComponents(t,!0);if(s===void 0){const r=this.resolveFailureStatus();return this.isImplicitDirectory(t)?{status:0}:{status:r}}if(e===0)return{status:0};if(!this.strictPermissions)return{status:0};const i=this.readInode(s),n=this.getEffectivePermission(i);return e&4&&!(n&4)?{status:I.EACCES}:e&2&&!(n&2)?{status:I.EACCES}:e&1&&!(n&1)?{status:I.EACCES}:{status:0}}getEffectivePermission(t){const e=t.mode&511;return this.processUid===t.uid?e>>>6&7:this.processGid===t.gid?e>>>3&7:e&7}realpath(t){t=this.normalizePath(t);const e=this.resolvePathComponents(t,!0);if(e===void 0){const n=this.resolveFailureStatus();return this.isImplicitDirectory(t)?{status:0,data:R.encode(t)}:{status:n,data:null}}const s=this.readInode(e),i=this.readPath(s.pathOffset,s.pathLength);return{status:0,data:R.encode(i)}}chmod(t,e,s=!0){t=this.normalizePath(t);const i=this.resolvePathComponents(t,s);if(i===void 0)return{status:this.resolveFailureStatus()};const n=this.readInode(i);return n.mode=n.mode&at|e&4095,n.ctime=Date.now(),this.writeInode(i,n),{status:0}}chown(t,e,s,i=!0){t=this.normalizePath(t);const n=this.resolvePathComponents(t,i);if(n===void 0)return{status:this.resolveFailureStatus()};const r=this.readInode(n);return r.uid=e,r.gid=s,r.ctime=Date.now(),this.writeInode(n,r),{status:0}}utimes(t,e,s,i=!0){t=this.normalizePath(t);const n=this.resolvePathComponents(t,i);if(n===void 0)return{status:this.resolveFailureStatus()};const r=this.readInode(n);return r.atime=e,r.mtime=s,r.ctime=Date.now(),this.writeInode(n,r),{status:0}}symlink(t,e){if(e=this.normalizePath(e),this.pathIndex.has(e)||this.isImplicitDirectory(e))return{status:I.EEXIST};const s=this.ensureParent(e);if(s!==0)return{status:s};const i=R.encode(t);return this.createInode(e,f.SYMLINK,pt,i.byteLength,i),this.commitPending(),{status:0}}readlink(t){t=this.normalizePath(t);const e=this.pathIndex.get(t);if(e===void 0)return{status:I.ENOENT,data:null};const s=this.readInode(e);return s.type!==f.SYMLINK?{status:I.EINVAL,data:null}:{status:0,data:this.readData(s.firstBlock,s.blockCount,s.size)}}link(t,e){t=this.normalizePath(t),e=this.normalizePath(e);const s=this.resolvePathComponents(t,!0);if(s===void 0)return{status:this.resolveFailureStatus()};const i=this.readInode(s);if(i.type===f.DIRECTORY)return{status:I.EPERM};if(this.pathIndex.has(e)||this.isImplicitDirectory(e))return{status:I.EEXIST};const n=this.copy(t,e);if(n.status!==0)return n;i.nlink++,this.writeInode(s,i);const r=this.pathIndex.get(e);if(r!==void 0){const o=this.readInode(r);o.nlink=i.nlink,this.writeInode(r,o)}return{status:0}}open(t,e,s,i=438){t=this.normalizePath(t);const n=(e&64)!==0,r=(e&512)!==0,o=(e&128)!==0;let l=this.resolvePathComponents(t,!0);if(l===void 0){const a=this.resolveDanglingLink(t);if(a===null)return{status:I.ELOOP,data:null};a!==t&&(t=a,l=this.resolvePathComponents(t,!0))}if(H.isWritable(e)&&(l!==void 0?this.readInode(l).type===f.DIRECTORY:this.isImplicitDirectory(t)))return{status:I.EISDIR,data:null};if(l===void 0){if(!n)return{status:this.resolveFailureStatus(),data:null};const a=this.ensureParent(t);if(a!==0)return{status:a,data:null};l=this.createInode(t,f.FILE,this.fileModeFor(i),0)}else if(o&&n)return{status:I.EEXIST,data:null};r&&this.truncate(t,0);const h=this.nextFd++;this.fdTable.set(h,{tabId:s,inodeIdx:l,position:0,flags:e});const c=new Uint8Array(4);return new DataView(c.buffer).setUint32(0,h,!0),{status:0,data:c}}close(t){return this.fdTable.has(t)?(this.fdTable.delete(t),{status:0}):{status:I.EBADF}}fread(t,e,s){const i=this.fdTable.get(t);if(!i)return{status:I.EBADF,data:null};if(!H.isReadable(i.flags))return{status:I.EBADF,data:null};const n=this.readInode(i.inodeIdx);if(n.type===f.DIRECTORY)return{status:I.EISDIR,data:null};const r=s??i.position,o=Math.min(e,n.size-r);if(o<=0)return{status:0,data:new Uint8Array(0)};const l=this.dataOffset+n.firstBlock*this.blockSize+r,h=new Uint8Array(o);return this.handle.read(h,{at:l}),s===null&&(i.position+=o),{status:0,data:h}}fwrite(t,e,s){const i=this.fdTable.get(t);if(!i)return{status:I.EBADF,data:null};if(!H.isWritable(i.flags))return{status:I.EBADF,data:null};const n=this.readInode(i.inodeIdx),o=(i.flags&1024)!==0?n.size:s??i.position,l=o+e.byteLength;if(l>n.size){const c=Math.ceil(l/this.blockSize);if(c>n.blockCount){const a=this.allocateBlocks(c),d=this.dataOffset+a*this.blockSize,u=this.dataOffset+n.firstBlock*this.blockSize;if(n.size>0){const w=new Uint8Array(Math.min(4194304,n.size));let E=0;for(;E<n.size;){const y=Math.min(4194304,n.size-E),C=y<w.length?w.subarray(0,y):w;this.handle.read(C,{at:u+E}),this.handle.write(C,{at:d+E}),E+=y}}this.freeBlockRange(n.firstBlock,n.blockCount),o>n.size&&this.zeroFileRange(d+n.size,o-n.size),this.handle.write(e,{at:d+o}),n.firstBlock=a,n.blockCount=c}else{o>n.size&&this.zeroFileRange(this.dataOffset+n.firstBlock*this.blockSize+n.size,o-n.size);const a=this.dataOffset+n.firstBlock*this.blockSize+o;this.handle.write(e,{at:a})}n.size=l}else{const c=this.dataOffset+n.firstBlock*this.blockSize+o;this.handle.write(e,{at:c})}n.mtime=Date.now(),this.writeInode(i.inodeIdx,n),s===null&&(i.position=l),this.commitPending();const h=new Uint8Array(4);return new DataView(h.buffer).setUint32(0,e.byteLength,!0),{status:0,data:h}}fstat(t){const e=this.fdTable.get(t);return e?e.implicitPath?this.encodeImplicitDirStatResponse(e.implicitPath):this.encodeStatResponse(e.inodeIdx):{status:I.EBADF,data:null}}ftruncate(t,e=0){const s=this.fdTable.get(t);if(!s)return{status:I.EBADF};if(!H.isWritable(s.flags))return{status:I.EINVAL};const i=this.readInode(s.inodeIdx),n=this.readPath(i.pathOffset,i.pathLength);return this.truncate(n,e)}statfs(t="/"){if(t=this.normalizePath(t),this.resolvePathComponents(t,!0)===void 0&&!this.isImplicitDirectory(t))return{status:this.resolveFailureStatus(),data:null};const e=new Set(this.pathIndex.values()).size,s=new Uint8Array(24),i=new DataView(s.buffer);return i.setUint32(0,V,!0),i.setUint32(4,this.blockSize,!0),i.setUint32(8,this.totalBlocks,!0),i.setUint32(12,this.freeBlocks,!0),i.setUint32(16,this.inodeCount,!0),i.setUint32(20,Math.max(0,this.inodeCount-e),!0),{status:0,data:s}}fsync(t){return t!==void 0&&!this.fdTable.has(t)?{status:I.EBADF}:(this.commitPending(),this.handle.flush(),{status:0})}fchmod(t,e){const s=this.fdTable.get(t);if(!s)return{status:I.EBADF};if(s.implicitPath)return{status:0};const i=this.readInode(s.inodeIdx);return i.mode=i.mode&at|e&4095,i.ctime=Date.now(),this.writeInode(s.inodeIdx,i),{status:0}}fchown(t,e,s){const i=this.fdTable.get(t);if(!i)return{status:I.EBADF};if(i.implicitPath)return{status:0};const n=this.readInode(i.inodeIdx);return n.uid=e,n.gid=s,n.ctime=Date.now(),this.writeInode(i.inodeIdx,n),{status:0}}futimes(t,e,s){const i=this.fdTable.get(t);if(!i)return{status:I.EBADF};if(i.implicitPath)return{status:0};const n=this.readInode(i.inodeIdx);return n.atime=e,n.mtime=s,n.ctime=Date.now(),this.writeInode(i.inodeIdx,n),{status:0}}opendir(t,e){t=this.normalizePath(t);const s=this.resolvePathComponents(t,!0);if(s===void 0){if(this.isImplicitDirectory(t)){const o=this.nextFd++;this.fdTable.set(o,{tabId:e,inodeIdx:-1,position:0,flags:0,implicitPath:t});const l=new Uint8Array(4);return new DataView(l.buffer).setUint32(0,o,!0),{status:0,data:l}}return{status:I.ENOENT,data:null}}if(this.readInode(s).type!==f.DIRECTORY)return{status:I.ENOTDIR,data:null};const n=this.nextFd++;this.fdTable.set(n,{tabId:e,inodeIdx:s,position:0,flags:0});const r=new Uint8Array(4);return new DataView(r.buffer).setUint32(0,n,!0),{status:0,data:r}}mkdtemp(t){const e=Math.random().toString(36).substring(2,8),s=this.normalizePath(t+e),i=s.substring(0,s.lastIndexOf("/"))||"/";return i!=="/"&&this.resolvePathComponents(i,!0)===void 0&&!this.isImplicitDirectory(i)?{status:I.ENOENT,data:null}:(this.createInode(s,f.DIRECTORY,this.dirModeFor(448),0),this.commitPending(),{status:0,data:R.encode(s)})}getDirectChildren(t){this.ensureChildIndex();const e=this.childIndex.get(t);if(!e)return[];const s=t==="/"?"/":t+"/",i=[];for(const n of e.keys()){const r=s+n;this.pathIndex.has(r)&&i.push(r)}return i.sort()}rebuildImplicitDirs(){if(this.implicitDirsGen===this.pathIndexGen)return;const t=Date.now(),e=this.implicitDirs;this.implicitDirs=new Map;for(const s of this.pathIndex.keys()){let i=s.length;for(;i=s.lastIndexOf("/",i-1),!(i<=0);){const n=s.substring(0,i);if(this.implicitDirs.has(n))break;this.pathIndex.has(n)||this.implicitDirs.set(n,e.get(n)??t)}}this.implicitDirsGen=this.pathIndexGen}isImplicitDirectory(t){return t==="/"||this.pathIndex.has(t)?!1:(this.descCountGen<this.pathIndexGen&&this.rebuildDescCount(),(this.descCount.get(t)??0)>0)}rebuildDescCount(){this.descCount.clear();for(const t of this.pathIndex.keys())this.bumpDescCount(t);this.descCountGen=this.pathIndexGen}setPathIndex(t,e){const s=this.pathIndex.has(t);this.pathIndex.set(t,e),s||(this.bumpDescCount(t),this.bumpChildIndex(t)),this.descCountGen=this.pathIndexGen+1,this.childIndexGen=this.pathIndexGen+1}deletePathIndex(t){const e=this.pathIndex.delete(t);return e&&(this.decDescCount(t),this.decChildIndex(t)),this.descCountGen=this.pathIndexGen+1,this.childIndexGen=this.pathIndexGen+1,e}bumpDescCount(t){let e=t.length;for(;e=t.lastIndexOf("/",e-1),!(e<=0);){const s=t.substring(0,e);this.descCount.set(s,(this.descCount.get(s)??0)+1)}}decDescCount(t){let e=t.length;for(;e=t.lastIndexOf("/",e-1),!(e<=0);){const s=t.substring(0,e),i=this.descCount.get(s);if(i===void 0)break;i<=1?this.descCount.delete(s):this.descCount.set(s,i-1)}}bumpChildIndex(t){if(t==="/"||t.length===0)return;let e="/",s=1;for(;s<=t.length;){let i=t.indexOf("/",s);i===-1&&(i=t.length);const n=t.substring(s,i);if(n.length>0){let r=this.childIndex.get(e);r||(r=new Map,this.childIndex.set(e,r)),r.set(n,(r.get(n)??0)+1),e=e==="/"?"/"+n:e+"/"+n}s=i+1}}decChildIndex(t){if(t==="/"||t.length===0)return;let e="/",s=1;for(;s<=t.length;){let i=t.indexOf("/",s);i===-1&&(i=t.length);const n=t.substring(s,i);if(n.length>0){const r=this.childIndex.get(e);if(!r)break;const o=r.get(n);if(o===void 0)break;o<=1?(r.delete(n),r.size===0&&this.childIndex.delete(e)):r.set(n,o-1),e=e==="/"?"/"+n:e+"/"+n}s=i+1}}ensureChildIndex(){if(!(this.childIndexGen>=this.pathIndexGen)){this.childIndex.clear();for(const t of this.pathIndex.keys())this.bumpChildIndex(t);this.childIndexGen=this.pathIndexGen}}countSubdirectories(t){this.ensureChildIndex();const e=this.childIndex.get(t);if(!e)return 0;const s=t==="/"?"/":t+"/";let i=0;for(const n of e.keys()){const r=this.pathIndex.get(s+n);(r===void 0||this.readInode(r).type===f.DIRECTORY)&&i++}return i}getDirectChildrenWithImplicit(t){this.ensureChildIndex();const e=this.childIndex.get(t);if(!e)return[];const s=t==="/"?"/":t+"/",i=[];for(const n of e.keys()){const r=s+n;i.push({path:r,type:this.pathIndex.has(r)?"real":"implicit"})}return i.sort((n,r)=>n.path<r.path?-1:n.path>r.path?1:0),i}encodeImplicitDirStatResponse(t){this.rebuildImplicitDirs();const e=this.implicitDirs.get(t)??Date.now(),s=rt&~(this.umask&511),i=2+this.countSubdirectories(t),n=new Uint8Array(53),r=new DataView(n.buffer);return r.setUint8(0,f.DIRECTORY),r.setUint32(1,s,!0),r.setFloat64(5,0,!0),r.setFloat64(13,e,!0),r.setFloat64(21,e,!0),r.setFloat64(29,e,!0),r.setUint32(37,this.processUid,!0),r.setUint32(41,this.processGid,!0),r.setUint32(45,0,!0),r.setUint32(49,i,!0),{status:0,data:n}}getAllDescendants(t){const e=t==="/"?"/":t+"/",s=[];for(const i of this.pathIndex.keys())i!==t&&i.startsWith(e)&&s.push(i);return s.sort((i,n)=>{const r=i.split("/").length;return n.split("/").length-r})}ensureParent(t){const e=t.lastIndexOf("/");if(e<=0)return 0;const s=t.substring(0,e),i=this.pathIndex.get(s);return i===void 0?this.isImplicitDirectory(s)?0:I.ENOENT:this.readInode(i).type!==f.DIRECTORY?I.ENOTDIR:0}cleanupTab(t){for(const[e,s]of this.fdTable)s.tabId===t&&this.fdTable.delete(e)}getAllFiles(){const t=[];for(const[e,s]of this.pathIndex)t.push({path:e,idx:s});return t}getPathForFd(t){const e=this.fdTable.get(t);if(!e)return null;const s=this.readInode(e.inodeIdx);return this.readPath(s.pathOffset,s.pathLength)}getInodeData(t){const e=this.readInode(t),s=e.size>0?this.readData(e.firstBlock,e.blockCount,e.size):new Uint8Array(0);return{type:e.type,data:s,mtime:e.mtime}}exportAll(){const t=[];for(const[e,s]of this.pathIndex){const i=this.readInode(s);let n=null;(i.type===f.FILE||i.type===f.SYMLINK)&&(n=i.size>0?this.readData(i.firstBlock,i.blockCount,i.size):new Uint8Array(0)),t.push({path:e,type:i.type,data:n,mode:i.mode,mtime:i.mtime})}return t.sort((e,s)=>e.type===f.DIRECTORY&&s.type!==f.DIRECTORY?-1:e.type!==f.DIRECTORY&&s.type===f.DIRECTORY?1:e.path.localeCompare(s.path)),t}flush(){this.handle.flush()}};self.onmessage=async S=>{try{const t=S.data;if(t.type==="repair")self.postMessage(await kt(t.root));else if(t.type==="load")self.postMessage(await St(t.root));else throw new Error(`Unknown message type: ${t.type}`)}catch(t){self.postMessage({error:t.message||String(t)})}};async function ht(S){let t=await navigator.storage.getDirectory();if(S&&S!=="/")for(const e of S.split("/").filter(Boolean))t=await t.getDirectoryHandle(e,{create:!0});return t}async function dt(S,t,e){const s=[];for await(const[i,n]of S.entries()){if(t===""&&e.has(i))continue;const r=t?`${t}/${i}`:`/${i}`;if(n.kind==="directory"){s.push({path:r,type:"directory"});const o=await dt(n,r,e);s.push(...o)}else{const l=await(await n.getFile()).arrayBuffer();s.push({path:r,type:"file",data:l})}}return s}async function N(S){try{await S.removeEntry(".vfs.bin.tmp")}catch{}}async function Et(S){const t=await S.createSyncAccessHandle();try{new Q().init(t)}finally{t.close()}}async function ut(S,t){await Et(t);const e=await S.getFileHandle(".vfs.bin",{create:!0}),s=await t.createSyncAccessHandle(),i=await e.createSyncAccessHandle();try{const n=s.getSize();i.truncate(n);const r=1024*1024,o=new Uint8Array(r);for(let l=0;l<n;l+=r){const h=s.read(o,{at:l});i.write(h<r?o.subarray(0,h):o,{at:l})}i.flush()}finally{i.close(),s.close()}try{await S.removeEntry(".vfs.bin.tmp")}catch{}}async function kt(S){const t=await ht(S);await N(t);const s=await(await t.getFileHandle(".vfs.bin")).getFile(),i=new Uint8Array(await s.arrayBuffer()),n=i.byteLength;if(n<b.SIZE)throw new Error(`VFS file too small to repair (${n} bytes)`);const r=new DataView(i.buffer);let o,l,h,c,a,d,u,m;const w=r.getUint32(b.MAGIC,!0),E=r.getUint32(b.VERSION,!0),y=r.getUint32(b.CRC32,!0),C=y===0||j(i,0,b.CRC32)===y;if(w===V&&E===G&&C){if(o=r.getUint32(b.INODE_COUNT,!0),l=r.getUint32(b.BLOCK_SIZE,!0),h=r.getUint32(b.TOTAL_BLOCKS,!0),c=r.getFloat64(b.INODE_OFFSET,!0),a=r.getFloat64(b.PATH_OFFSET,!0),d=r.getFloat64(b.DATA_OFFSET,!0),u=r.getFloat64(b.BITMAP_OFFSET,!0),m=u-a,l===0||(l&l-1)!==0||o===0||c>=n||a>=n||d>=n||m<=0){const g=X(P,U,L);o=P,l=U,h=L,c=g.inodeTableOffset,a=g.pathTableOffset,d=g.dataOffset,u=g.bitmapOffset,m=u-a}}else{const g=X(P,U,L);o=P,l=U,h=L,c=g.inodeTableOffset,a=g.pathTableOffset,d=g.dataOffset,u=g.bitmapOffset,m=u-a}const D=new TextDecoder("utf-8",{fatal:!0}),B=[];let F=0;const ft=Math.min(o,Math.floor((n-c)/T));for(let g=0;g<ft;g++){const _=c+g*T;if(_+T>n)break;const v=i[_+p.TYPE];if(v<f.FILE||v>f.SYMLINK)continue;const A=new DataView(i.buffer,_,T),k=A.getUint32(p.PATH_OFFSET,!0),x=A.getUint16(p.PATH_LENGTH,!0),z=A.getFloat64(p.SIZE,!0),K=A.getUint32(p.FIRST_BLOCK,!0),Z=a+k;if(x===0||x>4096||Z+x>n||k+x>m){F++;continue}let M;try{M=D.decode(i.subarray(Z,Z+x))}catch{F++;continue}if(!M.startsWith("/")||M.includes("\\0")){F++;continue}if(v===f.DIRECTORY){B.push({path:M,type:v,dataOffset:0,dataSize:0,contentLost:!1});continue}if(z<0||z>n||!isFinite(z)){F++;continue}const st=A.getUint32(p.BLOCK_COUNT,!0),nt=d+K*l;if(nt+z>n||K>=h||st>0&&K+st>h){B.push({path:M,type:v,dataOffset:0,dataSize:0,contentLost:!0}),F++;continue}B.push({path:M,type:v,dataOffset:nt,dataSize:z,contentLost:!1})}const q=await t.getFileHandle(".vfs.bin.tmp",{create:!0}),tt=await q.createSyncAccessHandle();let et=!1,Y=0;const mt=5;try{const g=new Q;g.init(tt);const _=B.filter(k=>k.type===f.DIRECTORY&&k.path!=="/").sort((k,x)=>k.path.localeCompare(x.path)),v=B.filter(k=>k.type===f.FILE),A=B.filter(k=>k.type===f.SYMLINK);for(const k of _)if(g.mkdir(k.path,1,493).status!==0&&(Y++,F++,Y>=mt))throw new Error(`Repair aborted: too many critical errors (${Y} mkdir failures)`);for(const k of v){const x=k.dataSize>0?i.subarray(k.dataOffset,k.dataOffset+k.dataSize):new Uint8Array(0);g.write(k.path,x).status!==0&&F++}for(const k of A){if(k.dataSize===0&&k.contentLost){F++;continue}const x=k.dataSize>0?i.subarray(k.dataOffset,k.dataOffset+k.dataSize):new Uint8Array(0);let z;try{z=D.decode(x)}catch{F++;continue}if(z.length===0||z.includes("\\0")){F++;continue}g.symlink(z,k.path).status!==0&&F++}g.flush(),et=!0}finally{tt.close(),et||await N(t)}try{await ut(t,q)}catch(g){throw await N(t),new Error(`Repair built a VFS but verification failed: ${g.message}`)}const it=B.filter(g=>g.path!=="/").map(g=>({path:g.path,type:g.type===f.FILE?"file":g.type===f.DIRECTORY?"directory":"symlink",size:g.dataSize,contentLost:g.contentLost}));return{recovered:it.length,lost:F,entries:it}}async function St(S){const t=await ht(S);await N(t);const e=await dt(t,"",new Set([".vfs.bin",".vfs.bin.tmp"])),s=await t.getFileHandle(".vfs.bin.tmp",{create:!0}),i=await s.createSyncAccessHandle();let n=!1,r=0,o=0;try{const l=new Q;l.init(i);const h=e.filter(a=>a.type==="directory").sort((a,d)=>a.path.localeCompare(d.path));for(const a of h)l.mkdir(a.path,1,493).status===0&&o++;const c=e.filter(a=>a.type==="file");for(const a of c)l.write(a.path,new Uint8Array(a.data??new ArrayBuffer(0))).status===0&&r++;l.flush(),n=!0}finally{i.close(),n||await N(t)}try{await ut(t,s)}catch(l){throw await N(t),new Error(`Load built a VFS but verification failed: ${l.message}`)}return{files:r,directories:o}}\n';
 
 // src/vfs/crc32.ts
 var TABLE = (() => {
@@ -6559,21 +7161,7 @@ var VFSEngine = class _VFSEngine {
     const inode = this.readInode(idx);
     let nlink = inode.nlink;
     if (inode.type === INODE_TYPE.DIRECTORY) {
-      const path = this.readPath(inode.pathOffset, inode.pathLength);
-      const children = this.getDirectChildrenWithImplicit(path);
-      let subdirCount = 0;
-      for (const child of children) {
-        if (child.type === "implicit") {
-          subdirCount++;
-        } else {
-          const childIdx = this.pathIndex.get(child.path);
-          if (childIdx !== void 0) {
-            const childInode = this.readInode(childIdx);
-            if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
-          }
-        }
-      }
-      nlink = 2 + subdirCount;
+      nlink = 2 + this.countSubdirectories(this.readPath(inode.pathOffset, inode.pathLength));
     }
     const buf = new Uint8Array(53);
     const view = new DataView(buf.buffer);
@@ -6976,9 +7564,16 @@ var VFSEngine = class _VFSEngine {
     return { status: 0, data: encoder10.encode(resolvedPath) };
   }
   // ---- CHMOD ----
-  chmod(path, mode) {
+  /**
+   * `follow: false` is `lchmod` — act on the symlink itself rather than what it points at.
+   *
+   * This used to have no such parameter and `lchmod` simply called `chmod`, so it changed the
+   * **target's** permissions: the one thing the `l` prefix exists to prevent. `resolvePathComponents`
+   * already distinguishes the two, exactly as `stat` and `lstat` do.
+   */
+  chmod(path, mode, follow = true) {
     path = this.normalizePath(path);
-    const idx = this.resolvePathComponents(path, true);
+    const idx = this.resolvePathComponents(path, follow);
     if (idx === void 0) return { status: this.resolveFailureStatus() };
     const inode = this.readInode(idx);
     inode.mode = inode.mode & S_IFMT | mode & 4095;
@@ -6987,9 +7582,10 @@ var VFSEngine = class _VFSEngine {
     return { status: 0 };
   }
   // ---- CHOWN ----
-  chown(path, uid, gid) {
+  /** `follow: false` is `lchown` — the link's own ownership, not its target's. */
+  chown(path, uid, gid, follow = true) {
     path = this.normalizePath(path);
-    const idx = this.resolvePathComponents(path, true);
+    const idx = this.resolvePathComponents(path, follow);
     if (idx === void 0) return { status: this.resolveFailureStatus() };
     const inode = this.readInode(idx);
     inode.uid = uid;
@@ -6999,9 +7595,10 @@ var VFSEngine = class _VFSEngine {
     return { status: 0 };
   }
   // ---- UTIMES ----
-  utimes(path, atime, mtime) {
+  /** `follow: false` is `lutimes` — timestamps on the symlink itself, not on its target. */
+  utimes(path, atime, mtime, follow = true) {
     path = this.normalizePath(path);
-    const idx = this.resolvePathComponents(path, true);
+    const idx = this.resolvePathComponents(path, follow);
     if (idx === void 0) return { status: this.resolveFailureStatus() };
     const inode = this.readInode(idx);
     inode.atime = atime;
@@ -7078,6 +7675,10 @@ var VFSEngine = class _VFSEngine {
         path = linkTarget;
         idx = this.resolvePathComponents(path, true);
       }
+    }
+    if (_VFSEngine.isWritable(flags)) {
+      const isDirectory = idx !== void 0 ? this.readInode(idx).type === INODE_TYPE.DIRECTORY : this.isImplicitDirectory(path);
+      if (isDirectory) return { status: CODE_TO_STATUS.EISDIR, data: null };
     }
     if (idx === void 0) {
       if (!hasCreate) return { status: this.resolveFailureStatus(), data: null };
@@ -7222,7 +7823,19 @@ var VFSEngine = class _VFSEngine {
     dv.setUint32(20, Math.max(0, this.inodeCount - usedInodes), true);
     return { status: 0, data: buf };
   }
-  fsync() {
+  /**
+   * fsync(2) / fdatasync(2).
+   *
+   * Everything here is committed to one backing handle, so there is nothing per-descriptor to
+   * flush — but the descriptor still has to be *checked*. `fs.fsyncSync(fd)` on a closed or
+   * never-opened fd answers EBADF in node, and reporting success instead turns a use-after-close
+   * into silence at the one call whose entire job is to confirm the data is safe.
+   *
+   * `fd` is optional because the volume-wide flush behind `promises.flush()` has no descriptor
+   * to name, and because a request encoded by an older worker carries no fd payload.
+   */
+  fsync(fd) {
+    if (fd !== void 0 && !this.fdTable.has(fd)) return { status: CODE_TO_STATUS.EBADF };
     this.commitPending();
     this.handle.flush();
     return { status: 0 };
@@ -7290,12 +7903,9 @@ var VFSEngine = class _VFSEngine {
   mkdtemp(prefix) {
     const suffix = Math.random().toString(36).substring(2, 8);
     const path = this.normalizePath(prefix + suffix);
-    const parentStatus = this.ensureParent(path);
-    if (parentStatus !== 0) {
-      const parentPath = path.substring(0, path.lastIndexOf("/"));
-      if (parentPath) {
-        this.mkdirRecursive(parentPath);
-      }
+    const parentPath = path.substring(0, path.lastIndexOf("/")) || "/";
+    if (parentPath !== "/" && this.resolvePathComponents(parentPath, true) === void 0 && !this.isImplicitDirectory(parentPath)) {
+      return { status: CODE_TO_STATUS.ENOENT, data: null };
     }
     this.createInode(path, INODE_TYPE.DIRECTORY, this.dirModeFor(448), 0);
     this.commitPending();
@@ -7480,6 +8090,29 @@ var VFSEngine = class _VFSEngine {
    * Returns unique child full paths. Each entry is tagged with whether it's a
    * real inode or an implicit directory.
    */
+  /**
+   * How many direct children of `dirPath` are directories — the `nlink` a directory reports
+   * (`2 + subdirectories`, as on a real filesystem).
+   *
+   * Counting through {@link getDirectChildrenWithImplicit} meant every `stat` on a directory
+   * allocated one object and one string per child, built an array, and then **sorted** it, all to
+   * arrive at a single integer. The sort in particular is entirely wasted: order cannot change a
+   * count. This walks the child index directly and allocates nothing per child beyond the lookup
+   * key, which is why `stat` on a directory was ~40× the cost of `stat` on a file.
+   */
+  countSubdirectories(dirPath) {
+    this.ensureChildIndex();
+    const names = this.childIndex.get(dirPath);
+    if (!names) return 0;
+    const prefix = dirPath === "/" ? "/" : dirPath + "/";
+    let subdirs = 0;
+    for (const name of names.keys()) {
+      const childIdx = this.pathIndex.get(prefix + name);
+      if (childIdx === void 0) subdirs++;
+      else if (this.readInode(childIdx).type === INODE_TYPE.DIRECTORY) subdirs++;
+    }
+    return subdirs;
+  }
   getDirectChildrenWithImplicit(dirPath) {
     this.ensureChildIndex();
     const names = this.childIndex.get(dirPath);
@@ -7501,20 +8134,7 @@ var VFSEngine = class _VFSEngine {
     this.rebuildImplicitDirs();
     const ts = this.implicitDirs.get(path) ?? Date.now();
     const mode = DEFAULT_DIR_MODE & ~(this.umask & 511);
-    const children = this.getDirectChildrenWithImplicit(path);
-    let subdirCount = 0;
-    for (const child of children) {
-      if (child.type === "implicit") {
-        subdirCount++;
-      } else {
-        const childIdx = this.pathIndex.get(child.path);
-        if (childIdx !== void 0) {
-          const childInode = this.readInode(childIdx);
-          if (childInode.type === INODE_TYPE.DIRECTORY) subdirCount++;
-        }
-      }
-    }
-    const nlink = 2 + subdirCount;
+    const nlink = 2 + this.countSubdirectories(path);
     const buf = new Uint8Array(53);
     const view = new DataView(buf.buffer);
     view.setUint8(0, INODE_TYPE.DIRECTORY);
@@ -7880,12 +8500,9 @@ async function repairVFS(root = "/", fs) {
 }
 function spawnRepairWorker(msg) {
   return new Promise((resolve2, reject) => {
-    const worker = new Worker(
-      new URL("./workers/repair.worker.js", import.meta.url),
-      { type: "module" }
-    );
+    const worker = workerFromSource(repair_default, "vfs-repair");
     worker.onmessage = (event) => {
-      worker.terminate();
+      terminateWorker(worker);
       if (event.data.error) {
         reject(new Error(event.data.error));
       } else {
@@ -7893,7 +8510,7 @@ function spawnRepairWorker(msg) {
       }
     };
     worker.onerror = (event) => {
-      worker.terminate();
+      terminateWorker(worker);
       reject(new Error(event.message || "Repair worker failed"));
     };
     worker.postMessage(msg);
@@ -9206,6 +9823,6 @@ function init() {
   return getDefaultFS().init();
 }
 
-export { BigIntStats, CloudDrive, Dir, Dirent, DriveManager, FSError, IndexedDbDrive, LocalFolderDrive, LocalStorageDrive, MemoryDrive, NodeReadable, NodeWritable, NodeReadable as ReadStream, SAB_OFFSETS, SIGNAL, SimpleEventEmitter, Stats, SyncEngine, TreeDrive, VFSFileSystem, VfsDrive, NodeWritable as WriteStream, acquireFsLock, constants, createError, createFS, createServiceWorkerBridge, dropHandle, getDefaultFS, init, loadFromOPFS, loadHandle, localFolderSupported, path_exports as path, pickDirectory, releaseFsLock, repairVFS, statusToError, unpackToOPFS };
+export { BigIntStats, CloudDrive, Dir, Dirent, DriveManager, FSError, IndexedDbDrive, LocalFolderDrive, LocalStorageDrive, MemoryDrive, NodeReadable, NodeWritable, NodeReadable as ReadStream, SAB_OFFSETS, SIGNAL, SimpleEventEmitter, Stats, SyncEngine, TreeDrive, VFSFileSystem, VfsDrive, NodeWritable as WriteStream, acquireFsLock, constants, createError, createFS, createServiceWorkerBridge, disposeAll, dropHandle, getDefaultFS, init, loadFromOPFS, loadHandle, localFolderSupported, path_exports as path, pickDirectory, releaseFsLock, repairVFS, statusToError, unpackToOPFS };
 //# sourceMappingURL=index.js.map
 //# sourceMappingURL=index.js.map
