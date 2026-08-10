@@ -575,6 +575,17 @@ Close the leader tab and watch a follower take over: the badge above changes wit
      */
     let renderTimer = null;
     let renderSuspended = false;
+
+    // Redraw when the tab comes back to the foreground.
+    //
+    // Redraws are coalesced behind a `setTimeout`, and browsers throttle timers in hidden tabs —
+    // heavily, after a tab has been backgrounded a while. So a background tab can receive a watch
+    // event and still not repaint for a long time, which looks exactly like "one tab updated and
+    // another did not". The event was delivered; the redraw was not scheduled. Repainting on the
+    // way back to visible closes that gap without weakening the coalescing.
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden && !renderSuspended) render();
+    });
     function scheduleRender() {
       if (renderSuspended || renderTimer) return;
       renderTimer = setTimeout(() => { renderTimer = null; render(); }, 120);
