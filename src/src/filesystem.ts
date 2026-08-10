@@ -387,6 +387,10 @@ export class VFSFileSystem {
   /** Callbacks for {@link onLeaderChange}. */
   private leaderListeners = new Set<(isLeader: boolean) => void>();
   private holdingLeaderLock = false;
+  /** Resolving this releases the leader lock — see {@link acquireLeaderLock}. */
+  private releaseLeaderLock: (() => void) | null = null;
+  /** Cancels a queued bid for promotion, so a disposed follower cannot later be elected. */
+  private leaderLockBid: AbortController | null = null;
   private brokerInitialized = false;
   private brokerHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   private brokerControlPort: MessagePort | null = null;
@@ -548,7 +552,13 @@ export class VFSFileSystem {
       if (lock) {
         this.holdingLeaderLock = true;
         this.startAsLeader();
-        await new Promise(() => {}); // Hold lock forever (released when tab closes)
+        // Held until the tab closes *or* the instance is disposed. It used to be
+        // `new Promise(() => {})` — never resolved — so a disposed leader kept the lock for the
+        // life of the page. The next instance on the same volume then started as a follower of a
+        // leader whose workers were already terminated, and its first synchronous call spun until
+        // the 30s stall guard. Creating and disposing instances in a loop is exactly what
+        // `dispose` is documented for, so the lock has to come back.
+        await new Promise<void>((resolve) => { this.releaseLeaderLock = resolve; });
       } else {
         this.startAsFollower();
         this.waitForLeaderLock();
@@ -559,12 +569,17 @@ export class VFSFileSystem {
   /** Queue for leader takeover when the current leader's lock is released */
   private waitForLeaderLock(): void {
     if (!('locks' in navigator)) return;
-    navigator.locks.request(`${this.ns}-leader`, async () => {
-      console.log('[VFS] Leader lock acquired — promoting to leader');
+    // Abortable: without it a disposed follower stays queued and gets promoted once the current
+    // leader goes away, taking ownership of a volume it can no longer serve.
+    const bid = new AbortController();
+    this.leaderLockBid = bid;
+    navigator.locks.request(`${this.ns}-leader`, { signal: bid.signal }, async () => {
+      this.leaderLockBid = null;
+      if (this.closed) return;
       this.holdingLeaderLock = true;
       this.promoteToLeader();
-      await new Promise(() => {}); // Hold lock as new leader
-    });
+      await new Promise<void>((resolve) => { this.releaseLeaderLock = resolve; });
+    }).catch(() => { /* aborted on dispose, or the page is going away */ });
   }
 
   /** Send init-leader message to sync-relay worker */
@@ -1884,6 +1899,12 @@ export class VFSFileSystem {
     await this.shutdownRelay();
     terminateWorker(this.syncWorker);
     terminateWorker(this.asyncWorker);
+    // Last, so a tab promoted by this release does not race the relay we just shut down.
+    this.leaderLockBid?.abort();
+    this.leaderLockBid = null;
+    this.releaseLeaderLock?.();
+    this.releaseLeaderLock = null;
+    this.holdingLeaderLock = false;
     this.isReady = false;
   }
 

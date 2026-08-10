@@ -203,7 +203,7 @@
     #drop {
       position: relative;
       min-height: 19rem;
-      max-height: 32rem;
+      max-height: 24rem;
       overflow: auto;
     }
 
@@ -275,7 +275,7 @@
       font-size: 12.5px;
       white-space: pre-wrap;
       word-break: break-word;
-      max-height: 15rem;
+      max-height: 11rem;
       overflow: auto;
       background: var(--code);
     }
@@ -338,8 +338,12 @@
     <div id="role" class="banner" style="display:none"></div>
 
     <div class="grid">
-      <!-- ── file browser ─────────────────────────────────────────── -->
-      <section class="panel">
+      <!-- The left column carries the benchmark too. With every panel but the browser stacked
+           on the right, that column ran half again as tall as this one and pushed the benchmark
+           and the log below the fold. -->
+      <div style="display:grid; gap:1.25rem; align-content:start">
+        <!-- ── file browser ─────────────────────────────────────────── -->
+        <section class="panel">
         <h2>Files <span id="watchPill" class="pill">watching…</span></h2>
         <div class="toolbar">
           <button id="btnUp">↑ Up</button>
@@ -356,10 +360,31 @@
             <tbody id="rows"></tbody>
           </table>
           <div id="empty" class="empty">Drop files or folders here — from Finder, Explorer, or the desktop.</div>
-        </div>
-      </section>
+          </div>
+        </section>
 
-      <div style="display:grid; gap:1.25rem;">
+      <!-- ── benchmark ──────────────────────────────────────────── -->
+      <section class="panel">
+        <h2>Benchmark <span class="pill">your machine, right now</span></h2>
+        <div class="toolbar">
+          <button id="btnBench" class="primary">Run benchmark</button>
+          <span id="benchNote" class="pill" style="align-self:center">~3s</span>
+        </div>
+        <table class="bench">
+          <tbody id="benchRows">
+            <tr>
+              <td colspan="3" style="color:var(--muted); padding:1rem .9rem">
+                Measures this library against real OPFS in your browser. Numbers vary by engine —
+                Chromium is storage-bound, WebKit is not.</td>
+            </tr>
+          </tbody>
+        </table>
+        <p id="benchRole" style="margin:0; padding:.6rem .9rem; border-top:1px solid var(--line);
+         color:var(--muted); font-size:.83rem"></p>
+      </section>
+      </div>
+
+      <div style="display:grid; gap:1.25rem; align-content:start">
         <!-- ── cross-tab ──────────────────────────────────────────── -->
         <section class="panel">
           <h2>Across tabs</h2>
@@ -381,26 +406,6 @@ Close the leader tab and watch a follower take over: the badge above changes wit
           <pre class="out" id="mtOut">The listing above runs inside a worker, which is what Safari needs. But the sync API is not worker-only — on Chrome and Firefox it works directly on a page's main thread, no worker involved.
 
 This runs a page-hosted instance right here and times it.</pre>
-        </section>
-
-        <!-- ── benchmark ──────────────────────────────────────────── -->
-        <section class="panel">
-          <h2>Benchmark <span class="pill">your machine, right now</span></h2>
-          <div class="toolbar">
-            <button id="btnBench" class="primary">Run benchmark</button>
-            <span id="benchNote" class="pill" style="align-self:center">~3s</span>
-          </div>
-          <table class="bench">
-            <tbody id="benchRows">
-              <tr>
-                <td colspan="3" style="color:var(--muted); padding:1rem .9rem">
-                  Measures this library against real OPFS in your browser. Numbers vary by engine —
-                  Chromium is storage-bound, WebKit is not.</td>
-              </tr>
-            </tbody>
-          </table>
-          <p id="benchRole" style="margin:0; padding:.6rem .9rem; border-top:1px solid var(--line);
-           color:var(--muted); font-size:.83rem"></p>
         </section>
 
         <!-- ── console ────────────────────────────────────────────── -->
@@ -722,6 +727,7 @@ This runs a page-hosted instance right here and times it.</pre>
         $('btnMain').textContent = 'Run anyway (freezes this tab)';
       }
 
+      let mainFs = null;
       $('btnMain').onclick = async () => {
         $('btnMain').disabled = true;
         $('mtPill').textContent = 'running…';
@@ -733,9 +739,15 @@ This runs a page-hosted instance right here and times it.</pre>
 
         try {
           const { VFSFileSystem } = await import('./vendor/index.js');
-          // Its own volume, so it does not join the leader election for the one the worker owns.
-          const mainFs = new VFSFileSystem({ root: '/demo-main-thread' });
-          await mainFs.init();
+          // Built once and kept. It used to be constructed and disposed per click, which froze
+          // the tab for 30s from the second click on: a disposed instance does not release its
+          // exclusive handle on the volume, so reopening the same volume waits on a handle
+          // nobody will give back. Keeping one instance is what an app would do anyway.
+          if (!mainFs) {
+            // Its own volume, so it does not join the election for the one the worker owns.
+            mainFs = new VFSFileSystem({ root: '/demo-main-thread' });
+            await mainFs.init();
+          }
 
           const t0 = performance.now();
           mainFs.mkdirSync('/notes', { recursive: true });
@@ -744,7 +756,6 @@ This runs a page-hosted instance right here and times it.</pre>
           const size = mainFs.statSync('/notes/hello.txt').size;
           const names = mainFs.readdirSync('/notes');
           const ms = performance.now() - t0;
-          await mainFs.dispose();
 
           $('mtPill').textContent = ms < 1000 ? 'works here' : 'slow here';
           $('mtPill').className = 'pill' + (ms < 1000 ? ' live' : '');

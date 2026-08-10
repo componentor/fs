@@ -1004,6 +1004,10 @@ declare class VFSFileSystem {
     /** Callbacks for {@link onLeaderChange}. */
     private leaderListeners;
     private holdingLeaderLock;
+    /** Resolving this releases the leader lock — see {@link acquireLeaderLock}. */
+    private releaseLeaderLock;
+    /** Cancels a queued bid for promotion, so a disposed follower cannot later be elected. */
+    private leaderLockBid;
     private brokerInitialized;
     private brokerHeartbeatTimer;
     private brokerControlPort;

@@ -4126,6 +4126,10 @@ var VFSFileSystem = class {
   /** Callbacks for {@link onLeaderChange}. */
   leaderListeners = /* @__PURE__ */ new Set();
   holdingLeaderLock = false;
+  /** Resolving this releases the leader lock — see {@link acquireLeaderLock}. */
+  releaseLeaderLock = null;
+  /** Cancels a queued bid for promotion, so a disposed follower cannot later be elected. */
+  leaderLockBid = null;
   brokerInitialized = false;
   brokerHeartbeatTimer = null;
   brokerControlPort = null;
@@ -4247,7 +4251,8 @@ var VFSFileSystem = class {
       if (lock) {
         this.holdingLeaderLock = true;
         this.startAsLeader();
-        await new Promise(() => {
+        await new Promise((resolve2) => {
+          this.releaseLeaderLock = resolve2;
         });
       } else {
         this.startAsFollower();
@@ -4258,12 +4263,17 @@ var VFSFileSystem = class {
   /** Queue for leader takeover when the current leader's lock is released */
   waitForLeaderLock() {
     if (!("locks" in navigator)) return;
-    navigator.locks.request(`${this.ns}-leader`, async () => {
-      console.log("[VFS] Leader lock acquired \u2014 promoting to leader");
+    const bid = new AbortController();
+    this.leaderLockBid = bid;
+    navigator.locks.request(`${this.ns}-leader`, { signal: bid.signal }, async () => {
+      this.leaderLockBid = null;
+      if (this.closed) return;
       this.holdingLeaderLock = true;
       this.promoteToLeader();
-      await new Promise(() => {
+      await new Promise((resolve2) => {
+        this.releaseLeaderLock = resolve2;
       });
+    }).catch(() => {
     });
   }
   /** Send init-leader message to sync-relay worker */
@@ -5320,6 +5330,11 @@ var VFSFileSystem = class {
     await this.shutdownRelay();
     terminateWorker(this.syncWorker);
     terminateWorker(this.asyncWorker);
+    this.leaderLockBid?.abort();
+    this.leaderLockBid = null;
+    this.releaseLeaderLock?.();
+    this.releaseLeaderLock = null;
+    this.holdingLeaderLock = false;
     this.isReady = false;
   }
   /** `await using` support, so an instance can be scoped to a block. */
