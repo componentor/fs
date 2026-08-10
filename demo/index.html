@@ -129,6 +129,19 @@
 Close the leader tab and watch a follower take over: the badge above changes without a reload.</pre>
       </section>
 
+      <!-- ── main-thread sync ───────────────────────────────────── -->
+      <section class="panel">
+        <h2>Sync on the main thread <span id="mtPill" class="pill">not run</span></h2>
+        <div class="toolbar">
+          <button id="btnMain" class="primary">Run sync calls on this thread</button>
+        </div>
+        <pre class="out" id="mtOut">The listing above runs inside a worker, which is what Safari
+needs. But the sync API is not worker-only — on Chrome and Firefox it works
+directly on a page's main thread, no worker involved.
+
+This runs a page-hosted instance right here and times it.</pre>
+      </section>
+
       <!-- ── benchmark ──────────────────────────────────────────── -->
       <section class="panel">
         <h2>Benchmark <span class="pill">your machine, right now</span></h2>
@@ -163,16 +176,17 @@ Close the leader tab and watch a follower take over: the badge above changes wit
   </footer>
 </div>
 
-<script type="importmap">
-{ "imports": { "@componentor/fs": "./vendor/index.js" } }
-</script>
-
 <script type="module">
-import { VFSFileSystem } from '@componentor/fs';
+/**
+ * The page drives a worker that owns the filesystem — see fs-worker.js for why that matters on
+ * Safari. Nothing here touches `fs` directly; everything goes over a small RPC, which keeps the
+ * main thread free and makes the sync API behave identically on every engine.
+ */
+import { createServiceWorkerBridge } from './vendor/index.js';
 
 const $ = (id) => document.getElementById(id);
 const logEl = $('log'), rowsEl = $('rows'), emptyEl = $('empty');
-let fs, cwd = '/';
+let cwd = '/', isLeader = true;
 
 const log = (...a) => {
   const line = a.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ');
@@ -181,52 +195,83 @@ const log = (...a) => {
 const fmt = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n/1024).toFixed(1)} KB` : `${(n/1048576).toFixed(1)} MB`;
 const join = (dir, name) => (dir === '/' ? '' : dir) + '/' + name;
 
+// ── the worker, and the RPC to it ───────────────────────────────────────────
+
+const worker = new Worker(new URL('./fs-worker.js', import.meta.url), { type: 'module' });
+let nextId = 1;
+const pending = new Map();
+let onReady;
+const ready = new Promise((resolve) => { onReady = resolve; });
+
+function call(op, arg, transfer) {
+  const id = nextId++;
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    worker.postMessage({ id, op, arg }, transfer ?? []);
+  });
+}
+
+worker.onmessage = ({ data }) => {
+  if (data.type === 'ready') { onReady(data); return; }
+  if (data.type === 'role') { isLeader = data.isLeader; renderRole(); return; }
+  if (data.type === 'watching') {
+    $('watchPill').textContent = data.ok ? 'live' : 'watch unavailable';
+    if (data.ok) $('watchPill').className = 'pill live';
+    return;
+  }
+  if (data.type === 'watch') {
+    log(`watch: ${data.eventType} ${data.filename ?? ''}`);
+    render();
+    if (data.filename && data.filename.includes('tab-ping')) {
+      $('tabLog').textContent = `Another tab wrote ${data.filename} — picked up here automatically at `
+        + new Date().toLocaleTimeString() + '.';
+    }
+    return;
+  }
+  const entry = pending.get(data.id);
+  if (!entry) return;
+  pending.delete(data.id);
+  data.ok ? entry.resolve(data.value) : entry.reject(Object.assign(new Error(data.error), { code: data.code }));
+};
+
 // ── file browser ────────────────────────────────────────────────────────────
 
 async function render() {
-  const entries = await fs.promises.readdir(cwd, { withFileTypes: true });
-  entries.sort((a, b) => (b.isDirectory() - a.isDirectory()) || a.name.localeCompare(b.name));
-
+  const entries = await call('list', cwd);
   $('crumbs').replaceChildren(...crumbTrail());
   $('btnUp').disabled = cwd === '/';
   emptyEl.style.display = entries.length ? 'none' : 'block';
 
   rowsEl.replaceChildren(...entries.map((entry) => {
     const full = join(cwd, entry.name);
-    const isDir = entry.isDirectory();
     const tr = document.createElement('tr');
 
     const name = document.createElement('td');
-    name.className = 'name' + (isDir ? ' dir' : '');
-    name.textContent = (isDir ? '📁 ' : '📄 ') + entry.name;
-    if (isDir) name.onclick = () => { cwd = full; render(); };
+    name.className = 'name' + (entry.isDirectory ? ' dir' : '');
+    name.textContent = (entry.isDirectory ? '📁 ' : '📄 ') + entry.name;
+    if (entry.isDirectory) name.onclick = () => { cwd = full; render(); };
     tr.appendChild(name);
 
     const size = document.createElement('td');
     size.className = 'size';
-    size.textContent = isDir ? '—' : fmt(fs.statSync(full).size);
+    size.textContent = entry.isDirectory ? '—' : fmt(entry.size);
     tr.appendChild(size);
 
     const act = document.createElement('td');
     act.className = 'act';
-    if (!isDir) {
+    if (!entry.isDirectory) {
       const view = document.createElement('button');
       view.textContent = 'view';
-      view.onclick = () => {
-        const bytes = fs.readFileSync(full);
-        const text = new TextDecoder().decode(bytes.subarray(0, 2000));
-        log(`── ${full} (${fmt(bytes.length)}) ──\n${text}`);
+      view.onclick = async () => {
+        const { size: n, head } = await call('read', full);
+        log(`── ${full} (${fmt(n)}) ──\n${head}`);
       };
       act.appendChild(view);
     }
     const del = document.createElement('button');
     del.className = 'danger';
     del.textContent = 'delete';
-    del.onclick = async () => {
-      await fs.promises.rm(full, { recursive: true, force: true });
-      log('deleted', full);
-      render();
-    };
+    del.onclick = async () => { await call('remove', full); log('deleted', full); render(); };
     act.appendChild(del);
     tr.appendChild(act);
     return tr;
@@ -235,67 +280,54 @@ async function render() {
 
 function crumbTrail() {
   const parts = cwd.split('/').filter(Boolean);
-  const out = [];
   const mk = (label, path) => {
     const b = document.createElement('button');
     b.textContent = label;
     b.onclick = () => { cwd = path; render(); };
     return b;
   };
-  out.push(mk('/', '/'));
+  const out = [mk('/', '/')];
   let acc = '';
-  for (const part of parts) {
-    acc += '/' + part;
-    out.push(document.createTextNode('›'), mk(part, acc));
-  }
+  for (const part of parts) { acc += '/' + part; out.push(document.createTextNode('›'), mk(part, acc)); }
   return out;
 }
 
 // ── importing from the OS ───────────────────────────────────────────────────
 //
-// Folders arrive as directory entries, so the whole tree is walked and recreated. This is the
-// part that makes it a real filesystem rather than a key/value store: `mkdir -p` then write.
+// The directory walk stays here: `webkitGetAsEntry` is a DOM API and does not exist in a worker.
+// Files are read to bytes on this side and sent over in one batch, so a dropped folder costs one
+// message rather than one per file.
 
-async function importEntry(entry, destDir) {
+async function collect(entry, destDir, out) {
   if (entry.isFile) {
     const file = await new Promise((res, rej) => entry.file(res, rej));
-    const buf = new Uint8Array(await file.arrayBuffer());
-    await fs.promises.mkdir(destDir, { recursive: true });
-    await fs.promises.writeFile(join(destDir, file.name), buf);
-    return 1;
+    out.push({ path: join(destDir, file.name), data: await file.arrayBuffer() });
+    return;
   }
   if (entry.isDirectory) {
     const child = join(destDir, entry.name);
-    await fs.promises.mkdir(child, { recursive: true });
+    await call('mkdir', child);
     const reader = entry.createReader();
-    let count = 0;
     for (;;) {
       const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
       if (!batch.length) break;
-      for (const e of batch) count += await importEntry(e, child);
+      for (const e of batch) await collect(e, child, out);
     }
-    return count;
   }
-  return 0;
 }
 
 async function importDataTransfer(dt) {
-  const entries = [...dt.items]
-    .filter((i) => i.kind === 'file')
-    .map((i) => i.webkitGetAsEntry?.())
-    .filter(Boolean);
+  const entries = [...dt.items].filter((i) => i.kind === 'file')
+    .map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
 
-  let files = 0;
+  const files = [];
   if (entries.length) {
-    for (const entry of entries) files += await importEntry(entry, cwd);
+    for (const entry of entries) await collect(entry, cwd, files);
   } else {
-    // No entry API (rare) — fall back to the flat file list.
-    for (const file of dt.files) {
-      await fs.promises.writeFile(join(cwd, file.name), new Uint8Array(await file.arrayBuffer()));
-      files++;
-    }
+    for (const file of dt.files) files.push({ path: join(cwd, file.name), data: await file.arrayBuffer() });
   }
-  log(`imported ${files} file${files === 1 ? '' : 's'} into ${cwd}`);
+  if (files.length) await call('importFiles', files, files.map((f) => f.data));
+  log(`imported ${files.length} file${files.length === 1 ? '' : 's'} into ${cwd}`);
   render();
 }
 
@@ -303,175 +335,165 @@ const drop = $('drop');
 drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
 drop.addEventListener('dragleave', (e) => { if (e.target === drop) drop.classList.remove('over'); });
 drop.addEventListener('drop', async (e) => {
-  e.preventDefault();
-  drop.classList.remove('over');
-  try { await importDataTransfer(e.dataTransfer); }
-  catch (err) { log('import failed:', err.message); }
+  e.preventDefault(); drop.classList.remove('over');
+  try { await importDataTransfer(e.dataTransfer); } catch (err) { log('import failed:', err.message); }
 });
 
-// ── benchmark ───────────────────────────────────────────────────────────────
-
-async function benchmark() {
-  $('btnBench').disabled = true;
-  $('benchRows').innerHTML = '<tr><td colspan="3" style="padding:1rem .9rem">Running…</td></tr>';
-  await fs.promises.mkdir('/.bench', { recursive: true });
-
-  const body = 'x'.repeat(1024);
-  const time = (label, n, fn) => {
-    const t0 = performance.now();
-    for (let i = 0; i < n; i++) fn(i);
-    const per = (performance.now() - t0) / n;
-    return { label, per, ops: Math.round(1000 / per) };
-  };
-
-  const rows = [];
-  let i = 0;
-  rows.push(time('writeFileSync 1KB (create)', 150, (n) => fs.writeFileSync(`/.bench/c${n}.txt`, body)));
-  fs.writeFileSync('/.bench/fixed.txt', body);
-  rows.push(time('writeFileSync 1KB (overwrite)', 200, () => fs.writeFileSync('/.bench/fixed.txt', body)));
-  rows.push(time('readFileSync 1KB', 400, () => fs.readFileSync('/.bench/fixed.txt')));
-  rows.push(time('statSync', 800, () => fs.statSync('/.bench/fixed.txt')));
-  rows.push(time('existsSync', 800, () => fs.existsSync('/.bench/fixed.txt')));
-  rows.push(time('readdirSync (150 entries)', 60, () => fs.readdirSync('/.bench')));
-  rows.push(time('unlinkSync', 140, () => fs.unlinkSync(`/.bench/c${i++}.txt`)));
-
-  await fs.promises.rm('/.bench', { recursive: true, force: true });
-  $('benchRows').replaceChildren(...rows.map((r) => {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${r.label}</td><td class="n mono">${r.per.toFixed(3)} ms</td>` +
-                   `<td class="n mono">${r.ops.toLocaleString()}/s</td>`;
-    return tr;
-  }));
-  $('benchNote').textContent = (crossOriginIsolated ? 'sync API' : 'async only')
-    + ' · ' + (fs.isLeader ? 'leader' : 'follower');
-  renderRole();
-  $('btnBench').disabled = false;
-  render();
-}
-
 // ── who owns the volume ─────────────────────────────────────────────────────
-//
-// One tab per origin holds the lock and does the work; the rest relay their calls to it. Which
-// one you are is not cosmetic: a follower's synchronous calls cost a round trip to the leader, so
-// they measure slower, and a benchmark that does not say which role it ran in is not comparable.
 
 function renderRole() {
-  const leader = fs.isLeader;
   const el = $('role');
   el.style.display = '';
-  el.className = 'banner ' + (leader ? 'leader' : 'follower');
-  el.innerHTML = leader
+  el.className = 'banner ' + (isLeader ? 'leader' : 'follower');
+  el.innerHTML = isLeader
     ? '<span class="role-tag">This tab is the leader.</span> It owns the volume and performs every '
       + 'operation directly. Other tabs relay their calls here.'
     : '<span class="role-tag">This tab is a follower.</span> The leader is another tab; calls from '
       + 'here relay to it and back, so they are slower — expected, not a fault. Close the leader '
       + 'and this tab is promoted, with no reload.';
-  $('benchRole').textContent = leader
-    ? 'Measured as the leader — the fast path, with no cross-tab hop. A follower will be slower on '
-      + 'the same machine; compare like with like.'
+  $('benchRole').textContent = isLeader
+    ? 'Measured as the leader, inside a worker — real Atomics.wait, no main-thread spin. A '
+      + 'follower will be slower on the same machine; compare like with like.'
     : 'Measured as a follower: every call round-trips to the leader tab, so these numbers are '
-      + 'expected to be slower than the leader\'s. Run it in the leader tab to see the ceiling.';
+      + "expected to be slower than the leader's. Run it in the leader tab to see the ceiling.";
 }
 
 // ── boot ────────────────────────────────────────────────────────────────────
 
 (async function start() {
-  try {
-    fs = new VFSFileSystem({
-      root: '/demo',
-      // Relative on purpose: this site is served from a subpath (`/fs/` on GitHub project
-      // pages), so an absolute `/vfs-service-worker.js` would point at the user-pages root and
-      // 404. The Pages workflow copies the broker next to this page.
-      swUrl: './vfs-service-worker.js',
-    });
-    await fs.init();
-  } catch (err) {
+  // The bridge lets the worker reach `navigator.serviceWorker`, which worker scopes on Safari and
+  // Firefox cannot. `ns` is `vfs-${root}` with every non-alphanumeric replaced by `_`.
+  const channel = new MessageChannel();
+  createServiceWorkerBridge(channel.port1, { ns: 'vfs-_demo', swUrl: './vfs-service-worker.js' });
+  worker.postMessage({ type: 'init', swBridge: channel.port2 }, [channel.port2]);
+
+  const boot = await ready;
+  if (boot.error) {
     $('banner').className = 'banner warn';
-    $('banner').innerHTML = `<strong>Failed to start:</strong> ${err.message}`;
+    $('banner').innerHTML = `<strong>Failed to start:</strong> ${boot.error}`;
     return;
   }
 
   const b = $('banner');
-  if (crossOriginIsolated) {
-    b.className = 'banner ok';
-    b.innerHTML = '<strong>Cross-origin isolated ✓</strong> — the full synchronous API is live. '
-      + 'The file sizes in the table come from <code>fs.statSync()</code>, called straight through '
-      + 'with no <code>await</code> anywhere.';
-  } else {
-    b.className = 'banner warn';
-    b.innerHTML = '<strong>Not cross-origin isolated</strong> — the async API works, the sync calls '
-      + 'will throw. Usually one more reload settles it; the service worker needs to take control first.';
-  }
+  b.className = 'banner ok';
+  b.innerHTML = '<strong>Filesystem running in a worker.</strong> Every listing below comes from '
+    + '<code>readdirSync</code> and <code>statSync</code> called with no <code>await</code> — '
+    + 'inside the worker, where the blocking wait is a real <code>Atomics.wait</code>. That is the '
+    + 'arrangement Safari needs; on a page main thread a sync call there can stall for 30 seconds.';
 
+  isLeader = boot.isLeader;
   renderRole();
-  fs.onLeaderChange((isLeader) => {
-    renderRole();
-    log(isLeader ? 'promoted: this tab is now the leader' : 'this tab is a follower');
-  });
 
   $('btnUp').onclick = () => { cwd = cwd.replace(/\/[^/]+$/, '') || '/'; render(); };
   $('btnNewDir').onclick = async () => {
     const name = prompt('Folder name', 'new-folder');
-    if (name) { await fs.promises.mkdir(join(cwd, name), { recursive: true }); render(); }
+    if (name) { await call('mkdir', join(cwd, name)); render(); }
   };
   $('btnNewFile').onclick = async () => {
     const name = prompt('File name', 'note.txt');
-    if (name) { await fs.promises.writeFile(join(cwd, name), 'Written at ' + new Date().toISOString() + '\n'); render(); }
+    if (name) {
+      await call('write', { path: join(cwd, name), text: 'Written at ' + new Date().toISOString() + '\n' });
+      render();
+    }
   };
   $('btnPick').onclick = () => $('filePicker').click();
   $('filePicker').onchange = async (e) => {
-    for (const file of e.target.files) {
-      await fs.promises.writeFile(join(cwd, file.name), new Uint8Array(await file.arrayBuffer()));
-    }
-    log(`imported ${e.target.files.length} file(s)`);
+    const files = [];
+    for (const file of e.target.files) files.push({ path: join(cwd, file.name), data: await file.arrayBuffer() });
+    if (files.length) await call('importFiles', files, files.map((f) => f.data));
+    log(`imported ${files.length} file(s)`);
     e.target.value = '';
     render();
   };
-  $('btnSeed').onclick = async () => {
-    await fs.promises.mkdir(join(cwd, 'src/components'), { recursive: true });
-    await fs.promises.writeFile(join(cwd, 'src/index.js'), 'export * from "./components/button.js";\n');
-    await fs.promises.writeFile(join(cwd, 'src/components/button.js'), 'export const Button = () => "click";\n');
-    await fs.promises.writeFile(join(cwd, 'readme.md'), '# Sample tree\n\nCreated with fs.promises.mkdir + writeFile.\n');
-    log('added a sample tree');
-    render();
-  };
-  $('btnWipe').onclick = async () => {
-    await fs.promises.rm('/', { recursive: true, force: true });
-    cwd = '/';
-    log('wiped the volume');
-    render();
-  };
-  $('btnBench').onclick = () => benchmark().catch((e) => log('benchmark failed:', e.message));
+  $('btnSeed').onclick = async () => { await call('seed', cwd); log('added a sample tree'); render(); };
+  $('btnWipe').onclick = async () => { await call('wipe'); cwd = '/'; log('wiped the volume'); render(); };
   $('btnTab').onclick = () => window.open(location.href, '_blank');
   $('btnPing').onclick = async () => {
-    const stamp = new Date().toLocaleTimeString();
-    await fs.promises.writeFile('/tab-ping.txt', `written at ${stamp}\n`);
-    $('tabLog').textContent = `This tab wrote /tab-ping.txt at ${stamp}.\nAny other open tab should show it within a moment — it is the same volume.`;
+    const stamp = await call('ping');
+    $('tabLog').textContent = `This tab wrote /tab-ping.txt at ${stamp}.\nAny other open tab should `
+      + 'show it within a moment — it is the same volume.';
+    render();
+  };
+  $('btnBench').onclick = async () => {
+    $('btnBench').disabled = true;
+    $('benchRows').innerHTML = '<tr><td colspan="3" style="padding:1rem .9rem">Running…</td></tr>';
+    try {
+      const { rows, isLeader: wasLeader } = await call('bench');
+      $('benchRows').replaceChildren(...rows.map((r) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${r.label}</td><td class="n mono">${r.per.toFixed(3)} ms</td>`
+                     + `<td class="n mono">${r.ops.toLocaleString()}/s</td>`;
+        return tr;
+      }));
+      $('benchNote').textContent = 'sync API · in a worker · ' + (wasLeader ? 'leader' : 'follower');
+    } catch (err) {
+      log('benchmark failed:', err.message);
+    }
+    $('btnBench').disabled = false;
     render();
   };
 
-  // Live cross-tab updates: `watch` broadcasts to every tab on this origin, so a write in one
-  // window refreshes the table in the others without polling.
-  try {
-    fs.watch('/', { recursive: true }, (eventType, filename) => {
-      $('watchPill').textContent = 'live';
-      $('watchPill').className = 'pill live';
-      log(`watch: ${eventType} ${filename ?? ''}`);
-      render();
-      if (filename && String(filename).includes('tab-ping')) {
-        $('tabLog').textContent = `Another tab wrote ${filename} — picked up here automatically at `
-          + new Date().toLocaleTimeString() + '.';
-      }
-    });
-    $('watchPill').textContent = 'live';
-    $('watchPill').className = 'pill live';
-  } catch (err) {
-    $('watchPill').textContent = 'watch unavailable';
-    log('watch unavailable:', err.message);
+  // ── main-thread sync, on demand ───────────────────────────────────────────
+  //
+  // The capability is real and it is the headline feature — it just is not safe to put on the
+  // boot path on WebKit, where a main-thread sync call busy-spins (Atomics.wait is illegal
+  // there), starves the worker's continuations and sits until the 30s stall guard. So it runs
+  // when asked, on its own volume, and reports what actually happened.
+  const webkitLike = /^((?!chrome|android|crios|fxios).)*safari/i.test(navigator.userAgent);
+  if (webkitLike) {
+    $('mtPill').textContent = 'expect a freeze';
+    $('btnMain').textContent = 'Run anyway (freezes this tab)';
   }
 
+  $('btnMain').onclick = async () => {
+    $('btnMain').disabled = true;
+    $('mtPill').textContent = 'running…';
+    $('mtOut').textContent = webkitLike
+      ? 'Running on the main thread. On WebKit this tab may freeze for ~30s — that is the '
+        + 'behaviour the worker arrangement exists to avoid.'
+      : 'Running on the main thread…';
+    await new Promise((r) => setTimeout(r, 50));   // let the UI paint before we block it
+
+    try {
+      const { VFSFileSystem } = await import('./vendor/index.js');
+      // Its own volume, so it does not join the leader election for the one the worker owns.
+      const mainFs = new VFSFileSystem({ root: '/demo-main-thread' });
+      await mainFs.init();
+
+      const t0 = performance.now();
+      mainFs.mkdirSync('/notes', { recursive: true });
+      mainFs.writeFileSync('/notes/hello.txt', 'written from the page main thread');
+      const text = mainFs.readFileSync('/notes/hello.txt', 'utf8');   // blocks, returns a value
+      const size = mainFs.statSync('/notes/hello.txt').size;
+      const names = mainFs.readdirSync('/notes');
+      const ms = performance.now() - t0;
+      await mainFs.dispose();
+
+      $('mtPill').textContent = ms < 1000 ? 'works here' : 'slow here';
+      $('mtPill').className = 'pill' + (ms < 1000 ? ' live' : '');
+      $('mtOut').textContent =
+        `Five synchronous calls on this page's main thread, no worker, no await:\n\n`
+        + `  mkdirSync('/notes')\n  writeFileSync('/notes/hello.txt', …)\n`
+        + `  readFileSync(…, 'utf8')  -> ${JSON.stringify(text)}\n`
+        + `  statSync(…).size         -> ${size}\n`
+        + `  readdirSync('/notes')    -> ${JSON.stringify(names)}\n\n`
+        + `Total: ${ms.toFixed(1)} ms.\n\n`
+        + (ms < 1000
+            ? 'That is the sync API working directly on the main thread — supported on Chrome and '
+              + 'Firefox. Safari is the exception, which is why the browser above runs in a worker.'
+            : 'That took long enough to show the problem: on WebKit a main-thread sync call '
+              + 'busy-spins and starves the worker it is waiting on. Run the instance in a worker '
+              + 'there, as the file browser above does.');
+    } catch (err) {
+      $('mtPill').textContent = 'failed';
+      $('mtOut').textContent = 'Main-thread sync failed: ' + err.message
+        + '\n\nThis is expected on WebKit; use a worker-hosted instance there.';
+    }
+    $('btnMain').disabled = false;
+  };
+
   await render();
-  log('ready — volume mounted at /demo');
+  log('ready — volume mounted at /demo, hosted in a worker');
 })();
 </script>
 </body>

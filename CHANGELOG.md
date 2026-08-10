@@ -1,5 +1,18 @@
 # Changelog
 
+## 4.1.1
+
+- **Fixed: `swUrl` threw a `ReferenceError` in a worker.** 4.1.0 started resolving it against `document.baseURI`, which does not exist in a worker scope. A worker-hosted instance normally returns earlier via `swBridge` and never reaches that line, but one configured with `swUrl` and no bridge crashed instead of failing on a registration it could not perform anyway. It falls back to `location.href` off the main thread.
+
+### The demo now runs the filesystem in a worker
+
+Not a package change — `files: ["dist"]` — but it is the arrangement this library recommends for
+Safari, and the reason is worth recording.
+
+- **The Pages demo booted in ~30 seconds on Safari, about half the time.** Measured across repeated WebKit loads: `30207ms`, `30183ms`, ~`200ms`, ~`200ms`. The 30s is exactly `SPIN_STALL_TIMEOUT_MS`. `Atomics.wait` is illegal on a page's main thread, so a synchronous call busy-spins; on Chromium the relay progresses anyway, on WebKit the spinning page starves the worker's continuations and the reply never lands until the stall guard trips. Hosting the instance in a worker makes the wait a real `Atomics.wait` and the main thread stays free: **6 of 6 WebKit loads now boot in 240–374 ms.**
+- **The readme framed this risk too narrowly.** It described main-thread sync stalls as an `opfs`-mode and follower-tab problem; it also hits a *leader* in the default `hybrid` mode on WebKit. Corrected.
+- The demo gained a panel that runs sync calls on the page's main thread on demand and reports what actually happened — "works here" on Chrome and Firefox, an honest failure on Safari with the reason. Main-thread sync is not worker-only; Safari is the exception, and the demo now shows which is which instead of claiming either.
+
 ## 4.1.0
 
 - **Added `fs.isLeader` and `fs.onLeaderChange(listener)`.** One tab per origin holds the lock and does the work; the rest relay their calls to it. That was documented architecture with no way to ask which one you are — and it is not cosmetic. A follower's synchronous calls cost a round trip to the leader, so **a benchmark taken in a follower is expected to be slower**, and one that does not say which role it ran in is not comparable. On Safari a follower's main-thread sync call cannot work at all, so knowing the role is how you decide to move the instance into a worker. Leadership moves when the leader goes away, so it is exposed as a live signal rather than a value you read once.

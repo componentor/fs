@@ -731,8 +731,12 @@ export class VFSFileSystem {
       // never there and got a 404 at registration. An absolute `/path.js` still means exactly
       // what it says; only the relative form changes, and only to what it should always have
       // meant.
+      // `document` does not exist in a worker. A worker-hosted instance normally returns above
+      // via `swBridge`, but one configured with `swUrl` and no bridge would otherwise throw a
+      // ReferenceError instead of failing on the registration it cannot do anyway.
+      const base = typeof document !== 'undefined' ? document.baseURI : location.href;
       const swUrl = this.config.swUrl
-        ? new URL(this.config.swUrl, document.baseURI)
+        ? new URL(this.config.swUrl, base)
         : new URL('./workers/service.worker.js', import.meta.url);
       const scope = this.config.swScope ?? new URL(`./${this.ns}/`, swUrl).href;
       this.swReg = await navigator.serviceWorker.register(swUrl.href, { scope });

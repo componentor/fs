@@ -4401,7 +4401,8 @@ var VFSFileSystem = class {
       };
     }
     if (!this.swReg) {
-      const swUrl = this.config.swUrl ? new URL(this.config.swUrl, document.baseURI) : new URL("./workers/service.worker.js", import.meta.url);
+      const base = typeof document !== "undefined" ? document.baseURI : location.href;
+      const swUrl = this.config.swUrl ? new URL(this.config.swUrl, base) : new URL("./workers/service.worker.js", import.meta.url);
       const scope = this.config.swScope ?? new URL(`./${this.ns}/`, swUrl).href;
       this.swReg = await navigator.serviceWorker.register(swUrl.href, { scope });
     }

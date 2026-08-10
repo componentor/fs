@@ -579,6 +579,19 @@ const fs = new VFSFileSystem({ swUrl: './vfs-service-worker.js' });
 
 If you only use a single tab, the service worker is not needed — the tab always runs as the leader.
 
+### Synchronous calls on Safari need a worker
+
+`Atomics.wait` is illegal on a page's main thread, so a sync call busy-spins instead. On Chromium
+and Firefox the relay worker progresses regardless and calls finish in milliseconds. **On WebKit
+the spinning page starves the worker's continuations**, the reply never arrives, and the call sits
+until the 30-second stall guard fires — measured on this project's own demo, where roughly half of
+all Safari loads took 30.2s to boot until the instance was moved into a worker.
+
+This is not limited to `opfs` mode or to follower tabs: it hits a leader in the default `hybrid`
+mode too. Run the instance inside a worker on Safari — `Atomics.wait` is legal there and the
+page's main thread stays free. [examples/03-worker-hosted](examples/03-worker-hosted/) is that
+arrangement, and so is the [live demo](https://componentor.github.io/fs/).
+
 ### Multi-Tab Sync on Safari (worker-hosted instances)
 
 In secondary ("follower") tabs, a synchronous FS call relays to the leader tab.
