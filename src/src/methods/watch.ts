@@ -57,6 +57,10 @@ function ensureBc(ns: string): void {
 function releaseBc(ns: string): void {
   const entry = bcMap.get(ns);
   if (!entry) return;
+  // Guard the shared channel against an unbalanced release: closing it early silences every
+  // watcher in this context, and the symptom (a tab that stops seeing changes) points nowhere
+  // near the cause.
+  if (entry.refCount <= 0) return;
   if (--entry.refCount <= 0) {
     entry.bc.close();
     bcMap.delete(ns);
@@ -237,10 +241,22 @@ export function watch(
     throw code ? createError(code, 'watch', filePath) : err;
   }
 
-  const watcher = new VFSWatcher(() => {
+  // One watcher, one release — however many times it is torn down.
+  //
+  // Closing and aborting both used to release, and `close()` can be called more than once, so a
+  // watcher could give back more references than it took. The channel is shared by every watcher
+  // in the context, so the refcount hitting zero early closed it *while other watchers were still
+  // registered* — and those watchers went silent for good. Reported as one tab out of four whose
+  // watcher stopped firing, which is exactly what a prematurely closed channel looks like.
+  let released = false;
+  const release = (): void => {
+    if (released) return;
+    released = true;
     watchers.delete(entry);
     releaseBc(ns);
-  });
+  };
+
+  const watcher = new VFSWatcher(release);
   if (cb) watcher.on('change', cb as (...args: unknown[]) => void);
 
   const entry: WatchEntry = {
@@ -259,8 +275,7 @@ export function watch(
   // AbortSignal support
   if (signal) {
     const onAbort = () => {
-      watchers.delete(entry);
-      releaseBc(ns);
+      release();
       signal.removeEventListener('abort', onAbort);
     };
     if (signal.aborted) {

@@ -3131,6 +3131,7 @@ function ensureBc(ns) {
 function releaseBc(ns) {
   const entry = bcMap.get(ns);
   if (!entry) return;
+  if (entry.refCount <= 0) return;
   if (--entry.refCount <= 0) {
     entry.bc.close();
     bcMap.delete(ns);
@@ -3240,10 +3241,14 @@ function watch(ns, syncRequest, filePath, options, listener) {
     const code = err.code;
     throw code ? createError(code, "watch", filePath) : err;
   }
-  const watcher = new VFSWatcher(() => {
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
     watchers.delete(entry);
     releaseBc(ns);
-  });
+  };
+  const watcher = new VFSWatcher(release);
   if (cb) watcher.on("change", cb);
   const entry = {
     ns,
@@ -3258,8 +3263,7 @@ function watch(ns, syncRequest, filePath, options, listener) {
   watchers.add(entry);
   if (signal) {
     const onAbort = () => {
-      watchers.delete(entry);
-      releaseBc(ns);
+      release();
       signal.removeEventListener("abort", onAbort);
     };
     if (signal.aborted) {

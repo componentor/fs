@@ -1,5 +1,11 @@
 # Changelog
 
+## 4.1.6
+
+- **Fixed: tearing a watcher down twice closed the broadcast channel other watchers were using.** Every `fs.watch` in a context shares one `BroadcastChannel`, refcounted. Closing released, an `AbortSignal` firing released again, and `close()` is callable repeatedly — so a single watcher could give back more references than it took. When the count hit zero with watchers still registered, the channel closed underneath them and they stopped receiving events permanently. A watcher now releases exactly once however many times it is torn down, and `releaseBc` refuses to decrement past zero.
+
+Scope, stated plainly: this was found while investigating a report of one tab out of four whose watcher stopped firing, and it is **not** confirmed to be that bug. The demo never closes a watcher, so it cannot reach this path — the defect is real and worth fixing on its own, but the reported case is still open.
+
 ## 4.1.5
 
 Changing which thread hosts the filesystem, with more than one tab open, took ~10.1s per call and
