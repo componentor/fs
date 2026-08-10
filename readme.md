@@ -750,6 +750,17 @@ await fs.setMode('hybrid' | 'vfs' | 'opfs'): Promise<void>
 // Non-blocking async init (waits for VFS to be ready)
 await fs.init(): Promise<void>
 
+// Release the instance: relay workers, the OPFS mirror worker, and the
+// FileSystemObserver it registers on the origin's storage. The observer is the
+// one resource that does NOT die with a page navigation on its own, so call
+// this in anything that creates instances repeatedly (a test suite, an app that
+// switches volumes). Instances also tear down on `pagehide` automatically.
+// Named `dispose` because `close(fd)` is node's descriptor API.
+await fs.dispose(): Promise<void>
+
+// Or scope it to a block — `Symbol.asyncDispose` is implemented:
+await using fs = new VFSFileSystem({ root: '/scratch' });
+
 // Moment-in-time readiness: true only when ready AND no leader transition is
 // in flight (equivalent to isReady && !transitioning)
 fs.ready: boolean

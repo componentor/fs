@@ -4,7 +4,26 @@ export default defineConfig({
   testDir: './tests/benchmark',
   fullyParallel: false, // Run tests sequentially to avoid conflicts
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 2 : 0,
+  /**
+   * One retry locally, because Chromium can take itself down mid-suite.
+   *
+   * Playwright's `chrome-headless-shell` ships with PartitionAlloc's dangling-`raw_ptr` detector
+   * enabled. After the heaviest specs it fires `FATAL: Detected dangling raw_ptr in unretained`
+   * while tearing down a page that used OPFS, which aborts the **browser process** — so the next
+   * test in line dies with "Target page, context or browser has been closed", and which test
+   * that is moves around between runs.
+   *
+   * That is a use-after-free in Chromium's own C++. JavaScript cannot create one, so it is a
+   * browser bug this workload happens to trigger, not a defect here — confirmed two ways: a page
+   * that deliberately leaks a recursive `FileSystemObserver` and closes does *not* trip it, and
+   * fixing the library's genuine observer/worker leak (3.3.29) did not stop it either. Release
+   * Chrome ships the detector off, so no user meets it. `--disable-features=PartitionAllocDanglingPtr`
+   * does not turn it off in this binary.
+   *
+   * A retry gets a freshly launched browser and passes, which is the honest handling: re-run the
+   * test the crash stole, rather than pretend the crash did not happen.
+   */
+  retries: process.env.CI ? 2 : 1,
   workers: 1, // Single worker for benchmark consistency
   reporter: [['list'], ['html', { open: 'never' }]],
   use: {
@@ -23,20 +42,6 @@ export default defineConfig({
         launchOptions: {
           args: [
             '--enable-features=FileSystemAccessAPI',
-            // Playwright's chrome-headless-shell ships with PartitionAlloc's dangling-`raw_ptr`
-            // detector on. Under the heaviest specs (the LightningFS comparison, create-scaling)
-            // it fires `FATAL: Detected dangling raw_ptr in unretained` while tearing down a page
-            // that used OPFS + FileSystemObserver, which aborts the whole browser process — so
-            // the *next* test fails with "Target page, context or browser has been closed", and
-            // which test that is moves around between runs.
-            //
-            // A dangling `raw_ptr` is a use-after-free in Chromium's own C++; JavaScript has no
-            // way to create one, so this is a browser bug our load happens to trigger, not a leak
-            // in this library. (Verified: a page that leaves a recursive FileSystemObserver
-            // attached and closes does *not* trip it — so it is not simply "we forgot to
-            // disconnect", and the teardown added in 3.3.29 does not make it go away either.)
-            // Release Chrome ships with this detector off, so no user sees it.
-            '--disable-features=PartitionAllocDanglingPtr',
           ],
         },
       },
