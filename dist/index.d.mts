@@ -1010,6 +1010,8 @@ declare class VFSFileSystem {
     private leaderLockBid;
     private brokerInitialized;
     private brokerHeartbeatTimer;
+    /** The service worker this instance registered its broker with, so it can deregister. */
+    private brokerSw;
     private brokerControlPort;
     private leaderChangeBc;
     private _sync;
@@ -1315,6 +1317,16 @@ declare class VFSFileSystem {
      * means something entirely different. `await using fs = new VFSFileSystem()` works too.
      */
     dispose(): Promise<void>;
+    /**
+     * Tell the service-worker broker this instance is no longer serving.
+     *
+     * The broker holds one `serverPort` for the volume. If a leader goes away without saying so,
+     * that slot keeps a detached port, and posting to a detached port is a silent no-op — so
+     * followers' ports were dropped on the floor instead of being queued for the next leader, and
+     * every call they made waited out the 10s forward deadline. Clearing it is what lets the
+     * broker queue arrivals and flush them the moment a new leader registers.
+     */
+    private deregisterBroker;
     /** `await using` support, so an instance can be scoped to a block. */
     [Symbol.asyncDispose](): Promise<void>;
     /**

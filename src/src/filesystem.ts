@@ -393,6 +393,8 @@ export class VFSFileSystem {
   private leaderLockBid: AbortController | null = null;
   private brokerInitialized = false;
   private brokerHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** The service worker this instance registered its broker with, so it can deregister. */
+  private brokerSw: { postMessage(message: unknown, transfer?: Transferable[]): void } | null = null;
   private brokerControlPort: MessagePort | null = null;
   private leaderChangeBc: BroadcastChannel | null = null;
 
@@ -814,6 +816,7 @@ export class VFSFileSystem {
 
     const register = (): void => {
       this.getServiceWorker().then(sw => {
+        this.brokerSw = sw;
         // Deliberately do NOT close the previous control port. Closing it
         // sends a disentangle signal to the SW on a separate IPC pipe from
         // the one carrying `register-server`, with no FIFO guarantee between
@@ -887,6 +890,7 @@ export class VFSFileSystem {
       try { this.brokerControlPort.close(); } catch { /* ignore */ }
       this.brokerControlPort = null;
     }
+    this.deregisterBroker();
 
     // Stop listening for leader changes (we ARE the leader now)
     if (this.leaderChangeBc) {
@@ -1896,6 +1900,14 @@ export class VFSFileSystem {
       removeEventListener('pagehide', this.onPageHide);
       this.onPageHide = null;
     }
+    // Before anything is torn down: a follower routed to this instance must be re-queued rather
+    // than posted into a port that is about to detach.
+    if (this.brokerHeartbeatTimer) {
+      clearInterval(this.brokerHeartbeatTimer);
+      this.brokerHeartbeatTimer = null;
+    }
+    this.deregisterBroker();
+
     await this.shutdownRelay();
     terminateWorker(this.syncWorker);
     terminateWorker(this.asyncWorker);
@@ -1906,6 +1918,21 @@ export class VFSFileSystem {
     this.releaseLeaderLock = null;
     this.holdingLeaderLock = false;
     this.isReady = false;
+  }
+
+  /**
+   * Tell the service-worker broker this instance is no longer serving.
+   *
+   * The broker holds one `serverPort` for the volume. If a leader goes away without saying so,
+   * that slot keeps a detached port, and posting to a detached port is a silent no-op — so
+   * followers' ports were dropped on the floor instead of being queued for the next leader, and
+   * every call they made waited out the 10s forward deadline. Clearing it is what lets the
+   * broker queue arrivals and flush them the moment a new leader registers.
+   */
+  private deregisterBroker(): void {
+    if (!this.brokerSw) return;
+    try { this.brokerSw.postMessage({ type: 'deregister-server' }); } catch { /* SW already gone */ }
+    this.brokerSw = null;
   }
 
   /** `await using` support, so an instance can be scoped to a block. */

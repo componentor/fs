@@ -49,6 +49,17 @@ sw.addEventListener('message', (event: ExtendableMessageEvent) => {
     return;
   }
 
+  // A leader that is going away says so, rather than leaving a dead port behind.
+  //
+  // Without this, `serverPort` stayed non-null after the leader's tab reloaded or disposed, and
+  // posting to a detached port is a silent no-op per spec — so a follower's port vanished instead
+  // of being queued, and its next call waited out the full 10s forward deadline before returning
+  // EIO. Clearing the slot puts arrivals back on `pending`, where the next leader flushes them.
+  if (msg.type === 'deregister-server') {
+    serverPort = null;
+    return;
+  }
+
   if (msg.type === 'transfer-port') {
     // Follower sends a port to be forwarded to the leader
     const port = event.ports[0];

@@ -4132,6 +4132,8 @@ var VFSFileSystem = class {
   leaderLockBid = null;
   brokerInitialized = false;
   brokerHeartbeatTimer = null;
+  /** The service worker this instance registered its broker with, so it can deregister. */
+  brokerSw = null;
   brokerControlPort = null;
   leaderChangeBc = null;
   // Bound request functions for method delegation
@@ -4470,6 +4472,7 @@ var VFSFileSystem = class {
     this.brokerInitialized = true;
     const register = () => {
       this.getServiceWorker().then((sw) => {
+        this.brokerSw = sw;
         const mc = new MessageChannel();
         sw.postMessage({ type: "register-server" }, [mc.port2]);
         mc.port1.onmessage = (event) => {
@@ -4514,6 +4517,7 @@ var VFSFileSystem = class {
       }
       this.brokerControlPort = null;
     }
+    this.deregisterBroker();
     if (this.leaderChangeBc) {
       this.leaderChangeBc.close();
       this.leaderChangeBc = null;
@@ -5327,6 +5331,11 @@ var VFSFileSystem = class {
       removeEventListener("pagehide", this.onPageHide);
       this.onPageHide = null;
     }
+    if (this.brokerHeartbeatTimer) {
+      clearInterval(this.brokerHeartbeatTimer);
+      this.brokerHeartbeatTimer = null;
+    }
+    this.deregisterBroker();
     await this.shutdownRelay();
     terminateWorker(this.syncWorker);
     terminateWorker(this.asyncWorker);
@@ -5336,6 +5345,23 @@ var VFSFileSystem = class {
     this.releaseLeaderLock = null;
     this.holdingLeaderLock = false;
     this.isReady = false;
+  }
+  /**
+   * Tell the service-worker broker this instance is no longer serving.
+   *
+   * The broker holds one `serverPort` for the volume. If a leader goes away without saying so,
+   * that slot keeps a detached port, and posting to a detached port is a silent no-op — so
+   * followers' ports were dropped on the floor instead of being queued for the next leader, and
+   * every call they made waited out the 10s forward deadline. Clearing it is what lets the
+   * broker queue arrivals and flush them the moment a new leader registers.
+   */
+  deregisterBroker() {
+    if (!this.brokerSw) return;
+    try {
+      this.brokerSw.postMessage({ type: "deregister-server" });
+    } catch {
+    }
+    this.brokerSw = null;
   }
   /** `await using` support, so an instance can be scoped to a block. */
   [Symbol.asyncDispose]() {

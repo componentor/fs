@@ -1,5 +1,19 @@
 # Changelog
 
+## 4.1.4
+
+- **Fixed: a leader never told the service-worker broker it was leaving.** The broker holds one `serverPort` per volume. When a leader disposed or its tab reloaded, that slot kept a *detached* port — and posting to a detached port is a silent no-op per spec, so arriving followers' ports were dropped on the floor instead of being queued. `dispose()` and leadership handover now send `deregister-server`, which clears the slot so arrivals land on the pending queue and the next leader flushes them. The 5s re-registration heartbeat is also stopped on dispose, so a departing leader cannot re-register itself.
+
+### Known: a page-hosted follower cannot ride out a leader change
+
+Root-caused this release, not fixed — the fix is architectural, so it is written down rather than guessed at.
+
+- **Symptom:** with two tabs, changing which tab leads makes the follower's next synchronous call take ~10.1s and return `EIO`.
+- **Cause:** a follower's synchronous call blocks on `spinWait` when the instance is page-hosted, because `Atomics.wait` is illegal on a page's main thread. The leader handshake that would reconnect it — `leader-changed` over `BroadcastChannel`, then the port transfer — is delivered *to that same main thread*. So the call blocks the very message that would let it succeed, and waits out `FORWARD_DEADLINE_MS` (10s) before returning `EIO`. Traced by timestamping the log: `[VFS] Leader changed — reconnecting` arrives at +10118ms, immediately after the deadline expires, never before it.
+- **Scope:** page-hosted *followers* only, and only across a leadership change. A page-hosted leader is unaffected, and a worker-hosted instance is unaffected — there the wait is a real `Atomics.wait` and the handshake lands on the worker's own thread.
+- **Why no patch:** `spinWait` cannot yield to the event loop; that is what makes it a spin. Shortening the deadline trades a 10s stall for a faster failure, not a success. A real fix means a follower either driving its wait from a thread that can receive the handshake, or refusing to start a sync call until it holds a confirmed-live leader port.
+- **Workaround:** host followers in a worker, which is what the demo does on WebKit and what the readme recommends for multi-tab synchronous use.
+
 ## 4.1.3
 
 - **Fixed: `dispose()` never released the leader lock.** Leadership was held with `await new Promise(() => {})`, on the reasoning that the lock dies with the tab — true, but a disposed instance is not a closed tab. The dead instance kept `<ns>-leader` for the life of the page, so the next instance on the same volume started as a **follower of a leader whose relay workers were already terminated**, and its first synchronous call waited for a reply that could never come until the 30s stall guard. The lock is now resolved on dispose, and a queued follower's bid is aborted so a disposed instance cannot be elected later. Covered by a test that stubs `navigator.locks` with the queueing semantics the real thing has, rather than mocking the election away.

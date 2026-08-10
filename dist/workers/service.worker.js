@@ -21,6 +21,10 @@ sw.addEventListener("message", (event) => {
     }
     return;
   }
+  if (msg.type === "deregister-server") {
+    serverPort = null;
+    return;
+  }
   if (msg.type === "transfer-port") {
     const port = event.ports[0];
     if (!port) return;
