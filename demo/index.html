@@ -1,500 +1,778 @@
 <!doctype html>
 <html lang="en">
+
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>sync-opfs — a real synchronous filesystem in your browser</title>
-<meta name="description" content="Drag files in, browse them, delete them, and watch them sync across tabs — a Node fs API with a readFileSync that actually blocks, running on OPFS." />
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>sync-opfs — a real synchronous filesystem in your browser</title>
+  <meta name="description"
+    content="Drag files in, browse them, delete them, and watch them sync across tabs — a Node fs API with a readFileSync that actually blocks, running on OPFS." />
 
-<!-- Adds the isolation headers GitHub Pages will not, so the SYNC api works here. See the file. -->
-<script src="./coi-serviceworker.js"></script>
+  <!-- Adds the isolation headers GitHub Pages will not, so the SYNC api works here. See the file. -->
+  <script src="./coi-serviceworker.js"></script>
 
-<style>
-  :root {
-    --bg:#fff; --panel:#fff; --fg:#16161a; --muted:#6b6b76; --line:#e4e4e9;
-    --accent:#6f42c1; --accent-soft:#f3edff; --ok:#0a7d33; --warn:#b8860b; --bad:#c0392b;
-    --code:#f6f6f8; --shadow:0 1px 2px rgba(0,0,0,.05),0 8px 24px rgba(0,0,0,.04);
-  }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg:#141418; --panel:#1a1a20; --fg:#e9e9ee; --muted:#9a9aa6; --line:#2b2b33;
-            --accent:#a97bff; --accent-soft:#241b38; --ok:#4ade80; --warn:#e0b341; --bad:#f87171;
-            --code:#1f1f27; --shadow:0 1px 2px rgba(0,0,0,.3),0 8px 24px rgba(0,0,0,.25); }
-  }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--fg); -webkit-font-smoothing:antialiased;
-         font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; }
-  .wrap { max-width:74rem; margin:0 auto; padding:2.5rem 1.25rem 5rem; }
-  header h1 { font-size:1.7rem; margin:0 0 .35rem; letter-spacing:-.02em; }
-  header p { color:var(--muted); margin:0 0 1.25rem; max-width:52rem; }
-  code, pre, .mono { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
-  a { color:var(--accent); }
+  <style>
+    :root {
+      --bg: #fff;
+      --panel: #fff;
+      --fg: #16161a;
+      --muted: #6b6b76;
+      --line: #e4e4e9;
+      --accent: #6f42c1;
+      --accent-soft: #f3edff;
+      --ok: #0a7d33;
+      --warn: #b8860b;
+      --bad: #c0392b;
+      --code: #f6f6f8;
+      --shadow: 0 1px 2px rgba(0, 0, 0, .05), 0 8px 24px rgba(0, 0, 0, .04);
+    }
 
-  .banner { padding:.7rem .9rem; border:1px solid var(--line); border-left-width:3px;
-            border-radius:8px; margin-bottom:1.5rem; font-size:.9rem; background:var(--panel); }
-  .banner.ok { border-left-color:var(--ok); }
-  .banner.warn { border-left-color:var(--warn); }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #141418;
+        --panel: #1a1a20;
+        --fg: #e9e9ee;
+        --muted: #9a9aa6;
+        --line: #2b2b33;
+        --accent: #a97bff;
+        --accent-soft: #241b38;
+        --ok: #4ade80;
+        --warn: #e0b341;
+        --bad: #f87171;
+        --code: #1f1f27;
+        --shadow: 0 1px 2px rgba(0, 0, 0, .3), 0 8px 24px rgba(0, 0, 0, .25);
+      }
+    }
 
-  .grid { display:grid; grid-template-columns:1.15fr .85fr; gap:1.25rem; align-items:start; }
-  @media (max-width:900px){ .grid { grid-template-columns:1fr; } }
+    * {
+      box-sizing: border-box;
+    }
 
-  .panel { background:var(--panel); border:1px solid var(--line); border-radius:12px;
-           box-shadow:var(--shadow); overflow:hidden; }
-  .panel > h2 { font-size:.75rem; text-transform:uppercase; letter-spacing:.07em; color:var(--muted);
-                margin:0; padding:.7rem .9rem; border-bottom:1px solid var(--line); font-weight:600;
-                display:flex; align-items:center; gap:.5rem; justify-content:space-between; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      -webkit-font-smoothing: antialiased;
+      font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
 
-  .toolbar { display:flex; gap:.4rem; flex-wrap:wrap; padding:.6rem .9rem; border-bottom:1px solid var(--line); }
-  button { font:inherit; font-size:.85rem; padding:.34rem .7rem; border-radius:7px;
-           border:1px solid var(--line); background:var(--bg); color:var(--fg); cursor:pointer; }
-  button:hover:not(:disabled) { border-color:var(--accent); color:var(--accent); }
-  button:disabled { opacity:.45; cursor:default; }
-  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
-  button.primary:hover:not(:disabled) { opacity:.9; color:#fff; }
-  button.danger:hover:not(:disabled) { border-color:var(--bad); color:var(--bad); }
+    .wrap {
+      max-width: 74rem;
+      margin: 0 auto;
+      padding: 2.5rem 1.25rem 5rem;
+    }
 
-  .crumbs { padding:.5rem .9rem; font-size:.85rem; border-bottom:1px solid var(--line);
-            display:flex; gap:.25rem; flex-wrap:wrap; align-items:center; }
-  .crumbs button { border:0; background:none; padding:.1rem .25rem; color:var(--accent); }
+    header h1 {
+      font-size: 1.7rem;
+      margin: 0 0 .35rem;
+      letter-spacing: -.02em;
+    }
 
-  #drop { position:relative; min-height:19rem; max-height:32rem; overflow:auto; }
-  #drop.over::after { content:"Drop to import"; position:absolute; inset:.4rem; border-radius:9px;
-    border:2px dashed var(--accent); background:var(--accent-soft); display:grid; place-items:center;
-    font-weight:600; color:var(--accent); pointer-events:none; }
+    header p {
+      color: var(--muted);
+      margin: 0 0 1.25rem;
+      max-width: 52rem;
+    }
 
-  table { width:100%; border-collapse:collapse; font-size:.88rem; }
-  tbody tr { border-top:1px solid var(--line); }
-  tbody tr:hover { background:var(--accent-soft); }
-  td { padding:.42rem .9rem; vertical-align:middle; }
-  td.name { cursor:default; }
-  td.name.dir { cursor:pointer; color:var(--accent); font-weight:500; }
-  td.size, td.act { text-align:right; color:var(--muted); white-space:nowrap; }
-  td.act button { padding:.15rem .45rem; font-size:.78rem; }
-  .empty { padding:3.5rem 1rem; text-align:center; color:var(--muted); font-size:.9rem; }
+    code,
+    pre,
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
 
-  pre.out { margin:0; padding:.85rem; font-size:12.5px; white-space:pre-wrap; word-break:break-word;
-            max-height:15rem; overflow:auto; background:var(--code); }
-  .bench td { padding:.3rem .9rem; font-size:.86rem; }
-  .bench .n { text-align:right; font-variant-numeric:tabular-nums; }
-  .pill { font-size:.7rem; padding:.1rem .45rem; border-radius:99px; border:1px solid var(--line); color:var(--muted); }
-  .pill.live { color:var(--ok); border-color:var(--ok); }
-  .banner.leader { border-left-color:var(--accent); }
-  .banner.follower { border-left-color:var(--warn); }
-  .role-tag { font-weight:700; }
-  footer { margin-top:2.5rem; padding-top:1.25rem; border-top:1px solid var(--line);
-           color:var(--muted); font-size:.87rem; }
-</style>
+    a {
+      color: var(--accent);
+    }
+
+    .banner {
+      padding: .7rem .9rem;
+      border: 1px solid var(--line);
+      border-left-width: 3px;
+      border-radius: 8px;
+      margin-bottom: 1.5rem;
+      font-size: .9rem;
+      background: var(--panel);
+    }
+
+    .banner.ok {
+      border-left-color: var(--ok);
+    }
+
+    .banner.warn {
+      border-left-color: var(--warn);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.15fr .85fr;
+      gap: 1.25rem;
+      align-items: start;
+    }
+
+    @media (max-width:900px) {
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel>h2 {
+      font-size: .75rem;
+      text-transform: uppercase;
+      letter-spacing: .07em;
+      color: var(--muted);
+      margin: 0;
+      padding: .7rem .9rem;
+      border-bottom: 1px solid var(--line);
+      font-weight: 600;
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      justify-content: space-between;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: .4rem;
+      flex-wrap: wrap;
+      padding: .6rem .9rem;
+      border-bottom: 1px solid var(--line);
+    }
+
+    button {
+      font: inherit;
+      font-size: .85rem;
+      padding: .34rem .7rem;
+      border-radius: 7px;
+      border: 1px solid var(--line);
+      background: var(--bg);
+      color: var(--fg);
+      cursor: pointer;
+    }
+
+    button:hover:not(:disabled) {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    button:disabled {
+      opacity: .45;
+      cursor: default;
+    }
+
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    button.primary:hover:not(:disabled) {
+      opacity: .9;
+      color: #fff;
+    }
+
+    button.danger:hover:not(:disabled) {
+      border-color: var(--bad);
+      color: var(--bad);
+    }
+
+    .crumbs {
+      padding: .5rem .9rem;
+      font-size: .85rem;
+      border-bottom: 1px solid var(--line);
+      display: flex;
+      gap: .25rem;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .crumbs button {
+      border: 0;
+      background: none;
+      padding: .1rem .25rem;
+      color: var(--accent);
+    }
+
+    #drop {
+      position: relative;
+      min-height: 19rem;
+      max-height: 32rem;
+      overflow: auto;
+    }
+
+    #drop.over::after {
+      content: "Drop to import";
+      position: absolute;
+      inset: .4rem;
+      border-radius: 9px;
+      border: 2px dashed var(--accent);
+      background: var(--accent-soft);
+      display: grid;
+      place-items: center;
+      font-weight: 600;
+      color: var(--accent);
+      pointer-events: none;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: .88rem;
+    }
+
+    tbody tr {
+      border-top: 1px solid var(--line);
+    }
+
+    tbody tr:hover {
+      background: var(--accent-soft);
+    }
+
+    td {
+      padding: .42rem .9rem;
+      vertical-align: middle;
+    }
+
+    td.name {
+      cursor: default;
+    }
+
+    td.name.dir {
+      cursor: pointer;
+      color: var(--accent);
+      font-weight: 500;
+    }
+
+    td.size,
+    td.act {
+      text-align: right;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
+    td.act button {
+      padding: .15rem .45rem;
+      font-size: .78rem;
+    }
+
+    .empty {
+      padding: 3.5rem 1rem;
+      text-align: center;
+      color: var(--muted);
+      font-size: .9rem;
+    }
+
+    pre.out {
+      margin: 0;
+      padding: .85rem;
+      font-size: 12.5px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 15rem;
+      overflow: auto;
+      background: var(--code);
+    }
+
+    .bench td {
+      padding: .3rem .9rem;
+      font-size: .86rem;
+    }
+
+    .bench .n {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .pill {
+      font-size: .7rem;
+      padding: .1rem .45rem;
+      border-radius: 99px;
+      border: 1px solid var(--line);
+      color: var(--muted);
+    }
+
+    .pill.live {
+      color: var(--ok);
+      border-color: var(--ok);
+    }
+
+    .banner.leader {
+      border-left-color: var(--accent);
+    }
+
+    .banner.follower {
+      border-left-color: var(--warn);
+    }
+
+    .role-tag {
+      font-weight: 700;
+    }
+
+    footer {
+      margin-top: 2.5rem;
+      padding-top: 1.25rem;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: .87rem;
+    }
+  </style>
 </head>
+
 <body>
-<div class="wrap">
-  <header>
-    <h1>sync-opfs</h1>
-    <p>Node's <code>fs</code> in your browser, with a <code>readFileSync</code> that actually blocks.
-       Everything below is the real library running against your browser's own OPFS storage —
-       drag files in, and they are still here after a refresh.</p>
-  </header>
+  <div class="wrap">
+    <header>
+      <h1>sync-opfs</h1>
+      <p>Node's <code>fs</code> in your browser, with a <code>readFileSync</code> that actually blocks.
+        Everything below is the real library running against your browser's own OPFS storage —
+        drag files in, and they are still here after a refresh.</p>
+    </header>
 
-  <div id="banner" class="banner">Starting…</div>
-  <div id="role" class="banner" style="display:none"></div>
+    <div id="banner" class="banner">Starting…</div>
+    <div id="role" class="banner" style="display:none"></div>
 
-  <div class="grid">
-    <!-- ── file browser ─────────────────────────────────────────── -->
-    <section class="panel">
-      <h2>Files <span id="watchPill" class="pill">watching…</span></h2>
-      <div class="toolbar">
-        <button id="btnUp">↑ Up</button>
-        <button id="btnNewDir">New folder</button>
-        <button id="btnNewFile">New file</button>
-        <button id="btnPick">Import files…</button>
-        <button id="btnSeed">Add sample tree</button>
-        <button id="btnWipe" class="danger">Wipe</button>
-        <input id="filePicker" type="file" multiple hidden />
-      </div>
-      <div class="crumbs" id="crumbs"></div>
-      <div id="drop">
-        <table><tbody id="rows"></tbody></table>
-        <div id="empty" class="empty">Drop files or folders here — from Finder, Explorer, or the desktop.</div>
-      </div>
-    </section>
-
-    <div style="display:grid; gap:1.25rem;">
-      <!-- ── cross-tab ──────────────────────────────────────────── -->
+    <div class="grid">
+      <!-- ── file browser ─────────────────────────────────────────── -->
       <section class="panel">
-        <h2>Across tabs</h2>
+        <h2>Files <span id="watchPill" class="pill">watching…</span></h2>
         <div class="toolbar">
-          <button id="btnTab" class="primary">Open a second tab ↗</button>
-          <button id="btnPing">Write from this tab</button>
+          <button id="btnUp">↑ Up</button>
+          <button id="btnNewDir">New folder</button>
+          <button id="btnNewFile">New file</button>
+          <button id="btnPick">Import files…</button>
+          <button id="btnSeed">Add sample tree</button>
+          <button id="btnWipe" class="danger">Wipe</button>
+          <input id="filePicker" type="file" multiple hidden />
         </div>
-        <pre class="out" id="tabLog">One volume, many tabs. Open a second tab and write from either — the other updates on its own, through a shared worker and a leader/follower election.
+        <div class="crumbs" id="crumbs"></div>
+        <div id="drop">
+          <table>
+            <tbody id="rows"></tbody>
+          </table>
+          <div id="empty" class="empty">Drop files or folders here — from Finder, Explorer, or the desktop.</div>
+        </div>
+      </section>
+
+      <div style="display:grid; gap:1.25rem;">
+        <!-- ── cross-tab ──────────────────────────────────────────── -->
+        <section class="panel">
+          <h2>Across tabs</h2>
+          <div class="toolbar">
+            <button id="btnTab" class="primary">Open a second tab ↗</button>
+            <button id="btnPing">Write from this tab</button>
+          </div>
+          <pre class="out" id="tabLog">One volume, many tabs. Open a second tab and write from either — the other updates on its own, through a shared worker and a leader/follower election.
 
 Close the leader tab and watch a follower take over: the badge above changes without a reload.</pre>
-      </section>
+        </section>
 
-      <!-- ── main-thread sync ───────────────────────────────────── -->
-      <section class="panel">
-        <h2>Sync on the main thread <span id="mtPill" class="pill">not run</span></h2>
-        <div class="toolbar">
-          <button id="btnMain" class="primary">Run sync calls on this thread</button>
-        </div>
-        <pre class="out" id="mtOut">The listing above runs inside a worker, which is what Safari
-needs. But the sync API is not worker-only — on Chrome and Firefox it works
-directly on a page's main thread, no worker involved.
+        <!-- ── main-thread sync ───────────────────────────────────── -->
+        <section class="panel">
+          <h2>Sync on the main thread <span id="mtPill" class="pill">not run</span></h2>
+          <div class="toolbar">
+            <button id="btnMain" class="primary">Run sync calls on this thread</button>
+          </div>
+          <pre class="out" id="mtOut">The listing above runs inside a worker, which is what Safari needs. But the sync API is not worker-only — on Chrome and Firefox it works directly on a page's main thread, no worker involved.
 
 This runs a page-hosted instance right here and times it.</pre>
-      </section>
+        </section>
 
-      <!-- ── benchmark ──────────────────────────────────────────── -->
-      <section class="panel">
-        <h2>Benchmark <span class="pill">your machine, right now</span></h2>
-        <div class="toolbar">
-          <button id="btnBench" class="primary">Run benchmark</button>
-          <span id="benchNote" class="pill" style="align-self:center">~3s</span>
-        </div>
-        <table class="bench"><tbody id="benchRows">
-          <tr><td colspan="3" style="color:var(--muted); padding:1rem .9rem">
-            Measures this library against real OPFS in your browser. Numbers vary by engine —
-            Chromium is storage-bound, WebKit is not.</td></tr>
-        </tbody></table>
-        <p id="benchRole" style="margin:0; padding:.6rem .9rem; border-top:1px solid var(--line);
+        <!-- ── benchmark ──────────────────────────────────────────── -->
+        <section class="panel">
+          <h2>Benchmark <span class="pill">your machine, right now</span></h2>
+          <div class="toolbar">
+            <button id="btnBench" class="primary">Run benchmark</button>
+            <span id="benchNote" class="pill" style="align-self:center">~3s</span>
+          </div>
+          <table class="bench">
+            <tbody id="benchRows">
+              <tr>
+                <td colspan="3" style="color:var(--muted); padding:1rem .9rem">
+                  Measures this library against real OPFS in your browser. Numbers vary by engine —
+                  Chromium is storage-bound, WebKit is not.</td>
+              </tr>
+            </tbody>
+          </table>
+          <p id="benchRole" style="margin:0; padding:.6rem .9rem; border-top:1px solid var(--line);
            color:var(--muted); font-size:.83rem"></p>
-      </section>
+        </section>
 
-      <!-- ── console ────────────────────────────────────────────── -->
-      <section class="panel">
-        <h2>Log</h2>
-        <pre class="out" id="log">ready</pre>
-      </section>
+        <!-- ── console ────────────────────────────────────────────── -->
+        <section class="panel">
+          <h2>Log</h2>
+          <pre class="out" id="log">ready</pre>
+        </section>
+      </div>
     </div>
+
+    <footer>
+      <a href="https://github.com/componentor/fs">GitHub</a> ·
+      <a href="https://www.npmjs.com/package/sync-opfs">npm</a> ·
+      <a href="https://github.com/componentor/fs#readme">Docs</a><br />
+      The two isolation headers the synchronous API needs are added here by a
+      <a href="./coi-serviceworker.js">service worker</a>, because GitHub Pages cannot send them —
+      the same trick works for your own static deploy.
+    </footer>
   </div>
 
-  <footer>
-    <a href="https://github.com/componentor/fs">GitHub</a> ·
-    <a href="https://www.npmjs.com/package/sync-opfs">npm</a> ·
-    <a href="https://github.com/componentor/fs#readme">Docs</a><br />
-    The two isolation headers the synchronous API needs are added here by a
-    <a href="./coi-serviceworker.js">service worker</a>, because GitHub Pages cannot send them —
-    the same trick works for your own static deploy.
-  </footer>
-</div>
+  <script type="module">
+    /**
+     * The page drives a worker that owns the filesystem — see fs-worker.js for why that matters on
+     * Safari. Nothing here touches `fs` directly; everything goes over a small RPC, which keeps the
+     * main thread free and makes the sync API behave identically on every engine.
+     */
+    import { createServiceWorkerBridge } from './vendor/index.js';
 
-<script type="module">
-/**
- * The page drives a worker that owns the filesystem — see fs-worker.js for why that matters on
- * Safari. Nothing here touches `fs` directly; everything goes over a small RPC, which keeps the
- * main thread free and makes the sync API behave identically on every engine.
- */
-import { createServiceWorkerBridge } from './vendor/index.js';
+    const $ = (id) => document.getElementById(id);
+    const logEl = $('log'), rowsEl = $('rows'), emptyEl = $('empty');
+    let cwd = '/', isLeader = true;
 
-const $ = (id) => document.getElementById(id);
-const logEl = $('log'), rowsEl = $('rows'), emptyEl = $('empty');
-let cwd = '/', isLeader = true;
+    // Buffered, for the same reason `render` is debounced: `watch` fires per mutation, and
+    // rebuilding a 200-line string and reflowing the log on each one cost more than the
+    // filesystem operation that triggered it.
+    let logLines = [];
+    let logPending = [];
+    let logTimer = null;
+    const log = (...a) => {
+      logPending.unshift(a.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' '));
+      if (logTimer) return;
+      logTimer = setTimeout(() => {
+        logTimer = null;
+        logLines = [...logPending, ...logLines].slice(0, 200);
+        logPending = [];
+        logEl.textContent = logLines.join('\n');
+      }, 120);
+    };
+    const fmt = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1048576).toFixed(1)} MB`;
+    const join = (dir, name) => (dir === '/' ? '' : dir) + '/' + name;
 
-const log = (...a) => {
-  const line = a.map((x) => typeof x === 'string' ? x : JSON.stringify(x)).join(' ');
-  logEl.textContent = (line + '\n' + logEl.textContent).split('\n').slice(0, 200).join('\n');
-};
-const fmt = (n) => n < 1024 ? `${n} B` : n < 1048576 ? `${(n/1024).toFixed(1)} KB` : `${(n/1048576).toFixed(1)} MB`;
-const join = (dir, name) => (dir === '/' ? '' : dir) + '/' + name;
+    // ── the worker, and the RPC to it ───────────────────────────────────────────
 
-// ── the worker, and the RPC to it ───────────────────────────────────────────
+    const worker = new Worker(new URL('./fs-worker.js', import.meta.url), { type: 'module' });
+    let nextId = 1;
+    const pending = new Map();
+    let onReady;
+    const ready = new Promise((resolve) => { onReady = resolve; });
 
-const worker = new Worker(new URL('./fs-worker.js', import.meta.url), { type: 'module' });
-let nextId = 1;
-const pending = new Map();
-let onReady;
-const ready = new Promise((resolve) => { onReady = resolve; });
-
-function call(op, arg, transfer) {
-  const id = nextId++;
-  return new Promise((resolve, reject) => {
-    pending.set(id, { resolve, reject });
-    worker.postMessage({ id, op, arg }, transfer ?? []);
-  });
-}
-
-worker.onmessage = ({ data }) => {
-  if (data.type === 'ready') { onReady(data); return; }
-  if (data.type === 'role') { isLeader = data.isLeader; renderRole(); return; }
-  if (data.type === 'watching') {
-    $('watchPill').textContent = data.ok ? 'live' : 'watch unavailable';
-    if (data.ok) $('watchPill').className = 'pill live';
-    return;
-  }
-  if (data.type === 'watch') {
-    log(`watch: ${data.eventType} ${data.filename ?? ''}`);
-    render();
-    if (data.filename && data.filename.includes('tab-ping')) {
-      $('tabLog').textContent = `Another tab wrote ${data.filename} — picked up here automatically at `
-        + new Date().toLocaleTimeString() + '.';
+    function call(op, arg, transfer) {
+      const id = nextId++;
+      return new Promise((resolve, reject) => {
+        pending.set(id, { resolve, reject });
+        worker.postMessage({ id, op, arg }, transfer ?? []);
+      });
     }
-    return;
-  }
-  const entry = pending.get(data.id);
-  if (!entry) return;
-  pending.delete(data.id);
-  data.ok ? entry.resolve(data.value) : entry.reject(Object.assign(new Error(data.error), { code: data.code }));
-};
 
-// ── file browser ────────────────────────────────────────────────────────────
+    worker.onmessage = ({ data }) => {
+      if (data.type === 'ready') { onReady(data); return; }
+      if (data.type === 'role') { isLeader = data.isLeader; renderRole(); return; }
+      if (data.type === 'watching') {
+        $('watchPill').textContent = data.ok ? 'live' : 'watch unavailable';
+        if (data.ok) $('watchPill').className = 'pill live';
+        return;
+      }
+      if (data.type === 'watch') {
+        log(`watch: ${data.eventType} ${data.filename ?? ''}`);
+        scheduleRender();
+        if (data.filename && data.filename.includes('tab-ping')) {
+          $('tabLog').textContent = `Another tab wrote ${data.filename} — picked up here automatically at `
+            + new Date().toLocaleTimeString() + '.';
+        }
+        return;
+      }
+      const entry = pending.get(data.id);
+      if (!entry) return;
+      pending.delete(data.id);
+      data.ok ? entry.resolve(data.value) : entry.reject(Object.assign(new Error(data.error), { code: data.code }));
+    };
 
-async function render() {
-  const entries = await call('list', cwd);
-  $('crumbs').replaceChildren(...crumbTrail());
-  $('btnUp').disabled = cwd === '/';
-  emptyEl.style.display = entries.length ? 'none' : 'block';
+    // ── file browser ────────────────────────────────────────────────────────────
 
-  rowsEl.replaceChildren(...entries.map((entry) => {
-    const full = join(cwd, entry.name);
-    const tr = document.createElement('tr');
-
-    const name = document.createElement('td');
-    name.className = 'name' + (entry.isDirectory ? ' dir' : '');
-    name.textContent = (entry.isDirectory ? '📁 ' : '📄 ') + entry.name;
-    if (entry.isDirectory) name.onclick = () => { cwd = full; render(); };
-    tr.appendChild(name);
-
-    const size = document.createElement('td');
-    size.className = 'size';
-    size.textContent = entry.isDirectory ? '—' : fmt(entry.size);
-    tr.appendChild(size);
-
-    const act = document.createElement('td');
-    act.className = 'act';
-    if (!entry.isDirectory) {
-      const view = document.createElement('button');
-      view.textContent = 'view';
-      view.onclick = async () => {
-        const { size: n, head } = await call('read', full);
-        log(`── ${full} (${fmt(n)}) ──\n${head}`);
-      };
-      act.appendChild(view);
+    /**
+     * Coalesce redraws.
+     *
+     * `watch` fires once per mutation, and this used to redraw on every one — so a benchmark
+     * making ~490 mutations had a follower tab issue ~490 full listings, each a round trip
+     * through the leader, *while it was being timed*. Writes measured ~60 ms instead of ~1 ms:
+     * the demo was benchmarking its own redraw loop, not the filesystem. A trailing debounce
+     * collapses a burst into one redraw, and the benchmark suspends redrawing entirely.
+     */
+    let renderTimer = null;
+    let renderSuspended = false;
+    function scheduleRender() {
+      if (renderSuspended || renderTimer) return;
+      renderTimer = setTimeout(() => { renderTimer = null; render(); }, 120);
     }
-    const del = document.createElement('button');
-    del.className = 'danger';
-    del.textContent = 'delete';
-    del.onclick = async () => { await call('remove', full); log('deleted', full); render(); };
-    act.appendChild(del);
-    tr.appendChild(act);
-    return tr;
-  }));
-}
 
-function crumbTrail() {
-  const parts = cwd.split('/').filter(Boolean);
-  const mk = (label, path) => {
-    const b = document.createElement('button');
-    b.textContent = label;
-    b.onclick = () => { cwd = path; render(); };
-    return b;
-  };
-  const out = [mk('/', '/')];
-  let acc = '';
-  for (const part of parts) { acc += '/' + part; out.push(document.createTextNode('›'), mk(part, acc)); }
-  return out;
-}
+    async function render() {
+      const entries = await call('list', cwd);
+      $('crumbs').replaceChildren(...crumbTrail());
+      $('btnUp').disabled = cwd === '/';
+      emptyEl.style.display = entries.length ? 'none' : 'block';
 
-// ── importing from the OS ───────────────────────────────────────────────────
-//
-// The directory walk stays here: `webkitGetAsEntry` is a DOM API and does not exist in a worker.
-// Files are read to bytes on this side and sent over in one batch, so a dropped folder costs one
-// message rather than one per file.
-
-async function collect(entry, destDir, out) {
-  if (entry.isFile) {
-    const file = await new Promise((res, rej) => entry.file(res, rej));
-    out.push({ path: join(destDir, file.name), data: await file.arrayBuffer() });
-    return;
-  }
-  if (entry.isDirectory) {
-    const child = join(destDir, entry.name);
-    await call('mkdir', child);
-    const reader = entry.createReader();
-    for (;;) {
-      const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
-      if (!batch.length) break;
-      for (const e of batch) await collect(e, child, out);
-    }
-  }
-}
-
-async function importDataTransfer(dt) {
-  const entries = [...dt.items].filter((i) => i.kind === 'file')
-    .map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
-
-  const files = [];
-  if (entries.length) {
-    for (const entry of entries) await collect(entry, cwd, files);
-  } else {
-    for (const file of dt.files) files.push({ path: join(cwd, file.name), data: await file.arrayBuffer() });
-  }
-  if (files.length) await call('importFiles', files, files.map((f) => f.data));
-  log(`imported ${files.length} file${files.length === 1 ? '' : 's'} into ${cwd}`);
-  render();
-}
-
-const drop = $('drop');
-drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
-drop.addEventListener('dragleave', (e) => { if (e.target === drop) drop.classList.remove('over'); });
-drop.addEventListener('drop', async (e) => {
-  e.preventDefault(); drop.classList.remove('over');
-  try { await importDataTransfer(e.dataTransfer); } catch (err) { log('import failed:', err.message); }
-});
-
-// ── who owns the volume ─────────────────────────────────────────────────────
-
-function renderRole() {
-  const el = $('role');
-  el.style.display = '';
-  el.className = 'banner ' + (isLeader ? 'leader' : 'follower');
-  el.innerHTML = isLeader
-    ? '<span class="role-tag">This tab is the leader.</span> It owns the volume and performs every '
-      + 'operation directly. Other tabs relay their calls here.'
-    : '<span class="role-tag">This tab is a follower.</span> The leader is another tab; calls from '
-      + 'here relay to it and back, so they are slower — expected, not a fault. Close the leader '
-      + 'and this tab is promoted, with no reload.';
-  $('benchRole').textContent = isLeader
-    ? 'Measured as the leader, inside a worker — real Atomics.wait, no main-thread spin. A '
-      + 'follower will be slower on the same machine; compare like with like.'
-    : 'Measured as a follower: every call round-trips to the leader tab, so these numbers are '
-      + "expected to be slower than the leader's. Run it in the leader tab to see the ceiling.";
-}
-
-// ── boot ────────────────────────────────────────────────────────────────────
-
-(async function start() {
-  // The bridge lets the worker reach `navigator.serviceWorker`, which worker scopes on Safari and
-  // Firefox cannot. `ns` is `vfs-${root}` with every non-alphanumeric replaced by `_`.
-  const channel = new MessageChannel();
-  createServiceWorkerBridge(channel.port1, { ns: 'vfs-_demo', swUrl: './vfs-service-worker.js' });
-  worker.postMessage({ type: 'init', swBridge: channel.port2 }, [channel.port2]);
-
-  const boot = await ready;
-  if (boot.error) {
-    $('banner').className = 'banner warn';
-    $('banner').innerHTML = `<strong>Failed to start:</strong> ${boot.error}`;
-    return;
-  }
-
-  const b = $('banner');
-  b.className = 'banner ok';
-  b.innerHTML = '<strong>Filesystem running in a worker.</strong> Every listing below comes from '
-    + '<code>readdirSync</code> and <code>statSync</code> called with no <code>await</code> — '
-    + 'inside the worker, where the blocking wait is a real <code>Atomics.wait</code>. That is the '
-    + 'arrangement Safari needs; on a page main thread a sync call there can stall for 30 seconds.';
-
-  isLeader = boot.isLeader;
-  renderRole();
-
-  $('btnUp').onclick = () => { cwd = cwd.replace(/\/[^/]+$/, '') || '/'; render(); };
-  $('btnNewDir').onclick = async () => {
-    const name = prompt('Folder name', 'new-folder');
-    if (name) { await call('mkdir', join(cwd, name)); render(); }
-  };
-  $('btnNewFile').onclick = async () => {
-    const name = prompt('File name', 'note.txt');
-    if (name) {
-      await call('write', { path: join(cwd, name), text: 'Written at ' + new Date().toISOString() + '\n' });
-      render();
-    }
-  };
-  $('btnPick').onclick = () => $('filePicker').click();
-  $('filePicker').onchange = async (e) => {
-    const files = [];
-    for (const file of e.target.files) files.push({ path: join(cwd, file.name), data: await file.arrayBuffer() });
-    if (files.length) await call('importFiles', files, files.map((f) => f.data));
-    log(`imported ${files.length} file(s)`);
-    e.target.value = '';
-    render();
-  };
-  $('btnSeed').onclick = async () => { await call('seed', cwd); log('added a sample tree'); render(); };
-  $('btnWipe').onclick = async () => { await call('wipe'); cwd = '/'; log('wiped the volume'); render(); };
-  $('btnTab').onclick = () => window.open(location.href, '_blank');
-  $('btnPing').onclick = async () => {
-    const stamp = await call('ping');
-    $('tabLog').textContent = `This tab wrote /tab-ping.txt at ${stamp}.\nAny other open tab should `
-      + 'show it within a moment — it is the same volume.';
-    render();
-  };
-  $('btnBench').onclick = async () => {
-    $('btnBench').disabled = true;
-    $('benchRows').innerHTML = '<tr><td colspan="3" style="padding:1rem .9rem">Running…</td></tr>';
-    try {
-      const { rows, isLeader: wasLeader } = await call('bench');
-      $('benchRows').replaceChildren(...rows.map((r) => {
+      rowsEl.replaceChildren(...entries.map((entry) => {
+        const full = join(cwd, entry.name);
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${r.label}</td><td class="n mono">${r.per.toFixed(3)} ms</td>`
-                     + `<td class="n mono">${r.ops.toLocaleString()}/s</td>`;
+
+        const name = document.createElement('td');
+        name.className = 'name' + (entry.isDirectory ? ' dir' : '');
+        name.textContent = (entry.isDirectory ? '📁 ' : '📄 ') + entry.name;
+        if (entry.isDirectory) name.onclick = () => { cwd = full; render(); };
+        tr.appendChild(name);
+
+        const size = document.createElement('td');
+        size.className = 'size';
+        size.textContent = entry.isDirectory ? '—' : fmt(entry.size);
+        tr.appendChild(size);
+
+        const act = document.createElement('td');
+        act.className = 'act';
+        if (!entry.isDirectory) {
+          const view = document.createElement('button');
+          view.textContent = 'view';
+          view.onclick = async () => {
+            const { size: n, head } = await call('read', full);
+            log(`── ${full} (${fmt(n)}) ──\n${head}`);
+          };
+          act.appendChild(view);
+        }
+        const del = document.createElement('button');
+        del.className = 'danger';
+        del.textContent = 'delete';
+        del.onclick = async () => { await call('remove', full); log('deleted', full); render(); };
+        act.appendChild(del);
+        tr.appendChild(act);
         return tr;
       }));
-      $('benchNote').textContent = 'sync API · in a worker · ' + (wasLeader ? 'leader' : 'follower');
-    } catch (err) {
-      log('benchmark failed:', err.message);
     }
-    $('btnBench').disabled = false;
-    render();
-  };
 
-  // ── main-thread sync, on demand ───────────────────────────────────────────
-  //
-  // The capability is real and it is the headline feature — it just is not safe to put on the
-  // boot path on WebKit, where a main-thread sync call busy-spins (Atomics.wait is illegal
-  // there), starves the worker's continuations and sits until the 30s stall guard. So it runs
-  // when asked, on its own volume, and reports what actually happened.
-  const webkitLike = /^((?!chrome|android|crios|fxios).)*safari/i.test(navigator.userAgent);
-  if (webkitLike) {
-    $('mtPill').textContent = 'expect a freeze';
-    $('btnMain').textContent = 'Run anyway (freezes this tab)';
-  }
+    function crumbTrail() {
+      const parts = cwd.split('/').filter(Boolean);
+      const mk = (label, path) => {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.onclick = () => { cwd = path; render(); };
+        return b;
+      };
+      const out = [mk('/', '/')];
+      let acc = '';
+      for (const part of parts) { acc += '/' + part; out.push(document.createTextNode('›'), mk(part, acc)); }
+      return out;
+    }
 
-  $('btnMain').onclick = async () => {
-    $('btnMain').disabled = true;
-    $('mtPill').textContent = 'running…';
-    $('mtOut').textContent = webkitLike
-      ? 'Running on the main thread. On WebKit this tab may freeze for ~30s — that is the '
-        + 'behaviour the worker arrangement exists to avoid.'
-      : 'Running on the main thread…';
-    await new Promise((r) => setTimeout(r, 50));   // let the UI paint before we block it
+    // ── importing from the OS ───────────────────────────────────────────────────
+    //
+    // The directory walk stays here: `webkitGetAsEntry` is a DOM API and does not exist in a worker.
+    // Files are read to bytes on this side and sent over in one batch, so a dropped folder costs one
+    // message rather than one per file.
 
-    try {
-      const { VFSFileSystem } = await import('./vendor/index.js');
-      // Its own volume, so it does not join the leader election for the one the worker owns.
-      const mainFs = new VFSFileSystem({ root: '/demo-main-thread' });
-      await mainFs.init();
+    async function collect(entry, destDir, out) {
+      if (entry.isFile) {
+        const file = await new Promise((res, rej) => entry.file(res, rej));
+        out.push({ path: join(destDir, file.name), data: await file.arrayBuffer() });
+        return;
+      }
+      if (entry.isDirectory) {
+        const child = join(destDir, entry.name);
+        await call('mkdir', child);
+        const reader = entry.createReader();
+        for (; ;) {
+          const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+          if (!batch.length) break;
+          for (const e of batch) await collect(e, child, out);
+        }
+      }
+    }
 
-      const t0 = performance.now();
-      mainFs.mkdirSync('/notes', { recursive: true });
-      mainFs.writeFileSync('/notes/hello.txt', 'written from the page main thread');
-      const text = mainFs.readFileSync('/notes/hello.txt', 'utf8');   // blocks, returns a value
-      const size = mainFs.statSync('/notes/hello.txt').size;
-      const names = mainFs.readdirSync('/notes');
-      const ms = performance.now() - t0;
-      await mainFs.dispose();
+    async function importDataTransfer(dt) {
+      const entries = [...dt.items].filter((i) => i.kind === 'file')
+        .map((i) => i.webkitGetAsEntry?.()).filter(Boolean);
 
-      $('mtPill').textContent = ms < 1000 ? 'works here' : 'slow here';
-      $('mtPill').className = 'pill' + (ms < 1000 ? ' live' : '');
-      $('mtOut').textContent =
-        `Five synchronous calls on this page's main thread, no worker, no await:\n\n`
-        + `  mkdirSync('/notes')\n  writeFileSync('/notes/hello.txt', …)\n`
-        + `  readFileSync(…, 'utf8')  -> ${JSON.stringify(text)}\n`
-        + `  statSync(…).size         -> ${size}\n`
-        + `  readdirSync('/notes')    -> ${JSON.stringify(names)}\n\n`
-        + `Total: ${ms.toFixed(1)} ms.\n\n`
-        + (ms < 1000
-            ? 'That is the sync API working directly on the main thread — supported on Chrome and '
+      const files = [];
+      if (entries.length) {
+        for (const entry of entries) await collect(entry, cwd, files);
+      } else {
+        for (const file of dt.files) files.push({ path: join(cwd, file.name), data: await file.arrayBuffer() });
+      }
+      if (files.length) await call('importFiles', files, files.map((f) => f.data));
+      log(`imported ${files.length} file${files.length === 1 ? '' : 's'} into ${cwd}`);
+      render();
+    }
+
+    const drop = $('drop');
+    drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
+    drop.addEventListener('dragleave', (e) => { if (e.target === drop) drop.classList.remove('over'); });
+    drop.addEventListener('drop', async (e) => {
+      e.preventDefault(); drop.classList.remove('over');
+      try { await importDataTransfer(e.dataTransfer); } catch (err) { log('import failed:', err.message); }
+    });
+
+    // ── who owns the volume ─────────────────────────────────────────────────────
+
+    function renderRole() {
+      const el = $('role');
+      el.style.display = '';
+      el.className = 'banner ' + (isLeader ? 'leader' : 'follower');
+      el.innerHTML = isLeader
+        ? '<span class="role-tag">This tab is the leader.</span> It owns the volume and performs every '
+        + 'operation directly. Other tabs relay their calls here.'
+        : '<span class="role-tag">This tab is a follower.</span> The leader is another tab; calls from '
+        + 'here relay to it and back, so they are slower — expected, not a fault. Close the leader '
+        + 'and this tab is promoted, with no reload.';
+      $('benchRole').textContent = isLeader
+        ? 'Measured as the leader, inside a worker — real Atomics.wait, no main-thread spin. A '
+        + 'follower will be slower on the same machine; compare like with like.'
+        : 'Measured as a follower: every call round-trips to the leader tab, so these numbers are '
+        + "expected to be slower than the leader's. Run it in the leader tab to see the ceiling.";
+    }
+
+    // ── boot ────────────────────────────────────────────────────────────────────
+
+    (async function start() {
+      // The bridge lets the worker reach `navigator.serviceWorker`, which worker scopes on Safari and
+      // Firefox cannot. `ns` is `vfs-${root}` with every non-alphanumeric replaced by `_`.
+      const channel = new MessageChannel();
+      createServiceWorkerBridge(channel.port1, { ns: 'vfs-_demo', swUrl: './vfs-service-worker.js' });
+      worker.postMessage({ type: 'init', swBridge: channel.port2 }, [channel.port2]);
+
+      const boot = await ready;
+      if (boot.error) {
+        $('banner').className = 'banner warn';
+        $('banner').innerHTML = `<strong>Failed to start:</strong> ${boot.error}`;
+        return;
+      }
+
+      const b = $('banner');
+      b.className = 'banner ok';
+      b.innerHTML = '<strong>Filesystem running in a worker.</strong> Every listing below comes from '
+        + '<code>readdirSync</code> and <code>statSync</code> called with no <code>await</code> — '
+        + 'inside the worker, where the blocking wait is a real <code>Atomics.wait</code>. That is the '
+        + 'arrangement Safari needs; on a page main thread a sync call there can stall for 30 seconds.';
+
+      isLeader = boot.isLeader;
+      renderRole();
+
+      $('btnUp').onclick = () => { cwd = cwd.replace(/\/[^/]+$/, '') || '/'; render(); };
+      $('btnNewDir').onclick = async () => {
+        const name = prompt('Folder name', 'new-folder');
+        if (name) { await call('mkdir', join(cwd, name)); render(); }
+      };
+      $('btnNewFile').onclick = async () => {
+        const name = prompt('File name', 'note.txt');
+        if (name) {
+          await call('write', { path: join(cwd, name), text: 'Written at ' + new Date().toISOString() + '\n' });
+          render();
+        }
+      };
+      $('btnPick').onclick = () => $('filePicker').click();
+      $('filePicker').onchange = async (e) => {
+        const files = [];
+        for (const file of e.target.files) files.push({ path: join(cwd, file.name), data: await file.arrayBuffer() });
+        if (files.length) await call('importFiles', files, files.map((f) => f.data));
+        log(`imported ${files.length} file(s)`);
+        e.target.value = '';
+        render();
+      };
+      $('btnSeed').onclick = async () => { await call('seed', cwd); log('added a sample tree'); render(); };
+      $('btnWipe').onclick = async () => { await call('wipe'); cwd = '/'; log('wiped the volume'); render(); };
+      $('btnTab').onclick = () => window.open(location.href, '_blank');
+      $('btnPing').onclick = async () => {
+        const stamp = await call('ping');
+        $('tabLog').textContent = `This tab wrote /tab-ping.txt at ${stamp}.\nAny other open tab should `
+          + 'show it within a moment — it is the same volume.';
+        render();
+      };
+      $('btnBench').onclick = async () => {
+        $('btnBench').disabled = true;
+        // Not cosmetic: redrawing on each of the benchmark's own mutations is exactly what made
+        // a follower tab measure ~60 ms per write.
+        renderSuspended = true;
+        $('benchRows').innerHTML = '<tr><td colspan="3" style="padding:1rem .9rem">Running…</td></tr>';
+        try {
+          const { rows, isLeader: wasLeader } = await call('bench');
+          $('benchRows').replaceChildren(...rows.map((r) => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `<td>${r.label}</td><td class="n mono">${r.per.toFixed(3)} ms</td>`
+              + `<td class="n mono">${r.ops.toLocaleString()}/s</td>`;
+            return tr;
+          }));
+          $('benchNote').textContent = 'sync API · in a worker · ' + (wasLeader ? 'leader' : 'follower');
+        } catch (err) {
+          log('benchmark failed:', err.message);
+        }
+        renderSuspended = false;
+        $('btnBench').disabled = false;
+        render();
+      };
+
+      // ── main-thread sync, on demand ───────────────────────────────────────────
+      //
+      // The capability is real and it is the headline feature — it just is not safe to put on the
+      // boot path on WebKit, where a main-thread sync call busy-spins (Atomics.wait is illegal
+      // there), starves the worker's continuations and sits until the 30s stall guard. So it runs
+      // when asked, on its own volume, and reports what actually happened.
+      const webkitLike = /^((?!chrome|android|crios|fxios).)*safari/i.test(navigator.userAgent);
+      if (webkitLike) {
+        $('mtPill').textContent = 'expect a freeze';
+        $('btnMain').textContent = 'Run anyway (freezes this tab)';
+      }
+
+      $('btnMain').onclick = async () => {
+        $('btnMain').disabled = true;
+        $('mtPill').textContent = 'running…';
+        $('mtOut').textContent = webkitLike
+          ? 'Running on the main thread. On WebKit this tab may freeze for ~30s — that is the '
+          + 'behaviour the worker arrangement exists to avoid.'
+          : 'Running on the main thread…';
+        await new Promise((r) => setTimeout(r, 50));   // let the UI paint before we block it
+
+        try {
+          const { VFSFileSystem } = await import('./vendor/index.js');
+          // Its own volume, so it does not join the leader election for the one the worker owns.
+          const mainFs = new VFSFileSystem({ root: '/demo-main-thread' });
+          await mainFs.init();
+
+          const t0 = performance.now();
+          mainFs.mkdirSync('/notes', { recursive: true });
+          mainFs.writeFileSync('/notes/hello.txt', 'written from the page main thread');
+          const text = mainFs.readFileSync('/notes/hello.txt', 'utf8');   // blocks, returns a value
+          const size = mainFs.statSync('/notes/hello.txt').size;
+          const names = mainFs.readdirSync('/notes');
+          const ms = performance.now() - t0;
+          await mainFs.dispose();
+
+          $('mtPill').textContent = ms < 1000 ? 'works here' : 'slow here';
+          $('mtPill').className = 'pill' + (ms < 1000 ? ' live' : '');
+          $('mtOut').textContent =
+            `Five synchronous calls on this page's main thread, no worker, no await:\n\n`
+            + `  mkdirSync('/notes')\n  writeFileSync('/notes/hello.txt', …)\n`
+            + `  readFileSync(…, 'utf8')  -> ${JSON.stringify(text)}\n`
+            + `  statSync(…).size         -> ${size}\n`
+            + `  readdirSync('/notes')    -> ${JSON.stringify(names)}\n\n`
+            + `Total: ${ms.toFixed(1)} ms.\n\n`
+            + (ms < 1000
+              ? 'That is the sync API working directly on the main thread — supported on Chrome and '
               + 'Firefox. Safari is the exception, which is why the browser above runs in a worker.'
-            : 'That took long enough to show the problem: on WebKit a main-thread sync call '
+              : 'That took long enough to show the problem: on WebKit a main-thread sync call '
               + 'busy-spins and starves the worker it is waiting on. Run the instance in a worker '
               + 'there, as the file browser above does.');
-    } catch (err) {
-      $('mtPill').textContent = 'failed';
-      $('mtOut').textContent = 'Main-thread sync failed: ' + err.message
-        + '\n\nThis is expected on WebKit; use a worker-hosted instance there.';
-    }
-    $('btnMain').disabled = false;
-  };
+        } catch (err) {
+          $('mtPill').textContent = 'failed';
+          $('mtOut').textContent = 'Main-thread sync failed: ' + err.message
+            + '\n\nThis is expected on WebKit; use a worker-hosted instance there.';
+        }
+        $('btnMain').disabled = false;
+      };
 
-  await render();
-  log('ready — volume mounted at /demo, hosted in a worker');
-})();
-</script>
+      await render();
+      log('ready — volume mounted at /demo, hosted in a worker');
+    })();
+  </script>
 </body>
+
 </html>
