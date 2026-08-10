@@ -132,9 +132,16 @@
       min-height: 0;
     }
 
+    /* The log fills what the cross-tab card leaves and scrolls inside it.
+       An explicit cap, not `flex: 1` alone: the grid row is auto-sized, so the stack's own
+       content decides the row height, and an uncapped log grows the row — the whole page went
+       from 1264px to 5144px with 200 lines in it. `min-height: 0` is still needed so the flex
+       item may shrink below its content instead of flooring at it. */
     .stack > section .out {
       flex: 1;
-      max-height: none;
+      min-height: 0;
+      max-height: 9rem;
+      overflow: auto;
     }
 
     @media (max-width:900px) {
