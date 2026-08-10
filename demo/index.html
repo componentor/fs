@@ -892,8 +892,9 @@ Close the leader tab and watch a follower take over: the badge above changes wit
             + '\n\nA browser cannot reach github.com\'s git endpoints directly, so this goes'
             + ' through isomorphic-git\'s public CORS proxy. If that is unreachable, or the'
             + ' repository is private, the clone cannot start.';
+        } finally {
+          $('btnClone').disabled = false;
         }
-        $('btnClone').disabled = false;
       };
 
       $('btnBench').onclick = async () => {
@@ -915,9 +916,15 @@ Close the leader tab and watch a follower take over: the badge above changes wit
             + ' · ' + (wasLeader ? 'leader' : 'follower');
         } catch (err) {
           log('benchmark failed:', err.message);
+        } finally {
+          // `finally`, not a trailing statement: if the benchmark never settles — which it did
+          // while leadership changes were broken — a plain assignment after the `try` is never
+          // reached, and this tab stops redrawing for the rest of its life while every other tab
+          // carries on updating. A visible tab that silently stops following the filesystem is
+          // indistinguishable from the library dropping its watch events.
+          renderSuspended = false;
+          $('btnBench').disabled = false;
         }
-        renderSuspended = false;
-        $('btnBench').disabled = false;
         render();
       };
 
