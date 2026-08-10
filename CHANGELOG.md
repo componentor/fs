@@ -1,5 +1,10 @@
 # Changelog
 
+## 4.1.0
+
+- **Added `fs.isLeader` and `fs.onLeaderChange(listener)`.** One tab per origin holds the lock and does the work; the rest relay their calls to it. That was documented architecture with no way to ask which one you are — and it is not cosmetic. A follower's synchronous calls cost a round trip to the leader, so **a benchmark taken in a follower is expected to be slower**, and one that does not say which role it ran in is not comparable. On Safari a follower's main-thread sync call cannot work at all, so knowing the role is how you decide to move the instance into a worker. Leadership moves when the leader goes away, so it is exposed as a live signal rather than a value you read once.
+- The demo now names the role in a banner, labels its benchmark with it (`sync API · follower`), and explains that a follower measuring slower is expected. Close the leader tab and the badge flips without a reload.
+
 ## 4.0.1
 
 A patch for one bug that only appears once the package is deployed somewhere other than a domain

@@ -77,6 +77,9 @@
   .bench .n { text-align:right; font-variant-numeric:tabular-nums; }
   .pill { font-size:.7rem; padding:.1rem .45rem; border-radius:99px; border:1px solid var(--line); color:var(--muted); }
   .pill.live { color:var(--ok); border-color:var(--ok); }
+  .banner.leader { border-left-color:var(--accent); }
+  .banner.follower { border-left-color:var(--warn); }
+  .role-tag { font-weight:700; }
   footer { margin-top:2.5rem; padding-top:1.25rem; border-top:1px solid var(--line);
            color:var(--muted); font-size:.87rem; }
 </style>
@@ -91,6 +94,7 @@
   </header>
 
   <div id="banner" class="banner">Starting…</div>
+  <div id="role" class="banner" style="display:none"></div>
 
   <div class="grid">
     <!-- ── file browser ─────────────────────────────────────────── -->
@@ -120,7 +124,9 @@
           <button id="btnTab" class="primary">Open a second tab ↗</button>
           <button id="btnPing">Write from this tab</button>
         </div>
-        <pre class="out" id="tabLog">One volume, many tabs. Open a second tab and write from either — the other updates on its own, through a shared worker and a leader/follower election.</pre>
+        <pre class="out" id="tabLog">One volume, many tabs. Open a second tab and write from either — the other updates on its own, through a shared worker and a leader/follower election.
+
+Close the leader tab and watch a follower take over: the badge above changes without a reload.</pre>
       </section>
 
       <!-- ── benchmark ──────────────────────────────────────────── -->
@@ -135,6 +141,8 @@
             Measures this library against real OPFS in your browser. Numbers vary by engine —
             Chromium is storage-bound, WebKit is not.</td></tr>
         </tbody></table>
+        <p id="benchRole" style="margin:0; padding:.6rem .9rem; border-top:1px solid var(--line);
+           color:var(--muted); font-size:.83rem"></p>
       </section>
 
       <!-- ── console ────────────────────────────────────────────── -->
@@ -334,9 +342,35 @@ async function benchmark() {
                    `<td class="n mono">${r.ops.toLocaleString()}/s</td>`;
     return tr;
   }));
-  $('benchNote').textContent = crossOriginIsolated ? 'sync API' : 'async only';
+  $('benchNote').textContent = (crossOriginIsolated ? 'sync API' : 'async only')
+    + ' · ' + (fs.isLeader ? 'leader' : 'follower');
+  renderRole();
   $('btnBench').disabled = false;
   render();
+}
+
+// ── who owns the volume ─────────────────────────────────────────────────────
+//
+// One tab per origin holds the lock and does the work; the rest relay their calls to it. Which
+// one you are is not cosmetic: a follower's synchronous calls cost a round trip to the leader, so
+// they measure slower, and a benchmark that does not say which role it ran in is not comparable.
+
+function renderRole() {
+  const leader = fs.isLeader;
+  const el = $('role');
+  el.style.display = '';
+  el.className = 'banner ' + (leader ? 'leader' : 'follower');
+  el.innerHTML = leader
+    ? '<span class="role-tag">This tab is the leader.</span> It owns the volume and performs every '
+      + 'operation directly. Other tabs relay their calls here.'
+    : '<span class="role-tag">This tab is a follower.</span> The leader is another tab; calls from '
+      + 'here relay to it and back, so they are slower — expected, not a fault. Close the leader '
+      + 'and this tab is promoted, with no reload.';
+  $('benchRole').textContent = leader
+    ? 'Measured as the leader — the fast path, with no cross-tab hop. A follower will be slower on '
+      + 'the same machine; compare like with like.'
+    : 'Measured as a follower: every call round-trips to the leader tab, so these numbers are '
+      + 'expected to be slower than the leader\'s. Run it in the leader tab to see the ceiling.';
 }
 
 // ── boot ────────────────────────────────────────────────────────────────────
@@ -368,6 +402,12 @@ async function benchmark() {
     b.innerHTML = '<strong>Not cross-origin isolated</strong> — the async API works, the sync calls '
       + 'will throw. Usually one more reload settles it; the service worker needs to take control first.';
   }
+
+  renderRole();
+  fs.onLeaderChange((isLeader) => {
+    renderRole();
+    log(isLeader ? 'promoted: this tab is now the leader' : 'this tab is a follower');
+  });
 
   $('btnUp').onclick = () => { cwd = cwd.replace(/\/[^/]+$/, '') || '/'; render(); };
   $('btnNewDir').onclick = async () => {

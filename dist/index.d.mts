@@ -1001,6 +1001,8 @@ declare class VFSFileSystem {
     private ns;
     private swReg;
     private isFollower;
+    /** Callbacks for {@link onLeaderChange}. */
+    private leaderListeners;
     private holdingLeaderLock;
     private brokerInitialized;
     private brokerHeartbeatTimer;
@@ -1311,6 +1313,27 @@ declare class VFSFileSystem {
     dispose(): Promise<void>;
     /** `await using` support, so an instance can be scoped to a block. */
     [Symbol.asyncDispose](): Promise<void>;
+    /**
+     * Whether this tab owns the volume.
+     *
+     * One tab per origin holds the lock and does the actual work; the rest relay their calls to it.
+     * Which one you are is worth knowing for two reasons. A follower's synchronous calls cost a
+     * round trip to the leader, so they measure slower — a benchmark that does not say which role
+     * it ran in is not comparable. And on Safari a follower's *main-thread* sync call cannot work
+     * at all (see the readme), so code that must be synchronous everywhere runs the instance in a
+     * worker.
+     *
+     * Leadership moves: close the leader and a follower is promoted, without reloading. Use
+     * {@link onLeaderChange} rather than reading this once.
+     */
+    get isLeader(): boolean;
+    /**
+     * Observe leadership changes. Returns an unsubscribe function.
+     *
+     * Fires on election and on promotion when the previous leader goes away.
+     */
+    onLeaderChange(listener: (isLeader: boolean) => void): () => void;
+    private announceRole;
     /** Switch the filesystem mode at runtime.
      *
      *  Typical flow for IDE corruption recovery:

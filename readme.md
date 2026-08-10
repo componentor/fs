@@ -978,6 +978,12 @@ await fs.init(): Promise<void>
 // Named `dispose` because `close(fd)` is node's descriptor API.
 await fs.dispose(): Promise<void>
 
+// Which tab owns the volume. One holds the lock and does the work; the rest relay to it, so a
+// follower's sync calls cost a round trip — worth knowing before comparing benchmarks, and
+// before relying on main-thread sync calls in a follower on Safari.
+fs.isLeader: boolean
+fs.onLeaderChange(listener): () => void   // leadership moves when the leader closes
+
 // Or scope it to a block — `Symbol.asyncDispose` is implemented:
 await using fs = new VFSFileSystem({ root: '/scratch' });
 

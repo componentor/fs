@@ -4123,6 +4123,8 @@ var VFSFileSystem = class {
   // Service worker registration for multi-tab port transfer
   swReg = null;
   isFollower = false;
+  /** Callbacks for {@link onLeaderChange}. */
+  leaderListeners = /* @__PURE__ */ new Set();
   holdingLeaderLock = false;
   brokerInitialized = false;
   brokerHeartbeatTimer = null;
@@ -4346,6 +4348,7 @@ var VFSFileSystem = class {
   /** Start as leader — tell sync-relay to init VFS engine + OPFS handle */
   startAsLeader() {
     this.isFollower = false;
+    this.announceRole();
     if (this._mode === "opfs") {
       this.sendOPFSInit();
     } else {
@@ -4355,6 +4358,7 @@ var VFSFileSystem = class {
   /** Start as follower — connect to leader via service worker port brokering */
   startAsFollower() {
     this.isFollower = true;
+    this.announceRole();
     this.syncWorker.postMessage({
       type: "init-follower",
       sab: this.hasSAB ? this.sab : null,
@@ -4484,6 +4488,7 @@ var VFSFileSystem = class {
   /** Promote from follower to leader (after leader tab dies and lock is acquired) */
   promoteToLeader() {
     this.isFollower = false;
+    this.announceRole();
     this.isReady = false;
     this.transitioning = true;
     this.brokerInitialized = false;
@@ -5319,6 +5324,43 @@ var VFSFileSystem = class {
   /** `await using` support, so an instance can be scoped to a block. */
   [Symbol.asyncDispose]() {
     return this.dispose();
+  }
+  /**
+   * Whether this tab owns the volume.
+   *
+   * One tab per origin holds the lock and does the actual work; the rest relay their calls to it.
+   * Which one you are is worth knowing for two reasons. A follower's synchronous calls cost a
+   * round trip to the leader, so they measure slower — a benchmark that does not say which role
+   * it ran in is not comparable. And on Safari a follower's *main-thread* sync call cannot work
+   * at all (see the readme), so code that must be synchronous everywhere runs the instance in a
+   * worker.
+   *
+   * Leadership moves: close the leader and a follower is promoted, without reloading. Use
+   * {@link onLeaderChange} rather than reading this once.
+   */
+  get isLeader() {
+    return !this.isFollower;
+  }
+  /**
+   * Observe leadership changes. Returns an unsubscribe function.
+   *
+   * Fires on election and on promotion when the previous leader goes away.
+   */
+  onLeaderChange(listener) {
+    this.leaderListeners.add(listener);
+    return () => {
+      this.leaderListeners.delete(listener);
+    };
+  }
+  announceRole() {
+    const isLeader = !this.isFollower;
+    for (const listener of this.leaderListeners) {
+      try {
+        listener(isLeader);
+      } catch (err) {
+        console.warn("[VFS] leader listener threw:", err);
+      }
+    }
   }
   /** Switch the filesystem mode at runtime.
    *
