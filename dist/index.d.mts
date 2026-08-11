@@ -1018,6 +1018,8 @@ declare class VFSFileSystem {
     private leaderLockBid;
     private brokerInitialized;
     private brokerHeartbeatTimer;
+    /** Backoff for reopening a volume whose previous holder has not let go yet. */
+    private volumeRetryDelayMs;
     /** The service worker this instance registered its broker with, so it can deregister. */
     private brokerSw;
     private brokerControlPort;
@@ -1288,17 +1290,22 @@ declare class VFSFileSystem {
     /** Detach the observer. Synchronous on purpose — the unload path cannot await. */
     private stopWatchingExternalChanges;
     /**
-     * Tear the workers down when the page goes away, without needing the caller to remember.
+     * Give back what the page owns when it goes away, without needing the caller to remember.
      *
-     * The OPFS mirror worker holds a recursive `FileSystemObserver`, and Chromium aborts the
-     * **browser process** — `FATAL: Detected dangling raw_ptr in unretained` — when a page is
-     * destroyed with one still attached. Callers cannot reasonably be relied on to call
-     * {@link dispose} before every navigation, and `pagehide` is too late to round-trip a message
-     * to the worker and back: nothing will run the event loop again.
+     * Two things must not survive the page, and they need opposite treatment.
      *
-     * So this does the one thing that works synchronously — terminate the relay. The mirror worker
-     * is a *nested* worker owned by the relay, so killing the parent destroys the child's context
-     * and the observer with it, before teardown can trip over it.
+     * The `FileSystemObserver` must be **detached synchronously**: Chromium aborts the whole
+     * **browser process** — `FATAL: Detected dangling raw_ptr in unretained` — on a page destroyed
+     * with a recursive one still attached. That is why the observer lives on this side rather than
+     * in the mirror worker (see {@link watchExternalChanges}); here `disconnect()` is an
+     * ordinary synchronous call on the unload path, and it is the first thing this does.
+     *
+     * The volume's exclusive `createSyncAccessHandle` must be **handed back**, and terminating the
+     * relay does not do it — the browser reclaims such a handle whenever it gets round to it, and
+     * the next leader cannot open the volume until then. So the relay is asked to shut down instead:
+     * `postMessage` still reaches a live worker during `pagehide`, and the relay closes the handle
+     * synchronously on its own thread. Neither relay is terminated here — they die with the page
+     * anyway, and killing the sync relay is precisely what removed its chance to let go first.
      *
      * `event.persisted` means the page is going into the back/forward cache and may be restored,
      * so the filesystem is left alone in that case.
@@ -1307,10 +1314,11 @@ declare class VFSFileSystem {
     /**
      * Ask the sync relay to release what it owns, and wait briefly for it to confirm.
      *
-     * The thing that actually has to happen here is the OPFS mirror worker disconnecting its
-     * recursive `FileSystemObserver`. Everything else the relay holds dies with the worker; an
-     * attached observer does not, and Chromium aborts the browser process on a page teardown that
-     * leaves one dangling. Bounded, because a close must not be able to hang.
+     * The thing that actually has to happen here is the volume's exclusive sync access handle going
+     * back: the browser does not reclaim it promptly on its own, and until it does, nothing — not
+     * the next leader, not this instance reopening the same root — can open the volume. The wait is
+     * for `shutdown-done`, which also means the mirror worker has stopped and closed its port, and
+     * it is bounded because a close must not be able to hang.
      */
     private shutdownRelay;
     /**

@@ -393,6 +393,8 @@ export class VFSFileSystem {
   private leaderLockBid: AbortController | null = null;
   private brokerInitialized = false;
   private brokerHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** Backoff for reopening a volume whose previous holder has not let go yet. */
+  private volumeRetryDelayMs = 0;
   /** The service worker this instance registered its broker with, so it can deregister. */
   private brokerSw: { postMessage(message: unknown, transfer?: Transferable[]): void } | null = null;
   private brokerControlPort: MessagePort | null = null;
@@ -502,6 +504,8 @@ export class VFSFileSystem {
       if (msg.type === 'ready') {
         this.isReady = true;
         this.transitioning = false;
+        // Opened — so a later volume handoff starts from the fast retry again.
+        this.volumeRetryDelayMs = 0;
         // Initialize async-relay AFTER sync-relay is ready to avoid
         // requests arriving before the leader loop is running.
         this.initAsyncRelay();
@@ -514,8 +518,17 @@ export class VFSFileSystem {
         if (msg.error?.startsWith('Corrupt VFS:')) {
           this.handleCorruptVFS(msg.error);
         } else if (this.holdingLeaderLock) {
-          // We hold the lock but OPFS handle not released yet — retry
-          setTimeout(() => this.sendLeaderInit(), 500);
+          // We hold the lock but the OPFS handle has not been released yet — retry.
+          //
+          // Backed off from a flat 500ms, because that interval is the whole cost when the
+          // handle is released a moment after the first attempt: the boot waits out the rest
+          // of the tick for nothing. A departing leader now hands the volume back explicitly
+          // (see installUnloadTeardown), so the common case is "free within a few ms" — but a
+          // tab that was killed, crashed, or force-quit never got to say anything, and only
+          // the browser's own reclaim ends that wait. Start fast for the first case, and grow
+          // to the old interval so the second cannot spin.
+          this.volumeRetryDelayMs = Math.min((this.volumeRetryDelayMs || 0) * 2 || 25, 500);
+          setTimeout(() => this.sendLeaderInit(), this.volumeRetryDelayMs);
         } else if (!('locks' in navigator)) {
           // No Web Locks fallback — become follower via OPFS handle detection
           this.startAsFollower();
@@ -1822,17 +1835,22 @@ export class VFSFileSystem {
   }
 
   /**
-   * Tear the workers down when the page goes away, without needing the caller to remember.
+   * Give back what the page owns when it goes away, without needing the caller to remember.
    *
-   * The OPFS mirror worker holds a recursive `FileSystemObserver`, and Chromium aborts the
-   * **browser process** — `FATAL: Detected dangling raw_ptr in unretained` — when a page is
-   * destroyed with one still attached. Callers cannot reasonably be relied on to call
-   * {@link dispose} before every navigation, and `pagehide` is too late to round-trip a message
-   * to the worker and back: nothing will run the event loop again.
+   * Two things must not survive the page, and they need opposite treatment.
    *
-   * So this does the one thing that works synchronously — terminate the relay. The mirror worker
-   * is a *nested* worker owned by the relay, so killing the parent destroys the child's context
-   * and the observer with it, before teardown can trip over it.
+   * The `FileSystemObserver` must be **detached synchronously**: Chromium aborts the whole
+   * **browser process** — `FATAL: Detected dangling raw_ptr in unretained` — on a page destroyed
+   * with a recursive one still attached. That is why the observer lives on this side rather than
+   * in the mirror worker (see {@link watchExternalChanges}); here `disconnect()` is an
+   * ordinary synchronous call on the unload path, and it is the first thing this does.
+   *
+   * The volume's exclusive `createSyncAccessHandle` must be **handed back**, and terminating the
+   * relay does not do it — the browser reclaims such a handle whenever it gets round to it, and
+   * the next leader cannot open the volume until then. So the relay is asked to shut down instead:
+   * `postMessage` still reaches a live worker during `pagehide`, and the relay closes the handle
+   * synchronously on its own thread. Neither relay is terminated here — they die with the page
+   * anyway, and killing the sync relay is precisely what removed its chance to let go first.
    *
    * `event.persisted` means the page is going into the back/forward cache and may be restored,
    * so the filesystem is left alone in that case.
@@ -1841,21 +1859,21 @@ export class VFSFileSystem {
     if (typeof addEventListener !== 'function' || typeof document === 'undefined') return;
     this.onPageHide = (event: Event) => {
       if ((event as PageTransitionEvent).persisted) return;
-      // Ask the relay to shut down rather than killing it outright.
-      //
-      // The relay owns the OPFS mirror worker, which holds a **recursive
-      // `FileSystemObserver`**. Terminating the relay leaves that observer attached while the
-      // page is torn down, and Chromium aborts the whole browser process on it —
-      // `FATAL: Detected dangling raw_ptr`. Confirmed by construction: with the observer
-      // disabled the crash disappears entirely, and with it it reproduces within a few specs.
-      //
-      // `postMessage` still reaches a live worker during `pagehide`, and the worker disconnects
-      // and calls `self.close()`. The workers are not terminated here: they die with the page
-      // anyway, and killing them is what removed the chance to detach first.
+
       // Synchronous, and the reason the observer lives on this side: it is guaranteed detached
       // before the page is destroyed, which is the state Chromium aborts on.
       this.stopWatchingExternalChanges();
-      terminateWorker(this.syncWorker);
+
+      // The sync relay is ASKED, not killed, so it can give the volume back.
+      //
+      // A reloading leader that merely terminated its relay left the volume locked behind it, and
+      // the tab coming back — which wins the leader lock immediately, because the old holder's tab
+      // is gone — could not open the volume and sat in `sendLeaderInit`'s retry loop until the
+      // handle happened to be released. Measured in a two-tab reload storm: 4.8s, 6.1s and 12.1s
+      // boots, always in the tab that had been the leader.
+      //
+      // The async relay holds no volume handle, so killing it outright costs nothing.
+      try { this.syncWorker?.postMessage({ type: 'shutdown' }); } catch { /* already gone */ }
       terminateWorker(this.asyncWorker);
     };
     addEventListener('pagehide', this.onPageHide);
@@ -1864,10 +1882,11 @@ export class VFSFileSystem {
   /**
    * Ask the sync relay to release what it owns, and wait briefly for it to confirm.
    *
-   * The thing that actually has to happen here is the OPFS mirror worker disconnecting its
-   * recursive `FileSystemObserver`. Everything else the relay holds dies with the worker; an
-   * attached observer does not, and Chromium aborts the browser process on a page teardown that
-   * leaves one dangling. Bounded, because a close must not be able to hang.
+   * The thing that actually has to happen here is the volume's exclusive sync access handle going
+   * back: the browser does not reclaim it promptly on its own, and until it does, nothing — not
+   * the next leader, not this instance reopening the same root — can open the volume. The wait is
+   * for `shutdown-done`, which also means the mirror worker has stopped and closed its port, and
+   * it is bounded because a close must not be able to hang.
    */
   private async shutdownRelay(): Promise<void> {
     if (!this.syncWorker) return;

@@ -4287,6 +4287,7 @@ async function openVolumeExclusive(fileHandle) {
   }
 }
 var vfsVolumeHandle = null;
+var volumeReleased = false;
 var OPFS_POPULATE_CHUNK = 2 * 1024 * 1024;
 async function populateVFSFromOPFS(dir, prefix) {
   const subdirs = [];
@@ -4627,6 +4628,7 @@ function notifyOPFSSync(op, path, newPath) {
   }
 }
 function handleExternalChange(msg) {
+  if (volumeReleased) return;
   switch (msg.op) {
     case "external-write": {
       let result = engine.write(msg.path, new Uint8Array(msg.data), 0);
@@ -4823,27 +4825,6 @@ self.onmessage = async (e) => {
     return;
   }
   if (msg.type === "shutdown") {
-    if (opfsSyncWorker) {
-      const worker = opfsSyncWorker;
-      opfsSyncWorker = null;
-      await new Promise((resolve) => {
-        const done = () => {
-          clearTimeout(timer);
-          terminateWorker(worker);
-          resolve();
-        };
-        const timer = setTimeout(done, 500);
-        worker.onmessage = (ev) => {
-          if (ev.data?.type === "shutdown-done") done();
-        };
-      });
-    }
-    try {
-      opfsSyncPort?.close();
-    } catch {
-    }
-    opfsSyncPort = null;
-    opfsSyncEnabled = false;
     try {
       engine.flush();
     } catch {
@@ -4857,6 +4838,29 @@ self.onmessage = async (e) => {
     } catch {
     }
     vfsVolumeHandle = null;
+    volumeReleased = true;
+    if (opfsSyncWorker) {
+      const worker = opfsSyncWorker;
+      opfsSyncWorker = null;
+      await new Promise((resolve) => {
+        const done = () => {
+          clearTimeout(timer);
+          terminateWorker(worker);
+          resolve();
+        };
+        const timer = setTimeout(done, 500);
+        worker.onmessage = (ev) => {
+          if (ev.data?.type === "shutdown-done") done();
+        };
+        worker.postMessage({ type: "shutdown" });
+      });
+    }
+    try {
+      opfsSyncPort?.close();
+    } catch {
+    }
+    opfsSyncPort = null;
+    opfsSyncEnabled = false;
     self.postMessage({ type: "shutdown-done" });
     return;
   }

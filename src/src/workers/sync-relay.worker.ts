@@ -78,6 +78,8 @@ let opfsSyncWorker: Worker | null = null;
 
 // Watch broadcast (leader mode only — fires on every VFS mutation)
 let watchBc: BroadcastChannel | null = null;
+/** Volume namespace, kept so the shutdown path can announce the release. */
+let volumeNs: string | null = null;
 
 // Own tab's sync SAB
 let sab: SharedArrayBuffer;
@@ -1078,6 +1080,17 @@ async function openVolumeExclusive(
  */
 let vfsVolumeHandle: { close(): void; flush?(): void } | null = null;
 
+/**
+ * Set once `shutdown` has handed the volume back, so nothing tries to write through the engine
+ * afterwards.
+ *
+ * The engine writes through {@link vfsVolumeHandle} directly (`engine.init(vfsHandle)`), so every
+ * engine call is an error once it is closed. Request dispatch already survives that — it is
+ * wrapped in `safeHandleRequest` and degrades to `EIO` — but the mirror worker's inbound records
+ * arrive on a bare `onmessage`, where a throw escapes into nothing.
+ */
+let volumeReleased = false;
+
 // Chunk size for streamed population of fresh VFS from existing OPFS.
 // Caps peak memory during init at this size per file instead of
 // materializing every OPFS file into the heap simultaneously.
@@ -1631,6 +1644,13 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
 // re-mirroring (resyncSymlinks*), and those re-mirror writes are echo-suppressed
 // by the mirror worker, so there is no loop.
 function handleExternalChange(msg: { op: string; path: string; newPath?: string; data?: ArrayBuffer }): void {
+  // The volume is handed back at the top of `shutdown`, before the mirror worker is told to stop,
+  // so a record the mirror worker had already posted can arrive after the engine has nothing to
+  // write through. Dropping it is the correct outcome and not a loss of the change itself: the
+  // mutation is ALREADY in OPFS, which is where the next boot reads the tree from. Attempting it
+  // would throw out of this handler — an unhandled rejection in a worker that is going away.
+  if (volumeReleased) return;
+
   switch (msg.op) {
     case 'external-write': {
       let result = engine.write(msg.path, new Uint8Array(msg.data!), 0);
@@ -1890,11 +1910,29 @@ self.onmessage = async (e: MessageEvent) => {
 
   // --- Orderly shutdown ---
   //
-  // Sent by `VFSFileSystem.close()`. The mirror worker has to be told to disconnect its
-  // FileSystemObserver *before* anything is terminated: a worker killed while a recursive
-  // observer is still attached is what makes Chromium abort the browser process during page
-  // teardown. Terminating it outright would skip that, so it gets a message and a moment.
+  // Sent by `dispose()` and, on the way out, by the page's `pagehide` handler. Two things have to
+  // happen here, and the order between them is the whole point: the volume's exclusive handle goes
+  // back to the origin, and the mirror worker gets told to stop rather than being killed mid-write.
   if (msg.type === 'shutdown') {
+    // The volume goes back FIRST, before anything that can await.
+    //
+    // This handler also runs on `pagehide`, where the page has a moment rather than a
+    // guarantee: whatever has not happened when the browser kills this worker does not
+    // happen at all. The mirror-worker handshake below can take up to 500ms, so releasing the
+    // volume after it means that on a reload the handle is usually still held when the next
+    // leader opens the volume — and that leader then sits in `sendLeaderInit`'s `init-failed`
+    // retry loop waiting for a handle nobody is going to hand back. Measured as multi-second
+    // boots in the tab that reloaded (4.8s, 6.1s, 12.1s) for exactly this reason.
+    //
+    // Releasing first is safe: `close()` is synchronous, local to this worker, and terminates
+    // nothing. What it does end is the engine — it writes through this very handle — so
+    // `volumeReleased` stops the mirror worker's inbound records from arriving at a closed one.
+    try { engine.flush(); } catch { /* nothing buffered */ }
+    try { vfsVolumeHandle?.flush?.(); } catch { /* best effort */ }
+    try { vfsVolumeHandle?.close(); } catch { /* already gone */ }
+    vfsVolumeHandle = null;
+    volumeReleased = true;
+
     if (opfsSyncWorker) {
       const worker = opfsSyncWorker;
       opfsSyncWorker = null;
@@ -1902,17 +1940,15 @@ self.onmessage = async (e: MessageEvent) => {
         const done = () => { clearTimeout(timer); terminateWorker(worker); resolve(); };
         const timer = setTimeout(done, 500); // don't hang a close on an unresponsive worker
         worker.onmessage = (ev: MessageEvent) => { if (ev.data?.type === 'shutdown-done') done(); };
+        // The message this whole handshake waits for. Without it the worker was never asked to
+        // stop, so `shutdown-done` never came and every close paid the full 500ms timeout before
+        // terminating it — and the mirror worker never got to close its port on its own terms.
+        worker.postMessage({ type: 'shutdown' });
       });
     }
     try { opfsSyncPort?.close(); } catch { /* already closed */ }
     opfsSyncPort = null;
     opfsSyncEnabled = false;
-    // Flush through the engine, then the handle, then release it: the next leader cannot open
-    // this volume until we do, and it must not inherit a half-written one.
-    try { engine.flush(); } catch { /* nothing buffered */ }
-    try { vfsVolumeHandle?.flush?.(); } catch { /* best effort */ }
-    try { vfsVolumeHandle?.close(); } catch { /* already gone */ }
-    vfsVolumeHandle = null;
     (self as unknown as Worker).postMessage({ type: 'shutdown-done' });
     return;
   }

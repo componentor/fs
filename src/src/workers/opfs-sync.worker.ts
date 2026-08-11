@@ -668,9 +668,9 @@ self.onmessage = async (e: MessageEvent) => {
     return;
   }
 
-  // Sent by the sync relay when the filesystem is closing. Disconnecting before the worker goes
-  // away is the point: terminating a worker that still holds a recursive observer is exactly the
-  // shape Chromium aborts on.
+  // Sent by the sync relay when the filesystem is closing. Stopping on request rather than being
+  // terminated is what lets this worker close its end of the port and finish whatever mirror write
+  // it is in the middle of, instead of being cut off partway through one.
   if (msg.type === 'shutdown') {
     try { serverPort?.close(); } catch { /* already closed */ }
     (self as unknown as Worker).postMessage({ type: 'shutdown-done' });

@@ -1,5 +1,15 @@
 # Changelog
 
+## 4.2.1
+
+**Reloading a tab that held the volume no longer costs seconds of dead time.** Four fixes on the teardown path, all of them the same root cause seen from different sides: the page was destroying its workers instead of asking them to stop, so nothing they owned was ever given back.
+
+- **Fixed: a reloading leader left the volume locked behind it, and the tab coming back waited on a handle nobody would return.** The relay owns the volume's exclusive `createSyncAccessHandle`, and terminating a worker does not close one — the browser reclaims it whenever it gets round to it. The returning tab wins the leader lock immediately (the old holder's tab is gone), then cannot open the volume, and sits in the `init-failed` retry loop until the reclaim happens. **Measured in a two-tab reload storm: 4.8s, 6.1s and 12.1s boots, always in the tab that had been the leader.** `pagehide` now sends the relay a `shutdown` instead, which closes the handle synchronously on the relay's own thread, so the next leader finds the volume free.
+- **Fixed: the relay never actually told the OPFS mirror worker to shut down.** It installed the `shutdown-done` listener and awaited it, but the `postMessage` that would have prompted the reply was missing — so the handshake could only ever end in its own 500ms timeout, and **every close paid that 500ms in full** before terminating the worker anyway. The mirror worker also never got to close its port on its own terms, or finish the write it was in the middle of. One message; the handshake now completes as soon as the worker is done.
+- **Fixed: an external change arriving during shutdown threw out of a bare message handler.** The volume is now released at the *top* of `shutdown` rather than after the mirror handshake — that ordering is what makes the reload fast — but the engine writes through that same handle, so a record the mirror worker had already posted could reach a closed volume. Inbound records are dropped once the volume is back. Nothing is lost by it: the mutation is already in OPFS, which is where the next boot reads the tree from.
+- **Fixed: the retry after a failed volume open was a flat 500ms, which was the entire cost when the handle was released a moment later.** With a departing leader now handing the volume back explicitly, the common case is "free within a few milliseconds" — but a tab that was killed, crashed or force-quit never got to say anything, and only the browser's own reclaim ends that wait. The interval starts at 25ms and doubles to the old 500ms, so the first case is quick and the second still cannot spin.
+- Corrected the comments on this path, which described the opposite of what the code did. They had the `FileSystemObserver` living in the mirror worker and the relay being terminated to take it down with it; the observer moved to the page some time ago, precisely so it can be disconnected synchronously on unload, and terminating the relay is the thing being fixed here.
+
 ## 4.2.0
 
 **Two behaviour changes**, both corrections toward node: a function `exclude` passed to `glob` now
