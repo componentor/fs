@@ -45,7 +45,20 @@ interface FdEntry {
   flags: number;
 }
 
+/** Bytes moved between two progress reports inside one read or write. */
+const PROGRESS_CHUNK = 4 * 1024 * 1024;
+
 export class OPFSEngine {
+  /**
+   * Called as an operation advances, so a synchronous caller waiting on the other side of the SAB
+   * can tell a long operation from a stalled one without either side guessing at durations.
+   *
+   * It matters most in the middle of a large read or write: those run through a *synchronous*
+   * access handle, so nothing else in this worker gets to run while one is in flight — not even
+   * the heartbeat timer. Reporting per chunk is what keeps a multi-gigabyte transfer legible as
+   * work rather than looking like a wedged worker.
+   */
+  onProgress: (() => void) | null = null;
   private rootDir!: FileSystemDirectoryHandle;
   private fdTable = new Map<number, FdEntry>();
   private nextFd = 3;
@@ -194,7 +207,11 @@ export class OPFSEngine {
       try {
         const size: number = sh.getSize();
         const buf = new Uint8Array(size);
-        if (size > 0) sh.read(buf, { at: 0 });
+        // Chunked so the work counter advances during the read, not only once it is over.
+        for (let at = 0; at < size; at += PROGRESS_CHUNK) {
+          sh.read(buf.subarray(at, Math.min(at + PROGRESS_CHUNK, size)), { at });
+          this.onProgress?.();
+        }
         return { status: OK, data: buf };
       } finally {
         sh.close();
@@ -214,7 +231,10 @@ export class OPFSEngine {
       const sh = await (fh as any).createSyncAccessHandle();
       try {
         sh.truncate(0);
-        if (data.byteLength > 0) sh.write(data, { at: 0 });
+        for (let at = 0; at < data.byteLength; at += PROGRESS_CHUNK) {
+          sh.write(data.subarray(at, Math.min(at + PROGRESS_CHUNK, data.byteLength)), { at });
+          this.onProgress?.();
+        }
         sh.flush();
       } finally {
         sh.close();
@@ -351,6 +371,7 @@ export class OPFSEngine {
 
     for await (const [name, handle] of (dir as any).entries()) {
       entries.push({ name, kind: handle.kind });
+      this.onProgress?.();
     }
 
     if (withFileTypes) {
@@ -461,6 +482,7 @@ export class OPFSEngine {
     if (!srcDir) return;
 
     for await (const [name, handle] of (srcDir as any).entries()) {
+      this.onProgress?.();
       const srcChild = srcPath === '/' ? `/${name}` : `${srcPath}/${name}`;
       const dstChild = dstPath === '/' ? `/${name}` : `${dstPath}/${name}`;
 
@@ -641,7 +663,10 @@ export class OPFSEngine {
     if (readLen <= 0) return { status: OK, data: new Uint8Array(0) };
 
     const buf = new Uint8Array(readLen);
-    entry.handle.read(buf, { at: pos });
+    for (let off = 0; off < readLen; off += PROGRESS_CHUNK) {
+      entry.handle.read(buf.subarray(off, Math.min(off + PROGRESS_CHUNK, readLen)), { at: pos + off });
+      this.onProgress?.();
+    }
 
     if (position === null) {
       entry.position += readLen;
@@ -656,7 +681,10 @@ export class OPFSEngine {
     const isAppend = (entry.flags & 1024) !== 0; // O_APPEND
     const pos = isAppend ? entry.handle.getSize() : (position ?? entry.position);
 
-    entry.handle.write(data, { at: pos });
+    for (let off = 0; off < data.byteLength; off += PROGRESS_CHUNK) {
+      entry.handle.write(data.subarray(off, Math.min(off + PROGRESS_CHUNK, data.byteLength)), { at: pos + off });
+      this.onProgress?.();
+    }
 
     if (position === null) {
       entry.position = pos + data.byteLength;

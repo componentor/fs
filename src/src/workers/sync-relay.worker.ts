@@ -94,6 +94,19 @@ let tabId: string = '';
 
 const HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
 const HEARTBEAT_INDEX = SAB_OFFSETS.HEARTBEAT >> 2;
+const WORK_INDEX = SAB_OFFSETS.WORK >> 2;
+
+/**
+ * Report forward progress on the request in hand.
+ *
+ * Separate from the heartbeat on purpose: that one is a timer and keeps firing even when this
+ * worker's storage continuations are starved, which is the failure a spinning page most needs to
+ * be able to see. This advances only when the work does, so a caller can wait out an operation of
+ * any length and still notice one that has stopped moving.
+ */
+function bumpWork(): void {
+  if (ctrl) Atomics.add(ctrl, WORK_INDEX, 1);
+}
 const HEARTBEAT_INTERVAL_MS = 1000;
 
 // Liveness heartbeat: the main thread can't Atomics.wait(), so it spin-waits and
@@ -340,6 +353,9 @@ function handleRequest(reqTabId: string, buffer: ArrayBuffer): { status: number;
 
 async function handleRequestOPFS(reqTabId: string, buffer: ArrayBuffer): Promise<{ status: number; data?: Uint8Array; _op?: number; _path?: string; _newPath?: string }> {
   const oe = opfsEngine!;
+  // Picking the request up is itself progress, and it starts the caller's no-progress window from
+  // the moment work actually began rather than from whenever it happened to start waiting.
+  bumpWork();
   let op: number, flags: number, path: string, data: Uint8Array | null;
   try {
     ({ op, flags, path, data } = decodeRequest(buffer));
@@ -1367,6 +1383,7 @@ async function initOPFSEngine(config: {
   }
 
   opfsEngine = new OPFSEngine();
+  opfsEngine.onProgress = bumpWork;
   await opfsEngine.init(rootDir, {
     uid: config.uid,
     gid: config.gid,

@@ -1028,12 +1028,16 @@ declare class VFSFileSystem {
     private leaderChangeBc;
     private _sync;
     /**
-     * Spin cap for the current mode: bounded in `opfs` mode, unbounded otherwise.
+     * Which counter proves the relay is getting somewhere, for the current mode.
      *
-     * `undefined` keeps hybrid/vfs behaviour exactly as it was — those service sync requests
-     * synchronously in the relay, so a long spin there means a genuinely slow op, not a stall.
+     * `hybrid` and `vfs` answer from the relay's own loop, so a beating heart there means it is
+     * still turning and a long wait means a genuinely long operation. `opfs` does every operation
+     * through storage continuations that a spinning page can starve on Firefox and WebKit — the
+     * heartbeat timer keeps firing throughout, which is precisely the case it cannot see — so that
+     * mode watches the work counter the relay bumps as it advances the request itself.
      */
-    private _opfsSpinCap;
+    private _progressIndex;
+    private _stalledMessage;
     private _async;
     readonly promises: VFSPromises;
     constructor(config?: VFSConfig);
@@ -1050,6 +1054,18 @@ declare class VFSFileSystem {
     /** Send init-opfs message to sync-relay for OPFS-direct mode */
     private sendOPFSInit;
     /**
+     * (Re)create the promise `whenReady()` and `init()` hand out.
+     *
+     * The `catch` attached here is not error handling and does not swallow anything: callers still
+     * see the rejection through their own continuation on `readyPromise`. It marks the promise as
+     * *handled*, which matters because the paths that reject it — a corrupt volume, a volume that
+     * never opens — can fire when nothing is awaiting. A promotion happens because a lock came free,
+     * not because someone asked for one, so there is often no caller attached at that moment. Left
+     * unmarked, that surfaces as an uncaught rejection: console noise in a browser, and a
+     * process-level crash under node's default handler.
+     */
+    private resetReadyPromise;
+    /**
      * Decide whether a failed volume open is worth another attempt.
      *
      * Returns true to retry (and advances the backoff), false once the attempt has
@@ -1061,6 +1077,14 @@ declare class VFSFileSystem {
      * does. Both arrive here as an `init-failed` message, and the second one used
      * to be retried indefinitely — leaving `init()` unsettled, with no rejection
      * and nothing in the console to explain it.
+     *
+     * Giving up also gives the leader lock back, because this instance cannot tell
+     * those two apart and has just spent the deadline failing to. If the origin has
+     * no storage the next tab to take the lock fails the same way and says so, which
+     * costs one bounded attempt each; if instead this was a handle that took longer
+     * than the deadline to come back, holding the lock while permanently failed would
+     * leave every other tab queued behind an instance that will never serve them —
+     * one tab's slow transient turned into an outage for the whole origin.
      */
     private retryVolumeOpen;
     /** Handle VFS corruption: log error, fall back to OPFS-direct mode.
@@ -1118,7 +1142,24 @@ declare class VFSFileSystem {
      * that URL. See [worker-blob.ts](./workers/worker-blob.ts).
      */
     private spawnWorker;
-    /** Block until workers are ready */
+    /**
+     * Require a mounted volume, without ever waiting for one.
+     *
+     * Waiting is not an option a synchronous call has here, however it is dressed up. Mounting runs
+     * on an event loop — `retryVolumeOpen` schedules the next attempt with `setTimeout`, and the
+     * first one starts from a `navigator.locks` callback — and a synchronous call blocks that event
+     * loop. On a page's main thread it must busy-loop, `Atomics.wait` being illegal there; in a
+     * worker `Atomics.wait` blocks the agent just as completely. Either way the thread that would
+     * perform the mount is the thread that is waiting for it, so the volume never arrives and the
+     * wait ends at whatever watchdog notices first — 30s of frozen tab, and nothing mounted at the
+     * end of it.
+     *
+     * So an unmounted volume refuses synchronous callers outright. The cost is an ordering rule at
+     * startup, which `await fs.init()` satisfies and the readme now states; what it buys is that no
+     * `*Sync` call can freeze a thread, and that this holds without any judgement about how long is
+     * too long. Once mounted, `*Sync` calls block and return exactly as before — nothing here
+     * constrains how long an operation may take.
+     */
     private ensureReady;
     /** Send a sync request via SAB and wait for response */
     private syncRequest;
@@ -1706,7 +1747,8 @@ declare const SAB_OFFSETS: {
     readonly TOTAL_LEN: 16;
     readonly CHUNK_IDX: 24;
     readonly HEARTBEAT: 28;
-    readonly HEADER_SIZE: 32;
+    readonly WORK: 32;
+    readonly HEADER_SIZE: 36;
 };
 declare const SIGNAL: {
     readonly IDLE: 0;

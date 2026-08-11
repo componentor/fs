@@ -18,7 +18,7 @@ import type {
 } from './types.js';
 import { NodeReadable, NodeWritable } from './node-streams.js';
 import type { SyncRequestFn, AsyncRequestFn } from './methods/context.js';
-import { SAB_OFFSETS, SIGNAL, OP, encodeRequest, decodeResponse } from './protocol/opcodes.js';
+import { SAB_OFFSETS, SIGNAL, OP, READY_SAB_SIZE, encodeRequest, decodeResponse } from './protocol/opcodes.js';
 import { acquireFsLock, releaseFsLock } from './protocol/fs-lock.js';
 
 // ---- Method imports ----
@@ -95,6 +95,7 @@ const _canAtomicsWait = typeof globalThis.WorkerGlobalScope !== 'undefined';
 
 // Int32 index of the heartbeat slot in a control SAB viewed as Int32Array.
 const SAB_HEARTBEAT_INDEX = SAB_OFFSETS.HEARTBEAT >> 2;
+const SAB_WORK_INDEX = SAB_OFFSETS.WORK >> 2;
 
 // How long the heartbeat may stall before we declare the worker unresponsive.
 // Must comfortably exceed the worker's heartbeat interval (~1s) plus the
@@ -124,24 +125,6 @@ const SPIN_STALL_TIMEOUT_MS = 30_000;
  */
 const VOLUME_ACQUIRE_DEADLINE_MS = 15_000;
 
-// Fallback timeout for spin-waits without a heartbeat channel (should not occur
-// in practice — every caller passes this.ctrl as the heartbeat source — but a
-// plain ceiling is safer than spinning forever if one ever doesn't).
-const SPIN_NO_HEARTBEAT_TIMEOUT_MS = 30_000;
-
-/**
- * Absolute cap on a main-thread spin in `opfs` mode.
- *
- * Every operation in that mode is async underneath, and `Atomics.wait` is illegal on a page's
- * main thread, so a sync call busy-spins. On Chromium the relay worker progresses anyway and
- * ops finish in milliseconds; on Firefox and WebKit the spinning page starves the worker's OPFS
- * continuations and the response never arrives. The heartbeat check cannot catch that — the
- * worker's timer keeps firing, so it looks alive — and the page spins until the browser kills
- * the tab. Ten seconds is far beyond any healthy op here and turns a dead tab into an error
- * that says what to do.
- */
-const OPFS_MAIN_THREAD_SPIN_TIMEOUT_MS = 10_000;
-
 const OPFS_SYNC_STALL_MESSAGE =
   'VFS sync operation stalled in opfs mode. Sync calls from a page main thread are only ' +
   'reliable on Chromium here: every operation is async underneath, and the spin-wait this ' +
@@ -161,46 +144,34 @@ function spinWait(
   arr: Int32Array,
   index: number,
   value: number,
-  heartbeatArr?: Int32Array,
-  absoluteDeadlineMs?: number,
-  deadlineMessage?: string,
+  progressArr: Int32Array,
+  progressIndex: number,
+  stalledMessage?: string,
 ): void {
   if (_canAtomicsWait) {
     Atomics.wait(arr, index, value);
     return;
   }
-  // An absolute cap on top of the heartbeat check, for the case where the worker is provably
-  // alive (its heartbeat timer keeps firing) yet never answers — see the opfs-mode note at the
-  // call site. Without it the page spins until the browser kills the tab.
-  const deadlineAt = absoluteDeadlineMs !== undefined ? performance.now() + absoluteDeadlineMs : Infinity;
-  const checkDeadline = (): void => {
-    if (performance.now() > deadlineAt) {
-      throw new Error(deadlineMessage ?? `VFS sync operation timed out after ${absoluteDeadlineMs}ms`);
-    }
-  };
-  if (!heartbeatArr) {
-    const start = performance.now();
-    while (Atomics.load(arr, index) === value) {
-      checkDeadline();
-      if (performance.now() - start > SPIN_NO_HEARTBEAT_TIMEOUT_MS) {
-        throw new Error(
-          `VFS sync operation timed out after ${SPIN_NO_HEARTBEAT_TIMEOUT_MS / 1000}s — relay worker did not respond`
-        );
-      }
-    }
-    return;
-  }
-  let lastBeat = Atomics.load(heartbeatArr, SAB_HEARTBEAT_INDEX);
-  let lastProgress = performance.now();
+  // Abort on a counterpart that has stopped getting anywhere, never on one that is merely taking a
+  // while. There is no cap on how long an operation may run: a multi-gigabyte read is slow on
+  // purpose, and killing it at some chosen number of seconds would be a bug dressed as a safeguard.
+  //
+  // Which counter to watch is the caller's choice, and the distinction matters. HEARTBEAT is a
+  // timer and proves only that the relay's event loop is alive — enough for a mode where the relay
+  // answers from that loop, useless in `opfs` mode, where a spinning page can starve the worker's
+  // storage continuations while its timer keeps ticking. WORK is bumped by the relay as it makes
+  // headway on the request in hand, so it stops exactly when the work does.
+  let last = Atomics.load(progressArr, progressIndex);
+  let lastAdvance = performance.now();
   while (Atomics.load(arr, index) === value) {
-    checkDeadline();
-    const beat = Atomics.load(heartbeatArr, SAB_HEARTBEAT_INDEX);
-    if (beat !== lastBeat) {
-      lastBeat = beat;
-      lastProgress = performance.now();
-    } else if (performance.now() - lastProgress > SPIN_STALL_TIMEOUT_MS) {
+    const current = Atomics.load(progressArr, progressIndex);
+    if (current !== last) {
+      last = current;
+      lastAdvance = performance.now();
+    } else if (performance.now() - lastAdvance > SPIN_STALL_TIMEOUT_MS) {
       throw new Error(
-        `VFS sync operation aborted: relay worker heartbeat stalled for ${SPIN_STALL_TIMEOUT_MS / 1000}s — worker is unresponsive`
+        stalledMessage ??
+        `VFS sync operation aborted: the relay made no progress for ${SPIN_STALL_TIMEOUT_MS / 1000}s — worker is unresponsive`,
       );
     }
   }
@@ -423,14 +394,22 @@ export class VFSFileSystem {
   private _sync: SyncRequestFn = (buf) => this.syncRequest(buf);
 
   /**
-   * Spin cap for the current mode: bounded in `opfs` mode, unbounded otherwise.
+   * Which counter proves the relay is getting somewhere, for the current mode.
    *
-   * `undefined` keeps hybrid/vfs behaviour exactly as it was — those service sync requests
-   * synchronously in the relay, so a long spin there means a genuinely slow op, not a stall.
+   * `hybrid` and `vfs` answer from the relay's own loop, so a beating heart there means it is
+   * still turning and a long wait means a genuinely long operation. `opfs` does every operation
+   * through storage continuations that a spinning page can starve on Firefox and WebKit — the
+   * heartbeat timer keeps firing throughout, which is precisely the case it cannot see — so that
+   * mode watches the work counter the relay bumps as it advances the request itself.
    */
-  private _opfsSpinCap(): number | undefined {
-    return this._mode === 'opfs' ? OPFS_MAIN_THREAD_SPIN_TIMEOUT_MS : undefined;
+  private _progressIndex(): number {
+    return this._mode === 'opfs' ? SAB_WORK_INDEX : SAB_HEARTBEAT_INDEX;
   }
+
+  private _stalledMessage(): string | undefined {
+    return this._mode === 'opfs' ? OPFS_SYNC_STALL_MESSAGE : undefined;
+  }
+
   private _async: AsyncRequestFn = (op, p, flags, data, path2, fdArgs) =>
     this.asyncRequest(op, p, flags, data, path2, fdArgs);
 
@@ -471,10 +450,7 @@ export class VFSFileSystem {
 
     this.tabId = crypto.randomUUID();
     this.ns = ns;
-    this.readyPromise = new Promise<void>((resolve, reject) => {
-      this.resolveReady = resolve;
-      this.rejectReady = reject;
-    });
+    this.resetReadyPromise();
     this.promises = new VFSPromises(this._async, ns);
 
     // Attach .native aliases (Node.js compat: fs.realpath.native, fs.realpathSync.native)
@@ -498,7 +474,7 @@ export class VFSFileSystem {
     if (this.hasSAB) {
       // Full mode: allocate SABs for sync + async communication
       this.sab = new SharedArrayBuffer(sabSize);
-      this.readySab = new SharedArrayBuffer(4);
+      this.readySab = new SharedArrayBuffer(READY_SAB_SIZE);
       this.asyncSab = new SharedArrayBuffer(sabSize);
       this.ctrl = new Int32Array(this.sab, 0, 8);
       this.readySignal = new Int32Array(this.readySab, 0, 1);
@@ -668,6 +644,25 @@ export class VFSFileSystem {
   }
 
   /**
+   * (Re)create the promise `whenReady()` and `init()` hand out.
+   *
+   * The `catch` attached here is not error handling and does not swallow anything: callers still
+   * see the rejection through their own continuation on `readyPromise`. It marks the promise as
+   * *handled*, which matters because the paths that reject it — a corrupt volume, a volume that
+   * never opens — can fire when nothing is awaiting. A promotion happens because a lock came free,
+   * not because someone asked for one, so there is often no caller attached at that moment. Left
+   * unmarked, that surfaces as an uncaught rejection: console noise in a browser, and a
+   * process-level crash under node's default handler.
+   */
+  private resetReadyPromise(): void {
+    this.readyPromise = new Promise<void>((resolve, reject) => {
+      this.resolveReady = resolve;
+      this.rejectReady = reject;
+    });
+    this.readyPromise.catch(() => { /* see above — marks handled, callers still get it */ });
+  }
+
+  /**
    * Decide whether a failed volume open is worth another attempt.
    *
    * Returns true to retry (and advances the backoff), false once the attempt has
@@ -679,6 +674,14 @@ export class VFSFileSystem {
    * does. Both arrive here as an `init-failed` message, and the second one used
    * to be retried indefinitely — leaving `init()` unsettled, with no rejection
    * and nothing in the console to explain it.
+   *
+   * Giving up also gives the leader lock back, because this instance cannot tell
+   * those two apart and has just spent the deadline failing to. If the origin has
+   * no storage the next tab to take the lock fails the same way and says so, which
+   * costs one bounded attempt each; if instead this was a handle that took longer
+   * than the deadline to come back, holding the lock while permanently failed would
+   * leave every other tab queued behind an instance that will never serve them —
+   * one tab's slow transient turned into an outage for the whole origin.
    */
   private retryVolumeOpen(error: string | undefined, label = 'Volume'): boolean {
     const now = Date.now();
@@ -707,6 +710,11 @@ export class VFSFileSystem {
       Atomics.store(this.readySignal, 0, -1);
       Atomics.notify(this.readySignal, 0);
     }
+    // Last, for the same reason `dispose` releases last: a tab promoted by this must not start
+    // opening the volume until this instance has finished failing.
+    this.holdingLeaderLock = false;
+    this.releaseLeaderLock?.();
+    this.releaseLeaderLock = null;
     return false;
   }
 
@@ -983,10 +991,7 @@ export class VFSFileSystem {
     }
 
     // Reset readyPromise for async callers during transition
-    this.readyPromise = new Promise<void>((resolve, reject) => {
-      this.resolveReady = resolve;
-      this.rejectReady = reject;
-    });
+    this.resetReadyPromise();
 
     // Terminate old workers
     terminateWorker(this.syncWorker);
@@ -996,7 +1001,7 @@ export class VFSFileSystem {
     const sabSize = this.config.sabSize;
     if (this.hasSAB) {
       this.sab = new SharedArrayBuffer(sabSize);
-      this.readySab = new SharedArrayBuffer(4);
+      this.readySab = new SharedArrayBuffer(READY_SAB_SIZE);
       this.asyncSab = new SharedArrayBuffer(sabSize);
       this.ctrl = new Int32Array(this.sab, 0, 8);
       this.readySignal = new Int32Array(this.readySab, 0, 1);
@@ -1083,32 +1088,45 @@ export class VFSFileSystem {
 
   // ========== Sync operation primitives ==========
 
-  /** Block until workers are ready */
+  /**
+   * Require a mounted volume, without ever waiting for one.
+   *
+   * Waiting is not an option a synchronous call has here, however it is dressed up. Mounting runs
+   * on an event loop — `retryVolumeOpen` schedules the next attempt with `setTimeout`, and the
+   * first one starts from a `navigator.locks` callback — and a synchronous call blocks that event
+   * loop. On a page's main thread it must busy-loop, `Atomics.wait` being illegal there; in a
+   * worker `Atomics.wait` blocks the agent just as completely. Either way the thread that would
+   * perform the mount is the thread that is waiting for it, so the volume never arrives and the
+   * wait ends at whatever watchdog notices first — 30s of frozen tab, and nothing mounted at the
+   * end of it.
+   *
+   * So an unmounted volume refuses synchronous callers outright. The cost is an ordering rule at
+   * startup, which `await fs.init()` satisfies and the readme now states; what it buys is that no
+   * `*Sync` call can freeze a thread, and that this holds without any judgement about how long is
+   * too long. Once mounted, `*Sync` calls block and return exactly as before — nothing here
+   * constrains how long an operation may take.
+   */
   private ensureReady(): void {
     if (this.isReady) return;
     if (this.initError) throw this.initError;
     if (!this.hasSAB) {
       throw new Error('Sync API requires crossOriginIsolated (COOP/COEP headers). Use the promises API instead.');
     }
-    // Check if ready signal is set
     const signal = Atomics.load(this.readySignal, 0);
     if (signal === 1) {
       this.isReady = true;
       return;
     }
     if (signal === -1) {
-      // Permanent failure (e.g. VFS corruption in vfs-only mode)
+      // Permanent failure (e.g. VFS corruption in vfs-only mode) — report the cause, not the state.
       throw this.initError ?? new Error('VFS initialization failed');
     }
-    // Block until ready (heartbeat lives in the control SAB, which is allocated
-    // before init starts, so it advances even while the worker is initializing).
-    spinWait(this.readySignal, 0, 0, this.ctrl);
-    // Check again after wake — could be ready (1) or failed (-1)
-    const finalSignal = Atomics.load(this.readySignal, 0);
-    if (finalSignal === -1) {
-      throw this.initError ?? new Error('VFS initialization failed');
-    }
-    this.isReady = true;
+    throw new Error(
+      'VFS is not mounted yet, so synchronous calls are refused: mounting needs the event loop that a ' +
+      'synchronous call blocks, which makes waiting here futile rather than slow. Await fs.init() or ' +
+      'fs.whenReady() before the first synchronous call — any await between constructing the filesystem ' +
+      'and using it will do — or use the async API (fs.promises.*).',
+    );
   }
 
   /** Send a sync request via SAB and wait for response */
@@ -1166,7 +1184,7 @@ export class VFSFileSystem {
         sent += chunkSize;
         if (sent < requestBytes.byteLength) {
           // Wait for worker to ack
-          spinWait(this.ctrl, 0, sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK, this.ctrl, this._opfsSpinCap(), OPFS_SYNC_STALL_MESSAGE);
+          spinWait(this.ctrl, 0, sent === chunkSize ? SIGNAL.REQUEST : SIGNAL.CHUNK, this.ctrl, this._progressIndex(), this._stalledMessage());
         }
       }
     }
@@ -1186,7 +1204,7 @@ export class VFSFileSystem {
     // invisible no-op transition). True today — a request only exceeds maxChunk
     // for WRITE/FWRITE/APPEND, whose responses are 8 bytes — but if that ever
     // changes, readPayload must be made to ack the final chunk too.
-    spinWait(this.ctrl, 0, multiChunkRequest ? SIGNAL.CHUNK : SIGNAL.REQUEST, this.ctrl, this._opfsSpinCap(), OPFS_SYNC_STALL_MESSAGE);
+    spinWait(this.ctrl, 0, multiChunkRequest ? SIGNAL.CHUNK : SIGNAL.REQUEST, this.ctrl, this._progressIndex(), this._stalledMessage());
 
     // Read response — may be chunked
     const signal = Atomics.load(this.ctrl, 0);
@@ -1212,7 +1230,7 @@ export class VFSFileSystem {
         // Ack and wait for next chunk
         Atomics.store(this.ctrl, 0, SIGNAL.CHUNK_ACK);
         Atomics.notify(this.ctrl, 0);
-        spinWait(this.ctrl, 0, SIGNAL.CHUNK_ACK, this.ctrl, this._opfsSpinCap(), OPFS_SYNC_STALL_MESSAGE);
+        spinWait(this.ctrl, 0, SIGNAL.CHUNK_ACK, this.ctrl, this._progressIndex(), this._stalledMessage());
 
         const nextLen = Atomics.load(this.ctrl, 3);
         responseBytes.set(new Uint8Array(this.sab, HEADER_SIZE, nextLen), received);
@@ -2081,13 +2099,13 @@ export class VFSFileSystem {
     this.corruptionError = null;
     this.initError = null;
     this.isReady = false;
+    // A fresh init gets a fresh deadline; anything left over belongs to the run being torn down.
+    this.volumeRetryStartedAt = 0;
+    this.volumeRetryDelayMs = 0;
     this.config.opfsSync = newMode === 'hybrid';
 
     // Reset readyPromise
-    this.readyPromise = new Promise<void>((resolve, reject) => {
-      this.resolveReady = resolve;
-      this.rejectReady = reject;
-    });
+    this.resetReadyPromise();
 
     // Terminate old workers and spawn fresh ones. The relay is asked to shut down first so the
     // OPFS mirror worker it owns can detach its FileSystemObserver — terminating the relay
@@ -2099,7 +2117,7 @@ export class VFSFileSystem {
     const sabSize = this.config.sabSize;
     if (this.hasSAB) {
       this.sab = new SharedArrayBuffer(sabSize);
-      this.readySab = new SharedArrayBuffer(4);
+      this.readySab = new SharedArrayBuffer(READY_SAB_SIZE);
       this.asyncSab = new SharedArrayBuffer(sabSize);
       this.ctrl = new Int32Array(this.sab, 0, 8);
       this.readySignal = new Int32Array(this.readySab, 0, 1);

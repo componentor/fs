@@ -75,7 +75,15 @@ var SAB_OFFSETS = {
   //         while its event loop is alive (incl. mid-await of a
   //         long op) so a spin-waiting main thread can tell
   //         "slow" from "dead". Never written by the main thread.
-  HEADER_SIZE: 32
+  WORK: 32,
+  // Int32 - work counter; the relay bumps this as it makes forward progress on
+  //         the request in hand (see the OPFS engine's chunked read/write).
+  //         HEARTBEAT proves the relay's event loop is alive, which is not the
+  //         same thing: in `opfs` mode a spinning page can starve the worker's
+  //         storage continuations while its heartbeat timer keeps firing. This
+  //         slot is what separates "working" from "alive but getting nowhere",
+  //         and it is why a long operation needs no time limit to be safe.
+  HEADER_SIZE: 36
   // Data payload starts here
 };
 var SIGNAL = {

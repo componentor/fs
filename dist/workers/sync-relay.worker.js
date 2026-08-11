@@ -2303,7 +2303,18 @@ var EEXIST = 2;
 var ENOTEMPTY = 5;
 var EINVAL = 7;
 var EBADF = 8;
+var PROGRESS_CHUNK = 4 * 1024 * 1024;
 var OPFSEngine = class {
+  /**
+   * Called as an operation advances, so a synchronous caller waiting on the other side of the SAB
+   * can tell a long operation from a stalled one without either side guessing at durations.
+   *
+   * It matters most in the middle of a large read or write: those run through a *synchronous*
+   * access handle, so nothing else in this worker gets to run while one is in flight — not even
+   * the heartbeat timer. Reporting per chunk is what keeps a multi-gigabyte transfer legible as
+   * work rather than looking like a wedged worker.
+   */
+  onProgress = null;
   rootDir;
   fdTable = /* @__PURE__ */ new Map();
   nextFd = 3;
@@ -2427,7 +2438,10 @@ var OPFSEngine = class {
       try {
         const size = sh.getSize();
         const buf = new Uint8Array(size);
-        if (size > 0) sh.read(buf, { at: 0 });
+        for (let at = 0; at < size; at += PROGRESS_CHUNK) {
+          sh.read(buf.subarray(at, Math.min(at + PROGRESS_CHUNK, size)), { at });
+          this.onProgress?.();
+        }
         return { status: OK, data: buf };
       } finally {
         sh.close();
@@ -2446,7 +2460,10 @@ var OPFSEngine = class {
       const sh = await fh.createSyncAccessHandle();
       try {
         sh.truncate(0);
-        if (data.byteLength > 0) sh.write(data, { at: 0 });
+        for (let at = 0; at < data.byteLength; at += PROGRESS_CHUNK) {
+          sh.write(data.subarray(at, Math.min(at + PROGRESS_CHUNK, data.byteLength)), { at });
+          this.onProgress?.();
+        }
         sh.flush();
       } finally {
         sh.close();
@@ -2566,6 +2583,7 @@ var OPFSEngine = class {
     const entries = [];
     for await (const [name, handle] of dir.entries()) {
       entries.push({ name, kind: handle.kind });
+      this.onProgress?.();
     }
     if (withFileTypes) {
       let totalSize2 = 4;
@@ -2651,6 +2669,7 @@ var OPFSEngine = class {
     const srcDir = await this.navigateToDir(srcPath);
     if (!srcDir) return;
     for await (const [name, handle] of srcDir.entries()) {
+      this.onProgress?.();
       const srcChild = srcPath === "/" ? `/${name}` : `${srcPath}/${name}`;
       const dstChild = dstPath === "/" ? `/${name}` : `${dstPath}/${name}`;
       if (handle.kind === "directory") {
@@ -2803,7 +2822,10 @@ var OPFSEngine = class {
     const readLen = Math.min(length, size - pos);
     if (readLen <= 0) return { status: OK, data: new Uint8Array(0) };
     const buf = new Uint8Array(readLen);
-    entry.handle.read(buf, { at: pos });
+    for (let off = 0; off < readLen; off += PROGRESS_CHUNK) {
+      entry.handle.read(buf.subarray(off, Math.min(off + PROGRESS_CHUNK, readLen)), { at: pos + off });
+      this.onProgress?.();
+    }
     if (position === null) {
       entry.position += readLen;
     }
@@ -2814,7 +2836,10 @@ var OPFSEngine = class {
     if (!entry) return { status: EBADF, data: null };
     const isAppend = (entry.flags & 1024) !== 0;
     const pos = isAppend ? entry.handle.getSize() : position ?? entry.position;
-    entry.handle.write(data, { at: pos });
+    for (let off = 0; off < data.byteLength; off += PROGRESS_CHUNK) {
+      entry.handle.write(data.subarray(off, Math.min(off + PROGRESS_CHUNK, data.byteLength)), { at: pos + off });
+      this.onProgress?.();
+    }
     if (position === null) {
       entry.position = pos + data.byteLength;
     }
@@ -2973,7 +2998,15 @@ var SAB_OFFSETS = {
   //         while its event loop is alive (incl. mid-await of a
   //         long op) so a spin-waiting main thread can tell
   //         "slow" from "dead". Never written by the main thread.
-  HEADER_SIZE: 32
+  WORK: 32,
+  // Int32 - work counter; the relay bumps this as it makes forward progress on
+  //         the request in hand (see the OPFS engine's chunked read/write).
+  //         HEARTBEAT proves the relay's event loop is alive, which is not the
+  //         same thing: in `opfs` mode a spinning page can starve the worker's
+  //         storage continuations while its heartbeat timer keeps firing. This
+  //         slot is what separates "working" from "alive but getting nowhere",
+  //         and it is why a long operation needs no time limit to be safe.
+  HEADER_SIZE: 36
   // Data payload starts here
 };
 var SIGNAL = {
@@ -3572,6 +3605,10 @@ var asyncCtrl = null;
 var tabId = "";
 var HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
 var HEARTBEAT_INDEX = SAB_OFFSETS.HEARTBEAT >> 2;
+var WORK_INDEX = SAB_OFFSETS.WORK >> 2;
+function bumpWork() {
+  if (ctrl) Atomics.add(ctrl, WORK_INDEX, 1);
+}
 var HEARTBEAT_INTERVAL_MS = 1e3;
 var heartbeatTimer = null;
 function startHeartbeat() {
@@ -3753,6 +3790,7 @@ function handleRequest(reqTabId, buffer) {
 }
 async function handleRequestOPFS(reqTabId, buffer) {
   const oe = opfsEngine;
+  bumpWork();
   let op, flags, path, data;
   try {
     ({ op, flags, path, data } = decodeRequest(buffer));
@@ -4468,6 +4506,7 @@ async function initOPFSEngine(config) {
     }
   }
   opfsEngine = new OPFSEngine();
+  opfsEngine.onProgress = bumpWork;
   await opfsEngine.init(rootDir, {
     uid: config.uid,
     gid: config.gid

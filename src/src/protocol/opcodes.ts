@@ -86,8 +86,24 @@ export const SAB_OFFSETS = {
                     //         while its event loop is alive (incl. mid-await of a
                     //         long op) so a spin-waiting main thread can tell
                     //         "slow" from "dead". Never written by the main thread.
-  HEADER_SIZE: 32,  // Data payload starts here
+  WORK: 32,         // Int32 - work counter; the relay bumps this as it makes forward progress on
+                    //         the request in hand (see the OPFS engine's chunked read/write).
+                    //         HEARTBEAT proves the relay's event loop is alive, which is not the
+                    //         same thing: in `opfs` mode a spinning page can starve the worker's
+                    //         storage continuations while its heartbeat timer keeps firing. This
+                    //         slot is what separates "working" from "alive but getting nowhere",
+                    //         and it is why a long operation needs no time limit to be safe.
+  HEADER_SIZE: 36,  // Data payload starts here
 } as const;
+
+/**
+ * The readiness SAB: one Int32 slot, written by the relay and read by anything asking whether the
+ * volume is mounted.
+ *
+ * 0 = not mounted, 1 = mounted, -1 = permanently failed. Synchronous callers require 1 and never
+ * wait for it — see `ensureReady` for why waiting is not something a synchronous call can do here.
+ */
+export const READY_SAB_SIZE = 4;
 
 // SAB control signals
 export const SIGNAL = {

@@ -102,6 +102,38 @@ describe('once the deadline passes', () => {
     expect(err.message).toContain('OPFS');
   });
 
+  it('gives the leader lock back so another tab can try', async () => {
+    const failure = captureFailure(fs);
+    let released = 0;
+    fs.releaseLeaderLock = () => { released++; };
+
+    failOpen(fs);
+    vi.setSystemTime(Date.now() + 16_000);
+    failOpen(fs);
+    await failure;
+
+    // Holding it while permanently failed would queue every other tab behind an instance that
+    // will never serve them.
+    expect(released).toBe(1);
+    expect(fs.holdingLeaderLock).toBe(false);
+    expect(fs.releaseLeaderLock).toBe(null);
+  });
+
+  it('does not report an uncaught rejection when nothing is awaiting', async () => {
+    // Deliberately no `captureFailure`: a promotion happens because a lock came free, not because
+    // a caller asked, so there is frequently nothing attached at the moment this rejects. An
+    // unhandled rejection here fails the run, which is the assertion — there is nothing else to
+    // observe, since a handled rejection and an unhandled one look identical from inside.
+    failOpen(fs);
+    vi.setSystemTime(Date.now() + 16_000);
+    failOpen(fs);
+    expect(fs.initError).toBeInstanceOf(Error);
+
+    // Let the runtime get to the point where it would report one.
+    vi.useRealTimers();
+    await new Promise((r) => setTimeout(r, 10));
+  });
+
   it('wakes a blocked sync caller with the permanent-failure signal', async () => {
     const failure = captureFailure(fs);
     failOpen(fs);

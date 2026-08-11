@@ -1,6 +1,9 @@
 <!DOCTYPE html>
 <html>
 <head>
+  <!-- Chromium requests /favicon.ico on its own and logs the 404 as a console error, which the
+       specs here assert against; Firefox and WebKit do not, so this failed on one engine only. -->
+  <link rel="icon" href="data:,">
   <meta charset="utf-8" />
   <title>VFS correctness harness</title>
 </head>

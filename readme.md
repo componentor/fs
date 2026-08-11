@@ -15,6 +15,7 @@ in OPFS, so they survive a reload.
 import { VFSFileSystem } from '@componentor/fs';
 
 const fs = new VFSFileSystem({ root: '/my-app' });
+await fs.init();                         // mount before the first blocking call
 
 fs.writeFileSync('/hello.txt', 'Hello from the browser');
 fs.readFileSync('/hello.txt', 'utf8');   // → 'Hello from the browser'
@@ -178,9 +179,13 @@ const code = await fs.promises.readFile('/src/index.js', 'utf8');
 const stats = await fs.promises.stat('/src/index.js');
 ```
 
-`await fs.init()` is optional for the sync API — the first `*Sync` call blocks until the volume is
-ready by itself. Await it when you want mount errors surfaced up front, and always before the
-first `promises.*` call.
+`await fs.init()` before the first `*Sync` call. Mounting the volume runs on the event loop, and a
+synchronous call blocks it — so a `*Sync` call in the same tick as the constructor waits for a mount
+that its own waiting prevents, and throws saying so rather than hanging. Any `await` in between is
+enough to avoid it; `init()` is the explicit one, and it surfaces mount errors up front. Always
+await it before the first `promises.*` call too. Once mounted, `*Sync` calls block and return
+normally — this is a startup-ordering rule, not a running cost. There is more on it under
+[`whenReady()`](#api-reference).
 
 Everything survives a reload: the bytes are in OPFS, not memory. Clear them with
 `fs.promises.rm('/', { recursive: true, force: true })` or by clearing site data.
@@ -1037,18 +1042,36 @@ await fs.whenReady(): Promise<void>
 
 The `fs.ready` / `fs.whenReady()` pair exists because the FS elects its own
 multi-tab leader via `navigator.locks`. When the leader tab dies and this tab is
-promoted, there's a window where the new sync-relay worker isn't looping yet —
-issuing a sync op then stalls until the worker's heartbeat watchdog fires. If
+promoted, there's a window where the new sync-relay worker isn't looping yet. If
 your app also does its own leader election, await `fs.whenReady()` *after*
 acquiring your own lock to be sure the FS has finished any promotion first:
 
 ```typescript
 navigator.locks.request('my-app-leader', async () => {
   await fs.whenReady();      // FS promotion (if any) has completed
-  fs.writeFileSync('/state.json', data); // safe — won't stall the relay worker
+  fs.writeFileSync('/state.json', data); // safe — the volume is mounted here
   await new Promise(() => {}); // hold the lock
 });
 ```
+
+**A sync call made before the volume is mounted throws, rather than waiting for a mount it is
+preventing.** Mounting runs on an event loop — the retry is a `setTimeout`, and the first attempt
+starts from a `navigator.locks` callback — and a synchronous call blocks that event loop. On a
+page's main thread it must busy-loop, because `Atomics.wait` is illegal there; in a worker
+`Atomics.wait` blocks the agent just as completely. So a sync call that waits for its own mount is
+not early, it is deadlocked, and the error says so and names `fs.promises.*`.
+
+This is why `await fs.init()` matters. Anything that gets you past one turn of the event loop is
+enough — `await fs.init()`, `await fs.whenReady()`, or simply any `await` between constructing the
+filesystem and the first `*Sync` call. Once mounted, sync calls behave exactly as advertised and
+this never comes up again; it is a startup-ordering rule, not a running cost.
+
+It applies to a handover too, for the same reason: while the volume is moving between tabs, the new
+leader's mount needs its own event loop.
+
+Note what this rule is *not*. It is a check on the filesystem's state, not a limit on how long a
+call may take — nothing here caps an operation, and a multi-gigabyte read or write on a mounted
+volume runs to completion however long that is.
 
 ### Watch API
 

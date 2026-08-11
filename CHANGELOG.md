@@ -1,5 +1,18 @@
 # Changelog
 
+## 4.2.3
+
+**Synchronous calls now require a mounted volume, and never wait for one.** A `*Sync` call made before the mount finished used to freeze the calling thread for 30 seconds and then fail; it now fails at once, saying what to do instead.
+
+- **Fixed: a `*Sync` call made before the volume was mounted froze the thread for 30s and mounted nothing.** Mounting runs on an event loop — the retry is a `setTimeout`, and the first attempt starts from a `navigator.locks` callback — and a synchronous call blocks that event loop. On a page's main thread it has to busy-loop, `Atomics.wait` being illegal there; in a worker `Atomics.wait` blocks the agent just as completely, and with no timeout it never returned at all. So the thread that would have performed the mount was the thread waiting for it: not early, deadlocked. The wait ended when the dead-relay watchdog fired, 30s later, with the volume still unmounted. A consumer measured 7 × 30s across one command resolution making a sync call per PATH entry.
+- **The rule is a state, not a duration.** An unmounted volume refuses synchronous callers outright — the same answer on every thread, with no elapsed-time threshold, no first-call-versus-handover distinction, and nothing to tune. A duration could not have expressed it anyway: the wait was never going to succeed at any length.
+- **Nothing here limits how long an operation may take.** The check is on whether the volume is mounted, not on how long a call runs; a large read or write on a mounted volume takes as long as it takes.
+- **Removed: the two limits on how long a synchronous operation was allowed to take.** In `opfs` mode a spin was capped at 10s absolutely, and there was a 30s ceiling on the fallback path — both of which kill a large read or write for being large. They are gone, and no limit replaces them: a multi-gigabyte transfer on a mounted volume now runs to completion however long it takes.
+- **What guards the wait instead is progress.** The relay bumps a work counter in the control SAB as it advances the request in hand, and a waiting caller aborts only when that counter stops moving. The existing heartbeat could not do this job in `opfs` mode — it is a timer, and it keeps firing while a spinning page starves the worker's storage continuations on Firefox and WebKit, which is exactly the case the 10s cap existed to catch. Large reads and writes report per 4MB chunk, because they run through a *synchronous* access handle that stops even the heartbeat while in flight.
+- The control SAB header grew by one Int32 to carry that counter (32 → 36 bytes). Both sides read the offset from one constant, and the multi-chunk round trip is asserted at 2MB and 5MB on Chromium, Firefox and WebKit.
+- Fixed a test-harness defect that made the browser suite fail on Chromium alone: `correctness.html` declared no favicon, so Chromium requested `/favicon.ico` itself and logged the 404 as a console error, which two specs assert against. Firefox and WebKit never reported it, so it read as an engine-specific bug rather than a missing `<link>`.
+- **Documented: `await fs.init()` is required before the first `*Sync` call**, where the readme called it optional and its headline example omitted it — that example could not have worked on a page's main thread. Any `await` between constructing the filesystem and the first synchronous call is enough; `init()` is the explicit one and surfaces mount errors up front. Once mounted, `*Sync` calls behave exactly as before.
+
 ## 4.2.2
 
 **`init()` can no longer hang forever on a volume that will never open**, and the bounded wait that fixes it no longer misfires on the ordinary case it was written to preserve.
