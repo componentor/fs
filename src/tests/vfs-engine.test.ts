@@ -887,6 +887,85 @@ describe('VFSEngine', () => {
     });
   });
 
+  describe('truncate that grows a file', () => {
+    // Growing a file zero-fills the extension, and it used to do so by writing every byte of it:
+    // a truncate to 4GB wrote 4GB. Most of that was redundant, because the extension usually sits
+    // in space the volume had just added, and added space arrives zeroed. The engine now skips
+    // whatever part of the extension came from that growth and writes the rest.
+    //
+    // The risk in skipping is the whole reason the zero-fill exists — a block a deleted file used
+    // still holds its bytes, and they must never surface as another file's zeros. So the cases
+    // below are split by where the extension lands: past the volume's old end (skipped), inside
+    // capacity the storage already had (written), and inside the file's own last block (written).
+
+    /** Bytes pushed through the handle while `fn` runs. */
+    function bytesWritten(fn: () => void): number {
+      const original = handle.write.bind(handle);
+      let total = 0;
+      handle.write = (buf: Uint8Array, opts?: { at?: number }) => {
+        total += buf.byteLength;
+        return original(buf, opts);
+      };
+      try { fn(); } finally { delete (handle as Partial<MockSyncHandle>).write; }
+      return total;
+    }
+
+    it('does not rewrite an extension the volume just created', () => {
+      const target = 32 * 1024 * 1024;
+      engine.write('/big.bin', new TextEncoder().encode('head'));
+
+      const written = bytesWritten(() => {
+        expect(engine.truncate('/big.bin', target).status).toBe(0);
+      });
+
+      // Before this, `written` was the extension itself — 32MB. What remains is the inode,
+      // superblock and bitmap traffic the operation legitimately does, which is orders of
+      // magnitude below that; the bound is loose because the point is the missing 32MB.
+      expect(written).toBeLessThan(1024 * 1024);
+
+      // And it still reads as a zero-filled file, which is the part that must not regress.
+      const r = engine.read('/big.bin');
+      expect(r.status).toBe(0);
+      expect(r.data!.byteLength).toBe(target);
+      expect(new TextDecoder().decode(r.data!.subarray(0, 4))).toBe('head');
+      let nonZero = 0;
+      for (let i = 4; i < target; i++) if (r.data![i] !== 0) nonZero++;
+      expect(nonZero).toBe(0);
+    });
+
+    it('zero-fills an extension that lands in storage the volume already had', () => {
+      // 0xff everywhere, then shrunk to nothing: the bytes are still down there, in blocks the
+      // allocator is now free to hand back out. Growing into them must not expose them.
+      const size = 256 * 1024;
+      engine.write('/reuse.bin', new Uint8Array(size).fill(0xff));
+      expect(engine.truncate('/reuse.bin', 4).status).toBe(0);
+      expect(engine.truncate('/reuse.bin', size).status).toBe(0);
+
+      const r = engine.read('/reuse.bin');
+      expect(r.status).toBe(0);
+      expect(r.data!.byteLength).toBe(size);
+      let nonZero = 0;
+      for (let i = 4; i < size; i++) if (r.data![i] !== 0) nonZero++;
+      expect(nonZero).toBe(0);
+    });
+
+    it('zero-fills a regrown tail inside the block the file already owns', () => {
+      // No allocation at all on the way back up — same block, stale bytes in its tail.
+      engine.write('/tail.bin', new Uint8Array(400).fill(0xff));
+      expect(engine.truncate('/tail.bin', 4).status).toBe(0);
+      expect(engine.truncate('/tail.bin', 400).status).toBe(0);
+
+      const r = engine.read('/tail.bin');
+      expect(r.status).toBe(0);
+      const data = r.data!;
+      expect(data.byteLength).toBe(400);
+      for (let i = 0; i < 4; i++) expect(data[i]).toBe(0xff);
+      let nonZero = 0;
+      for (let i = 4; i < 400; i++) if (data[i] !== 0) nonZero++;
+      expect(nonZero).toBe(0);
+    });
+  });
+
   describe('chunked large-buffer operations', () => {
     // These regression-guard the chunked-copy rewrites in `fwrite` grow,
     // `append`, `truncate` extend, and `copy`. The mock handle can't

@@ -703,13 +703,16 @@ var VFSEngine = class _VFSEngine {
   // write starts past the current file size — those bytes must read as
   // zeros rather than whatever stale data happened to live in the
   // underlying storage blocks.
-  zeroFileRange(at, length) {
+  zeroFileRange(at, length, knownZeroFrom = Infinity) {
     if (length <= 0) return;
+    const end = Math.min(at + length, knownZeroFrom);
+    if (end <= at) return;
     const CHUNK = 4 * 1024 * 1024;
-    const zeros = new Uint8Array(Math.min(length, CHUNK));
+    const total = end - at;
+    const zeros = new Uint8Array(Math.min(total, CHUNK));
     let written = 0;
-    while (written < length) {
-      const n = Math.min(CHUNK, length - written);
+    while (written < total) {
+      const n = Math.min(CHUNK, total - written);
       const slice = n < zeros.length ? zeros.subarray(0, n) : zeros;
       this.handle.write(slice, { at: at + written });
       written += n;
@@ -1500,6 +1503,7 @@ var VFSEngine = class _VFSEngine {
     } else if (len > inode.size) {
       const neededBlocks = Math.ceil(len / this.blockSize);
       if (neededBlocks > inode.blockCount) {
+        const knownZeroFrom = this.handle.getSize();
         const newFirst = this.allocateBlocks(neededBlocks);
         const newBase = this.dataOffset + newFirst * this.blockSize;
         if (inode.size > 0) {
@@ -1516,7 +1520,7 @@ var VFSEngine = class _VFSEngine {
           }
         }
         this.freeBlockRange(inode.firstBlock, inode.blockCount);
-        this.zeroFileRange(newBase + inode.size, len - inode.size);
+        this.zeroFileRange(newBase + inode.size, len - inode.size, knownZeroFrom);
         inode.firstBlock = newFirst;
       } else {
         this.zeroFileRange(
@@ -1794,6 +1798,7 @@ var VFSEngine = class _VFSEngine {
     if (endPos > inode.size) {
       const neededBlocks = Math.ceil(endPos / this.blockSize);
       if (neededBlocks > inode.blockCount) {
+        const knownZeroFrom = this.handle.getSize();
         const newFirst = this.allocateBlocks(neededBlocks);
         const newBase = this.dataOffset + newFirst * this.blockSize;
         const oldBase = this.dataOffset + inode.firstBlock * this.blockSize;
@@ -1811,7 +1816,7 @@ var VFSEngine = class _VFSEngine {
         }
         this.freeBlockRange(inode.firstBlock, inode.blockCount);
         if (pos > inode.size) {
-          this.zeroFileRange(newBase + inode.size, pos - inode.size);
+          this.zeroFileRange(newBase + inode.size, pos - inode.size, knownZeroFrom);
         }
         this.handle.write(data, { at: newBase + pos });
         inode.firstBlock = newFirst;

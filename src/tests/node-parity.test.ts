@@ -586,17 +586,17 @@ describe('parity: payload layouts (regression guards)', () => {
     expect(text(readFileSync(harness.request, '/ft', 'utf8'))).toBe('abcd');
   });
 
-  // The 4GB case is here to prove a length above 2^32 survives the payload encoding rather than
-  // being silently truncated to 32 bits, and it is the only one that costs anything: growing a
-  // file zero-fills the extension, so the engine writes the whole 4GB and the mock handle backing
-  // these tests holds it in memory. Roughly a second when the machine is idle, and enough more
-  // than that under load to trip the 5s default — which it did, once, during a release. The
-  // default is a hang guard, not a budget, so this one gets a limit that reflects the work.
+  // The 4GB case proves a length above 2^32 survives the payload encoding rather than being
+  // silently cut to 32 bits. It used to cost about a second and 4GB of resident memory — growing
+  // a file wrote its extension out as zeros — and tripped the 5s default once, under load, during
+  // a release. It is ~35ms now that the engine skips the part of an extension the volume's own
+  // growth already zeroed, so it needs no special timeout; see vfs-engine's "truncate that grows
+  // a file", which guards that directly.
   it.each([0, 1, 3, 1024, 4096, 0xffffffff + 1])('truncates to length %d exactly', (len) => {
     writeFileSync(harness.request, '/big', 'x'.repeat(16));
     truncateSync(harness.request, '/big', len);
     expect((statSync(harness.request, '/big') as nodefs.Stats).size).toBe(len);
-  }, 30_000);
+  });
 
   it('every opcode the method layer can emit has a decoder', () => {
     // Guards the failure mode this whole file exists for: an op added to the protocol without a

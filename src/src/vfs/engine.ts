@@ -776,13 +776,28 @@ export class VFSEngine {
   // write starts past the current file size — those bytes must read as
   // zeros rather than whatever stale data happened to live in the
   // underlying storage blocks.
-  private zeroFileRange(at: number, length: number): void {
+  private zeroFileRange(at: number, length: number, knownZeroFrom = Infinity): void {
     if (length <= 0) return;
+
+    // Anything at or beyond `knownZeroFrom` is already zero, so writing zeros over it is pure
+    // cost — and on a large grow it is the whole cost. Callers pass the volume's size as it was
+    // *before* the allocation that prompted this call: every byte past that point was added by
+    // `handle.truncate`, which pads with null bytes, so it reads as zeros without being touched.
+    // Below it the bytes may belong to a block some other file used and freed, and those must not
+    // become visible as this file's zero-filled extension — that part is written for real.
+    //
+    // The saving is the difference between a hole and a copy: growing a file to 4GB on a fresh
+    // volume wrote 4GB of zeros in 4MB chunks (about a second, and every byte of it resident);
+    // now it writes none.
+    const end = Math.min(at + length, knownZeroFrom);
+    if (end <= at) return;
+
     const CHUNK = 4 * 1024 * 1024;
-    const zeros = new Uint8Array(Math.min(length, CHUNK));
+    const total = end - at;
+    const zeros = new Uint8Array(Math.min(total, CHUNK));
     let written = 0;
-    while (written < length) {
-      const n = Math.min(CHUNK, length - written);
+    while (written < total) {
+      const n = Math.min(CHUNK, total - written);
       const slice = n < zeros.length ? zeros.subarray(0, n) : zeros;
       this.handle.write(slice, { at: at + written });
       written += n;
@@ -1905,6 +1920,11 @@ export class VFSEngine {
       if (neededBlocks > inode.blockCount) {
         // Allocate-then-copy-then-free so the old range is guaranteed
         // not to overlap the new one. See `fwrite` for the same pattern.
+        //
+        // Read the volume's size before allocating: whatever the allocation adds past this point
+        // comes back zero-filled from `handle.truncate` and does not need zeroing again. This is
+        // what keeps a grow to a large length from costing its own size in writes.
+        const knownZeroFrom = this.handle.getSize();
         const newFirst = this.allocateBlocks(neededBlocks);
         const newBase = this.dataOffset + newFirst * this.blockSize;
         if (inode.size > 0) {
@@ -1921,7 +1941,7 @@ export class VFSEngine {
           }
         }
         this.freeBlockRange(inode.firstBlock, inode.blockCount);
-        this.zeroFileRange(newBase + inode.size, len - inode.size);
+        this.zeroFileRange(newBase + inode.size, len - inode.size, knownZeroFrom);
         inode.firstBlock = newFirst;
       } else {
         // Same block count, just growing `size`. The tail of the last
@@ -2331,6 +2351,9 @@ export class VFSEngine {
         // (which is O(N) bytes but with a bounded scratch buffer), then
         // free the old blocks and write just the caller's `data` at its
         // offset inside the new region.
+        // Before allocating, so the hole below can skip the part of itself the allocation
+        // zero-filled for free. See `zeroFileRange`.
+        const knownZeroFrom = this.handle.getSize();
         const newFirst = this.allocateBlocks(neededBlocks);
         const newBase = this.dataOffset + newFirst * this.blockSize;
         const oldBase = this.dataOffset + inode.firstBlock * this.blockSize;
@@ -2354,7 +2377,7 @@ export class VFSEngine {
         // blocks. `allocateBlocks` only flips bitmap bits, it never
         // zeroes the underlying storage.
         if (pos > inode.size) {
-          this.zeroFileRange(newBase + inode.size, pos - inode.size);
+          this.zeroFileRange(newBase + inode.size, pos - inode.size, knownZeroFrom);
         }
         // Write the caller's new data at its offset inside the new region.
         this.handle.write(data, { at: newBase + pos });
