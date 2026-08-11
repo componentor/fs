@@ -145,8 +145,18 @@
     }
 
     @media (max-width:900px) {
-      .grid {
+      /* `.grid.pair` is listed explicitly: it is more specific than `.grid`, so a lone
+         `.grid { grid-template-columns: 1fr }` here loses to it and the clone/benchmark row
+         stayed two-across on a phone — two half-width cards at ~180px each. */
+      .grid,
+      .grid.pair {
         grid-template-columns: 1fr;
+      }
+
+      /* Stacked now, so the row-height sharing that made the log share the browser's height no
+         longer applies — let each card be as tall as it needs. */
+      .stack > section .out {
+        max-height: 12rem;
       }
     }
 
