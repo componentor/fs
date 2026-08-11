@@ -1787,14 +1787,10 @@ export class VFSFileSystem {
     //
     // A page qualifies: `pagehide` runs synchronously before teardown. A worker does not — the
     // page kills it outright, and a `postMessage` sent on the way out cannot be waited for. So a
-    // worker-hosted instance never creates one; it asks the main thread to observe on its behalf
-    // through the same bridge it already uses for the service worker, and the observer lives
-    // there. Without a bridge there is nowhere safe to put it, so the feature stays off rather
-    // than risking the browser.
-    // A worker cannot host one safely — the page kills it outright, with no chance to detach —
-    // so a worker-hosted instance does not watch for external changes. Mirroring outward is
-    // unaffected. Hosting the observer on the page on the worker's behalf was tried and measured
-    // *worse*: it is one more observer nothing reliably detaches.
+    // worker-hosted instance does not watch for external changes at all; mirroring outward is
+    // unaffected. Having the page host the observer on the worker's behalf was tried and measured
+    // *worse* — it is one more observer that nothing reliably detaches — so the feature stays off
+    // there rather than risking the browser.
     if (typeof document === 'undefined') return;
 
     try {
