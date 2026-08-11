@@ -1,5 +1,19 @@
 # Changelog
 
+## 4.2.0
+
+**Two behaviour changes**, both corrections toward node: a function `exclude` passed to `glob` now
+receives the entry's **basename** rather than its absolute path, and `dir.close()` on an
+already-closed handle throws `ERR_DIR_CLOSED` instead of returning silently. Details below.
+
+- **Fixed: `glob`'s function `exclude` was handed the absolute path, where node passes the entry's basename.** `exclude: (name) => name === 'node_modules'` — the form nearly everyone writes, and the one in node's own docs — therefore matched nothing and excluded nothing. It now receives the basename, or a `Dirent` when `withFileTypes` is set, both verified against a live `node:fs`.
+- **Fixed: excluding a directory did not prune its subtree.** The entry was dropped from the results and the walk descended into it anyway, so `exclude: (n) => n === 'node_modules'` would have returned every file beneath it even once the argument shape was right. `exclude` is now consulted before descending, as node does — which also makes it much cheaper: on a tree of 250 files with 200 of them in `node_modules`, excluding that directory takes **68 filesystem operations instead of 270**. Asserted by counting operations rather than by timing, because a timer cannot resolve it — repeated runs of the *same* build spread from 576 to 881 ops/sec. On that same measure the no-exclude path is unchanged.
+- **Added: the glob-pattern form of `exclude`**, which was not implemented and threw. Patterns are matched against the path relative to `cwd`, with brace expansion — `exclude: ['**/*.test.ts', 'dist/**']`. A trailing `**` requires at least one segment: `['a/**']` drops what is inside `a` and keeps `a`, while `['a']` drops both. Each case is compared against `node:fs` rather than assumed.
+- **Fixed: `dir.close()` on an already-closed handle returned silently; node throws `ERR_DIR_CLOSED`.** Checked in every form that reaches it — a second `close()`, a `close()` after `for await` (which closes the handle itself), after an early `break`, and after `Symbol.asyncDispose`. The old behaviour hid the misuse, and hid it *differently* from node, so a `finally { await dir.close() }` that fails there passed quietly here. Read-after-close already reported `ERR_DIR_CLOSED`; this makes close consistent with it. **Behaviour change** for callers that relied on the tolerant close.
+- One deliberate divergence, documented in the readme: a function `exclude` also drops **nested** files. Node's function form leaves them — `(n) => n.endsWith('.js')` removes `top.js` but keeps `a/drop.js`, while its own pattern form removes both. Keeping files the caller asked to drop is not worth reproducing; node's behaviour is asserted in the parity test so a future fix there surfaces here.
+- The API surface was re-checked against Node 24 at runtime: nothing missing on `fs`, `fs.promises`, `Stats` or `Dirent`, and only `getAsyncId` (an async_hooks internal) on `FileHandle`.
+- 1890 Node tests pass across 92 files, plus 80 browser tests across Chromium, Firefox and WebKit.
+
 ## 4.1.6
 
 - **Fixed: a tab could register no watcher at all and stay deaf to every change for the rest of its life.** `fs.watch` checks the path exists before registering, so a mistyped path throws instead of handing back a watcher that can never fire. That check is a synchronous call, and it is the *first* one a tab makes — and a follower whose leader port has not yet proved itself refuses such a call quickly with `EIO`, deliberately, because 4.1.5 replaced a ten-second stall with exactly that. So a tab that lost the election had this one check refused, threw out of `watch()` before registering anything, and never saw another change. `EIO` is the transport declining to answer rather than a fact about the path, and is no longer treated as one; `ENOENT` still throws.

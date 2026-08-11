@@ -2923,14 +2923,22 @@ var Dir = class {
     this._assertOpen();
     return this._index >= this._entries.length ? null : this._entries[this._index++];
   }
+  /**
+   * Closing an already-closed handle is `ERR_DIR_CLOSED`, not a no-op.
+   *
+   * Verified against `node:fs` in every form that reaches it: a second `close()`, a `close()`
+   * after `for await` (which closes the handle itself), after an early `break`, and after
+   * `Symbol.asyncDispose`. Returning silently here hid the misuse — and hid it *differently*
+   * from node, so a `finally { await dir.close() }` that throws in node passed quietly here.
+   */
   async close() {
-    if (this._closed) return;
+    this._assertOpen();
     this._closed = true;
     if (this._onClose) await this._onClose();
   }
   /** The synchronous form. Was missing entirely. */
   closeSync() {
-    if (this._closed) return;
+    this._assertOpen();
     this._closed = true;
     if (this._onClose) void this._onClose().catch(() => {
     });
@@ -2941,7 +2949,7 @@ var Dir = class {
         yield entry;
       }
     } finally {
-      await this.close();
+      if (!this._closed) await this.close();
     }
   }
 };
@@ -3527,6 +3535,9 @@ function segmentToRegex(pattern) {
   re += "$";
   return new RegExp(re);
 }
+function matchSegment(name, pattern) {
+  return segmentToRegex(pattern).test(name);
+}
 function joinPath(base, name) {
   if (base === "/") return "/" + name;
   return base + "/" + name;
@@ -3541,6 +3552,37 @@ function normalizeCwd(cwd) {
   if (typeof cwd === "string") return cwd || "/";
   return cwd.pathname || "/";
 }
+function resolveExclude(options, cwd, patternIsAbsolute) {
+  const raw = options?.exclude;
+  if (raw == null) return void 0;
+  if (typeof raw === "function") {
+    const fn = raw;
+    return (fullPath, dirent) => {
+      if (dirent) return fn(dirent);
+      const slash = fullPath.lastIndexOf("/");
+      return fn(slash < 0 ? fullPath : fullPath.slice(slash + 1));
+    };
+  }
+  const matchers = (Array.isArray(raw) ? raw : [raw]).flatMap((pat) => expandBraces(String(pat))).map((pat) => pat.split("/").filter((seg) => seg.length > 0));
+  return (fullPath) => {
+    const rel = toResultPath(fullPath, cwd, patternIsAbsolute);
+    const parts = rel.split("/").filter((seg) => seg.length > 0);
+    return matchers.some((segments) => matchSegments(parts, 0, segments, 0));
+  };
+}
+function matchSegments(parts, pi, segs2, si) {
+  if (si >= segs2.length) return pi >= parts.length;
+  if (segs2[si] === "**") {
+    if (si === segs2.length - 1) return pi < parts.length;
+    for (let skip = pi; skip <= parts.length; skip++) {
+      if (matchSegments(parts, skip, segs2, si + 1)) return true;
+    }
+    return false;
+  }
+  if (pi >= parts.length) return false;
+  if (!matchSegment(parts[pi], segs2[si])) return false;
+  return matchSegments(parts, pi + 1, segs2, si + 1);
+}
 function makeDirent(parentPath, name, isDir, isSymlink) {
   const type = isDir ? INODE_TYPE.DIRECTORY : INODE_TYPE.FILE;
   return new Dirent(name, type, parentPath);
@@ -3548,9 +3590,16 @@ function makeDirent(parentPath, name, isDir, isSymlink) {
 function globSync(syncRequest, pattern, options) {
   const patterns = Array.isArray(pattern) ? pattern : [pattern];
   const cwd = normalizeCwd(options?.cwd);
-  const exclude = options?.exclude;
   const withFileTypes = options?.withFileTypes === true;
   const patternIsAbsolute = patterns.every((p) => p.startsWith("/"));
+  const excludeAt = resolveExclude(options, cwd, patternIsAbsolute);
+  const blocked = (fullPath, isDir) => {
+    if (!excludeAt) return false;
+    if (!withFileTypes) return excludeAt(fullPath, null);
+    const slash = fullPath.lastIndexOf("/");
+    const parent = slash <= 0 ? "/" : fullPath.slice(0, slash);
+    return excludeAt(fullPath, makeDirent(parent, fullPath.slice(slash + 1), isDir));
+  };
   const resultsSet = /* @__PURE__ */ new Set();
   const resultsDirents = [];
   const pushResult = (fullPath) => {
@@ -3567,14 +3616,14 @@ function globSync(syncRequest, pattern, options) {
         const parent = slash <= 0 ? "/" : fullPath.slice(0, slash);
         const name = fullPath.slice(slash + 1);
         const dirent = makeDirent(parent, name, isDir);
-        if (exclude && exclude(dirent)) {
+        if (excludeAt && excludeAt(fullPath, dirent)) {
           resultsSet.delete(fullPath);
           return;
         }
         resultsDirents.push(dirent);
       }
     } else {
-      if (exclude && exclude(fullPath)) return;
+      if (excludeAt && excludeAt(fullPath, null)) return;
       resultsSet.add(toResultPath(fullPath, cwd, patternIsAbsolute));
     }
   };
@@ -3602,7 +3651,7 @@ function globSync(syncRequest, pattern, options) {
         } catch {
           continue;
         }
-        if (isDir) {
+        if (isDir && !blocked(full, true)) {
           walk(full, segments, segIdx);
         }
         if (isLast) pushResult(full);
@@ -3628,7 +3677,7 @@ function globSync(syncRequest, pattern, options) {
         } catch {
           continue;
         }
-        if (isDir) walk(full, segments, segIdx + 1);
+        if (isDir && !blocked(full, true)) walk(full, segments, segIdx + 1);
       }
     }
   }
@@ -3643,9 +3692,16 @@ function globSync(syncRequest, pattern, options) {
 async function glob(asyncRequest, pattern, options) {
   const patterns = Array.isArray(pattern) ? pattern : [pattern];
   const cwd = normalizeCwd(options?.cwd);
-  const exclude = options?.exclude;
   const withFileTypes = options?.withFileTypes === true;
   const patternIsAbsolute = patterns.every((p) => p.startsWith("/"));
+  const excludeAt = resolveExclude(options, cwd, patternIsAbsolute);
+  const blocked = (fullPath, isDir) => {
+    if (!excludeAt) return false;
+    if (!withFileTypes) return excludeAt(fullPath, null);
+    const slash = fullPath.lastIndexOf("/");
+    const parent = slash <= 0 ? "/" : fullPath.slice(0, slash);
+    return excludeAt(fullPath, makeDirent(parent, fullPath.slice(slash + 1), isDir));
+  };
   const resultsSet = /* @__PURE__ */ new Set();
   const resultsDirents = [];
   const pushResult = async (fullPath) => {
@@ -3662,13 +3718,13 @@ async function glob(asyncRequest, pattern, options) {
       const parent = slash <= 0 ? "/" : fullPath.slice(0, slash);
       const name = fullPath.slice(slash + 1);
       const dirent = makeDirent(parent, name, isDir);
-      if (exclude && exclude(dirent)) {
+      if (excludeAt && excludeAt(fullPath, dirent)) {
         resultsSet.delete(fullPath);
         return;
       }
       resultsDirents.push(dirent);
     } else {
-      if (exclude && exclude(fullPath)) return;
+      if (excludeAt && excludeAt(fullPath, null)) return;
       resultsSet.add(toResultPath(fullPath, cwd, patternIsAbsolute));
     }
   };
@@ -3696,7 +3752,7 @@ async function glob(asyncRequest, pattern, options) {
         } catch {
           continue;
         }
-        if (isDir) await walk(full, segments, segIdx);
+        if (isDir && !blocked(full, true)) await walk(full, segments, segIdx);
         if (isLast) await pushResult(full);
       }
       return;
@@ -3720,7 +3776,7 @@ async function glob(asyncRequest, pattern, options) {
         } catch {
           continue;
         }
-        if (isDir) await walk(full, segments, segIdx + 1);
+        if (isDir && !blocked(full, true)) await walk(full, segments, segIdx + 1);
       }
     }
   }

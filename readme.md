@@ -405,6 +405,13 @@ wrong about Node rather than the code being wrong about the docs.
 
 All deliberate:
 
+- **A function `exclude` passed to `glob` also drops nested files.** Node's *function* form
+  applies the predicate to top-level entries and to directories (pruning their subtrees), but
+  silently keeps **nested files**: `(n) => n.endsWith('.js')` removes `top.js` and leaves
+  `a/drop.js`, while node's own *pattern* form removes both. Reproducing that would keep files
+  the caller asked to drop, so the predicate is applied at every depth here. Node's behaviour is
+  [asserted in the parity test](src/tests/glob-exclude-parity.test.ts), so if it changes, we find
+  out.
 - **An invalid descriptor passed to `fs.readFile(fd, cb)` reaches the callback.** Node defers the
   check and then throws it *uncaught* from a later tick (inside `readFileAfterOpen`), taking the
   process down instead of calling back — `fs.readFile(-1, cb)` is an unhandled `ERR_OUT_OF_RANGE`
@@ -897,6 +904,23 @@ fs.promises.flush(): Promise<void>
 
 > **Changed in 4.0:** `fs.promises.glob` used to return `Promise<string[]>`. It is an async
 > iterator now, matching node — so `for await` works, and `await` no longer gives you an array.
+
+#### `glob`'s `exclude` option
+
+Both of node's forms work, and they do not share a contract:
+
+```js
+// Function — receives the entry's BASENAME (or a Dirent when withFileTypes is set)
+fs.globSync('**/*', { exclude: (name) => name === 'node_modules' });
+
+// Glob patterns — matched against the path RELATIVE TO cwd
+fs.globSync('**/*', { exclude: ['**/*.test.ts', 'dist/**'] });
+```
+
+Excluding a **directory** prunes its whole subtree, so the first example drops `node_modules`
+and everything under it. A trailing `**` needs at least one segment to match: `exclude: ['a/**']`
+drops what is inside `a` but keeps `a` itself, while `exclude: ['a']` drops both — both verified
+against `node:fs`.
 
 ### Streams API
 

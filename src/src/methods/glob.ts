@@ -172,6 +172,77 @@ function normalizeCwd(cwd: string | URL | undefined): string {
 }
 
 /**
+ * `exclude` — both of node's forms, resolved to one predicate.
+ *
+ * The contract was read off a live `node:fs` rather than the docs, because the two forms differ:
+ *
+ *   • **function** — receives a `Dirent` when `withFileTypes: true`, and otherwise the entry's
+ *     **basename**, not its path. That matters: `exclude: (n) => n === 'node_modules'` is the
+ *     common usage and works in node. We passed the *absolute path*, so it matched nothing and
+ *     every entry the caller asked to drop came back anyway.
+ *   • **array of glob patterns** — matched against the path **relative to `cwd`**, so `'a/*'`
+ *     drops that directory's children, `'*.js'` only top-level ones, and a bare `'drop.js'`
+ *     drops nothing when the entry sits at `a/drop.js`. This form was not supported at all and
+ *     threw.
+ *
+ * One deliberate difference, documented in the readme: node's *function* form fails to drop
+ * **nested files** — `(n) => n.endsWith('.js')` removes `top.js` but leaves `a/drop.js`, while
+ * its own pattern form removes both. Reproducing that would silently keep files the caller asked
+ * to drop, so the predicate is applied at every depth here, as the docs describe.
+ */
+function resolveExclude(
+  options: GlobOptions | undefined,
+  cwd: string,
+  patternIsAbsolute: boolean,
+): ((fullPath: string, dirent: Dirent | null) => boolean) | undefined {
+  const raw = options?.exclude;
+  if (raw == null) return undefined;
+
+  if (typeof raw === 'function') {
+    const fn = raw as (arg: string | Dirent) => boolean;
+    return (fullPath, dirent) => {
+      if (dirent) return fn(dirent);
+      const slash = fullPath.lastIndexOf('/');
+      return fn(slash < 0 ? fullPath : fullPath.slice(slash + 1));
+    };
+  }
+
+  // Pattern list: compiled once, matched against the cwd-relative path.
+  const matchers = (Array.isArray(raw) ? raw : [raw as string])
+    .flatMap((pat) => expandBraces(String(pat)))
+    .map((pat) => pat.split('/').filter((seg) => seg.length > 0));
+
+  return (fullPath) => {
+    const rel = toResultPath(fullPath, cwd, patternIsAbsolute);
+    const parts = rel.split('/').filter((seg) => seg.length > 0);
+    return matchers.some((segments) => matchSegments(parts, 0, segments, 0));
+  };
+}
+
+/**
+ * Glob-match a split path against a split exclude pattern.
+ *
+ * `**` spans any number of segments *in the middle* — `'**\/*.js'` matches `top.js` with `**`
+ * consuming none — but a **trailing** `**` requires at least one. Verified against node:
+ * `exclude: ['skip/**']` drops `skip/inner.txt` and keeps `skip` itself, while
+ * `exclude: ['skip']` drops both, because excluding a directory prunes its subtree.
+ */
+function matchSegments(parts: string[], pi: number, segs: string[], si: number): boolean {
+  if (si >= segs.length) return pi >= parts.length;
+  if (segs[si] === '**') {
+    // Trailing `**`: consumes the rest, and there must be a rest.
+    if (si === segs.length - 1) return pi < parts.length;
+    for (let skip = pi; skip <= parts.length; skip++) {
+      if (matchSegments(parts, skip, segs, si + 1)) return true;
+    }
+    return false;
+  }
+  if (pi >= parts.length) return false;
+  if (!matchSegment(parts[pi], segs[si])) return false;
+  return matchSegments(parts, pi + 1, segs, si + 1);
+}
+
+/**
  * Build a Dirent from a file path + parent dir + stat.
  *
  * The hand-written literal this replaced omitted `path` — node's deprecated alias of
@@ -193,9 +264,23 @@ export function globSync(
 ): string[] | Dirent[] {
   const patterns = Array.isArray(pattern) ? pattern : [pattern];
   const cwd = normalizeCwd(options?.cwd);
-  const exclude = options?.exclude as ((arg: string | Dirent) => boolean) | undefined;
   const withFileTypes = options?.withFileTypes === true;
   const patternIsAbsolute = patterns.every((p) => p.startsWith('/'));
+  const excludeAt = resolveExclude(options, cwd, patternIsAbsolute);
+
+  /**
+   * Whether `exclude` rejects this entry. Consulted before descending as well as at match time:
+   * excluding a **directory** prunes its whole subtree in node, so `(n) => n === 'node_modules'`
+   * drops the directory *and* everything under it. Checking only at match time removed the
+   * directory from the results and then walked into it anyway.
+   */
+  const blocked = (fullPath: string, isDir: boolean): boolean => {
+    if (!excludeAt) return false;
+    if (!withFileTypes) return excludeAt(fullPath, null);
+    const slash = fullPath.lastIndexOf('/');
+    const parent = slash <= 0 ? '/' : fullPath.slice(0, slash);
+    return excludeAt(fullPath, makeDirent(parent, fullPath.slice(slash + 1), isDir, false));
+  };
 
   const resultsSet = new Set<string>(); // dedupe across expanded patterns
   const resultsDirents: Dirent[] = [];
@@ -216,11 +301,11 @@ export function globSync(
         const parent = slash <= 0 ? '/' : fullPath.slice(0, slash);
         const name = fullPath.slice(slash + 1);
         const dirent = makeDirent(parent, name, isDir, isSymlink);
-        if (exclude && exclude(dirent)) { resultsSet.delete(fullPath); return }
+        if (excludeAt && excludeAt(fullPath, dirent)) { resultsSet.delete(fullPath); return }
         resultsDirents.push(dirent);
       }
     } else {
-      if (exclude && exclude(fullPath)) return;
+      if (excludeAt && excludeAt(fullPath, null)) return;
       resultsSet.add(toResultPath(fullPath, cwd, patternIsAbsolute));
     }
   };
@@ -255,7 +340,7 @@ export function globSync(
           isDir = statSync(syncRequest, full).isDirectory();
         } catch { continue }
 
-        if (isDir) {
+        if (isDir && !blocked(full, true)) {
           // Keep ** active at same segIdx
           walk(full, segments, segIdx);
         }
@@ -282,7 +367,7 @@ export function globSync(
         let isDir: boolean;
         try { isDir = statSync(syncRequest, full).isDirectory() }
         catch { continue }
-        if (isDir) walk(full, segments, segIdx + 1);
+        if (isDir && !blocked(full, true)) walk(full, segments, segIdx + 1);
       }
     }
   }
@@ -308,9 +393,23 @@ export async function glob(
 ): Promise<string[] | Dirent[]> {
   const patterns = Array.isArray(pattern) ? pattern : [pattern];
   const cwd = normalizeCwd(options?.cwd);
-  const exclude = options?.exclude as ((arg: string | Dirent) => boolean) | undefined;
   const withFileTypes = options?.withFileTypes === true;
   const patternIsAbsolute = patterns.every((p) => p.startsWith('/'));
+  const excludeAt = resolveExclude(options, cwd, patternIsAbsolute);
+
+  /**
+   * Whether `exclude` rejects this entry. Consulted before descending as well as at match time:
+   * excluding a **directory** prunes its whole subtree in node, so `(n) => n === 'node_modules'`
+   * drops the directory *and* everything under it. Checking only at match time removed the
+   * directory from the results and then walked into it anyway.
+   */
+  const blocked = (fullPath: string, isDir: boolean): boolean => {
+    if (!excludeAt) return false;
+    if (!withFileTypes) return excludeAt(fullPath, null);
+    const slash = fullPath.lastIndexOf('/');
+    const parent = slash <= 0 ? '/' : fullPath.slice(0, slash);
+    return excludeAt(fullPath, makeDirent(parent, fullPath.slice(slash + 1), isDir, false));
+  };
 
   const resultsSet = new Set<string>();
   const resultsDirents: Dirent[] = [];
@@ -328,10 +427,10 @@ export async function glob(
       const parent = slash <= 0 ? '/' : fullPath.slice(0, slash);
       const name = fullPath.slice(slash + 1);
       const dirent = makeDirent(parent, name, isDir, isSymlink);
-      if (exclude && exclude(dirent)) { resultsSet.delete(fullPath); return }
+      if (excludeAt && excludeAt(fullPath, dirent)) { resultsSet.delete(fullPath); return }
       resultsDirents.push(dirent);
     } else {
-      if (exclude && exclude(fullPath)) return;
+      if (excludeAt && excludeAt(fullPath, null)) return;
       resultsSet.add(toResultPath(fullPath, cwd, patternIsAbsolute));
     }
   };
@@ -359,7 +458,7 @@ export async function glob(
         try { isDir = (await stat(asyncRequest, full)).isDirectory() }
         catch { continue }
 
-        if (isDir) await walk(full, segments, segIdx);
+        if (isDir && !blocked(full, true)) await walk(full, segments, segIdx);
         if (isLast) await pushResult(full);
       }
       return;
@@ -379,7 +478,7 @@ export async function glob(
         let isDir: boolean;
         try { isDir = (await stat(asyncRequest, full)).isDirectory() }
         catch { continue }
-        if (isDir) await walk(full, segments, segIdx + 1);
+        if (isDir && !blocked(full, true)) await walk(full, segments, segIdx + 1);
       }
     }
   }

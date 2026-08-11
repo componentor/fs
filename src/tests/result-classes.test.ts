@@ -18,6 +18,7 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as nodefs from 'node:fs';
+import * as nodefsp from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createFsHarness } from './helpers/engine-transport.js';
@@ -243,10 +244,35 @@ describe('Dir', () => {
     await expect(nd.read()).rejects.toThrow(expect.objectContaining({ code: 'ERR_DIR_CLOSED' }));
   });
 
-  it('closing twice is not an error', async () => {
+  it('closing twice is ERR_DIR_CLOSED, as in node', async () => {
+    // This asserted the opposite — that a double close is harmless. node throws, in every form
+    // that reaches it, so a `finally { await dir.close() }` after a `for await` (which closes
+    // the handle itself) fails there and passed quietly here.
     const dir = fs.opendirSync('/d');
     dir.closeSync();
-    await expect(dir.close()).resolves.toBeUndefined();
+    await expect(dir.close()).rejects.toThrow(
+      expect.objectContaining({ code: 'ERR_DIR_CLOSED' })
+    );
+
+    const nodeDir = nodefs.opendirSync(join(root, 'd'));
+    nodeDir.closeSync();
+    await expect(nodeDir.close()).rejects.toThrow(
+      expect.objectContaining({ code: 'ERR_DIR_CLOSED' })
+    );
+  });
+
+  it('a for-await leaves the handle closed, so a later close throws — as in node', async () => {
+    const dir = await fs.promises.opendir('/d');
+    for await (const entry of dir) void entry;
+    await expect(dir.close()).rejects.toThrow(
+      expect.objectContaining({ code: 'ERR_DIR_CLOSED' })
+    );
+
+    const nodeDir = await nodefsp.opendir(join(root, 'd'));
+    for await (const entry of nodeDir) void entry;
+    await expect(nodeDir.close()).rejects.toThrow(
+      expect.objectContaining({ code: 'ERR_DIR_CLOSED' })
+    );
   });
 
   it('honours `recursive`, which was accepted and ignored', async () => {

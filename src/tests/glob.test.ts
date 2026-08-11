@@ -197,10 +197,18 @@ describe('globSync', () => {
   });
 
   it('should respect exclude option', () => {
+    // node hands the **basename** to a function `exclude`, not a path — this used to be given
+    // the absolute path, so the common `(n) => n === 'node_modules'` form matched nothing.
     const results = globSync(syncRequest, '*.txt', {
-      exclude: (p) => p === '/a.txt',
+      exclude: (p) => p === 'a.txt',
     });
     expect(results).toEqual([]);
+  });
+
+  it('accepts the glob-pattern form of exclude, which used to throw', () => {
+    // Patterns are matched against the path relative to cwd, as in node.
+    const results = globSync(syncRequest, '**/*.txt', { exclude: ['dir/sub/**'] });
+    expect((results as string[]).sort()).toEqual(['a.txt', 'dir/c.txt', 'dir/d.txt']);
   });
 
   it('should return empty array when nothing matches', () => {
@@ -243,13 +251,19 @@ describe('glob (async)', () => {
   });
 
   it('should respect exclude option', async () => {
-    const results = await glob(asyncRequest, '**/*.txt', {
-      exclude: (p) => p.includes('/dir/sub/'),
-    });
-    expect(results.sort()).toEqual([
+    // The pattern form expresses "everything under dir/sub"; the function form sees basenames
+    // only and cannot. Both are node's contract — see the sync cases above.
+    const results = await glob(asyncRequest, '**/*.txt', { exclude: ['dir/sub/**'] });
+    expect((results as string[]).sort()).toEqual([
       'a.txt',
       'dir/c.txt',
       'dir/d.txt',
     ]);
+  });
+
+  it('passes the basename to a function exclude', async () => {
+    const seen: string[] = [];
+    await glob(asyncRequest, '**/*.txt', { exclude: (p) => { seen.push(p as string); return false; } });
+    expect(seen.every((n) => !n.includes('/')), `saw paths, not basenames: ${JSON.stringify(seen)}`).toBe(true);
   });
 });

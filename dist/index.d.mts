@@ -636,6 +636,14 @@ declare class Dir {
     read(): Promise<Dirent$1 | null>;
     /** The synchronous form. Was missing entirely. */
     readSync(): Dirent$1 | null;
+    /**
+     * Closing an already-closed handle is `ERR_DIR_CLOSED`, not a no-op.
+     *
+     * Verified against `node:fs` in every form that reaches it: a second `close()`, a `close()`
+     * after `for await` (which closes the handle itself), after an early `break`, and after
+     * `Symbol.asyncDispose`. Returning silently here hid the misuse — and hid it *differently*
+     * from node, so a `finally { await dir.close() }` that throws in node passed quietly here.
+     */
     close(): Promise<void>;
     /** The synchronous form. Was missing entirely. */
     closeSync(): void;

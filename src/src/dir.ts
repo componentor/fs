@@ -48,8 +48,16 @@ export class Dir {
     return this._index >= this._entries.length ? null : this._entries[this._index++];
   }
 
+  /**
+   * Closing an already-closed handle is `ERR_DIR_CLOSED`, not a no-op.
+   *
+   * Verified against `node:fs` in every form that reaches it: a second `close()`, a `close()`
+   * after `for await` (which closes the handle itself), after an early `break`, and after
+   * `Symbol.asyncDispose`. Returning silently here hid the misuse — and hid it *differently*
+   * from node, so a `finally { await dir.close() }` that throws in node passed quietly here.
+   */
   async close(): Promise<void> {
-    if (this._closed) return;
+    this._assertOpen();
     this._closed = true;
     if (this._onClose) await this._onClose();
   }
@@ -58,7 +66,7 @@ export class Dir {
   closeSync(): void {
     // The descriptor is released asynchronously; marking the handle closed is what callers
     // observe, and a pending release cannot fail in a way they could act on.
-    if (this._closed) return;
+    this._assertOpen();
     this._closed = true;
     if (this._onClose) void this._onClose().catch(() => { /* handle is already gone */ });
   }
@@ -69,8 +77,10 @@ export class Dir {
         yield entry;
       }
     } finally {
-      // node closes the handle when iteration ends, including on an early `break`.
-      await this.close();
+      // node closes the handle when iteration ends, including on an early `break`. Guarded
+      // because the loop body may have closed it already, and `close()` now throws on a
+      // closed handle — the iterator's own cleanup is not the caller's misuse.
+      if (!this._closed) await this.close();
     }
   }
 }
