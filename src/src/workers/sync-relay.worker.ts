@@ -78,8 +78,6 @@ let opfsSyncWorker: Worker | null = null;
 
 // Watch broadcast (leader mode only — fires on every VFS mutation)
 let watchBc: BroadcastChannel | null = null;
-/** Volume namespace, kept so the shutdown path can announce the release. */
-let volumeNs: string | null = null;
 
 // Own tab's sync SAB
 let sab: SharedArrayBuffer;

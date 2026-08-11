@@ -23,7 +23,12 @@ beforeEach(() => {
   fs = createFsHarness().fs;
   root = nodefs.mkdtempSync(join(tmpdir(), 'stream-fix-'));
 });
-afterEach(() => nodefs.rmSync(root, { recursive: true, force: true }));
+// `maxRetries` because this threw once during a release, from the recursive remove rather than
+// from anything the suite asserts. `force` already covers ENOENT; what it does not cover is the
+// transient EBUSY/EPERM/ENOTEMPTY a real temp directory can return under load, which is the case
+// node ships this option for. Not reproduced in ~20 subsequent full runs, so this is a guard on
+// a cleanup path, not a diagnosed fix.
+afterEach(() => nodefs.rmSync(root, { recursive: true, force: true, maxRetries: 3 }));
 
 const real = (p: string) => join(root, p);
 
