@@ -4012,6 +4012,7 @@ var HEADER_SIZE = SAB_OFFSETS.HEADER_SIZE;
 var _canAtomicsWait = typeof globalThis.WorkerGlobalScope !== "undefined";
 var SAB_HEARTBEAT_INDEX = SAB_OFFSETS.HEARTBEAT >> 2;
 var SPIN_STALL_TIMEOUT_MS = 3e4;
+var VOLUME_ACQUIRE_DEADLINE_MS = 15e3;
 var SPIN_NO_HEARTBEAT_TIMEOUT_MS = 3e4;
 var OPFS_MAIN_THREAD_SPIN_TIMEOUT_MS = 1e4;
 var OPFS_SYNC_STALL_MESSAGE = "VFS sync operation stalled in opfs mode. Sync calls from a page main thread are only reliable on Chromium here: every operation is async underneath, and the spin-wait this thread must use (Atomics.wait is illegal on the main thread) starves the relay worker on Firefox and WebKit. Use fs.promises.* instead, or host the filesystem inside a Worker, where the sync API works on every engine.";
@@ -4206,6 +4207,8 @@ var VFSFileSystem = class {
   brokerHeartbeatTimer = null;
   /** Backoff for reopening a volume whose previous holder has not let go yet. */
   volumeRetryDelayMs = 0;
+  /** When the current run of volume-open retries began (0 = not retrying). */
+  volumeRetryStartedAt = 0;
   /** The service worker this instance registered its broker with, so it can deregister. */
   brokerSw = null;
   brokerControlPort = null;
@@ -4289,6 +4292,7 @@ var VFSFileSystem = class {
         this.isReady = true;
         this.transitioning = false;
         this.volumeRetryDelayMs = 0;
+        this.volumeRetryStartedAt = 0;
         this.initAsyncRelay();
         this.resolveReady();
         this.fireReadyListeners();
@@ -4299,8 +4303,9 @@ var VFSFileSystem = class {
         if (msg.error?.startsWith("Corrupt VFS:")) {
           this.handleCorruptVFS(msg.error);
         } else if (this.holdingLeaderLock) {
-          this.volumeRetryDelayMs = Math.min((this.volumeRetryDelayMs || 0) * 2 || 25, 500);
-          setTimeout(() => this.sendLeaderInit(), this.volumeRetryDelayMs);
+          if (this.retryVolumeOpen(msg.error)) {
+            setTimeout(() => this.sendLeaderInit(), this.volumeRetryDelayMs);
+          }
         } else if (!("locks" in navigator)) {
           this.startAsFollower();
         }
@@ -4397,6 +4402,40 @@ var VFSFileSystem = class {
         debug: this.config.debug
       }
     });
+  }
+  /**
+   * Decide whether a failed volume open is worth another attempt.
+   *
+   * Returns true to retry (and advances the backoff), false once the attempt has
+   * been abandoned — in which case this has already failed the instance, exactly
+   * as a corrupt volume does, so `init()` rejects instead of hanging forever.
+   *
+   * The distinction that matters: "the previous holder has not let go yet" clears
+   * on its own, usually in milliseconds; "this origin has no usable OPFS" never
+   * does. Both arrive here as an `init-failed` message, and the second one used
+   * to be retried indefinitely — leaving `init()` unsettled, with no rejection
+   * and nothing in the console to explain it.
+   */
+  retryVolumeOpen(error, label = "Volume") {
+    const now2 = Date.now();
+    if (!this.volumeRetryStartedAt) this.volumeRetryStartedAt = now2;
+    if (now2 - this.volumeRetryStartedAt < VOLUME_ACQUIRE_DEADLINE_MS) {
+      this.volumeRetryDelayMs = Math.min((this.volumeRetryDelayMs || 0) * 2 || 25, 500);
+      return true;
+    }
+    const err = new Error(
+      `Could not open the volume after ${Math.round((now2 - this.volumeRetryStartedAt) / 1e3)}s: ${error ?? "unknown error"}. The previous holder's exclusive handle is normally released within a few seconds, so this usually means the origin has no usable OPFS storage (private browsing, blocked site data, or an ephemeral automation profile).`
+    );
+    console.error(`[VFS] ${label}: ${err.message}`);
+    this.volumeRetryStartedAt = 0;
+    this.volumeRetryDelayMs = 0;
+    this.initError = err;
+    this.rejectReady(err);
+    if (this.hasSAB) {
+      Atomics.store(this.readySignal, 0, -1);
+      Atomics.notify(this.readySignal, 0);
+    }
+    return false;
   }
   /** Handle VFS corruption: log error, fall back to OPFS-direct mode.
    *  The readyPromise will resolve once OPFS mode is ready, but init()
@@ -4623,15 +4662,16 @@ var VFSFileSystem = class {
       if (msg.type === "ready") {
         this.isReady = true;
         this.transitioning = false;
+        this.volumeRetryDelayMs = 0;
+        this.volumeRetryStartedAt = 0;
         this.resolveReady();
         this.fireReadyListeners();
         this.initLeaderBroker();
       } else if (msg.type === "init-failed") {
         if (msg.error?.startsWith("Corrupt VFS:")) {
           this.handleCorruptVFS(msg.error);
-        } else {
-          console.warn("[VFS] Promotion: OPFS handle still busy, retrying...");
-          setTimeout(() => this.sendLeaderInit(), 500);
+        } else if (this.retryVolumeOpen(msg.error, "Promotion")) {
+          setTimeout(() => this.sendLeaderInit(), this.volumeRetryDelayMs);
         }
       }
     };

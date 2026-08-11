@@ -1020,6 +1020,8 @@ declare class VFSFileSystem {
     private brokerHeartbeatTimer;
     /** Backoff for reopening a volume whose previous holder has not let go yet. */
     private volumeRetryDelayMs;
+    /** When the current run of volume-open retries began (0 = not retrying). */
+    private volumeRetryStartedAt;
     /** The service worker this instance registered its broker with, so it can deregister. */
     private brokerSw;
     private brokerControlPort;
@@ -1047,6 +1049,20 @@ declare class VFSFileSystem {
     private sendLeaderInit;
     /** Send init-opfs message to sync-relay for OPFS-direct mode */
     private sendOPFSInit;
+    /**
+     * Decide whether a failed volume open is worth another attempt.
+     *
+     * Returns true to retry (and advances the backoff), false once the attempt has
+     * been abandoned — in which case this has already failed the instance, exactly
+     * as a corrupt volume does, so `init()` rejects instead of hanging forever.
+     *
+     * The distinction that matters: "the previous holder has not let go yet" clears
+     * on its own, usually in milliseconds; "this origin has no usable OPFS" never
+     * does. Both arrive here as an `init-failed` message, and the second one used
+     * to be retried indefinitely — leaving `init()` unsettled, with no rejection
+     * and nothing in the console to explain it.
+     */
+    private retryVolumeOpen;
     /** Handle VFS corruption: log error, fall back to OPFS-direct mode.
      *  The readyPromise will resolve once OPFS mode is ready, but init()
      *  will reject with the corruption error to inform the caller. */

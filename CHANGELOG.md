@@ -1,5 +1,12 @@
 # Changelog
 
+## 4.2.2
+
+**`init()` can no longer hang forever on a volume that will never open**, and the bounded wait that fixes it no longer misfires on the ordinary case it was written to preserve.
+
+- **Fixed: an origin with no usable OPFS left `init()` unsettled — no resolve, no reject, nothing logged.** Retrying a failed volume open is right when the previous leader's exclusive handle has merely not been reclaimed yet, which clears on its own in milliseconds. It is wrong when the failure is permanent: private browsing, blocked site data or an ephemeral automation profile fails every attempt identically, and the retry ran without a bound. Observed in an ephemeral WebKit context as a host app sitting on its splash screen with an empty console. The retries now carry a 15s deadline — far longer than any real handle reclaim — after which the instance fails with an error that names the likely cause, rejecting `init()` and waking any blocked sync caller through the same permanent-failure signal a corrupt volume uses.
+- **Fixed: the deadline could fire on a handoff that needed 25ms.** It measures one run of retries, so the success that ends a run has to reset it — and the promotion path, one of the two that retry, never did. A promotion that needed even a single retry left the clock running for the life of the instance; the next time that instance waited for a volume, the wait was abandoned on its **first** attempt and reported as though the origin had no storage. A clock left running that way is worse than no deadline at all, which is why both the reset and its consequence are asserted rather than just the deadline itself.
+
 ## 4.2.1
 
 **Reloading a tab that held the volume no longer costs seconds of dead time.** Four fixes on the teardown path, all of them the same root cause seen from different sides: the page was destroying its workers instead of asking them to stop, so nothing they owned was ever given back.

@@ -107,6 +107,23 @@ const SAB_HEARTBEAT_INDEX = SAB_OFFSETS.HEARTBEAT >> 2;
 // makes it survivable.
 const SPIN_STALL_TIMEOUT_MS = 30_000;
 
+/**
+ * How long to keep retrying a volume that will not open before giving up.
+ *
+ * Retrying is right for the case it was written for: the previous leader's tab
+ * is gone and its exclusive handle has not been reclaimed yet, which resolves in
+ * milliseconds to a few seconds. It is wrong for a failure that will never clear
+ * — an origin with no usable OPFS at all (private browsing, blocked site data,
+ * an ephemeral automation profile) fails `navigator.storage.getDirectory()` on
+ * every attempt, and an unbounded retry means `init()` NEVER SETTLES: no
+ * resolve, no reject, no error to log. Measured in an ephemeral WebKit context,
+ * where it retried every 500ms indefinitely and the host app sat on its splash
+ * screen with an empty console — a silent failure that cost a full session to
+ * identify. A bounded wait converts that into the rejection callers can act on,
+ * and is still far longer than any real handle reclaim.
+ */
+const VOLUME_ACQUIRE_DEADLINE_MS = 15_000;
+
 // Fallback timeout for spin-waits without a heartbeat channel (should not occur
 // in practice — every caller passes this.ctrl as the heartbeat source — but a
 // plain ceiling is safer than spinning forever if one ever doesn't).
@@ -395,6 +412,8 @@ export class VFSFileSystem {
   private brokerHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
   /** Backoff for reopening a volume whose previous holder has not let go yet. */
   private volumeRetryDelayMs = 0;
+  /** When the current run of volume-open retries began (0 = not retrying). */
+  private volumeRetryStartedAt = 0;
   /** The service worker this instance registered its broker with, so it can deregister. */
   private brokerSw: { postMessage(message: unknown, transfer?: Transferable[]): void } | null = null;
   private brokerControlPort: MessagePort | null = null;
@@ -504,8 +523,10 @@ export class VFSFileSystem {
       if (msg.type === 'ready') {
         this.isReady = true;
         this.transitioning = false;
-        // Opened — so a later volume handoff starts from the fast retry again.
+        // Opened — so a later volume handoff starts from the fast retry again,
+        // and gets its own full deadline rather than inheriting this one's clock.
         this.volumeRetryDelayMs = 0;
+        this.volumeRetryStartedAt = 0;
         // Initialize async-relay AFTER sync-relay is ready to avoid
         // requests arriving before the leader loop is running.
         this.initAsyncRelay();
@@ -527,8 +548,9 @@ export class VFSFileSystem {
           // tab that was killed, crashed, or force-quit never got to say anything, and only
           // the browser's own reclaim ends that wait. Start fast for the first case, and grow
           // to the old interval so the second cannot spin.
-          this.volumeRetryDelayMs = Math.min((this.volumeRetryDelayMs || 0) * 2 || 25, 500);
-          setTimeout(() => this.sendLeaderInit(), this.volumeRetryDelayMs);
+          if (this.retryVolumeOpen(msg.error)) {
+            setTimeout(() => this.sendLeaderInit(), this.volumeRetryDelayMs);
+          }
         } else if (!('locks' in navigator)) {
           // No Web Locks fallback — become follower via OPFS handle detection
           this.startAsFollower();
@@ -643,6 +665,49 @@ export class VFSFileSystem {
         debug: this.config.debug,
       },
     });
+  }
+
+  /**
+   * Decide whether a failed volume open is worth another attempt.
+   *
+   * Returns true to retry (and advances the backoff), false once the attempt has
+   * been abandoned — in which case this has already failed the instance, exactly
+   * as a corrupt volume does, so `init()` rejects instead of hanging forever.
+   *
+   * The distinction that matters: "the previous holder has not let go yet" clears
+   * on its own, usually in milliseconds; "this origin has no usable OPFS" never
+   * does. Both arrive here as an `init-failed` message, and the second one used
+   * to be retried indefinitely — leaving `init()` unsettled, with no rejection
+   * and nothing in the console to explain it.
+   */
+  private retryVolumeOpen(error: string | undefined, label = 'Volume'): boolean {
+    const now = Date.now();
+    if (!this.volumeRetryStartedAt) this.volumeRetryStartedAt = now;
+
+    if (now - this.volumeRetryStartedAt < VOLUME_ACQUIRE_DEADLINE_MS) {
+      // Start fast — the common case frees within a few ms — then grow, so a
+      // holder that never lets go cannot spin the timer.
+      this.volumeRetryDelayMs = Math.min((this.volumeRetryDelayMs || 0) * 2 || 25, 500);
+      return true;
+    }
+
+    const err = new Error(
+      `Could not open the volume after ${Math.round((now - this.volumeRetryStartedAt) / 1000)}s: ${error ?? 'unknown error'}. `
+      + `The previous holder's exclusive handle is normally released within a few seconds, so this usually means the origin `
+      + `has no usable OPFS storage (private browsing, blocked site data, or an ephemeral automation profile).`,
+    );
+    console.error(`[VFS] ${label}: ${err.message}`);
+    this.volumeRetryStartedAt = 0;
+    this.volumeRetryDelayMs = 0;
+    this.initError = err;
+    this.rejectReady(err);
+    if (this.hasSAB) {
+      // Wake anything blocked in `ensureReady()` with the permanent-failure
+      // signal, or a sync caller would keep waiting for a volume that is not coming.
+      Atomics.store(this.readySignal, 0, -1);
+      Atomics.notify(this.readySignal, 0);
+    }
+    return false;
   }
 
   /** Handle VFS corruption: log error, fall back to OPFS-direct mode.
@@ -947,16 +1012,20 @@ export class VFSFileSystem {
       if (msg.type === 'ready') {
         this.isReady = true;
         this.transitioning = false;
+        // Same reason as the first-open handler: the deadline measures one run of retries, so it
+        // has to end when that run succeeds. Left set, it would still be running the next time
+        // this instance had to wait for a volume, and that wait would be abandoned on its first
+        // attempt — the ordinary handoff this retries for, failed as though it were permanent.
+        this.volumeRetryDelayMs = 0;
+        this.volumeRetryStartedAt = 0;
         this.resolveReady();
         this.fireReadyListeners();
         this.initLeaderBroker();
       } else if (msg.type === 'init-failed') {
         if (msg.error?.startsWith('Corrupt VFS:')) {
           this.handleCorruptVFS(msg.error);
-        } else {
-          // OPFS handle not yet released by dead leader — retry
-          console.warn('[VFS] Promotion: OPFS handle still busy, retrying...');
-          setTimeout(() => this.sendLeaderInit(), 500);
+        } else if (this.retryVolumeOpen(msg.error, 'Promotion')) {
+          setTimeout(() => this.sendLeaderInit(), this.volumeRetryDelayMs);
         }
       }
     };
