@@ -34,12 +34,19 @@ const encoder = new TextEncoder();
 const PREGROW_HEADROOM_BLOCKS = 16384;
 const decoder = new TextDecoder();
 
+/** Is `child` strictly below `parent` in the tree? Both must be normalized. */
+function isUnder(child: string, parent: string): boolean {
+  return parent === '/' ? child !== '/' : child.startsWith(parent + '/');
+}
+
 interface Inode {
   type: number;
   pathOffset: number;
   pathLength: number;
   mode: number;
   size: number;
+  /** Index of the first data block — or, for an INODE_TYPE.HARDLINK entry, the index of the
+   *  inode this name is a second name for (that entry owns no blocks). See INODE.LINK_TARGET. */
   firstBlock: number;
   blockCount: number;
   mtime: number;
@@ -155,6 +162,25 @@ export class VFSEngine {
   private childIndex = new Map<string, Map<string, number>>();
   private childIndexGen = 0;
 
+  // ---- Hard links ----
+  //
+  // A hard link is a second NAME for an existing inode, stored on disk as its own
+  // INODE_TYPE.HARDLINK entry holding that name plus the target's inode index. The
+  // path index maps the link's path straight to the TARGET inode, so read, write,
+  // stat, truncate and every other path operation reach one shared inode with no
+  // special-casing anywhere. These two maps hold the part the path index cannot
+  // express — which names are links, and which inode owns which name:
+  //
+  //   linkInodes        link path → the HARDLINK inode that owns that directory entry
+  //   linkPathsByTarget target idx → every link path pointing at it
+  //
+  // Both are rebuilt from the inode table in `rebuildIndex`, which is what makes the
+  // second name survive a reload. An earlier attempt registered the extra name only
+  // in `pathIndex`; since the index is rebuilt by scanning inodes, and an inode
+  // stores exactly one path, that name silently disappeared on the next mount.
+  private linkInodes = new Map<string, number>();
+  private linkPathsByTarget = new Map<number, Set<string>>();
+
   /** Where the next block search resumes — see allocateBlocks. Reset on mount/format. */
   private allocCursor = 0;
 
@@ -235,6 +261,12 @@ export class VFSEngine {
     // Reserve the bitmap region for `this.maxBlocks` (honors opts.limits.maxBlocks)
     // so the bitmap never overflows into the data region as the FS grows.
     const layout = calculateLayout(DEFAULT_INODE_COUNT, DEFAULT_BLOCK_SIZE, INITIAL_DATA_BLOCKS, this.maxBlocks);
+
+    // A fresh volume has no names at all. `mount` clears these via rebuildIndex;
+    // `format` has no rebuild, so it clears them here — an engine object can be
+    // re-init'd onto a different handle.
+    this.linkInodes.clear();
+    this.linkPathsByTarget.clear();
 
     this.inodeCount = DEFAULT_INODE_COUNT;
     this.blockSize = DEFAULT_BLOCK_SIZE;
@@ -558,6 +590,13 @@ export class VFSEngine {
   private rebuildIndex(): void {
     this.pathIndex.clear();
     this.inodeCache.clear();
+    this.linkInodes.clear();
+    this.linkPathsByTarget.clear();
+
+    // Hard-link entries are registered in a second pass: an entry can appear in the
+    // table before the inode it names, so its target is only guaranteed to be loaded
+    // once the whole table has been read.
+    const pendingLinks: { idx: number; path: string; targetIdx: number }[] = [];
 
     // Bulk read entire inode table (e.g. 640KB for 10k inodes)
     const inodeTableSize = this.inodeCount * INODE_SIZE;
@@ -577,7 +616,7 @@ export class VFSEngine {
       if (type === INODE_TYPE.FREE) continue;
 
       // Validate inode type
-      if (type < INODE_TYPE.FILE || type > INODE_TYPE.SYMLINK) {
+      if (type < INODE_TYPE.FILE || type > INODE_TYPE.HARDLINK) {
         throw new Error(`Corrupt VFS: inode ${i} has invalid type ${type}`);
       }
 
@@ -592,8 +631,10 @@ export class VFSEngine {
         throw new Error(`Corrupt VFS: inode ${i} path out of bounds (offset=${pathOffset}, len=${pathLength}, tableUsed=${this.pathTableUsed})`);
       }
 
-      // Validate data bounds for files/symlinks
-      if (type !== INODE_TYPE.DIRECTORY) {
+      // Validate data bounds for files/symlinks. A hard-link entry owns no data —
+      // its FIRST_BLOCK field is a target inode index, checked in the second pass —
+      // and a directory owns none either.
+      if (type === INODE_TYPE.FILE || type === INODE_TYPE.SYMLINK) {
         if (size < 0 || !isFinite(size)) {
           throw new Error(`Corrupt VFS: inode ${i} has invalid size ${size}`);
         }
@@ -632,8 +673,34 @@ export class VFSEngine {
         throw new Error(`Corrupt VFS: inode ${i} has invalid path "${path.substring(0, 50)}"`);
       }
 
+      if (type === INODE_TYPE.HARDLINK) {
+        // The name resolves to the TARGET, not to this entry — deferred so the
+        // target is known to be loaded. `firstBlock` is INODE.LINK_TARGET here.
+        pendingLinks.push({ idx: i, path, targetIdx: firstBlock });
+        continue;
+      }
+
       this.setPathIndex(path, i);
     }
+
+    // Second pass: point every hard-link name at the inode it names. This is what
+    // restores the shared inode across a remount.
+    for (const link of pendingLinks) {
+      const target = this.inodeCache.get(link.targetIdx);
+      if (!target) {
+        throw new Error(`Corrupt VFS: hard link inode ${link.idx} ("${link.path.substring(0, 50)}") targets inode ${link.targetIdx}, which is not in use`);
+      }
+      if (target.type !== INODE_TYPE.FILE && target.type !== INODE_TYPE.SYMLINK) {
+        throw new Error(`Corrupt VFS: hard link inode ${link.idx} targets inode ${link.targetIdx} of type ${target.type}, which cannot be hard-linked`);
+      }
+      if (this.pathIndex.has(link.path)) {
+        throw new Error(`Corrupt VFS: hard link inode ${link.idx} duplicates the path "${link.path.substring(0, 50)}"`);
+      }
+      this.setPathIndex(link.path, link.targetIdx);
+      this.linkInodes.set(link.path, link.idx);
+      this.trackLinkPath(link.targetIdx, link.path);
+    }
+
     this.pathIndexGen++;
   }
 
@@ -1184,6 +1251,195 @@ export class VFSEngine {
     return idx;
   }
 
+  // ========== Hard links ==========
+
+  /**
+   * Create the on-disk record for a second name.
+   *
+   * Unlike {@link createInode} this does NOT register the path against the entry it
+   * writes: the name has to resolve to `targetIdx`, so the caller sets the path index.
+   * The entry carries no metadata of its own — mode, size, ownership and timestamps all
+   * belong to the target and are read through it — so only the path and the target
+   * pointer are meaningful.
+   */
+  private createLinkInode(path: string, targetIdx: number): number {
+    const idx = this.findFreeInode();
+    const { offset: pathOff, length: pathLen } = this.appendPath(path);
+    const now = Date.now();
+
+    const inode: Inode = {
+      type: INODE_TYPE.HARDLINK,
+      pathOffset: pathOff,
+      pathLength: pathLen,
+      nlink: 1,
+      mode: 0,
+      size: 0,
+      firstBlock: targetIdx, // INODE.LINK_TARGET
+      blockCount: 0,
+      mtime: now,
+      ctime: now,
+      atime: now,
+      uid: this.processUid,
+      gid: this.processGid,
+    };
+
+    this.writeInode(idx, inode);
+    return idx;
+  }
+
+  private trackLinkPath(targetIdx: number, linkPath: string): void {
+    let paths = this.linkPathsByTarget.get(targetIdx);
+    if (!paths) {
+      paths = new Set<string>();
+      this.linkPathsByTarget.set(targetIdx, paths);
+    }
+    paths.add(linkPath);
+  }
+
+  private untrackLinkPath(targetIdx: number, linkPath: string): void {
+    const paths = this.linkPathsByTarget.get(targetIdx);
+    if (!paths) return;
+    paths.delete(linkPath);
+    if (paths.size === 0) this.linkPathsByTarget.delete(targetIdx);
+  }
+
+  /**
+   * How many names reach this inode: the one it stores itself, plus every hard link.
+   *
+   * This is what `stat` reports as `nlink`, in preference to the stored NLINK field.
+   * Deriving it means the count cannot drift from the names that actually exist, and it
+   * corrects volumes written before links were real — where `link()` copied the file and
+   * stamped `nlink: 2` on two inodes that were never related.
+   */
+  private nameCount(idx: number): number {
+    return 1 + (this.linkPathsByTarget.get(idx)?.size ?? 0);
+  }
+
+  /** Mark an inode slot free and make it available to the next allocation. */
+  private releaseInode(idx: number, inode: Inode): void {
+    inode.type = INODE_TYPE.FREE;
+    this.writeInode(idx, inode);
+    if (idx < this.freeInodeHint) this.freeInodeHint = idx;
+  }
+
+  /**
+   * Remove ONE name for `idx`, freeing exactly what that name owned.
+   *
+   * Every path that destroys a directory entry — `unlink`, the target-replacement and
+   * descendant sweeps in `rename`, recursive `rmdir` — goes through here, because
+   * "free the blocks and mark the inode free" is only correct for the *last* name. With
+   * hard links there are three cases:
+   *
+   *  - the name is a hard link → free the link entry alone; the file is untouched;
+   *  - the name is the one the inode stores, and links remain → promote a link to be
+   *    the inode's own name (the inode adopts its path, that link entry is freed), so
+   *    the data keeps a name that still resolves after a remount;
+   *  - it was the last name → free the data blocks and the inode.
+   *
+   * The decision is made from the link registry rather than the stored `nlink`, so a
+   * stale or bogus count on an old volume can neither leak blocks nor free live ones.
+   *
+   * The caller still owns `pathIndexGen++` and `commitPending()` — one bump and one
+   * commit per logical operation, not per name.
+   */
+  private removeName(path: string, idx: number): void {
+    const linkIdx = this.linkInodes.get(path);
+
+    if (linkIdx !== undefined) {
+      // A second name. Only its directory entry goes away.
+      this.linkInodes.delete(path);
+      this.untrackLinkPath(idx, path);
+      this.releaseInode(linkIdx, this.readInode(linkIdx));
+
+      const target = this.readInode(idx);
+      target.nlink = this.nameCount(idx);
+      target.ctime = Date.now();
+      this.writeInode(idx, target);
+      this.deletePathIndex(path);
+      return;
+    }
+
+    const inode = this.readInode(idx);
+    const links = this.linkPathsByTarget.get(idx);
+
+    if (links && links.size > 0) {
+      // The inode's own name is going, but other names still reach it. Adopt one of
+      // them: the inode takes over that path and the link entry for it is freed, which
+      // keeps the invariant that every live inode stores a path that resolves to it.
+      const promoted = links.values().next().value as string;
+      const promotedLinkIdx = this.linkInodes.get(promoted)!;
+      this.linkInodes.delete(promoted);
+      this.untrackLinkPath(idx, promoted);
+      this.releaseInode(promotedLinkIdx, this.readInode(promotedLinkIdx));
+
+      const { offset: pathOff, length: pathLen } = this.appendPath(promoted);
+      inode.pathOffset = pathOff;
+      inode.pathLength = pathLen;
+      inode.nlink = this.nameCount(idx);
+      inode.ctime = Date.now();
+      this.writeInode(idx, inode);
+      this.deletePathIndex(path);
+      return;
+    }
+
+    // Last name — the data and the inode go with it.
+    inode.nlink = 0;
+    this.freeBlockRange(inode.firstBlock, inode.blockCount);
+    this.releaseInode(idx, inode);
+    this.deletePathIndex(path);
+  }
+
+  /**
+   * Move the directory entry `oldPath` to `newPath`, rewriting whichever inode owns the
+   * name — the hard-link entry if it is a second name, otherwise the inode itself.
+   * Renaming a link must not touch the file it names, and renaming the file must not
+   * disturb the links pointing at it.
+   *
+   * The path index is the caller's to update; this only fixes the on-disk record and the
+   * link registry.
+   */
+  private repathName(oldPath: string, newPath: string, idx: number, touchMtime: boolean): void {
+    const linkIdx = this.linkInodes.get(oldPath);
+    const ownerIdx = linkIdx ?? idx;
+    const owner = this.readInode(ownerIdx);
+
+    const { offset: pathOff, length: pathLen } = this.appendPath(newPath);
+    owner.pathOffset = pathOff;
+    owner.pathLength = pathLen;
+    if (touchMtime) owner.mtime = Date.now();
+    this.writeInode(ownerIdx, owner);
+
+    if (linkIdx !== undefined) {
+      this.linkInodes.delete(oldPath);
+      this.linkInodes.set(newPath, linkIdx);
+      this.untrackLinkPath(idx, oldPath);
+      this.trackLinkPath(idx, newPath);
+    }
+  }
+
+  /**
+   * Every OTHER name that reaches the same inode as `path`.
+   *
+   * Empty for the overwhelmingly common case of a file with one name, and answered
+   * from a single map probe in that case. The OPFS mirror needs it: a write through
+   * one name changes the bytes behind all of them, but OPFS has no hard links, so each
+   * name is a separate file over there and has to be re-mirrored.
+   */
+  linkNamesFor(path: string): string[] {
+    path = this.normalizePath(path);
+    const idx = this.pathIndex.get(path);
+    if (idx === undefined) return [];
+    const links = this.linkPathsByTarget.get(idx);
+    if (!links || links.size === 0) return [];
+
+    const names: string[] = [];
+    const inode = this.readInode(idx);
+    const primary = this.readPath(inode.pathOffset, inode.pathLength);
+    if (primary !== path) names.push(primary);
+    for (const link of links) if (link !== path) names.push(link);
+    return names;
+  }
+
   // ========== Public API — called by server worker dispatch ==========
 
   /** Normalize a path: ensure leading /, resolve . and .. */
@@ -1424,21 +1680,11 @@ export class VFSEngine {
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
 
-    // Decrement nlink; only free data when it reaches 0
-    inode.nlink = Math.max(0, inode.nlink - 1);
-
-    // Free data blocks
-    this.freeBlockRange(inode.firstBlock, inode.blockCount);
-
-    // Mark inode as free
-    inode.type = INODE_TYPE.FREE;
-    this.writeInode(idx, inode);
-
-    // Remove from index
-    this.deletePathIndex(path);
+    // Drop this one name. removeName frees the data blocks only when it was the last
+    // name for the inode — unlinking one of two hard links leaves the file intact,
+    // reachable through the other, exactly as unlink(2) does.
+    this.removeName(path, idx);
     this.pathIndexGen++;
-    // Reset free inode hint
-    if (idx < this.freeInodeHint) this.freeInodeHint = idx;
 
     this.commitPending();
     return { status: 0 };
@@ -1492,13 +1738,13 @@ export class VFSEngine {
   private encodeStatResponse(idx: number): { status: number; data: Uint8Array } {
     const inode = this.readInode(idx);
 
-    // Compute nlink for directories: 2 + number of child subdirectories
-    // (including implicit subdirectories so nlink stays consistent with
-    // what readdir reports).
-    let nlink = inode.nlink;
-    if (inode.type === INODE_TYPE.DIRECTORY) {
-      nlink = 2 + this.countSubdirectories(this.readPath(inode.pathOffset, inode.pathLength));
-    }
+    // nlink is derived, never read back from the record, so it always equals the number
+    // of names that actually reach this inode. For a directory that is 2 + its child
+    // subdirectories (implicit ones included, so the count agrees with readdir); for
+    // everything else it is its own name plus every hard link pointing at it.
+    const nlink = inode.type === INODE_TYPE.DIRECTORY
+      ? 2 + this.countSubdirectories(this.readPath(inode.pathOffset, inode.pathLength))
+      : this.nameCount(idx);
 
     // Encode stat into binary: type(1) + mode(4) + size(8) + mtime(8) + ctime(8) + atime(8) + uid(4) + gid(4) + ino(4) + nlink(4) = 53 bytes
     const buf = new Uint8Array(53);
@@ -1603,12 +1849,7 @@ export class VFSEngine {
           // Recursive: delete all real descendants; the implicit dir
           // disappears automatically when its children are gone.
           for (const desc of this.getAllDescendants(path)) {
-            const descIdx = this.pathIndex.get(desc)!;
-            const descInode = this.readInode(descIdx);
-            this.freeBlockRange(descInode.firstBlock, descInode.blockCount);
-            descInode.type = INODE_TYPE.FREE;
-            this.writeInode(descIdx, descInode);
-            this.deletePathIndex(desc);
+            this.removeName(desc, this.pathIndex.get(desc)!);
           }
           this.pathIndexGen++;
           this.commitPending();
@@ -1628,14 +1869,10 @@ export class VFSEngine {
     if (children.length > 0) {
       if (!recursive) return { status: CODE_TO_STATUS.ENOTEMPTY };
 
-      // Recursive delete
+      // Recursive delete. removeName keeps a file alive when a hard link outside this
+      // subtree still names it, and frees the link entry when the link is the one inside.
       for (const child of this.getAllDescendants(path)) {
-        const childIdx = this.pathIndex.get(child)!;
-        const childInode = this.readInode(childIdx);
-        this.freeBlockRange(childInode.firstBlock, childInode.blockCount);
-        childInode.type = INODE_TYPE.FREE;
-        this.writeInode(childIdx, childInode);
-        this.deletePathIndex(child);
+        this.removeName(child, this.pathIndex.get(child)!);
       }
     }
 
@@ -1651,11 +1888,8 @@ export class VFSEngine {
       return { status: 0 };
     }
 
-    inode.type = INODE_TYPE.FREE;
-    this.writeInode(idx, inode);
-    this.deletePathIndex(path);
+    this.removeName(path, idx);
     this.pathIndexGen++;
-    if (idx < this.freeInodeHint) this.freeInodeHint = idx;
 
     this.commitPending();
     return { status: 0 };
@@ -1766,6 +2000,27 @@ export class VFSEngine {
     // Same path → no-op (matches Node.js semantics)
     if (oldPath === newPath) return { status: 0 };
 
+    // Two different names for the SAME inode — hard links to each other. rename(2) is
+    // defined to succeed and do nothing here, and it has to: the replace-then-move path
+    // below would free the inode as the target and then rename the entry that named it.
+    if (this.pathIndex.get(newPath) === idx) return { status: 0 };
+
+    // Ancestry guards. Both of these used to report success and then destroy the tree,
+    // because the descendant sweep below and the move itself end up operating on each
+    // other: renaming `/d/sub` onto `/d` freed `/d/sub` as a descendant of the target and
+    // then moved the inode it had just freed (after a remount the whole tree was gone),
+    // and renaming `/d` into `/d/sub` re-listed the moved directory as its own descendant
+    // and renamed it again, to `/d/sub/sub`. Node reports ENOTEMPTY and EINVAL, and does
+    // nothing. Only meaningful for a directory source: a file cannot have a path under it,
+    // and file-onto-directory is already EISDIR below.
+    if (this.readInode(idx).type === INODE_TYPE.DIRECTORY) {
+      // A directory cannot become a subdirectory of itself.
+      if (isUnder(newPath, oldPath)) return { status: CODE_TO_STATUS.EINVAL };
+      // …and it cannot replace one of its own ancestors: that directory is not empty —
+      // it contains the source.
+      if (isUnder(oldPath, newPath)) return { status: CODE_TO_STATUS.ENOTEMPTY };
+    }
+
     // Ensure parent of new path exists
     const parentStatus = this.ensureParent(newPath);
     if (parentStatus !== 0) return { status: parentStatus };
@@ -1811,13 +2066,10 @@ export class VFSEngine {
       let cleanDescendants = targetIsImplicitDir;
 
       if (existingIdx !== undefined) {
-        const existingInode = this.readInode(existingIdx);
-        cleanDescendants = existingInode.type === INODE_TYPE.DIRECTORY;
-        this.freeBlockRange(existingInode.firstBlock, existingInode.blockCount);
-        existingInode.type = INODE_TYPE.FREE;
-        this.writeInode(existingIdx, existingInode);
-        this.deletePathIndex(newPath);
-        if (existingIdx < this.freeInodeHint) this.freeInodeHint = existingIdx;
+        cleanDescendants = this.readInode(existingIdx).type === INODE_TYPE.DIRECTORY;
+        // Through removeName, so replacing a name that is a hard link — or a file that
+        // still has links elsewhere — drops the name without destroying the data.
+        this.removeName(newPath, existingIdx);
       }
 
       if (cleanDescendants) {
@@ -1826,24 +2078,15 @@ export class VFSEngine {
         // rmdir's recursive path) — though for a flat free pass order
         // doesn't affect correctness here.
         for (const desc of this.getAllDescendants(newPath)) {
-          const descIdx = this.pathIndex.get(desc)!;
-          const descInode = this.readInode(descIdx);
-          this.freeBlockRange(descInode.firstBlock, descInode.blockCount);
-          descInode.type = INODE_TYPE.FREE;
-          this.writeInode(descIdx, descInode);
-          this.deletePathIndex(desc);
-          if (descIdx < this.freeInodeHint) this.freeInodeHint = descIdx;
+          this.removeName(desc, this.pathIndex.get(desc)!);
         }
       }
     }
 
-    // Update inode with new path
+    // Move the directory entry to its new path. For a hard-link name this rewrites the
+    // link record; for anything else, the inode's own stored path.
     const inode = this.readInode(idx);
-    const { offset: pathOff, length: pathLen } = this.appendPath(newPath);
-    inode.pathOffset = pathOff;
-    inode.pathLength = pathLen;
-    inode.mtime = Date.now();
-    this.writeInode(idx, inode);
+    this.repathName(oldPath, newPath, idx, true);
 
     // Update index
     this.deletePathIndex(oldPath);
@@ -1864,11 +2107,7 @@ export class VFSEngine {
       for (const [p, i] of toRename) {
         const suffix = p.substring(oldPath.length);
         const childNewPath = newPath + suffix;
-        const childInode = this.readInode(i);
-        const { offset: cpo, length: cpl } = this.appendPath(childNewPath);
-        childInode.pathOffset = cpo;
-        childInode.pathLength = cpl;
-        this.writeInode(i, childInode);
+        this.repathName(p, childNewPath, i, false);
         this.deletePathIndex(p);
         this.setPathIndex(childNewPath, i);
       }
@@ -2186,7 +2425,20 @@ export class VFSEngine {
     return { status: 0, data: target };
   }
 
-  // ---- LINK (hard link — copies the file data, tracks nlink) ----
+  /**
+   * link(2) — a real second name for one inode, not a copy.
+   *
+   * `newPath` becomes an INODE_TYPE.HARDLINK entry holding that name and the target's
+   * inode index, and the path index maps it straight to the target. So the two names
+   * share an inode number, a write through either is visible through the other, and
+   * `nlink` counts the names that exist. The entry is in the inode table, so the mount
+   * scan rebuilds the second name — the property the previous in-memory-only attempt
+   * lacked, which made every link vanish on reload.
+   *
+   * Linking a directory is EPERM, as it is on Linux. The final component of
+   * `existingPath` is resolved through symlinks (long-standing behaviour here), so a
+   * link to a symlink names the file the symlink points at.
+   */
   link(existingPath: string, newPath: string): { status: number } {
     existingPath = this.normalizePath(existingPath);
     newPath = this.normalizePath(newPath);
@@ -2201,22 +2453,23 @@ export class VFSEngine {
       return { status: CODE_TO_STATUS.EEXIST };
     }
 
-    // Copy file data to new inode
-    const result = this.copy(existingPath, newPath);
-    if (result.status !== 0) return result;
+    const parentStatus = this.ensureParent(newPath);
+    if (parentStatus !== 0) return { status: parentStatus };
 
-    // Increment nlink on source
-    srcInode.nlink++;
+    const linkIdx = this.createLinkInode(newPath, srcIdx);
+    this.linkInodes.set(newPath, linkIdx);
+    this.trackLinkPath(srcIdx, newPath);
+    this.setPathIndex(newPath, srcIdx);
+    this.pathIndexGen++;
+
+    // link(2) changes the target's ctime — the inode gained a name — and nothing else
+    // about it. The stored count is kept in step with the derived one so the record on
+    // disk is meaningful to anything reading it directly (the repair worker, say).
+    srcInode.nlink = this.nameCount(srcIdx);
+    srcInode.ctime = Date.now();
     this.writeInode(srcIdx, srcInode);
 
-    // Set nlink on destination to match source
-    const destIdx = this.pathIndex.get(newPath);
-    if (destIdx !== undefined) {
-      const destInode = this.readInode(destIdx);
-      destInode.nlink = srcInode.nlink;
-      this.writeInode(destIdx, destInode);
-    }
-
+    this.commitPending();
     return { status: 0 };
   }
 
@@ -2460,8 +2713,11 @@ export class VFSEngine {
 
     // Distinct inode indices in the path index, not a pass over the inode table: the table lives
     // on disk, so scanning it would mean one read per slot (100k by default). Counting distinct
-    // values is exact rather than approximate — hard links share an inode and must count once.
-    const usedInodes = new Set(this.pathIndex.values()).size;
+    // values is exact rather than approximate — the two names of a hard link resolve to one
+    // index and must count once. The link's own directory entry occupies a table slot of its
+    // own in this format, though, so `linkInodes` is added: `ffree` is capacity, and those
+    // slots are genuinely spent.
+    const usedInodes = new Set(this.pathIndex.values()).size + this.linkInodes.size;
 
     const buf = new Uint8Array(24);
     const dv = new DataView(buf.buffer);

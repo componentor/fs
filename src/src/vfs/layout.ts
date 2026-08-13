@@ -35,7 +35,7 @@ export const SUPERBLOCK = {
 
 // Inode entry layout (64 bytes each)
 export const INODE = {
-  TYPE: 0,            // uint8 - 0=free, 1=file, 2=directory, 3=symlink
+  TYPE: 0,            // uint8 - 0=free, 1=file, 2=directory, 3=symlink, 4=hard link
   FLAGS: 1,           // uint8[3] - reserved
   PATH_OFFSET: 4,     // uint32 - byte offset into path table
   PATH_LENGTH: 8,     // uint16 - length of path string
@@ -43,6 +43,14 @@ export const INODE = {
   MODE: 12,           // uint32 - permissions (e.g. 0o100644)
   SIZE: 16,           // float64 - file content size in bytes (using f64 for >4GB)
   FIRST_BLOCK: 24,    // uint32 - index of first data block
+  /**
+   * Alias of FIRST_BLOCK, used only by INODE_TYPE.HARDLINK entries: the index of
+   * the inode this name is a second name for. A hard-link entry owns no data
+   * blocks (BLOCK_COUNT is 0 and SIZE is 0), so the field is free to carry the
+   * pointer — which is what lets a second name survive a remount without adding
+   * a field to the 64-byte record or changing anything an older volume wrote.
+   */
+  LINK_TARGET: 24,    // uint32 - HARDLINK only: index of the target inode
   BLOCK_COUNT: 28,    // uint32 - number of contiguous data blocks
   MTIME: 32,          // float64 - last modification time (ms since epoch)
   CTIME: 40,          // float64 - creation/change time (ms since epoch)
@@ -51,12 +59,27 @@ export const INODE = {
   GID: 60,            // uint32 - group
 } as const;
 
-// Inode type constants
+/**
+ * Inode type constants.
+ *
+ * `HARDLINK` is a *directory entry*, not a file: it stores a path of its own and
+ * points at the inode that path is a second name for (see INODE.LINK_TARGET). The
+ * path index maps its path straight to the target, so every read, write and stat
+ * through either name reaches one inode — and because the entry lives in the inode
+ * table, the second name is rebuilt on mount instead of vanishing with the tab.
+ *
+ * The volume format version is deliberately NOT bumped for it. Nothing about the
+ * records an older build wrote changes, so new code mounts old volumes unchanged;
+ * an older build meeting a volume that *does* contain hard links rejects it as
+ * corrupt and hands it to the repair worker, which recovers every file under its
+ * own name and drops only the extra link names.
+ */
 export const INODE_TYPE = {
   FREE: 0,
   FILE: 1,
   DIRECTORY: 2,
   SYMLINK: 3,
+  HARDLINK: 4,
 } as const;
 
 // Default file modes

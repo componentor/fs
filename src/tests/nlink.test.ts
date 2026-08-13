@@ -106,19 +106,29 @@ describe('nlink', () => {
     expect(statOf(engine, '/a.txt').nlink).toBe(2);
     expect(statOf(engine, '/b.txt').nlink).toBe(2);
 
-    // Unlink one
+    // Unlink one. `link()` adds a name to one inode rather than copying the file, so
+    // removing that name leaves a single-named file behind — not, as it once did, a
+    // second independent copy still claiming a link that no longer exists.
     engine.unlink('/b.txt');
 
-    // Source should be back to 1
-    // Note: since this VFS copies data on link(), unlinking the dest
-    // decrements the dest inode's nlink. The source nlink remains at 2
-    // because it's a separate inode. We track nlink per-inode.
-    // However, the source nlink was incremented to 2 during link(),
-    // and unlink of b.txt only affects b.txt's inode.
-    // The source's nlink stays at 2 in this implementation.
-    // For the test, we verify the remaining file has the expected nlink.
-    const statsA = statOf(engine, '/a.txt');
-    expect(statsA.nlink).toBe(2);
+    expect(statOf(engine, '/a.txt').nlink).toBe(1);
+    // The remaining name still has the data; nothing was freed underneath it.
+    expect(new TextDecoder().decode(engine.read('/a.txt').data!)).toBe('data');
+  });
+
+  it('unlinking the ORIGINAL name leaves the link holding the file', () => {
+    engine.write('/a.txt', new TextEncoder().encode('data'));
+    engine.link('/a.txt', '/b.txt');
+    const ino = statOf(engine, '/a.txt').ino;
+
+    engine.unlink('/a.txt');
+
+    // The inode outlives the name it was created under: same inode, same bytes.
+    const statsB = statOf(engine, '/b.txt');
+    expect(statsB.nlink).toBe(1);
+    expect(statsB.ino).toBe(ino);
+    expect(new TextDecoder().decode(engine.read('/b.txt').data!)).toBe('data');
+    expect(engine.read('/a.txt').status).not.toBe(0);
   });
 
   it('directory has nlink >= 2', () => {
@@ -172,11 +182,17 @@ describe('nlink', () => {
     engine.link('/orig.txt', '/link1.txt');
     engine.link('/orig.txt', '/link2.txt');
 
-    // Source was incremented twice
-    expect(statOf(engine, '/orig.txt').nlink).toBe(3);
-    // Each link gets the nlink at the time of linking
-    expect(statOf(engine, '/link1.txt').nlink).toBe(2);
-    expect(statOf(engine, '/link2.txt').nlink).toBe(3);
+    // Three names, one inode — so every name reports the same count of three. (When
+    // links were copies each name reported whatever the count happened to be at the
+    // moment it was made: 3, 2 and 3 for these three names.)
+    for (const p of ['/orig.txt', '/link1.txt', '/link2.txt']) {
+      expect(statOf(engine, p).nlink, p).toBe(3);
+    }
+
+    // …and the count falls back as names go, from every name.
+    engine.unlink('/link1.txt');
+    expect(statOf(engine, '/orig.txt').nlink).toBe(2);
+    expect(statOf(engine, '/link2.txt').nlink).toBe(2);
   });
 
   it('stat response is 53 bytes with nlink field', () => {

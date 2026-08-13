@@ -230,6 +230,19 @@ async function handleRepair(root: string) {
     /** true when inode was found but data blocks were out of bounds */
     contentLost: boolean;
   }> = [];
+  // Hard-link entries name an inode rather than owning data, so they are replayed as
+  // `link()` calls once their target exists under its own name. `byInode` is how the
+  // target index in the damaged table is turned back into a path.
+  const hardlinks: Array<{ path: string; targetIdx: number }> = [];
+  const byInode = new Map<number, { path: string; type: number; size: number }>();
+  /**
+   * Files and symlinks whose data is intact but whose stored path is not — held back
+   * rather than discarded, because a hard link may still name one. See the adoption pass
+   * after the scan.
+   */
+  const nameless = new Map<number, { type: number; dataOffset: number; dataSize: number; contentLost: boolean }>();
+  /** Link names successfully rebuilt — reported alongside the recovered inodes. */
+  const recoveredLinks: Array<{ path: string; size: number }> = [];
   let lost = 0;
 
   const maxInodes = Math.min(inodeCount, Math.floor((fileSize - inodeTableOffset) / INODE_SIZE));
@@ -239,7 +252,7 @@ async function handleRepair(root: string) {
     if (off + INODE_SIZE > fileSize) break;
 
     const type = raw[off + INODE.TYPE];
-    if (type < INODE_TYPE.FILE || type > INODE_TYPE.SYMLINK) continue;
+    if (type < INODE_TYPE.FILE || type > INODE_TYPE.HARDLINK) continue;
 
     const inodeView = new DataView(raw.buffer, off, INODE_SIZE);
     const pathOff = inodeView.getUint32(INODE.PATH_OFFSET, true);
@@ -247,36 +260,41 @@ async function handleRepair(root: string) {
     const size = inodeView.getFloat64(INODE.SIZE, true);
     const firstBlock = inodeView.getUint32(INODE.FIRST_BLOCK, true);
 
-    // Validate path bounds against the allocated path table region and file size.
-    // Use pathTableSize (not PATH_USED from superblock) because PATH_USED may be
-    // stale if the superblock wasn't flushed — the path bytes are still on disk.
+    // Decode the stored path, or leave it null. Bounds are validated against the
+    // allocated path table region and the file size — using pathTableSize rather than
+    // PATH_USED from the superblock, because PATH_USED may be stale if the superblock
+    // wasn't flushed while the path bytes themselves reached disk. Strict UTF-8
+    // (fatal: true) rejects invalid sequences.
     const absPathOffset = pathTableOffset + pathOff;
-    if (pathLength === 0 || pathLength > 4096 ||
-        absPathOffset + pathLength > fileSize ||
-        pathOff + pathLength > pathTableSize) {
-      lost++;
-      continue;
+    let entryPath: string | null = null;
+    if (pathLength > 0 && pathLength <= 4096 &&
+        absPathOffset + pathLength <= fileSize &&
+        pathOff + pathLength <= pathTableSize) {
+      try {
+        const decoded = decoder.decode(raw.subarray(absPathOffset, absPathOffset + pathLength));
+        if (decoded.startsWith('/') && !decoded.includes('\0')) entryPath = decoded;
+      } catch { /* invalid UTF-8 — treated as no path at all */ }
     }
 
-    // Decode path with strict UTF-8 (fatal: true rejects invalid sequences)
-    let entryPath: string;
-    try {
-      entryPath = decoder.decode(raw.subarray(absPathOffset, absPathOffset + pathLength));
-    } catch {
-      lost++;
-      continue;
-    }
-
-    if (!entryPath.startsWith('/') || entryPath.includes('\0')) {
-      lost++;
+    if (type === INODE_TYPE.HARDLINK) {
+      // No data of its own — FIRST_BLOCK is INODE.LINK_TARGET, the inode it names. A
+      // link with no readable path of its own is nothing: it names something, but under
+      // no name anyone can reach.
+      if (entryPath === null) { lost++; continue; }
+      hardlinks.push({ path: entryPath, targetIdx: firstBlock });
       continue;
     }
 
     if (type === INODE_TYPE.DIRECTORY) {
+      if (entryPath === null) { lost++; continue; }
+      byInode.set(i, { path: entryPath, type, size: 0 });
       recovered.push({ path: entryPath, type, dataOffset: 0, dataSize: 0, contentLost: false });
       continue;
     }
 
+    // FILE or SYMLINK. The data extent is validated even when the path did not survive:
+    // an inode with intact data and an unreadable path is still recoverable if a hard
+    // link names it, so the decision to give up is deferred to the adoption pass below.
     if (size < 0 || size > fileSize || !isFinite(size)) {
       lost++;
       continue;
@@ -284,15 +302,41 @@ async function handleRepair(root: string) {
 
     const blockCount = inodeView.getUint32(INODE.BLOCK_COUNT, true);
     const dataStart = dataOffset + firstBlock * blockSize;
-    if (dataStart + size > fileSize || firstBlock >= totalBlocks ||
-        (blockCount > 0 && firstBlock + blockCount > totalBlocks)) {
-      // Inode metadata is valid but data blocks are out of bounds — content is lost
-      recovered.push({ path: entryPath, type, dataOffset: 0, dataSize: 0, contentLost: true });
-      lost++;
+    // Inode metadata is valid but data blocks are out of bounds — content is lost
+    const outOfBounds = dataStart + size > fileSize || firstBlock >= totalBlocks ||
+      (blockCount > 0 && firstBlock + blockCount > totalBlocks);
+    const content = outOfBounds
+      ? { dataOffset: 0, dataSize: 0, contentLost: true }
+      : { dataOffset: dataStart, dataSize: size, contentLost: false };
+
+    if (entryPath === null) {
+      nameless.set(i, { type, ...content });
       continue;
     }
 
-    recovered.push({ path: entryPath, type, dataOffset: dataStart, dataSize: size, contentLost: false });
+    if (outOfBounds) lost++;
+    byInode.set(i, { path: entryPath, type, size: content.dataSize });
+    recovered.push({ path: entryPath, type, ...content });
+  }
+
+  // Adoption pass: a file whose own path was unreadable is not lost if a hard link still
+  // names it. The link's path becomes the name the file is recovered under — it is the
+  // one directory entry that reached this inode and survived — and any further links to
+  // the same inode are replayed against it as usual. Without this an intact file was
+  // discarded because the single damaged thing about it was the one path it stored,
+  // while a perfectly good second name for it sat in the table unused.
+  for (const [idx, entry] of nameless) {
+    const at = hardlinks.findIndex(l => l.targetIdx === idx);
+    if (at === -1) {
+      // No name reached this inode at all. Now it is genuinely lost.
+      lost++;
+      continue;
+    }
+    // Consumed: this entry is no longer a second name, it is the file's only one.
+    const [adopted] = hardlinks.splice(at, 1);
+    if (entry.contentLost) lost++;
+    byInode.set(idx, { path: adopted.path, type: entry.type, size: entry.dataSize });
+    recovered.push({ path: adopted.path, type: entry.type, dataOffset: entry.dataOffset, dataSize: entry.dataSize, contentLost: entry.contentLost });
   }
 
   // Build repaired VFS in temp file — original .vfs.bin untouched until verified
@@ -362,6 +406,26 @@ async function handleRepair(root: string) {
       if (engine.symlink(target, sym.path).status !== 0) lost++;
     }
 
+    // Replay hard links last: the inode they name has to exist under its own name first.
+    // Recreating them as `link()` rebuilds the shared inode rather than duplicating the
+    // file, so a repaired volume keeps the property the links were made for.
+    //
+    // Only one thing is checked here — whether the target survived under some name. A
+    // target that survived but cannot be hard-linked (a directory, which is corruption:
+    // `link()` refuses one with EPERM, so no such entry can have been written) needs no
+    // check of its own, because the `status !== 0` below is that check. Testing the type
+    // as well would be a second way to reach an outcome that already has one.
+    for (const link of hardlinks) {
+      const target = byInode.get(link.targetIdx);
+      if (!target) {
+        // The inode this name pointed at did not survive — the name has nothing to name.
+        lost++;
+        continue;
+      }
+      if (engine.link(target.path, link.path).status !== 0) lost++;
+      else recoveredLinks.push({ path: link.path, size: target.size });
+    }
+
     engine.flush();
     repairOk = true;
   } finally {
@@ -389,7 +453,15 @@ async function handleRepair(root: string) {
       type: (e.type === INODE_TYPE.FILE ? 'file' : e.type === INODE_TYPE.DIRECTORY ? 'directory' : 'symlink') as 'file' | 'directory' | 'symlink',
       size: e.dataSize,
       contentLost: e.contentLost,
-    }));
+    }))
+    // A rebuilt hard link is a second name for a file that is already in the list — it is
+    // reported as the file it names, which is what it now is on the repaired volume.
+    .concat(recoveredLinks.map(l => ({
+      path: l.path,
+      type: 'file' as const,
+      size: l.size,
+      contentLost: false,
+    })));
 
   return { recovered: entries.length, lost, entries };
 }

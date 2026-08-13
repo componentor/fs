@@ -762,6 +762,98 @@ describe('parity: rm, link, access, realpath, utimes, glob', () => {
     );
   });
 
+  it('a write through one hard link is visible through the other', () => {
+    // The defining property of a hard link, and the one `link()` did not have while it
+    // copied the file: the two names were separate inodes, so this returned the original
+    // bytes here and the new bytes on node.
+    same(
+      () => {
+        writeFileSync(harness.request, '/a', 'first');
+        linkSync(harness.request, '/a', '/b');
+        writeFileSync(harness.request, '/b', 'second, rather longer');
+        const s = statSync(harness.request, '/a') as nodefs.Stats;
+        return [text(readFileSync(harness.request, '/a', 'utf8')), s.size, s.nlink];
+      },
+      () => {
+        nodefs.writeFileSync(real('a'), 'first');
+        nodefs.linkSync(real('a'), real('b'));
+        nodefs.writeFileSync(real('b'), 'second, rather longer');
+        const s = nodefs.statSync(real('a'));
+        return [nodefs.readFileSync(real('a'), 'utf8'), s.size, s.nlink];
+      }
+    );
+  });
+
+  it('nlink falls back as names are removed', () => {
+    same(
+      () => {
+        writeFileSync(harness.request, '/a', 'x');
+        linkSync(harness.request, '/a', '/b');
+        linkSync(harness.request, '/a', '/c');
+        const three = (statSync(harness.request, '/c') as nodefs.Stats).nlink;
+        unlinkSync(harness.request, '/a');
+        return [three, (statSync(harness.request, '/b') as nodefs.Stats).nlink];
+      },
+      () => {
+        nodefs.writeFileSync(real('a'), 'x');
+        nodefs.linkSync(real('a'), real('b'));
+        nodefs.linkSync(real('a'), real('c'));
+        const three = nodefs.statSync(real('c')).nlink;
+        nodefs.unlinkSync(real('a'));
+        return [three, nodefs.statSync(real('b')).nlink];
+      }
+    );
+  });
+
+  it('two names for one file report one inode number', () => {
+    // Inode numbers themselves are not comparable across the two filesystems, but whether
+    // two names share one is — it is what `[ a -ef b ]` and `find -samefile` test.
+    same(
+      () => {
+        writeFileSync(harness.request, '/a', 'x');
+        writeFileSync(harness.request, '/other', 'x');
+        linkSync(harness.request, '/a', '/b');
+        const [a, b, o] = ['/a', '/b', '/other'].map(p => (statSync(harness.request, p) as nodefs.Stats).ino);
+        return [a === b, a === o];
+      },
+      () => {
+        nodefs.writeFileSync(real('a'), 'x');
+        nodefs.writeFileSync(real('other'), 'x');
+        nodefs.linkSync(real('a'), real('b'));
+        const [a, b, o] = ['a', 'b', 'other'].map(p => nodefs.statSync(real(p)).ino);
+        return [a === b, a === o];
+      }
+    );
+  });
+
+  it('a directory cannot be renamed into or over itself', () => {
+    // Both of these used to report success and destroy the tree.
+    same(
+      () => {
+        mkdirSync(harness.request, '/d/sub', { recursive: true });
+        writeFileSync(harness.request, '/d/f', 'x');
+        const into = compare(() => renameSync(harness.request, '/d', '/d/sub'), () => {});
+        const over = compare(() => renameSync(harness.request, '/d/sub', '/d'), () => {});
+        return [
+          into.ours, over.ours,
+          text(readFileSync(harness.request, '/d/f', 'utf8')),
+          readdirSync(harness.request, '/d'),
+        ];
+      },
+      () => {
+        nodefs.mkdirSync(join(real('d'), 'sub'), { recursive: true });
+        nodefs.writeFileSync(join(real('d'), 'f'), 'x');
+        const into = compare(() => nodefs.renameSync(real('d'), join(real('d'), 'sub')), () => {});
+        const over = compare(() => nodefs.renameSync(join(real('d'), 'sub'), real('d')), () => {});
+        return [
+          into.ours, over.ours,
+          nodefs.readFileSync(join(real('d'), 'f'), 'utf8'),
+          nodefs.readdirSync(real('d')),
+        ];
+      }
+    );
+  });
+
   it('link onto an existing path gives the same error code', () => {
     writeFileSync(harness.request, '/a', 'x');
     writeFileSync(harness.request, '/b', 'y');

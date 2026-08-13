@@ -76,16 +76,26 @@ describe('statfs tracks the volume', () => {
     expect(fs.statfsSync('/').ffree).toBe(before.ffree);
   });
 
-  it('a hard link consumes an inode here, because links are copies', () => {
-    // On a real filesystem a hard link adds a name, not an inode, and `ffree` would not move.
-    // It moves here because `link` copies the file: the on-disk format stores one path per inode
-    // (INODE.PATH_OFFSET/PATH_LENGTH), so two names cannot share one. See the hard-link entry
-    // under "Known divergences" in the readme. This asserts what actually happens rather than
-    // what should — if links ever become real, this test is the one that should fail.
+  it('a hard link shares the file but still spends an inode-table slot', () => {
+    // A hard link adds a NAME: both names resolve to one inode, so no second copy of the
+    // data is made and `bfree` does not move. `ffree` does, and that is not the old
+    // copy behaviour resurfacing — this format keeps directory entries in the inode
+    // table, so the link's own entry (INODE_TYPE.HARDLINK: its path plus the target's
+    // index) occupies exactly one slot. `ffree` reports capacity, and that slot is spent.
     fs.writeFileSync('/a', 'shared');
     const before = fs.statfsSync('/');
     fs.linkSync('/a', '/b');
-    expect(fs.statfsSync('/').ffree).toBe(before.ffree - 1);
+    const after = fs.statfsSync('/');
+
+    expect(after.ffree).toBe(before.ffree - 1);
+    expect(after.bfree, 'no data blocks — the file is not copied').toBe(before.bfree);
+    expect(fs.statSync('/b').ino).toBe(fs.statSync('/a').ino);
+    expect(fs.statSync('/a').nlink).toBe(2);
+
+    // Removing the link returns the slot, and the file it named is untouched.
+    fs.unlinkSync('/b');
+    expect(fs.statfsSync('/').ffree).toBe(before.ffree);
+    expect(fs.readFileSync('/a', 'utf8')).toBe('shared');
   });
 
   it('does not report the same numbers regardless of contents', () => {

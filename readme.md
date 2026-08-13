@@ -435,12 +435,17 @@ All deliberate:
   the process* on two of these — copying onto an existing dangling link, and copying a tree
   containing a cyclic link — with uncaught C++ exceptions rather than throwable errors. We copy
   links as links and always terminate. Ordinary copies match Node exactly, permissions included.
-- **Hard links are copies.** `link()` duplicates the file rather than adding a second name for
-  one inode, and reports `nlink: 2` on both. Writing through one name does **not** change the
-  other — the defining property of a real hard link. The on-disk format stores exactly one path
-  per inode (`INODE.PATH_OFFSET`/`PATH_LENGTH`), so sharing would need a directory-entry table
-  and a format migration; that is not something to change underneath existing volumes. Symlinks
-  are real and behave correctly.
+- **Hard links are real.** They were copies once, and this entry used to say so.
+  `link()` adds a second *name* for one inode: both names share an inode number, a write
+  through either is visible through the other, `nlink` counts the names that exist, and the data
+  is freed only when the last one goes. The name is stored on disk as its own inode-table entry
+  (`INODE_TYPE.HARDLINK`: its path plus the target's index), so it is rebuilt by the mount scan
+  and survives a reload — an in-memory-only second name would not, since the path index is
+  rebuilt from inodes and an inode stores exactly one path. Two things still differ from a
+  POSIX filesystem: the link's entry occupies an inode-table slot, so `statfs().ffree` falls by
+  one per link, and the `opfs` mirror has no way to represent sharing, so each name is a
+  separate file there (kept in step on every write, but a hard link that reaches OPFS and comes
+  back through a repair/load is two independent files).
 - **No `ENAMETOOLONG`.** Real filesystems cap a path component at 255 bytes; we accept longer
   names. Enforcing the limit would reject names existing volumes may already contain, so the
   cap is left off.

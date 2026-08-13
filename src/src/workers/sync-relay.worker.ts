@@ -1509,6 +1509,22 @@ function resyncSymlinksFor(path: string): void {
 }
 
 /**
+ * Re-mirror the OTHER names of a hard-linked file after a write through one of them.
+ *
+ * In the VFS the names share an inode, so one write changes what all of them read. OPFS
+ * has no hard links, so over there each name is an independent file and the ones that
+ * were not written go stale. There is no registry to keep in step here: the engine is
+ * asked, so this stays correct across a reload and across renames, and answers from a
+ * single map probe for the ordinary file that has exactly one name.
+ *
+ * Deliberately NOT called from `flushPathSync`: scheduling a sibling from inside a flush
+ * would have each name reschedule the other forever.
+ */
+function resyncHardlinksFor(path: string): void {
+  for (const name of engine.linkNamesFor(path)) schedulePathSync(name);
+}
+
+/**
  * Re-mirror symlinks whose target is `path` OR a descendant of it — used when a
  * target is removed or renamed away so the dependent links flush to their new
  * (usually dangling → empty-placeholder) state. `path` alone covers a single
@@ -1583,6 +1599,10 @@ function notifyOPFSSync(op: number, path: string, newPath?: string): void {
       // If this path is a symlink target, re-mirror the links pointing at it so
       // their snapshot content doesn't go stale.
       resyncSymlinksFor(path);
+      // Same for the other names of a hard-linked file — they read the same bytes here
+      // but are separate files in OPFS. LINK is exempt: it adds a name, it does not
+      // change any content, and the new name is already scheduled above.
+      if (op !== OP.LINK) resyncHardlinksFor(path);
       break;
     }
     case OP.SYMLINK: {
@@ -1677,6 +1697,7 @@ function handleExternalChange(msg: { op: string; path: string; newPath?: string;
       }
       if (result.status === 0) {
         resyncSymlinksFor(msg.path); // links pointing at this now-updated target
+        resyncHardlinksFor(msg.path); // other names of the same inode, stale in OPFS now
         broadcastWatch(OP.WRITE, msg.path);
       }
       console.log('[sync-relay] external-write:', msg.path, `${msg.data?.byteLength ?? 0}B`, `status=${result.status}`);
