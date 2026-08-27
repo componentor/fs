@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+**A bulk write no longer freezes the tab.** In `opfs` mode our own mirror writes come back through the external-change observer, one relay message per file; a large install drowned the sync relay in them and every synchronous `fs.*` call in the page waited behind that traffic. The records are now coalesced into one message per interval.
+
+- **Fixed: writing many files starved the synchronous path and hung the page.** The `FileSystemObserver` is recursive over the whole root, so the mirror's own writes are detected as changes and posted straight back to the sync relay — the one worker that must stay responsive, because every `*Sync` call parks on it (`spinWait` → `syncRequestLocked`). A `composer create-project laravel/laravel`, about 10k files, therefore produced about 10k observer callbacks and 10k relay messages; the page spun waiting for an FS reply that was queued behind them and the tab froze mid-install. The mirror was already discarding these as echoes on arrival (content-hashed, `isOwnWriteEcho`), so the entire round trip was overhead.
+- **Records are coalesced into one message per 250ms**, which makes relay traffic O(1) per flush instead of O(files). Genuine external changes are unaffected in substance and bounded in latency by that interval — they reach the mirror up to 250ms later than before, and nothing else about how they are applied changes.
+- **A burst past 20,000 buffered records is counted rather than kept**, and the overflow is reported with a `console.warn` naming the count. Records that far past the ceiling inside a single window are a bulk operation of ours and echoes by construction; the honest cost is that a genuine external change arriving *during* one would be dropped with them, which is why the count is surfaced instead of being swallowed.
+- **The buffer and its pending timer are dropped with the observer that produced them.** Both teardown paths — `pagehide` and `dispose()` — take the relay down too, so a timer left running would fire a batch into a dead worker.
+- Records are buffered one at a time rather than with `push(...records)`. The observer hands over a whole batch in one callback, and a spread passes one argument per record, so a tree delete large enough would exceed the engine's argument limit and throw out of the callback — in exactly the bulk case this change exists to survive. Buffering per record also makes the 20,000 ceiling hold *within* a batch, not only between them.
+- The two intervals are module constants alongside the other tuning knobs (`SPIN_STALL_TIMEOUT_MS`, `VOLUME_ACQUIRE_DEADLINE_MS`) rather than class statics, which keeps `VFSFileSystem` free of statics — esbuild renames a class that refers to its own statics, and the bundled class name is observable to consumers.
+- No new tests. `FileSystemObserver` is Chromium-only and this path is inert without it, so the node-hosted suite cannot reach it; the 1974 existing tests over 96 files pass unchanged, and the public type surface gains nothing but private members.
+
 ## 4.3.0
 
 **Hard links are real.** `link()` used to copy the file. The two names were separate inodes, so a write through one was invisible through the other, `nlink` was a number stamped on unrelated records, and deleting either name left the survivor claiming a link that no longer existed. A second name is now a second name: both resolve to one inode, a write through either is visible through the other, and the data is freed only when the last name goes.

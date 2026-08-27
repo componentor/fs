@@ -125,6 +125,12 @@ const SPIN_STALL_TIMEOUT_MS = 30_000;
  */
 const VOLUME_ACQUIRE_DEADLINE_MS = 15_000;
 
+/** How long observer records may sit before reaching the mirror (bounds external-change latency). */
+const EXTERNAL_FLUSH_MS = 250;
+
+/** Ceiling on buffered observer records; a burst past this is a bulk write of ours, not news. */
+const EXTERNAL_MAX_BUFFER = 20_000;
+
 const OPFS_SYNC_STALL_MESSAGE =
   'VFS sync operation stalled in opfs mode. Sync calls from a page main thread are only ' +
   'reliable on Chromium here: every operation is async underneath, and the spin-wait this ' +
@@ -352,6 +358,10 @@ export class VFSFileSystem {
    * Only the detected records cross into the worker; the file I/O stays there.
    */
   private externalObserver: FileSystemObserver | null = null;
+  /** Coalescing buffer for observer records — see {@link forwardExternalRecords}. */
+  private externalRecordBuffer: unknown[] = [];
+  private externalFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private externalRecordsDropped = 0;
   /** True while a leader transition is in flight (promotion to leader, etc.).
    *  Cleared the moment the new sync-relay signals `ready`. Consumers can
    *  combine this with `isReady` to know when sync FS ops are safe again. */
@@ -1904,14 +1914,68 @@ export class VFSFileSystem {
     }
   }
 
-  /** Hand detected records to the mirror worker, which does the file I/O. */
+  /**
+   * Hand detected records to the mirror worker, which does the file I/O.
+   *
+   * ★ BATCHED, and deliberately so. These records reach the mirror through the **sync
+   * relay** — the one worker that must stay responsive, because every synchronous
+   * `fs.*` call in the app parks on it (`spinWait` → `syncRequestLocked`). The observer
+   * is recursive over the whole root, so OUR OWN mirror writes come straight back as
+   * records: a `composer create-project laravel/laravel` (~10k files) turned into ~10k
+   * observer callbacks, each posting to the relay, which starved the sync path — the
+   * page then spun forever waiting for an FS reply and the tab froze mid-install.
+   *
+   * The mirror already discards these as echoes (content-hashed, see
+   * `isOwnWriteEcho` in opfs-sync.worker.ts), so the work was pure overhead. Coalescing
+   * into one message per interval keeps genuine external-change detection (bounded by
+   * `EXTERNAL_FLUSH_MS`) while making relay traffic O(1) per flush instead of O(files).
+   */
   private forwardExternalRecords(records: unknown[]): void {
+    if (!records.length) return;
+    // One at a time rather than `push(...records)`: the observer hands over a whole
+    // batch in one callback, and a spread passes one argument per record — a tree
+    // delete is big enough to exceed the engine's argument limit and throw out of the
+    // callback. It also makes the ceiling hold within a batch, not just between them.
+    for (const record of records) {
+      if (this.externalRecordBuffer.length < EXTERNAL_MAX_BUFFER) {
+        this.externalRecordBuffer.push(record);
+      } else {
+        // A burst this large is a bulk operation of ours (install, clone, delete tree).
+        // Keeping every record would cost more than the mirror can ever save by reading
+        // them, and they are echoes by construction — count the overflow and move on.
+        this.externalRecordsDropped++;
+      }
+    }
+    if (this.externalFlushTimer !== null) return;
+    this.externalFlushTimer = setTimeout(() => {
+      this.externalFlushTimer = null;
+      this.flushExternalRecords();
+    }, EXTERNAL_FLUSH_MS);
+  }
+
+  /** Send one coalesced batch to the mirror. */
+  private flushExternalRecords(): void {
+    const records = this.externalRecordBuffer;
+    if (!records.length) return;
+    this.externalRecordBuffer = [];
+    if (this.externalRecordsDropped) {
+      console.warn(`[VFS] external-change records dropped during a bulk write: ${this.externalRecordsDropped}`);
+      this.externalRecordsDropped = 0;
+    }
     try { this.syncWorker?.postMessage({ type: 'external-records', records }); }
     catch { /* relay already gone */ }
   }
 
   /** Detach the observer. Synchronous on purpose — the unload path cannot await. */
   private stopWatchingExternalChanges(): void {
+    // Drop any coalesced batch with the observer that produced it: the relay is going
+    // away too, and a pending timer would fire into a dead worker.
+    if (this.externalFlushTimer !== null) {
+      clearTimeout(this.externalFlushTimer);
+      this.externalFlushTimer = null;
+    }
+    this.externalRecordBuffer = [];
+    this.externalRecordsDropped = 0;
     if (!this.externalObserver) return;
     try { this.externalObserver.disconnect(); } catch { /* already gone */ }
     this.externalObserver = null;

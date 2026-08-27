@@ -4024,6 +4024,8 @@ var SAB_HEARTBEAT_INDEX = SAB_OFFSETS.HEARTBEAT >> 2;
 var SAB_WORK_INDEX = SAB_OFFSETS.WORK >> 2;
 var SPIN_STALL_TIMEOUT_MS = 3e4;
 var VOLUME_ACQUIRE_DEADLINE_MS = 15e3;
+var EXTERNAL_FLUSH_MS = 250;
+var EXTERNAL_MAX_BUFFER = 2e4;
 var OPFS_SYNC_STALL_MESSAGE = "VFS sync operation stalled in opfs mode. Sync calls from a page main thread are only reliable on Chromium here: every operation is async underneath, and the spin-wait this thread must use (Atomics.wait is illegal on the main thread) starves the relay worker on Firefox and WebKit. Use fs.promises.* instead, or host the filesystem inside a Worker, where the sync API works on every engine.";
 function spinWait(arr, index, value, progressArr, progressIndex, stalledMessage) {
   if (_canAtomicsWait) {
@@ -4169,6 +4171,10 @@ var VFSFileSystem = class {
    * Only the detected records cross into the worker; the file I/O stays there.
    */
   externalObserver = null;
+  /** Coalescing buffer for observer records — see {@link forwardExternalRecords}. */
+  externalRecordBuffer = [];
+  externalFlushTimer = null;
+  externalRecordsDropped = 0;
   /** True while a leader transition is in flight (promotion to leader, etc.).
    *  Cleared the moment the new sync-relay signals `ready`. Consumers can
    *  combine this with `isReady` to know when sync FS ops are safe again. */
@@ -5394,8 +5400,46 @@ var VFSFileSystem = class {
       console.warn("[VFS] external-change watching unavailable:", err?.message);
     }
   }
-  /** Hand detected records to the mirror worker, which does the file I/O. */
+  /**
+   * Hand detected records to the mirror worker, which does the file I/O.
+   *
+   * ★ BATCHED, and deliberately so. These records reach the mirror through the **sync
+   * relay** — the one worker that must stay responsive, because every synchronous
+   * `fs.*` call in the app parks on it (`spinWait` → `syncRequestLocked`). The observer
+   * is recursive over the whole root, so OUR OWN mirror writes come straight back as
+   * records: a `composer create-project laravel/laravel` (~10k files) turned into ~10k
+   * observer callbacks, each posting to the relay, which starved the sync path — the
+   * page then spun forever waiting for an FS reply and the tab froze mid-install.
+   *
+   * The mirror already discards these as echoes (content-hashed, see
+   * `isOwnWriteEcho` in opfs-sync.worker.ts), so the work was pure overhead. Coalescing
+   * into one message per interval keeps genuine external-change detection (bounded by
+   * `EXTERNAL_FLUSH_MS`) while making relay traffic O(1) per flush instead of O(files).
+   */
   forwardExternalRecords(records) {
+    if (!records.length) return;
+    for (const record of records) {
+      if (this.externalRecordBuffer.length < EXTERNAL_MAX_BUFFER) {
+        this.externalRecordBuffer.push(record);
+      } else {
+        this.externalRecordsDropped++;
+      }
+    }
+    if (this.externalFlushTimer !== null) return;
+    this.externalFlushTimer = setTimeout(() => {
+      this.externalFlushTimer = null;
+      this.flushExternalRecords();
+    }, EXTERNAL_FLUSH_MS);
+  }
+  /** Send one coalesced batch to the mirror. */
+  flushExternalRecords() {
+    const records = this.externalRecordBuffer;
+    if (!records.length) return;
+    this.externalRecordBuffer = [];
+    if (this.externalRecordsDropped) {
+      console.warn(`[VFS] external-change records dropped during a bulk write: ${this.externalRecordsDropped}`);
+      this.externalRecordsDropped = 0;
+    }
     try {
       this.syncWorker?.postMessage({ type: "external-records", records });
     } catch {
@@ -5403,6 +5447,12 @@ var VFSFileSystem = class {
   }
   /** Detach the observer. Synchronous on purpose — the unload path cannot await. */
   stopWatchingExternalChanges() {
+    if (this.externalFlushTimer !== null) {
+      clearTimeout(this.externalFlushTimer);
+      this.externalFlushTimer = null;
+    }
+    this.externalRecordBuffer = [];
+    this.externalRecordsDropped = 0;
     if (!this.externalObserver) return;
     try {
       this.externalObserver.disconnect();

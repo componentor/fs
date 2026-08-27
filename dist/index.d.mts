@@ -994,6 +994,10 @@ declare class VFSFileSystem {
      * Only the detected records cross into the worker; the file I/O stays there.
      */
     private externalObserver;
+    /** Coalescing buffer for observer records — see {@link forwardExternalRecords}. */
+    private externalRecordBuffer;
+    private externalFlushTimer;
+    private externalRecordsDropped;
     /** True while a leader transition is in flight (promotion to leader, etc.).
      *  Cleared the moment the new sync-relay signals `ready`. Consumers can
      *  combine this with `isReady` to know when sync FS ops are safe again. */
@@ -1342,8 +1346,25 @@ declare class VFSFileSystem {
      * `applyExternalRecords` in opfs-sync.worker.ts.
      */
     private watchExternalChanges;
-    /** Hand detected records to the mirror worker, which does the file I/O. */
+    /**
+     * Hand detected records to the mirror worker, which does the file I/O.
+     *
+     * ★ BATCHED, and deliberately so. These records reach the mirror through the **sync
+     * relay** — the one worker that must stay responsive, because every synchronous
+     * `fs.*` call in the app parks on it (`spinWait` → `syncRequestLocked`). The observer
+     * is recursive over the whole root, so OUR OWN mirror writes come straight back as
+     * records: a `composer create-project laravel/laravel` (~10k files) turned into ~10k
+     * observer callbacks, each posting to the relay, which starved the sync path — the
+     * page then spun forever waiting for an FS reply and the tab froze mid-install.
+     *
+     * The mirror already discards these as echoes (content-hashed, see
+     * `isOwnWriteEcho` in opfs-sync.worker.ts), so the work was pure overhead. Coalescing
+     * into one message per interval keeps genuine external-change detection (bounded by
+     * `EXTERNAL_FLUSH_MS`) while making relay traffic O(1) per flush instead of O(files).
+     */
     private forwardExternalRecords;
+    /** Send one coalesced batch to the mirror. */
+    private flushExternalRecords;
     /** Detach the observer. Synchronous on purpose — the unload path cannot await. */
     private stopWatchingExternalChanges;
     /**
