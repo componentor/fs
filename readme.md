@@ -1,4 +1,4 @@
-# sync-opfs — a real synchronous Node.js filesystem in the browser
+# @componentor/fs — a real synchronous Node.js filesystem in the browser
 
 [![npm version](https://img.shields.io/npm/v/@componentor/fs.svg?label=%40componentor%2Ffs)](https://www.npmjs.com/package/@componentor/fs)
 [![npm version](https://img.shields.io/npm/v/sync-opfs.svg?label=sync-opfs)](https://www.npmjs.com/package/sync-opfs)
