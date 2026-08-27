@@ -2,7 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@componentor/fs.svg?label=%40componentor%2Ffs)](https://www.npmjs.com/package/@componentor/fs)
 [![npm version](https://img.shields.io/npm/v/sync-opfs.svg?label=sync-opfs)](https://www.npmjs.com/package/sync-opfs)
-[![node:fs coverage](https://img.shields.io/badge/node%3Afs%20coverage-134%2F134-brightgreen.svg)](#node-compatibility)
+[![node:fs coverage](https://img.shields.io/badge/node%3Afs%20coverage-134%2F134-brightgreen.svg)](docs/node-compatibility.md)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](#license)
 [![types: included](https://img.shields.io/badge/types-included-blue.svg)](#)
 
@@ -36,9 +36,29 @@ Install as [`@componentor/fs`](https://www.npmjs.com/package/@componentor/fs) or
 
 **[Try it in your browser →](https://componentor.github.io/fs/)** · no install, real OPFS.
 
+## Our flagship: Tab Desktop
+
+[![Tab Desktop — a full desktop OS running in the browser on @componentor/fs](https://raw.githubusercontent.com/componentor/fs/main/assets/tabdesktop-os.webp)](https://tabdesktop.com/os)
+
+**[Tab Desktop](https://tabdesktop.com/os) is a complete desktop OS that runs in a browser tab —
+file manager, terminal, code editor, git, databases — and this library is the filesystem
+underneath it.** Every `readFileSync` those apps make is a real blocking read against OPFS.
+
+It is the hardest test this library has, and the reason to trust the rest of this page:
+
+- **A WebContainer-class runtime, at speed.** A whole OS's worth of processes hammering one
+  filesystem — package installs, git checkouts, compilers, a live file manager — with the sync
+  calls that shape of software is written in, not an async rewrite of it.
+- **Across tabs.** Open it in several tabs and they share one filesystem, with one tab elected
+  leader and the rest routed to it. Not a copy per tab, and not last-write-wins.
+- **On Chrome, Safari *and* Firefox.** The one people expect to be a Chrome-only trick. Cross-tab
+  synchronous I/O on WebKit and Gecko is where in-browser filesystems usually stop — see
+  [Browser Support](#browser-support) for what each engine needs and the single case
+  (a Safari follower tab calling from the main thread rather than a worker) that stays impossible.
+
 **Jump to:** [Install](#installation) · [Quick start](#quick-start) · [Examples](#runnable-examples)
 · [Why sync needs two headers](#coopcoep-headers) · [How it compares](#how-it-compares)
-· [FAQ](#faq) · [API reference](#api-reference) · [Benchmarks](#benchmarks)
+· [FAQ](#faq) · [API reference](docs/api-reference.md) · [Benchmarks](#benchmarks)
 
 ### One thing to know first
 
@@ -59,12 +79,12 @@ console if you're unsure which tier you're on.
 
 - **True sync API** — blocking `readFileSync`/`writeFileSync`/… via SharedArrayBuffer + Atomics, not callbacks pretending to be sync.
 - **Async API too** — `fs.promises.*` works everywhere, even without COOP/COEP headers.
-- **100% of the `node:fs` surface** — all 134 functions across `node:fs` and `node:fs/promises` on Node 24, with nothing excluded, along with `FileHandle`, `Dir`, `Stats`/`BigIntStats`/`Dirent` as real classes, and `fs.constants`. Streams, file descriptors, `watch`, `glob`, `cp`, `mkdtemp`, `realpath`, `statfs`, bigint stats — all of it. The handful of behavioural divergences is listed under [Node compatibility](#node-compatibility); two tests keep the claim honest: one [enumerates Node's exports at runtime](src/tests/api-surface.test.ts) and fails if any are missing, the other [asserts every one of them is actually compared against a live `node:fs`](src/tests/parity-coverage.test.ts) — so a method cannot be implemented, typed, documented and never tested.
+- **100% of the `node:fs` surface** — all 134 functions across `node:fs` and `node:fs/promises` on Node 24, with nothing excluded, along with `FileHandle`, `Dir`, `Stats`/`BigIntStats`/`Dirent` as real classes, and `fs.constants`. Streams, file descriptors, `watch`, `glob`, `cp`, `mkdtemp`, `realpath`, `statfs`, bigint stats — all of it. The handful of behavioural divergences is listed under [Node compatibility](docs/node-compatibility.md); two tests keep the claim honest: one [enumerates Node's exports at runtime](src/tests/api-surface.test.ts) and fails if any are missing, the other [asserts every one of them is actually compared against a live `node:fs`](src/tests/parity-coverage.test.ts) — so a method cannot be implemented, typed, documented and never tested.
 - **Real persistence** — a compact binary VFS (`.vfs.bin`) in OPFS, plus an optional bidirectional mirror to real OPFS files DevTools and other tools can see.
 - **Multi-tab safe** — leader/follower architecture with automatic failover via `navigator.locks`; works on Safari (incl. worker-hosted followers).
-- **External-change aware** — a `FileSystemObserver` syncs edits made outside the library back into the VFS (Chrome 129+), on by default in `hybrid` mode. Available to instances running on a page; a **worker-hosted** instance does not watch, because a worker cannot detach an observer before the page kills it and Chromium aborts on one that outlives its scope — see [Known divergences](#known-divergences-from-node). Mirroring *outward* is unaffected either way.
+- **External-change aware** — a `FileSystemObserver` syncs edits made outside the library back into the VFS (Chrome 129+), on by default in `hybrid` mode. Available to instances running on a page; a **worker-hosted** instance does not watch, because a worker cannot detach an observer before the page kills it and Chromium aborts on one that outlives its scope — see [Known divergences](docs/node-compatibility.md#known-divergences-from-node). Mirroring *outward* is unaffected either way.
 - **isomorphic-git ready** — battle-tested against real git operations.
-- **Multi-drive (experimental)** — a uniform async `Drive` abstraction + `DriveManager` for cross-drive copy/move with progress. See [Multi-Drive API](#multi-drive-api-experimental).
+- **Multi-drive (experimental)** — a uniform async `Drive` abstraction + `DriveManager` for cross-drive copy/move with progress. See [Multi-Drive API](docs/multi-drive.md).
 - **No worker files, no bundler config** — the worker bundles are embedded in the entry as source text and started as same-origin blobs, so there is no URL for a bundler to rewrite and nothing to host. Works from a `<script type="module">`, from a CDN, and under Vite dev *and* build with an empty config.
 - **TypeScript-first** — complete type definitions included.
 
@@ -185,7 +205,7 @@ that its own waiting prevents, and throws saying so rather than hanging. Any `aw
 enough to avoid it; `init()` is the explicit one, and it surfaces mount errors up front. Always
 await it before the first `promises.*` call too. Once mounted, `*Sync` calls block and return
 normally — this is a startup-ordering rule, not a running cost. There is more on it under
-[`whenReady()`](#api-reference).
+[`whenReady()`](docs/api-reference.md).
 
 Everything survives a reload: the bytes are in OPFS, not memory. Clear them with
 `fs.promises.rm('/', { recursive: true, force: true })` or by clearing site data.
@@ -229,247 +249,28 @@ fails the suite rather than the reader.
 
 ## Configuration
 
-```typescript
-const fs = new VFSFileSystem({
-  root: '/',              // OPFS root directory (default: '/')
-  mode: 'hybrid',        // 'hybrid' | 'vfs' | 'opfs' (default: 'hybrid')
-  opfsSyncRoot: undefined, // Custom OPFS root for mirroring (default: same as root)
-  uid: 0,                 // User ID for file ownership (default: 0)
-  gid: 0,                 // Group ID for file ownership (default: 0)
-  umask: 0o022,           // File creation mask (default: 0o022)
-  strictPermissions: false, // Enforce Unix permissions (default: false)
-  sabSize: 4194304,       // SharedArrayBuffer size in bytes (default: 4MB)
-  debug: false,           // Per-op timing logs (caller roundTrip + relay handleRequest) (default: false)
-  forceSpin: undefined,   // Override the WebKit-only sync workarounds (spin/yield/slice + pre-grow).
-                          // undefined = auto (on only for WebKit); true/false force on/off — an
-                          // A/B escape hatch. You should not need this; see "Performance" below.
-  swUrl: undefined,       // URL of the service worker script (default: auto-resolved)
-  swScope: undefined,     // Custom service worker scope (default: auto-scoped per root)
-  swBridge: undefined,    // MessagePort to a main-thread service-worker bridge, for
-                          // running this instance inside a worker (enables follower
-                          // sync on Safari). See "Multi-Tab Sync on Safari" below.
-  limits: {               // Upper bounds for VFS validation (prevents corrupt data from causing OOM)
-    maxInodes: 4_000_000,   // Max inode count (default: 4M)
-    maxBlocks: 4_000_000,   // Max data blocks (default: 4M)
-    maxPathTable: 256 * 1024 * 1024, // Max path table bytes (default: 256MB)
-    maxVFSSize: 100 * 1024 * 1024 * 1024, // Max .vfs.bin size (default: 100GB)
-    maxPayload: 2 * 1024 * 1024 * 1024,   // Max single SAB payload (default: 2GB)
-  },
-});
-```
+Every constructor option, and the cross-cutting behaviours they govern — text encodings, file
+permissions, file descriptors in place of a path, result objects, argument-validation timing.
 
-### Text Encodings
-
-Encodings follow Node: the same names, matched **case-insensitively**, with the same aliases —
-`utf8`/`utf-8`, `utf16le`/`utf-16le`/`ucs2`/`ucs-2`, `latin1`/`binary`, `base64`, `base64url`,
-`ascii`, `hex`. An unrecognised name throws Node's `ERR_INVALID_ARG_VALUE` rather than silently
-falling back to UTF-8, so a typo surfaces at the call instead of as corrupted bytes later.
-
-```js
-fs.writeFileSync('/a.bin', '4142', 'hex');       // writes the two bytes 41 42
-fs.readFileSync('/a.bin', 'latin1');             // 'AB'
-fs.readdirSync('/dir', 'buffer');                // raw name bytes
-fs.writeFileSync('/b', 'x', 'utf9');             // throws ERR_INVALID_ARG_VALUE
-```
-
-The `base64` and `hex` parsers reproduce Node's leniency exactly: base64 skips characters outside
-the alphabet, stops at `=`, tolerates missing padding, and accepts the url-safe alphabet under
-either name; hex stops at the first pair that is not two hex digits and ignores a trailing odd
-character. Note the `ascii` asymmetry, which is Node's, not ours — encoding truncates to the low
-byte (identical to `latin1`), while decoding masks to 7 bits.
-
-### File Permissions
-
-Modes behave as they do in Node. `mkdir` takes the mode you give it, the engine subtracts the
-umask exactly as `mkdir(2)` does in the kernel, and `stat` reads back what was actually stored:
-
-```js
-fs.mkdirSync('/private', { mode: 0o700 });
-fs.statSync('/private').mode & 0o777;   // 0o700
-
-fs.mkdirSync('/pub');                    // default 0o777 & ~umask(0o022)
-fs.statSync('/pub').mode & 0o777;        // 0o755
-
-fs.mkdtempSync('/tmp/run-');             // 0o700 — mkdtemp(3) is private by design
-```
-
-A mode may be a uint32 or an octal **string** (`'0700'`), and a recursive `mkdir` applies it to
-every level it creates — both matching Node. Invalid modes throw Node's own
-`ERR_INVALID_ARG_VALUE` / `ERR_INVALID_ARG_TYPE` / `ERR_OUT_OF_RANGE`.
-
-Files work the same way. `open`'s mode defaults to Node's 0o666 (0o644 after the default umask)
-and, as in `open(2)`, applies **only when the file is created** — re-opening an existing file
-with a different mode leaves its permissions alone. `writeFile`'s `mode` option follows the same
-rule, because it rides along with the creating open:
-
-```js
-fs.writeFileSync('/secret.txt', data, { mode: 0o600 });
-fs.statSync('/secret.txt').mode & 0o777;   // 0o600
-
-fs.closeSync(fs.openSync('/pub.txt', 'w'));
-fs.statSync('/pub.txt').mode & 0o777;      // 0o644
-```
-
-Permission bits are stored and reported, but only *enforced* by `access()` when you opt in with
-`strictPermissions: true`.
-
-### File descriptors in place of a path
-
-`readFile`, `writeFile` and `appendFile` accept an open descriptor where a path goes, as in Node.
-The semantics are **not** the path semantics, and the differences are easy to trip over:
-
-```js
-const fd = fs.openSync('/log.txt', 'r+');   // contents: 'AAA'
-
-fs.appendFileSync(fd, 'B');                 // 'BAA' — writes at the cursor, does NOT append
-fs.closeSync(fd);                           // the descriptor is yours to close
-```
-
-- Every operation starts at the descriptor's **current position** and advances it. Calling
-  `readFileSync(fd)` twice returns the contents, then `''`.
-- `writeFile(fd, …)` **does not truncate** — writing `'ab'` over `'XXXXXXXXXX'` leaves
-  `'abXXXXXXXX'`.
-- `appendFile(fd, …)` **does not seek to end-of-file**. It is `writeFile`; the appending comes
-  from having opened with `'a'` (O_APPEND), as the example above shows.
-- The descriptor is **left open**, and `flag`/`mode` are ignored since the file is already open.
-
-The raw-number form is available on the sync and callback APIs. `fs.promises` takes a
-`FileHandle` instead — `fsPromises.readFile(fd)` is an `ERR_INVALID_ARG_TYPE` in Node and here:
-
-```js
-const handle = await fs.promises.open('/log.txt', 'r');
-await fs.promises.readFile(handle);         // ok
-```
-
-### Result objects
-
-`stat`, `readdir({ withFileTypes: true })` and `opendir` return real classes, so node's
-`instanceof` type-tests work and the objects serialise the way node's do:
-
-```js
-fs.statSync('/f') instanceof fs.Stats           // true
-entry instanceof fs.Dirent                       // true
-fs.opendirSync('/d') instanceof fs.Dir           // true
-
-Object.keys(fs.statSync('/f'))   // node's own-property list, in node's order
-JSON.stringify(fs.statSync('/f'))// same fields node emits
-```
-
-`Stats`, `BigIntStats`, `Dirent` and `Dir` are also exported from the package for direct import.
-The type predicates live on the prototype and read `mode & S_IFMT` as node's do, and
-`atime`/`mtime`/`ctime`/`birthtime` are built lazily on first access — a `stat` no longer
-allocates seven closures and four `Date`s it may never use, which makes building one
-**5.4× faster** ([stats-alloc.bench.ts](src/tests/stats-alloc.bench.ts)).
-
-Two intentional differences from current node, both for backward compatibility:
-`Dirent.path` is kept as a getter aliasing `parentPath` (node deprecated it and removed it in
-v24), and `Stats.atimeNs`/`mtimeNs`/`ctimeNs`/`birthtimeNs` remain readable as getters (node has
-them on bigint stats only). Neither appears in `Object.keys` or `JSON.stringify`.
-
-`Dir` supports the full node API including `readSync()` and `closeSync()`, and `opendir`
-honours `recursive`.
-
-### Argument validation timing
-
-Node's three APIs report a bad path at three different moments, and code depends on the
-difference. All three are reproduced:
-
-```js
-fs.statSync({})                  // throws
-fs.stat({}, cb)                  // throws at the call site — cb is never called
-fs.promises.stat({}).catch(e => …) // rejects; nothing is thrown
-```
-
-Errors carry Node's codes (`ERR_INVALID_ARG_TYPE`, `ERR_OUT_OF_RANGE`, …), so callers can branch
-on `err.code` rather than matching message text. `realpath` is Node's one exception — it
-stringifies its argument instead of type-checking it, so `realpathSync({ toString: () => '/tmp' })`
-resolves and a non-path value gives `ENOENT`; that looseness is reproduced too.
+**→ [Configuration reference](docs/configuration.md)**
 
 ## Node compatibility
 
-**Surface: 100% of Node 24.18, with no exceptions.** All 134 functions exported by `node:fs` and `node:fs/promises` exist here,
-plus the `FileHandle`, `Dir` and `Stats`/`BigIntStats`/`Dirent` classes and the full
-`fs.constants` table. This is not a claim maintained by hand —
-[api-surface.test.ts](src/tests/api-surface.test.ts) reads Node's own exports at runtime and
-fails if any are missing, and it checks the reverse too, so a documented omission that quietly
-gets implemented is caught as well.
+**Surface: 100% of Node 24.18, with no exceptions.** All 134 functions exported by `node:fs` and
+`node:fs/promises` are here, plus the `FileHandle`, `Dir` and `Stats`/`BigIntStats`/`Dirent`
+classes and the full `fs.constants` table — checked at runtime against Node's own exports by
+[api-surface.test.ts](src/tests/api-surface.test.ts), in both directions, rather than maintained
+by hand.
 
-There is no omissions list any more. `Utf8Stream` (Node 24's buffered append stream for logging)
-and `_toUnixTimestamp` (Node's internal time coercion, underscore and all) were the last two and
-landed in 4.0.0. The suite still checks in both directions, so an omission introduced later
-cannot be quietly forgotten.
+**Behaviour is verified against a live `node:fs`, not against the docs**: the suites run the same
+operation through this library and through real `node:fs` on a temp directory and compare
+contents, entry lists, sizes, permission bits and error codes, including four differential
+fuzzers. Several of the documented divergences were found that way — and more than one turned out
+to be the Node documentation being wrong rather than the code.
 
-**Behaviour: verified against a live `node:fs`, not against the docs.** The suites run the same
-operation through this library and through real `node:fs` on a temp directory and compare the
-results — contents, entry lists, sizes, permission bits and error `code`s — including four
-differential fuzzers over the sync, promise, file-descriptor and stream APIs. Several
-divergences below were found that way, and more than one was a case of the documentation being
-wrong about Node rather than the code being wrong about the docs.
+**→ [Node compatibility, and every deliberate divergence](docs/node-compatibility.md)**
 
-### Known divergences from Node
-
-All deliberate:
-
-- **A function `exclude` passed to `glob` also drops nested files.** Node's *function* form
-  applies the predicate to top-level entries and to directories (pruning their subtrees), but
-  silently keeps **nested files**: `(n) => n.endsWith('.js')` removes `top.js` and leaves
-  `a/drop.js`, while node's own *pattern* form removes both. Reproducing that would keep files
-  the caller asked to drop, so the predicate is applied at every depth here. Node's behaviour is
-  [asserted in the parity test](src/tests/glob-exclude-parity.test.ts), so if it changes, we find
-  out.
-- **An invalid descriptor passed to `fs.readFile(fd, cb)` reaches the callback.** Node defers the
-  check and then throws it *uncaught* from a later tick (inside `readFileAfterOpen`), taking the
-  process down instead of calling back — `fs.readFile(-1, cb)` is an unhandled `ERR_OUT_OF_RANGE`
-  crash. We report it to the callback, which is where the caller can act on it.
-- **`openAsBlob` rejects where node throws.** The error itself matches node exactly — any file it
-  cannot open is `TypeError: Unable to open file as blob` with `code: 'ERR_INVALID_ARG_VALUE'`,
-  not the errno — but node raises it *synchronously* out of a function that otherwise returns a
-  promise, so `fs.openAsBlob(missing).catch(…)` crashes rather than catching. This rejects, which
-  is identical under `await` and works with `.catch`.
-- **`watch` reports a new file as `change`, not `rename`.** Node emits `rename` when an entry
-  appears or disappears; a file created by `writeFile` surfaces here as `change` (deletes do
-  report `rename`). Telling the two apart would need a per-write existence check on the hot path,
-  and Node's own event types are platform-dependent enough that its docs call them "not always
-  accurate" — so this is left as-is.
-- **`cp` with symlinks does not chase Node's behaviour**, deliberately: `node:fs` (v24) *aborts
-  the process* on two of these — copying onto an existing dangling link, and copying a tree
-  containing a cyclic link — with uncaught C++ exceptions rather than throwable errors. We copy
-  links as links and always terminate. Ordinary copies match Node exactly, permissions included.
-- **Hard links are real.** They were copies once, and this entry used to say so.
-  `link()` adds a second *name* for one inode: both names share an inode number, a write
-  through either is visible through the other, `nlink` counts the names that exist, and the data
-  is freed only when the last one goes. The name is stored on disk as its own inode-table entry
-  (`INODE_TYPE.HARDLINK`: its path plus the target's index), so it is rebuilt by the mount scan
-  and survives a reload — an in-memory-only second name would not, since the path index is
-  rebuilt from inodes and an inode stores exactly one path. Two things still differ from a
-  POSIX filesystem: the link's entry occupies an inode-table slot, so `statfs().ffree` falls by
-  one per link, and the `opfs` mirror has no way to represent sharing, so each name is a
-  separate file there (kept in step on every write, but a hard link that reaches OPFS and comes
-  back through a repair/load is two independent files).
-- **No `ENAMETOOLONG`.** Real filesystems cap a path component at 255 bytes; we accept longer
-  names. Enforcing the limit would reject names existing volumes may already contain, so the
-  cap is left off.
-- **`opfs` fallback mode stores no permission metadata**, so entries there always read back as
-  the synthetic 0755/0644. Inherent to OPFS, which has no permission model; the default hybrid
-  mode persists real modes.
-
-- **`fs.constants` includes the platform-specific entries Node exposes but this cannot honour**
-  — `O_SYMLINK` (macOS), `UV_FS_O_FILEMAP` (Windows) and the `UV_FS_SYMLINK_*` pair are defined
-  with Node's values so a bitmask read does not come back `undefined`, but there is no OPFS
-  behaviour behind them. The `UV_DIRENT_*` numbering, which code reading a `Dirent` type
-  numerically depends on, is real.
-
-- **A worker-hosted instance does not watch for external OPFS changes.** The inbound half of the
-  mirror needs a `FileSystemObserver`, and one still attached when its scope is destroyed makes
-  Chromium abort the whole browser process — a use-after-free in Chromium's own C++, not
-  something this library can be careful enough to avoid. An instance on a page detaches it
-  synchronously on `pagehide`; a worker cannot, because the page kills it outright. Outward
-  mirroring — every change this library makes appearing as real OPFS files — works in every mode.
-
-Errno spellings that are platform-dependent in Node itself (`unlink` on a directory is `EISDIR`
-on Linux, `EPERM` on macOS) follow the Linux spelling.
-
-### Filesystem Modes
+## Filesystem Modes
 
 The `mode` option controls how the filesystem stores data:
 
@@ -568,7 +369,7 @@ console.log(fs.mode); // 'hybrid'
 
 `setMode()` terminates internal workers, allocates fresh shared memory, and reinitializes the filesystem in the requested mode.
 
-### Service Worker Setup (Multi-Tab)
+## Service Worker Setup (Multi-Tab)
 
 Multi-tab coordination requires a service worker that acts as a MessagePort broker between tabs. The built service worker is shipped at `dist/workers/service.worker.js`. Unlike regular workers (which are resolved by the bundler), **service workers must be served as a real file at a public URL**.
 
@@ -596,7 +397,7 @@ const fs = new VFSFileSystem({ swUrl: './vfs-service-worker.js' });
 
 If you only use a single tab, the service worker is not needed — the tab always runs as the leader.
 
-### Synchronous calls on Safari need a worker
+## Synchronous calls on Safari need a worker
 
 `Atomics.wait` is illegal on a page's main thread, so a sync call busy-spins instead. On Chromium
 and Firefox the relay worker progresses regardless and calls finish in milliseconds. **On WebKit
@@ -609,7 +410,7 @@ mode too. Run the instance inside a worker on Safari — `Atomics.wait` is legal
 page's main thread stays free. [examples/03-worker-hosted](examples/03-worker-hosted/) is that
 arrangement, and so is the [live demo](https://componentor.github.io/fs/).
 
-### Multi-Tab Sync on Safari (worker-hosted instances)
+## Multi-Tab Sync on Safari (worker-hosted instances)
 
 In secondary ("follower") tabs, a synchronous FS call relays to the leader tab.
 On **Chrome, Edge and Firefox** this works from the main thread. On **Safari it
@@ -810,552 +611,12 @@ Run the suite yourself:
 npm run benchmark:open
 ```
 
-## API Reference
+## API reference
 
-### Sync API (requires crossOriginIsolated)
+Every method, across the sync, async, stream, `FileHandle`, watch, path and constants surfaces.
 
-```typescript
-// Read/Write — `path` may also be a file descriptor (see below)
-fs.readFileSync(path | fd, options?): Uint8Array | string
-fs.writeFileSync(path | fd, data, options?): void
-fs.appendFileSync(path | fd, data, options?): void   // { encoding?, mode?, flag?, flush? } | encoding
-
-// Directories
-fs.mkdirSync(path, options?): string | undefined   // options: { recursive?, mode? } | mode
-fs.rmdirSync(path, options?): void
-fs.rmSync(path, options?): void
-fs.readdirSync(path, options?): string[] | Dirent[]
-
-// File Operations
-fs.unlinkSync(path): void
-fs.renameSync(oldPath, newPath): void
-fs.copyFileSync(src, dest, mode?): void
-fs.truncateSync(path, len?): void
-fs.symlinkSync(target, path): void
-fs.readlinkSync(path): string
-fs.linkSync(existingPath, newPath): void
-
-// Info
-fs.statSync(path): Stats
-fs.lstatSync(path): Stats
-fs.existsSync(path): boolean
-fs.accessSync(path, mode?): void
-fs.realpathSync(path): string
-
-// Metadata
-fs.chmodSync(path, mode): void
-fs.chownSync(path, uid, gid): void
-fs.utimesSync(path, atime, mtime): void
-
-// File Descriptors
-fs.openSync(path, flags?, mode?): number
-fs.closeSync(fd): void
-fs.readSync(fd, buffer, offset?, length?, position?): number
-fs.writeSync(fd, buffer, offset?, length?, position?): number
-fs.fstatSync(fd): Stats
-fs.ftruncateSync(fd, len?): void
-fs.fdatasyncSync(fd): void
-
-// Temp / Flush
-fs.mkdtempSync(prefix): string
-fs.flushSync(): void
-```
-
-### Async API (always available)
-
-```typescript
-// Read/Write — `path` may also be a FileHandle (not a raw descriptor; see below)
-fs.promises.readFile(path | handle, options?): Promise<Uint8Array | string>
-fs.promises.writeFile(path | handle, data, options?): Promise<void>
-fs.promises.appendFile(path | handle, data, options?): Promise<void>
-
-// Directories
-fs.promises.mkdir(path, options?): Promise<string | undefined>  // { recursive?, mode? } | mode
-fs.promises.rmdir(path, options?): Promise<void>
-fs.promises.rm(path, options?): Promise<void>
-fs.promises.readdir(path, options?): Promise<string[] | Dirent[]>
-
-// File Operations
-fs.promises.unlink(path): Promise<void>
-fs.promises.rename(oldPath, newPath): Promise<void>
-fs.promises.copyFile(src, dest, mode?): Promise<void>
-fs.promises.truncate(path, len?): Promise<void>
-fs.promises.symlink(target, path): Promise<void>
-fs.promises.readlink(path): Promise<string>
-fs.promises.link(existingPath, newPath): Promise<void>
-
-// Info
-fs.promises.stat(path): Promise<Stats>
-fs.promises.lstat(path): Promise<Stats>
-fs.promises.exists(path): Promise<boolean>
-fs.promises.access(path, mode?): Promise<void>
-fs.promises.realpath(path): Promise<string>
-
-// Metadata
-fs.promises.chmod(path, mode): Promise<void>
-fs.promises.chown(path, uid, gid): Promise<void>
-fs.promises.utimes(path, atime, mtime): Promise<void>
-
-// Advanced
-fs.promises.open(path, flags?, mode?): Promise<FileHandle>
-fs.promises.opendir(path, options?): Promise<Dir>   // { recursive?, encoding?, bufferSize? }
-fs.promises.mkdtemp(prefix): Promise<string>
-fs.promises.statfs(path?): Promise<StatFs>
-fs.promises.watch(path, options?): AsyncIterable<{ eventType, filename }>
-
-// glob returns an ASYNC ITERATOR, as node's does — not a promise. Iterate it:
-//   for await (const p of fs.promises.glob('/src/**/*.ts')) { … }
-// The callback form gives you the whole array at once: fs.glob(pattern, (err, matches) => …)
-fs.promises.glob(pattern, options?): AsyncIterator<string | Dirent>
-
-// Flush
-fs.promises.flush(): Promise<void>
-```
-
-> **Changed in 4.0:** `fs.promises.glob` used to return `Promise<string[]>`. It is an async
-> iterator now, matching node — so `for await` works, and `await` no longer gives you an array.
-
-#### `glob`'s `exclude` option
-
-Both of node's forms work, and they do not share a contract:
-
-```js
-// Function — receives the entry's BASENAME (or a Dirent when withFileTypes is set)
-fs.globSync('**/*', { exclude: (name) => name === 'node_modules' });
-
-// Glob patterns — matched against the path RELATIVE TO cwd
-fs.globSync('**/*', { exclude: ['**/*.test.ts', 'dist/**'] });
-```
-
-Excluding a **directory** prunes its whole subtree, so the first example drops `node_modules`
-and everything under it. A trailing `**` needs at least one segment to match: `exclude: ['a/**']`
-drops what is inside `a` but keeps `a` itself, while `exclude: ['a']` drops both — both verified
-against `node:fs`.
-
-### Streams API
-
-`createReadStream` returns a Node-style readable — `.on('data')`, `.pipe()`, and `for await`,
-which works because the stream implements `Symbol.asyncIterator` as node's does:
-
-```typescript
-const stream = fs.createReadStream('/large-file.bin', {
-  start: 0,                 // byte offset to start
-  end: 1024,                // byte offset to stop (inclusive, as in node)
-  highWaterMark: 64 * 1024, // chunk size (default: 64KB)
-});
-for await (const chunk of stream) {
-  console.log('Read chunk:', chunk.length, 'bytes');
-}
-
-// Writable — a node Writable, not a WHATWG WritableStream
-const writable = fs.createWriteStream('/output.bin');
-writable.write(new Uint8Array([1, 2, 3]));
-writable.end();
-await new Promise((resolve) => writable.on('finish', resolve));
-```
-
-Both accept an `fd` in the options, in which case the descriptor stays the caller's to close.
-
-### FileHandle
-
-`fs.promises.open()` returns a `FileHandle` with node's full API, including its stream methods:
-
-```typescript
-const handle = await fs.promises.open('/data.log', 'r');
-
-for await (const line of handle.readLines()) { … }   // lines, CRLF-aware
-handle.createReadStream(options?)                     // node Readable
-handle.createWriteStream(options?)                    // node Writable
-handle.readableWebStream()                            // WHATWG ReadableStream
-
-handle.on('close', () => { … });                      // it is an EventEmitter
-```
-
-A stream created from a handle **owns** it: node closes the handle when the stream finishes, so
-using it afterwards is `EBADF`. Pass `autoClose: false` to keep it open.
-
-### Utf8Stream (buffered logging)
-
-Node 24's `fs.Utf8Stream` — a buffered, append-only text stream. It batches writes instead of
-issuing one write per line, which is what makes it usable as a logger.
-
-```typescript
-const log = new fs.Utf8Stream({ dest: '/app.log', minLength: 4096 });
-
-log.write('started\n');          // buffered until 4 KB is pending
-log.flushSync();                  // or force it out now
-log.reopen('/app.1.log');         // log rotation: close, reopen elsewhere
-log.end();                        // flush, close, then 'finish' and 'close'
-
-log.on('drop', (chunk) => { … }); // fired when maxLength is exceeded
-```
-
-| Option | Default | |
-|---|---|---|
-| `dest` / `fd` | — | one is required; a supplied `fd` stays yours to close |
-| `minLength` | `0` | buffer until this many bytes are pending |
-| `maxLength` | `0` | drop writes past this, with a `drop` event; `0` is no limit |
-| `append` | `true` | `false` truncates the file instead |
-| `mkdir` | `false` | create the parent directory |
-| `contentMode` | `'utf8'` | `'buffer'` accepts `Uint8Array` instead of strings |
-| `fsync` | `false` | fsync after each flush |
-| `periodicFlush` | `0` | flush every N ms |
-| `mode` | — | mode for a file it creates |
-
-Unlike node's, this one is a property of the instance (`fs.Utf8Stream`) rather than a free class,
-because it writes through *this* filesystem.
-
-### Instance Methods
-
-```typescript
-// Get the current filesystem mode
-fs.mode: 'hybrid' | 'vfs' | 'opfs'
-
-// Switch mode at runtime (terminates workers, reinitializes)
-await fs.setMode('hybrid' | 'vfs' | 'opfs'): Promise<void>
-
-// Non-blocking async init (waits for VFS to be ready)
-await fs.init(): Promise<void>
-
-// Release the instance: relay workers, the OPFS mirror worker, and the
-// FileSystemObserver it registers on the origin's storage. The observer is the
-// one resource that does NOT die with a page navigation on its own, so call
-// this in anything that creates instances repeatedly (a test suite, an app that
-// switches volumes). Instances also tear down on `pagehide` automatically.
-// Named `dispose` because `close(fd)` is node's descriptor API.
-await fs.dispose(): Promise<void>
-
-// Which tab owns the volume. One holds the lock and does the work; the rest relay to it, so a
-// follower's sync calls cost a round trip — worth knowing before comparing benchmarks, and
-// before relying on main-thread sync calls in a follower on Safari.
-fs.isLeader: boolean
-fs.onLeaderChange(listener): () => void   // leadership moves when the leader closes
-
-// Or scope it to a block — `Symbol.asyncDispose` is implemented:
-await using fs = new VFSFileSystem({ root: '/scratch' });
-
-// Moment-in-time readiness: true only when ready AND no leader transition is
-// in flight (equivalent to isReady && !transitioning)
-fs.ready: boolean
-
-// Await readiness reliably, INCLUDING through an in-flight leader promotion.
-// Resolves immediately if already ready; otherwise resolves on the next time
-// the sync-relay signals 'ready'. Use this to coordinate with another
-// navigator.locks-based leader election running independently of the FS:
-await fs.whenReady(): Promise<void>
-```
-
-The `fs.ready` / `fs.whenReady()` pair exists because the FS elects its own
-multi-tab leader via `navigator.locks`. When the leader tab dies and this tab is
-promoted, there's a window where the new sync-relay worker isn't looping yet. If
-your app also does its own leader election, await `fs.whenReady()` *after*
-acquiring your own lock to be sure the FS has finished any promotion first:
-
-```typescript
-navigator.locks.request('my-app-leader', async () => {
-  await fs.whenReady();      // FS promotion (if any) has completed
-  fs.writeFileSync('/state.json', data); // safe — the volume is mounted here
-  await new Promise(() => {}); // hold the lock
-});
-```
-
-**A sync call made before the volume is mounted throws, rather than waiting for a mount it is
-preventing.** Mounting runs on an event loop — the retry is a `setTimeout`, and the first attempt
-starts from a `navigator.locks` callback — and a synchronous call blocks that event loop. On a
-page's main thread it must busy-loop, because `Atomics.wait` is illegal there; in a worker
-`Atomics.wait` blocks the agent just as completely. So a sync call that waits for its own mount is
-not early, it is deadlocked, and the error says so and names `fs.promises.*`.
-
-This is why `await fs.init()` matters. Anything that gets you past one turn of the event loop is
-enough — `await fs.init()`, `await fs.whenReady()`, or simply any `await` between constructing the
-filesystem and the first `*Sync` call. Once mounted, sync calls behave exactly as advertised and
-this never comes up again; it is a startup-ordering rule, not a running cost.
-
-It applies to a handover too, for the same reason: while the volume is moving between tabs, the new
-leader's mount needs its own event loop.
-
-Note what this rule is *not*. It is a check on the filesystem's state, not a limit on how long a
-call may take — nothing here caps an operation, and a multi-gigabyte read or write on a mounted
-volume runs to completion however long that is.
-
-### Watch API
-
-```typescript
-// Watch for changes (supports recursive + AbortSignal)
-const ac = new AbortController();
-const watcher = fs.watch('/dir', { recursive: true, signal: ac.signal }, (eventType, filename) => {
-  console.log(eventType, filename); // 'rename' 'newfile.txt' or 'change' 'file.txt'
-});
-watcher.close(); // or ac.abort()
-
-// Watch specific file with stat polling
-fs.watchFile('/file.txt', { interval: 1000 }, (curr, prev) => {
-  console.log('File changed:', curr.mtimeMs !== prev.mtimeMs);
-});
-fs.unwatchFile('/file.txt');
-
-// Async iterable (promises API)
-for await (const event of fs.promises.watch('/dir', { recursive: true })) {
-  console.log(event.eventType, event.filename);
-}
-```
-
-### Path Utilities
-
-```typescript
-import { path } from '@componentor/fs';
-
-path.join('/foo', 'bar', 'baz')       // '/foo/bar/baz'
-path.resolve('foo', 'bar')            // '/foo/bar'
-path.dirname('/foo/bar/baz.txt')      // '/foo/bar'
-path.basename('/foo/bar/baz.txt')     // 'baz.txt'
-path.extname('/foo/bar/baz.txt')      // '.txt'
-path.normalize('/foo//bar/../baz')    // '/foo/baz'
-path.isAbsolute('/foo')               // true
-path.relative('/foo/bar', '/foo/baz') // '../baz'
-path.parse('/foo/bar/baz.txt')        // { root, dir, base, ext, name }
-path.format({ dir: '/foo', name: 'bar', ext: '.txt' }) // '/foo/bar.txt'
-```
-
-### Constants
-
-```typescript
-import { constants } from '@componentor/fs';
-
-constants.F_OK  // 0 - File exists
-constants.R_OK  // 4 - File is readable
-constants.W_OK  // 2 - File is writable
-constants.X_OK  // 1 - File is executable
-
-constants.COPYFILE_EXCL  // 1 - Fail if dest exists
-
-constants.O_RDONLY   // 0
-constants.O_WRONLY   // 1
-constants.O_RDWR     // 2
-constants.O_CREAT    // 64
-constants.O_EXCL     // 128
-constants.O_TRUNC    // 512
-constants.O_APPEND   // 1024
-```
-
-## Maintenance Helpers
-
-Standalone utilities for VFS maintenance, recovery, and migration. Must be called from a Worker context (sync access handle requirement). Close any running `VFSFileSystem` instance first.
-
-```typescript
-import { unpackToOPFS, loadFromOPFS, repairVFS } from '@componentor/fs';
-
-// Export VFS contents to real OPFS files (clears existing OPFS files first)
-const { files, directories } = await unpackToOPFS('/my-app');
-
-// Rebuild VFS from real OPFS files (deletes .vfs.bin, creates fresh VFS)
-const { files, directories } = await loadFromOPFS('/my-app');
-
-// Attempt to recover files from a corrupt VFS binary
-const { recovered, lost, entries } = await repairVFS('/my-app');
-console.log(`Recovered ${recovered} entries, lost ${lost}`);
-for (const entry of entries) {
-  console.log(`  ${entry.type} ${entry.path} (${entry.size} bytes)`);
-}
-```
-
-| Function | Description |
-|----------|-------------|
-| `unpackToOPFS(root?)` | Read all files from VFS, write to real OPFS paths |
-| `loadFromOPFS(root?)` | Read all OPFS files, create fresh VFS with their contents |
-| `repairVFS(root?)` | Scan corrupt `.vfs.bin` for recoverable inodes, rebuild fresh VFS |
-
-## Multi-Drive API (experimental)
-
-> **Status: experimental.** Additive and self-contained — the single-OPFS
-> `VFSFileSystem` API above is unchanged and untouched by this. The `Drive` surface
-> is stable enough to build against but may still evolve. The in-RAM drives,
-> `DriveManager.transfer`, and `SyncEngine` are unit-tested; the browser-API drives
-> (`VfsDrive`, localStorage, IndexedDB, local-folder, cloud) compile and build but
-> need a browser to exercise. Pin a version if you depend on it. See
-> [`src/src/drives/DESIGN.md`](src/src/drives/DESIGN.md) for the full design.
-
-A **drive** is a uniform, async, path-relative file API for any disk a host's
-"Finder" might show — OPFS, in-memory, localStorage, IndexedDB, Google Drive /
-Dropbox / OneDrive, or a local/USB folder. Every drive implements the same
-[`Drive`](src/src/drives/types.ts) interface, so the UI, cross-drive copy/move,
-and sync all work against one abstraction with no per-backend code.
-
-> **Engine-free import.** The drive layer is also exported from
-> `@componentor/fs/drives`, which omits `VfsDrive` (the only drive that wraps the
-> VFS engine) so a host that brings its own OPFS layer can tree-shake the engine
-> out of its bundle. Import `VfsDrive` from the root `@componentor/fs` when you do
-> want to wrap the engine. Both entries are otherwise identical.
-
-```typescript
-import { DriveManager, MemoryDrive } from '@componentor/fs';
-// …or, engine-free: import { DriveManager, MemoryDrive } from '@componentor/fs/drives';
-
-const manager = new DriveManager();
-
-// Mount drives (each needs a stable unique id).
-const mem = manager.mount(new MemoryDrive('mem-1', 'Scratch'));
-const out = manager.mount(new MemoryDrive('mem-2', 'Output'));
-
-// React to the sidebar changing (mounted / unmounted / state-or-label changed).
-const off = manager.on((e) => console.log(e.type, manager.list().length));
-
-// Every drive speaks the same path-relative, async API. All paths are POSIX and
-// absolute within the drive ("/" = root); they never include the drive id.
-await mem.mkdir('/project/src', { recursive: true });
-await mem.writeFile('/project/src/app.ts', new TextEncoder().encode('export {}'));
-const entries = await mem.list('/project/src'); // [{ name: 'app.ts', type: 'file', size, mtimeMs, ... }]
-
-// Copy or move a file/tree between ANY two drives, with progress for a UI bar.
-// Same-drive transfers fast-path to native rename/copy.
-await manager.transfer(mem, '/project', out, '/backup', {
-  move: false,            // true = delete source after a fully successful copy
-  overwrite: true,        // default true
-  onProgress: (p) => {
-    const pct = p.totalBytes ? Math.round((p.movedBytes / p.totalBytes) * 100) : 100;
-    console.log(`${pct}%  ${p.movedFiles}/${p.totalFiles}  ${p.current}`);
-  },
-  // signal: abortController.signal, // optional AbortSignal
-});
-
-off();
-await manager.dispose(); // unmount + dispose every drive
-```
-
-### `Drive` interface
-
-Each drive advertises `kind`, an `icon` key, a `state`, and a `capabilities` set
-the UI uses to enable/disable actions. Core operations:
-
-| Op | Signature | Notes |
-|----|-----------|-------|
-| `stat` | `stat(path) → DriveStat` | `{ type, size, mtimeMs, ctimeMs?, readonly?, sync? }` |
-| `exists` | `exists(path) → boolean` | |
-| `list` | `list(path) → DriveEntry[]` | immediate children only |
-| `readFile` / `writeFile` | `(path[, data]) → Uint8Array \| void` | |
-| `createReadable` / `createWritable` | `(path) → stream handle` | optional; used for large-file streaming |
-| `mkdir` | `mkdir(path, { recursive? })` | |
-| `remove` | `remove(path, { recursive? })` | idempotent (`rm -f` semantics) |
-| `rename` | `rename(from, to)` | atomic within a drive |
-| `copy` | `copy(from, to)` | optional in-drive fast-path |
-| `usage` | `usage() → { total, used } \| null` | optional; `total: 0` = unbounded |
-| `batch` | `batch(fn)` | optional; coalesces a burst of writes into one commit (persist-per-op drives) |
-| `dispose` | `dispose()` | optional cleanup on unmount |
-
-Errors carry Node-style `code` fields (`ENOENT`, `ENOTDIR`, `EISDIR`,
-`ENOTEMPTY`, `EINVAL`), so existing `fs`-error handling applies.
-
-### `DriveManager`
-
-| Method | Description |
-|--------|-------------|
-| `mount(drive)` | register a drive (throws on duplicate id) |
-| `unmount(id)` | dispose + remove (no-op if absent) |
-| `get(id)` / `has(id)` / `list()` | registry queries |
-| `on(fn) → off` | subscribe to `mounted` / `unmounted` / `changed` events |
-| `notifyChanged(id)` | drivers call this when a drive's state/label changes |
-| `transfer(src, srcPath, dst, dstPath, opts)` | generic cross-drive copy/move with progress |
-| `dispose()` | unmount everything and drop listeners |
-
-`transfer` pre-walks the source to compute exact byte/file totals, streams files
-larger than 4 MB when both ends support streaming (otherwise buffers), and — on
-`move` — removes the source only after the whole tree copies successfully.
-`opts.signal` cancels between files and mid-file during streaming (rejects with
-`AbortError`). A few semantics to keep in mind:
-
-- Directory copies **merge** into an existing destination (per-file overwrite via
-  `opts.overwrite`, default `true`); they don't replace it wholesale.
-- A **cross-drive `move` is copy-then-delete, so it is not atomic** — an abort or
-  error mid-transfer can leave a partial copy with the source still intact.
-  Same-drive moves use the drive's atomic `rename`.
-
-### Drive implementations
-
-All of these implement the same `Drive` interface and interoperate via
-`DriveManager.transfer` and `SyncEngine`:
-
-| Class | `kind` | Backing | Persistent | Notes |
-|-------|--------|---------|------------|-------|
-| `TreeDrive` | — | abstract base | — | in-RAM POSIX tree (child-indexed dirs, batch/copy guards, streaming); subclass and override `persist()`/`hydrate()` |
-| `MemoryDrive` | `memory` | `Map` in one tab | no | a zero-persistence `TreeDrive`; fastest, single-tab; the reference disk |
-| `LocalStorageDrive` | `localstorage` | one `localStorage` key (base64 JSON) | yes | small (~5 MB origin budget), synchronous, single-origin |
-| `IndexedDbDrive` | `indexeddb` | IDB object store (one record/path) | yes | large; works **without** COOP/COEP or OPFS |
-| `VfsDrive` | `opfs` | wraps a `VFSFileSystem` | yes | bridges the OPFS engine; honours real symlinks; pass a sub-`root` for scoped disks |
-| `LocalFolderDrive` | `localfolder` | File System Access dir handle | yes | `pickDirectory()` / re-attach a saved handle; a mounted USB folder is just a picked dir |
-| `CloudDrive` | `gdrive`/`dropbox`/`onedrive` | host proxy (`/drives/:connId/*`) | yes | the **lib never sees OAuth tokens** — the host service brokers them |
-
-```typescript
-import {
-  IndexedDbDrive, VfsDrive, LocalFolderDrive, CloudDrive,
-  pickDirectory, localFolderSupported,
-} from '@componentor/fs';
-
-// Persistent disk that needs no cross-origin isolation:
-const idb = manager.mount(new IndexedDbDrive('idb-1', 'Projects'));
-
-// Expose the existing OPFS engine as a drive (optionally scoped to a sub-tree):
-const opfs = manager.mount(new VfsDrive('opfs', 'Disk', fs, '/Volumes/Disk', true));
-
-// A real local/USB folder (Chromium; needs a user gesture):
-if (localFolderSupported()) {
-  const folder = new LocalFolderDrive('usb-1', 'USB', await pickDirectory());
-  await folder.connect();
-  manager.mount(folder);
-}
-
-// A cloud account, brokered by your host service (no tokens in the lib):
-const gdrive = new CloudDrive({
-  id: 'gdrive:me', label: 'Google Drive', provider: 'gdrive',
-  baseUrl: 'https://app.example.com/api', connectionId: 'conn_123',
-});
-await gdrive.connect();
-manager.mount(gdrive);
-```
-
-**Persistence (`LocalStorageDrive` / `IndexedDbDrive`):** both persist
-**incrementally** — one record per path (IndexedDB) or one key per path
-(localStorage) — so a single write commits only the record(s) that changed, not
-the whole tree. Multi-file operations are coalesced into **one** commit: a
-recursive `copy`, a `rename`, a `DriveManager.transfer`, and anything you wrap in
-`drive.batch(fn)` flush once at the end rather than per file. The tree lives in
-memory and is loaded once on first access (`hydrate`); localStorage still has the
-~5 MB origin budget, so prefer `VfsDrive` (OPFS) or `IndexedDbDrive` for large
-working sets.
-
-```typescript
-// Group your own writes into a single store commit:
-await idb.batch(async () => {
-  for (const [path, bytes] of files) await idb.writeFile(path, bytes);
-});
-```
-
-To implement a custom persistent drive, subclass `TreeDrive` and override
-`hydrate()` (load all node records into `this.nodes`; the base rebuilds directory
-`children` sets) and `commit(puts, dels)` (write the changed paths, delete the
-removed ones).
-
-### Sync engine
-
-`SyncEngine` mirrors a folder on one drive into a folder on another (e.g. a cloud
-drive ↔ a local OPFS cache), one-way or two-way, emitting a per-path `SyncStatus`
-the UI can badge. Change detection uses a manifest (`.tdsync.json`) stored in the
-local folder.
-
-```typescript
-import { SyncEngine } from '@componentor/fs';
-
-const sync = new SyncEngine(gdrive, '/Reports', opfs, '/cache/Reports');
-const result = await sync.sync({
-  direction: 'two-way', // 'pull' | 'push' | 'two-way' (default)
-  onStatus: (path, status) => console.log(status, path), // synced | uploading | downloading | conflict | …
-  onProgress: (done, total) => console.log(`${done}/${total}`),
-});
-console.log(result); // { downloaded, uploaded, deleted, conflicts, errors }
-```
-
-Two-way conflicts (both sides changed since the last sync) are reported in
-`result.conflicts` and badged `conflict` rather than auto-resolved, so the host can
-prompt the user. Empty-directory deletions are not propagated.
+**→ [API reference](docs/api-reference.md)**  ·  **→ [Maintenance helpers](docs/maintenance.md)**
+·  **→ [Multi-Drive API](docs/multi-drive.md)** (experimental)
 
 ## isomorphic-git Integration
 

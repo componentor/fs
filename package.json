@@ -36,6 +36,7 @@
   ],
   "scripts": {
     "build": "node src/scripts/build.mjs",
+    "readme:alias": "node scripts/sync-alias-readme.mjs",
     "dev": "node src/scripts/build.mjs && cd src && npx tsup --watch",
     "test": "cd src && npx vitest run",
     "example": "node examples/serve.js",

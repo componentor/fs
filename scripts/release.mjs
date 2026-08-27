@@ -122,6 +122,13 @@ say('Verify — typecheck, tests, and a fresh build of dist/');
 run('npm', ['run', 'verify']);
 ok('typecheck clean, Node suite passed, dist/ rebuilt');
 
+// The alias readme is generated from the root one, so it is regenerated here for the same reason
+// `dist/` is: a copy that drifted since the last release cannot reach npm, because it is rebuilt
+// seconds before the tarball is packed.
+say('Regenerate the alias readme');
+run('node', ['scripts/sync-alias-readme.mjs']);
+ok('sync-opfs/readme.md matches readme.md');
+
 if (runBrowser) {
   say('Browser suite');
   run('npx', ['playwright', 'test', '--project=chromium']);
