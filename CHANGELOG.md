@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 4.3.1
 
 **A bulk write no longer freezes the tab.** In `opfs` mode our own mirror writes come back through the external-change observer, one relay message per file; a large install drowned the sync relay in them and every synchronous `fs.*` call in the page waited behind that traffic. The records are now coalesced into one message per interval.
 
