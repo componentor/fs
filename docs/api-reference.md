@@ -331,3 +331,18 @@ constants.O_EXCL     // 128
 constants.O_TRUNC    // 512
 constants.O_APPEND   // 1024
 ```
+
+### Convenience Helpers
+
+```typescript
+import { createFS, getDefaultFS, init } from '@componentor/fs';
+
+// Create with config
+const fs = createFS({ root: '/repo', debug: true });
+
+// Lazy singleton (created on first access)
+const defaultFs = getDefaultFS();
+
+// Async init helper
+await init(); // initializes the default singleton
+```
