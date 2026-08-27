@@ -6,6 +6,8 @@ This package is an alias. Everything lives in [`@componentor/fs`](https://www.np
 this is a re-export under a name that matches what people search for. Same code, same version,
 same docs — pick whichever name you prefer.
 
+**[Try it in your browser →](https://componentor.github.io/fs/)** · no install, real OPFS.
+
 ```bash
 npm install sync-opfs
 ```
