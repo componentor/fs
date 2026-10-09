@@ -4,9 +4,36 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>@componentor/fs — a real synchronous filesystem in your browser</title>
+  <title>@componentor/fs — Node fs in the browser with a real synchronous readFileSync (OPFS)</title>
   <meta name="description"
-    content="Drag files in, browse them, delete them, and watch them sync across tabs — a Node fs API with a readFileSync that actually blocks, running on OPFS." />
+    content="Live playground for @componentor/fs: Node's fs API in the browser, with a readFileSync that actually blocks, stored in OPFS. Drag files in, clone a git repo, sync across tabs, benchmark it." />
+  <link rel="canonical" href="https://componentor.github.io/fs/" />
+  <link rel="icon"
+    href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📁</text></svg>" />
+
+  <!-- Link previews (Slack, X, LinkedIn, Discord). -->
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="@componentor/fs" />
+  <meta property="og:url" content="https://componentor.github.io/fs/" />
+  <meta property="og:title" content="@componentor/fs — Node fs in the browser, synchronous, on OPFS" />
+  <meta property="og:description"
+    content="Node's fs API in the browser, with a readFileSync that actually blocks. Try it live: files, git clone, cross-tab sync and a benchmark." />
+  <meta name="twitter:card" content="summary" />
+
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareSourceCode",
+    "name": "@componentor/fs",
+    "alternateName": "sync-opfs",
+    "description": "Node's fs in the browser, including a real synchronous readFileSync/writeFileSync, stored in OPFS.",
+    "url": "https://componentor.github.io/fs/",
+    "codeRepository": "https://github.com/componentor/fs",
+    "programmingLanguage": "TypeScript",
+    "runtimePlatform": "Web browser",
+    "license": "https://github.com/componentor/fs/blob/main/LICENSE"
+  }
+  </script>
 
   <!-- Adds the isolation headers GitHub Pages will not, so the SYNC api works here. See the file. -->
   <script src="./coi-serviceworker.js"></script>
