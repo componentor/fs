@@ -4337,7 +4337,10 @@ function preGrowIfQuiet() {
 }
 function awaitResponseConsumed(targetCtrl, budgetMs) {
   if (!spinningNeeded()) {
-    Atomics.wait(targetCtrl, 0, SIGNAL.RESPONSE, budgetMs);
+    const end = Date.now() + budgetMs;
+    for (let left = budgetMs; Atomics.load(targetCtrl, 0) === SIGNAL.RESPONSE && left > 0; left = end - Date.now()) {
+      Atomics.wait(targetCtrl, 0, SIGNAL.RESPONSE, left);
+    }
     return Atomics.load(targetCtrl, 0) !== SIGNAL.RESPONSE;
   }
   const deadline = Date.now() + budgetMs;

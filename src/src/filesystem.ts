@@ -155,7 +155,11 @@ function spinWait(
   stalledMessage?: string,
 ): void {
   if (_canAtomicsWait) {
-    Atomics.wait(arr, index, value);
+    // A wake is not an answer. `Atomics.notify` wakes every waiter on the slot, and the async
+    // relay's wake hint notifies this same slot for every async request: returning on the first
+    // wake read the caller's own request back as the response (status = opcode → EINVAL on
+    // open/read/close, ENOTDIR on stat) and desynced the channel. Wait until the value moves.
+    while (Atomics.load(arr, index) === value) Atomics.wait(arr, index, value);
     return;
   }
   // Abort on a counterpart that has stopped getting anywhere, never on one that is merely taking a

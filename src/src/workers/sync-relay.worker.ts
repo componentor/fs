@@ -768,7 +768,12 @@ function awaitResponseConsumed(targetCtrl: Int32Array, budgetMs: number): boolea
   // as pre-3.2.0 did. Slicing there just adds repeated re-reads/timer churn
   // that contend for the CPU on a core-constrained device. `true` = consumed.
   if (!spinningNeeded()) {
-    Atomics.wait(targetCtrl, 0, SIGNAL.RESPONSE, budgetMs);
+    // Re-wait after a wake that did not consume the response: the async relay's wake hint
+    // notifies this slot too, and giving up early let the caller overwrite a live RESPONSE.
+    const end = Date.now() + budgetMs;
+    for (let left = budgetMs; Atomics.load(targetCtrl, 0) === SIGNAL.RESPONSE && left > 0; left = end - Date.now()) {
+      Atomics.wait(targetCtrl, 0, SIGNAL.RESPONSE, left);
+    }
     return Atomics.load(targetCtrl, 0) !== SIGNAL.RESPONSE;
   }
   const deadline = Date.now() + budgetMs;
