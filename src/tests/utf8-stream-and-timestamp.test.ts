@@ -85,19 +85,21 @@ describe('Utf8Stream', () => {
     }
   });
 
-  it('matches node\'s defaults', () => {
+  it('matches node\'s defaults', async () => {
     const ours = new fs.Utf8Stream({ dest: '/log.txt' });
     const theirs = new NodeU8({ dest: R('log.txt') });
-    // node's opens asynchronously; without a listener a late open failure — the temp root is
-    // removed in afterEach — surfaces as an uncaught exception rather than on the stream.
-    (theirs as unknown as { on(e: string, f: () => void): void }).on('error', () => {});
+    // node's opens asynchronously, so the test waits for it to close: returning early let that
+    // open create log.txt while afterEach was emptying the temp root, which then threw ENOTEMPTY.
+    const node = theirs as unknown as { once(e: string, f: () => void): void; end(): void };
+    const closed = new Promise<void>((done) => { node.once('close', done); node.once('error', done); });
     for (const key of ['minLength', 'maxLength', 'append', 'contentMode', 'mode', 'mkdir', 'fsync', 'periodicFlush', 'sync'] as const) {
       expect((ours as unknown as Record<string, unknown>)[key], `default ${key}`).toBe(theirs[key]);
     }
     expect(ours.file).toBe('/log.txt');
     expect(typeof ours.fd).toBe('number');
     ours.end();
-    (theirs as unknown as { end(): void }).end();
+    node.end();
+    await closed;
   });
 
   it('writes text through to the file', async () => {
