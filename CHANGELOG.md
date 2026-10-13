@@ -1,5 +1,15 @@
 # Changelog
 
+## 4.3.2
+
+**A synchronous call made while async writes are in flight no longer fails with `EINVAL` or `ENOTDIR`.** With the filesystem hosted in a worker, a sync `open`/`read`/`close` or `stat` that ran alongside `fs.promises` writes could throw an error that made no sense for its arguments, report a wrong size, or leave the channel out of step so that later calls hung.
+
+- **Cause: a wake was treated as an answer.** In a worker, `spinWait` returned on the first `Atomics.notify` on `ctrl[0]`. The async relay's wake hint notifies that same slot for every async request, so a sync caller woken that way read its own request back as the response. The status field was then the opcode, which surfaced as `EINVAL` from `open`/`read`/`close` and `ENOTDIR` from `stat`. It now waits until the slot's value actually changes, which is what its doc comment always said it did.
+- **The sync relay's `awaitResponseConsumed` had the same flaw in reverse.** It gave up on the first wake and let the caller overwrite a `RESPONSE` that had not been read yet. It now waits again for whatever remains of its budget.
+- **Performance is unchanged.** The new loop adds one `Atomics.load` before the `Atomics.wait`, which already returns at once when the value differs. Only spurious wakes, the ones that caused the bug, cost an extra wait. The main-thread spin path is untouched.
+- Found with a stress run: one VFS in a worker, sync `open`/`read`/`close` against async writes of 1–35 MB. It hit 446 errors in 120 s before the fix and none in 667k cycles after.
+- 1974 tests over 96 files pass, unchanged.
+
 ## 4.3.1
 
 **A bulk write no longer freezes the tab.** In `opfs` mode our own mirror writes come back through the external-change observer, one relay message per file; a large install drowned the sync relay in them and every synchronous `fs.*` call in the page waited behind that traffic. The records are now coalesced into one message per interval.
