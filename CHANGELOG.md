@@ -1,5 +1,17 @@
 # Changelog
 
+## 4.3.5
+
+**Write data is taken the way node takes it. An `ArrayBuffer` no longer becomes an empty file.**
+
+- **Fixed: `writeFile`, `appendFile` and `write` wrote whatever they were handed without checking it, and lost data doing so.** An `ArrayBuffer`, which is what `file.arrayBuffer()` and `fetch` give you, became an empty file without an error. A `DataView` wrote zeros. A `Uint16Array` or any other non-byte typed array wrote its element values truncated to bytes. A number or `null` wrote nothing or failed with an internal `RangeError`. Node writes the bytes of any `ArrayBufferView` and rejects everything else with `ERR_INVALID_ARG_TYPE`, and so does this now:
+  - **sync forms** (`writeFileSync`, `appendFileSync`, `writeSync`) and **callback forms** (`writeFile`, `appendFile`, `write`): thrown at the call, as node does, not handed to the callback;
+  - **promise forms** (`fs.promises` and `FileHandle`): a rejection.
+  Found in Vue Play Studio, where uploaded, dropped and imported files were all saved empty.
+- **The promise-based `writeFile` and `appendFile` take iterables, as node's do.** That covers an array, a generator, a `Set`, an async iterable or a readable stream of chunks. Each chunk is converted the way `Buffer.from(chunk, encoding)` would convert it: a string in the given encoding, any view, an `ArrayBuffer`, a `String` object, or an array of byte values. Any other chunk gets `Buffer.from`'s own error. Before, an iterable was treated as a byte array and written as garbage.
+- **No cost on the common path.** A string or `Uint8Array` (including `Buffer`) passes a `typeof` and an `instanceof` check, inline, and the promise forms only `await` for other kinds of data. Measured one process per side, counterbalanced over 8 rounds, against an identical copy of 4.3.4 as a noise control. The control moved +0.1% to +1.7%. The new code measured −0.1% to +0.6% on `writeFileSync` (bytes and string), `promises.writeFile` and `writeSync`.
+- **Test:** `write-data-types` checks 20 kinds of data (strings, byte arrays and views, `ArrayBuffer`, `DataView`, other typed arrays, numbers, objects, `null`/`undefined`, iterables, bad chunks) across all 11 write forms against real `node:fs`. It compares bytes written, error code and message, and whether a callback form throws or calls back. It also checks hex-encoded chunks. Making the check a pass-through fails all 11 forms. 2045 tests over 103 files pass. The core browser specs pass on Chromium, Firefox and WebKit.
+
 ## 4.3.4
 
 **Every correctness spec now passes on Chromium, Firefox and WebKit.** Three library bugs are fixed: `mode: 'opfs'` failed every write, WebKit hung on the first synchronous call after `init()`, and the mirror dropped genuine external deletes. Four test-harness defects that hid them are fixed too.
