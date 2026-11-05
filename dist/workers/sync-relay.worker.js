@@ -3339,6 +3339,7 @@ var SAB_OFFSETS = {
   HEADER_SIZE: 36
   // Data payload starts here
 };
+var CTRL_INT32S = SAB_OFFSETS.HEADER_SIZE >> 2;
 var SIGNAL = {
   IDLE: 0,
   REQUEST: 1,
@@ -3845,7 +3846,7 @@ function terminateWorker(worker) {
 }
 
 // src/workers/inlined/opfs-sync.workertext
-var opfs_sync_default = 'function E(e){if(e.startsWith("/")||(e="/"+e),e.length===1)return e;const t=[];for(const r of e.split("/"))if(!(r===""||r===".")){if(r===".."){t.pop();continue}t.push(r)}return"/"+t.join("/")}function q(e,t){const r=E(t);for(let n=e.length-1;n>=0;n--){const a=e[n];if(E(a.path)!==r){if(a.op==="rename"&&a.newPath&&E(a.newPath)===r)return-1;continue}return a.op==="write"?n:-1}return-1}var h,m;function f(e){if(e.charCodeAt(0)!==47&&(e="/"+e),e.indexOf("//")!==-1&&(e=e.replace(/\\/\\/+/g,"/")),e.indexOf("/.")!==-1){const t=e.split("/"),r=[];for(const n of t)if(!(n==="."||n==="")){if(n===".."){r.pop();continue}r.push(n)}e="/"+r.join("/")}return e.length>1&&e.charCodeAt(e.length-1)===47&&(e=e.slice(0,-1)),e||"/"}function H(e){return f(e).split("/").filter(Boolean)}var M=!1,D=new Set,p=new Map,b=new Map;function P(e){let t=2166136261;for(let r=0;r<e.length;r++)t^=e[r],t=Math.imul(t,16777619);return t>>>0^e.length}function R(e,t){if(e=f(e),D.has(e))return!0;const r=p.get(e);return!r||Date.now()-r>=A?!1:b.get(e)===P(t)}var A=3e3;function T(e){D.add(f(e))}function z(e){D.delete(f(e))}function C(e){p.set(f(e),Date.now())}function F(e,t=!1){e=f(e);const r=Date.now();if(D.has(e))return!0;const n=p.get(e);if(n&&r-n<A)return!0;if(t){let a=e;for(;;){const o=a.lastIndexOf("/");if(o<=0)break;if(a=a.substring(0,o),D.has(a))return!0;const i=p.get(a);if(i&&r-i<A)return!0}}return!1}setInterval(()=>{const e=Date.now()-A;for(const[t,r]of p)r<e&&(p.delete(t),b.delete(t))},5e3);var g=[],S=!1;function G(e){if(T(e.path),e.op==="rename"&&e.newPath&&T(e.newPath),e.op==="write"){const t=q(g,e.path);if(t!==-1){g[t].data=e.data,g[t].ts=e.ts;return}}g.push(e),S||B()}async function K(e){switch(e.op){case"write":e.data?await U(e.path,e.data):await U(e.path,new ArrayBuffer(0));break;case"delete":await X(e.path);break;case"mkdir":await J(e.path);break;case"rename":await L(e.path,e.newPath);break}}var I=4;async function B(){if(g.length===0){S=!1;return}S=!0;const e=g.shift();for(let t=1;t<=I;t++)try{await K(e);break}catch(r){if(t===I){console.warn("[opfs-sync] mirror failed after retries:",e.op,e.path,r);break}await new Promise(n=>setTimeout(n,10*t))}z(e.path),C(e.path),e.op==="rename"&&e.newPath&&(z(e.newPath),C(e.newPath)),B()}async function x(e){const t=H(e);t.pop();let r=m;for(const n of t)r=await r.getDirectoryHandle(n,{create:!0});return r}function y(e){const t=H(e);return t[t.length-1]||""}async function U(e,t){const r=await x(e),n=y(e),a=await r.getFileHandle(n,{create:!0}),o=new Uint8Array(t),i=await a.createSyncAccessHandle();try{i.truncate(0),i.write(o,{at:0}),i.flush()}finally{i.close()}b.set(f(e),P(o))}async function X(e){try{await(await v(e)).removeEntry(y(e),{recursive:!0})}catch{}}async function J(e){let t=m;for(const r of H(e))t=await t.getDirectoryHandle(r,{create:!0})}var W=2*1024*1024;async function L(e,t){let r=null,n=null,a,o,i=!1,u=null;for(let s=0;s<6;s++)try{a=await v(e),o=await a.getFileHandle(y(e)),i=!0;break}catch(d){u=d;const l=d?.message||"";if(d?.name==="TypeMismatchError"||l.includes("TypeMismatch")||l.includes("not a file")||l.includes("not an entry of requested type")){try{await N(e,t)}catch(c){console.warn("[opfs-sync] rename (dir) failed:",e,"\\u2192",t,c)}return}if(s<5){await new Promise(c=>setTimeout(c,8*(s+1)));continue}}if(!i){try{await N(e,t);return}catch{}console.warn("[opfs-sync] rename failed (source not found after retries):",e,"\\u2192",t,u);return}try{r=await o.createSyncAccessHandle();const s=r.getSize();if(n=await(await(await x(t)).getFileHandle(y(t),{create:!0})).createSyncAccessHandle(),n.truncate(0),s>0){const w=new Uint8Array(Math.min(s,W));let c=0;for(;c<s;){const k=Math.min(w.length,s-c),O=k===w.length?w:w.subarray(0,k);r.read(O,{at:c}),n.write(O,{at:c}),c+=k}}n.flush();try{n.close()}catch{}n=null;try{r.close()}catch{}r=null,await _(a,y(e))}catch(s){console.warn("[opfs-sync] rename failed:",e,"\\u2192",t,s)}finally{if(n)try{n.close()}catch{}if(r)try{r.close()}catch{}}}async function N(e,t){const r=await v(e),n=await r.getDirectoryHandle(y(e)),a=await x(t);try{await a.removeEntry(y(t),{recursive:!0})}catch(i){if(i?.name!=="NotFoundError")throw i}const o=await a.getDirectoryHandle(y(t),{create:!0});await j(n,o),await _(r,y(e),{recursive:!0})}async function _(e,t,r){let n=null;for(let a=0;a<4;a++)try{await e.removeEntry(t,r);return}catch(o){if(o?.name==="NotFoundError")return;n=o,await new Promise(i=>setTimeout(i,10*(a+1)))}throw n}async function j(e,t){for await(const[r,n]of e.entries())if(n.kind==="directory"){const a=await t.getDirectoryHandle(r,{create:!0});await j(n,a)}else{const a=n,o=await t.getFileHandle(r,{create:!0});let i=null,u=null;try{i=await a.createSyncAccessHandle(),u=await o.createSyncAccessHandle();const s=i.getSize();if(u.truncate(0),s>0){const d=new Uint8Array(Math.min(s,W));let l=0;for(;l<s;){const w=Math.min(d.length,s-l),c=w===d.length?d:d.subarray(0,w);i.read(c,{at:l}),u.write(c,{at:l}),l+=w}}u.flush()}finally{if(u)try{u.close()}catch{}if(i)try{i.close()}catch{}}}}async function v(e){const t=H(e);t.pop();let r=m;for(const n of t)r=await r.getDirectoryHandle(n);return r}function Q(e){for(const t of e){const r=f(t.path);if(!(r==="/.vfs.bin"||r==="/.vfs"||r.startsWith("/.vfs")))switch(t.kind){case"appeared":case"modified":V(r,t.handle??null);break;case"disappeared":if(F(r,!0))continue;Y(r);break;case"moved":{const n=f(t.from);if(F(r)||F(n))continue;Z(n,r);break}}}}async function V(e,t){try{if(!t||t.kind!=="file")return;const r=t;let n=await r.getFile().then(a=>a.arrayBuffer());if(R(e,new Uint8Array(n))||p.has(f(e))&&(n=await r.getFile().then(a=>a.arrayBuffer()),R(e,new Uint8Array(n))))return;h.postMessage({op:"external-write",path:e,data:n,ts:Date.now()},[n])}catch(r){M&&console.warn("[opfs-sync] external change read failed:",e,r)}}function Y(e){h.postMessage({op:"external-delete",path:e,ts:Date.now()})}function Z(e,t){h.postMessage({op:"external-rename",path:e,newPath:t,ts:Date.now()})}self.onmessage=async e=>{const t=e.data;if(t.type==="init"){if(M=t.debug===!0,h=e.ports[0],m=await navigator.storage.getDirectory(),t.root&&t.root!=="/"){const r=t.root.split("/").filter(Boolean);for(const n of r)m=await m.getDirectoryHandle(n,{create:!0})}M&&console.log("[opfs-sync] initialized with root:",t.root||"/","mirrorRoot.name:",m.name||"(opfs-root)"),h.onmessage=r=>{if(r.data?.type==="external-records"){Q(r.data.records);return}G(r.data)},h.start(),self.postMessage({type:"ready"});return}if(t.type==="shutdown"){try{h?.close()}catch{}self.postMessage({type:"shutdown-done"}),self.close();return}};\n';
+var opfs_sync_default = 'function H(e){if(e.startsWith("/")||(e="/"+e),e.length===1)return e;const t=[];for(const r of e.split("/"))if(!(r===""||r===".")){if(r===".."){t.pop();continue}t.push(r)}return"/"+t.join("/")}function W(e,t){const r=H(t);for(let n=e.length-1;n>=0;n--){const a=e[n];if(H(a.path)!==r){if(a.op==="rename"&&a.newPath&&H(a.newPath)===r)return-1;continue}return a.op==="write"?n:-1}return-1}var M=3e3;function x(e){let t=2166136261;for(let r=0;r<e.length;r++)t^=e[r],t=Math.imul(t,16777619);return t>>>0^e.length}function R(e){return e.op==="delete"?[e.path]:e.op==="rename"?e.newPath?[e.path,e.newPath]:[e.path]:[]}var U=class{constructor(e=Date.now){this.now=e}pending=new Set;pendingRemovals=new Set;completed=new Map;removed=new Map;written=new Map;enqueued(e){this.pending.add(e.path),e.op==="rename"&&e.newPath&&this.pending.add(e.newPath);for(const t of R(e))this.pendingRemovals.add(t)}finished(e){const t=this.now();this.pending.delete(e.path),this.completed.set(e.path,t),e.op==="rename"&&e.newPath&&(this.pending.delete(e.newPath),this.completed.set(e.newPath,t));for(const r of R(e))this.pendingRemovals.delete(r),this.removed.set(r,t)}wrote(e,t){this.written.set(e,x(t))}recentlyCompleted(e){const t=this.completed.get(e);return t!==void 0&&this.now()-t<M}wasCompleted(e){return this.completed.has(e)}isWriteEcho(e,t){return this.pending.has(e)?!0:this.recentlyCompleted(e)?this.written.get(e)===x(t):!1}isDeleteEcho(e){if(this.pending.has(e))return!0;const t=this.now();let r=e;for(;;){if(this.pendingRemovals.has(r))return!0;const n=this.removed.get(r);if(n!==void 0&&t-n<M)return!0;const a=r.lastIndexOf("/");if(a<=0)return!1;r=r.substring(0,a)}}isMoveEcho(e,t){return this.pending.has(t)?!0:this.isDeleteEcho(e)}sweep(){const e=this.now()-M;for(const[t,r]of this.completed)r<e&&(this.completed.delete(t),this.written.delete(t));for(const[t,r]of this.removed)r<e&&this.removed.delete(t)}},p,y;function m(e){if(e.charCodeAt(0)!==47&&(e="/"+e),e.indexOf("//")!==-1&&(e=e.replace(/\\/\\/+/g,"/")),e.indexOf("/.")!==-1){const t=e.split("/"),r=[];for(const n of t)if(!(n==="."||n==="")){if(n===".."){r.pop();continue}r.push(n)}e="/"+r.join("/")}return e.length>1&&e.charCodeAt(e.length-1)===47&&(e=e.slice(0,-1)),e||"/"}function E(e){return m(e).split("/").filter(Boolean)}var h=new U;setInterval(()=>h.sweep(),5e3);var A=!1,g=[],k=!1;function v(e){return{op:e.op,path:m(e.path),newPath:e.newPath&&m(e.newPath)}}function N(e){if(h.enqueued(v(e)),e.op==="write"){const t=W(g,e.path);if(t!==-1){g[t].data=e.data,g[t].ts=e.ts;return}}g.push(e),k||O()}async function _(e){switch(e.op){case"write":e.data?await P(e.path,e.data):await P(e.path,new ArrayBuffer(0));break;case"delete":await q(e.path);break;case"mkdir":await j(e.path);break;case"rename":await G(e.path,e.newPath);break}}var C=4;async function O(){if(g.length===0){k=!1;return}k=!0;const e=g.shift();for(let t=1;t<=C;t++)try{await _(e);break}catch(r){if(t===C){console.warn("[opfs-sync] mirror failed after retries:",e.op,e.path,r);break}await new Promise(n=>setTimeout(n,10*t))}h.finished(v(e)),O()}async function b(e){const t=E(e);t.pop();let r=y;for(const n of t)r=await r.getDirectoryHandle(n,{create:!0});return r}function w(e){const t=E(e);return t[t.length-1]||""}async function P(e,t){const r=await b(e),n=w(e),a=await r.getFileHandle(n,{create:!0}),o=new Uint8Array(t),i=await a.createSyncAccessHandle();try{i.truncate(0),i.write(o,{at:0}),i.flush()}finally{i.close()}h.wrote(m(e),o)}async function q(e){try{await(await S(e)).removeEntry(w(e),{recursive:!0})}catch{}}async function j(e){let t=y;for(const r of E(e))t=await t.getDirectoryHandle(r,{create:!0})}var T=2*1024*1024;async function G(e,t){let r=null,n=null,a,o,i=!1,f=null;for(let s=0;s<6;s++)try{a=await S(e),o=await a.getFileHandle(w(e)),i=!0;break}catch(u){f=u;const l=u?.message||"";if(u?.name==="TypeMismatchError"||l.includes("TypeMismatch")||l.includes("not a file")||l.includes("not an entry of requested type")){try{await z(e,t)}catch(c){console.warn("[opfs-sync] rename (dir) failed:",e,"\\u2192",t,c)}return}if(s<5){await new Promise(c=>setTimeout(c,8*(s+1)));continue}}if(!i){try{await z(e,t);return}catch{}console.warn("[opfs-sync] rename failed (source not found after retries):",e,"\\u2192",t,f);return}try{r=await o.createSyncAccessHandle();const s=r.getSize();if(n=await(await(await b(t)).getFileHandle(w(t),{create:!0})).createSyncAccessHandle(),n.truncate(0),s>0){const d=new Uint8Array(Math.min(s,T));let c=0;for(;c<s;){const D=Math.min(d.length,s-c),F=D===d.length?d:d.subarray(0,D);r.read(F,{at:c}),n.write(F,{at:c}),c+=D}}n.flush();try{n.close()}catch{}n=null;try{r.close()}catch{}r=null,await B(a,w(e))}catch(s){console.warn("[opfs-sync] rename failed:",e,"\\u2192",t,s)}finally{if(n)try{n.close()}catch{}if(r)try{r.close()}catch{}}}async function z(e,t){const r=await S(e),n=await r.getDirectoryHandle(w(e)),a=await b(t);try{await a.removeEntry(w(t),{recursive:!0})}catch(i){if(i?.name!=="NotFoundError")throw i}const o=await a.getDirectoryHandle(w(t),{create:!0});await I(n,o),await B(r,w(e),{recursive:!0})}async function B(e,t,r){let n=null;for(let a=0;a<4;a++)try{await e.removeEntry(t,r);return}catch(o){if(o?.name==="NotFoundError")return;n=o,await new Promise(i=>setTimeout(i,10*(a+1)))}throw n}async function I(e,t){for await(const[r,n]of e.entries())if(n.kind==="directory"){const a=await t.getDirectoryHandle(r,{create:!0});await I(n,a)}else{const a=n,o=await t.getFileHandle(r,{create:!0});let i=null,f=null;try{i=await a.createSyncAccessHandle(),f=await o.createSyncAccessHandle();const s=i.getSize();if(f.truncate(0),s>0){const u=new Uint8Array(Math.min(s,T));let l=0;for(;l<s;){const d=Math.min(u.length,s-l),c=d===u.length?u:u.subarray(0,d);i.read(c,{at:l}),f.write(c,{at:l}),l+=d}}f.flush()}finally{if(f)try{f.close()}catch{}if(i)try{i.close()}catch{}}}}async function S(e){const t=E(e);t.pop();let r=y;for(const n of t)r=await r.getDirectoryHandle(n);return r}function K(e){for(const t of e){const r=m(t.path);if(!(r==="/.vfs.bin"||r==="/.vfs"||r.startsWith("/.vfs")))switch(t.kind){case"appeared":case"modified":X(r,t.handle??null);break;case"disappeared":if(h.isDeleteEcho(r))continue;J(r);break;case"moved":{const n=m(t.from);if(h.isMoveEcho(n,r))continue;L(n,r);break}}}}async function X(e,t){try{if(!t||t.kind!=="file")return;const r=t;let n=await r.getFile().then(a=>a.arrayBuffer());if(h.isWriteEcho(e,new Uint8Array(n))||h.wasCompleted(e)&&(n=await r.getFile().then(a=>a.arrayBuffer()),h.isWriteEcho(e,new Uint8Array(n))))return;p.postMessage({op:"external-write",path:e,data:n,ts:Date.now()},[n])}catch(r){A&&console.warn("[opfs-sync] external change read failed:",e,r)}}function J(e){p.postMessage({op:"external-delete",path:e,ts:Date.now()})}function L(e,t){p.postMessage({op:"external-rename",path:e,newPath:t,ts:Date.now()})}self.onmessage=async e=>{const t=e.data;if(t.type==="init"){if(A=t.debug===!0,p=e.ports[0],y=await navigator.storage.getDirectory(),t.root&&t.root!=="/"){const r=t.root.split("/").filter(Boolean);for(const n of r)y=await y.getDirectoryHandle(n,{create:!0})}A&&console.log("[opfs-sync] initialized with root:",t.root||"/","mirrorRoot.name:",y.name||"(opfs-root)"),p.onmessage=r=>{if(r.data?.type==="external-records"){K(r.data.records);return}N(r.data)},p.start(),self.postMessage({type:"ready"});return}if(t.type==="shutdown"){try{p?.close()}catch{}self.postMessage({type:"shutdown-done"}),self.close();return}};\n';
 
 // src/protocol/mirror-plan.ts
 function sampleOpenPreState(engine2, flags, path) {
@@ -3925,6 +3926,8 @@ var leaderLoopRunning = false;
 var opfsSyncPort = null;
 var opfsSyncEnabled = false;
 var opfsSyncWorker = null;
+var mirrorReady = null;
+var OPFS_SYNC_READY_TIMEOUT_MS = 2e3;
 var watchBc = null;
 var sab;
 var ctrl;
@@ -4813,8 +4816,18 @@ async function initEngine(config) {
     opfsSyncPort = mc.port1;
     opfsSyncPort.onmessage = (e) => handleExternalChange(e.data);
     opfsSyncPort.start();
-    opfsSyncWorker = workerFromSource(opfs_sync_default, "vfs-opfs-sync");
-    opfsSyncWorker.postMessage(
+    const mirror = workerFromSource(opfs_sync_default, "vfs-opfs-sync");
+    opfsSyncWorker = mirror;
+    mirrorReady = new Promise((resolve) => {
+      const timer = setTimeout(resolve, OPFS_SYNC_READY_TIMEOUT_MS);
+      mirror.onmessage = (ev) => {
+        if (ev.data?.type !== "ready") return;
+        clearTimeout(timer);
+        mirror.onmessage = null;
+        resolve();
+      };
+    });
+    mirror.postMessage(
       { type: "init", root: config.opfsSyncRoot ?? config.root, debug },
       [mc.port2]
     );
@@ -4827,6 +4840,10 @@ async function initEngine(config) {
     }
   }
   watchBc = new BroadcastChannel(`${config.ns}-watch`);
+  if (mirrorReady) {
+    await mirrorReady;
+    mirrorReady = null;
+  }
 }
 async function initOPFSEngine(config) {
   debug = config.debug ?? false;
@@ -5088,13 +5105,13 @@ self.onmessage = async (e) => {
     if (hasSAB) {
       sab = msg.sab;
       readySab = msg.readySab;
-      ctrl = new Int32Array(sab, 0, 8);
+      ctrl = new Int32Array(sab, 0, CTRL_INT32S);
       readySignal = new Int32Array(readySab, 0, 1);
       startHeartbeat();
     }
     if (msg.asyncSab) {
       asyncSab = msg.asyncSab;
-      asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
+      asyncCtrl = new Int32Array(msg.asyncSab, 0, CTRL_INT32S);
     }
     try {
       await initEngine(msg.config);
@@ -5127,13 +5144,13 @@ self.onmessage = async (e) => {
     if (hasSAB) {
       sab = msg.sab;
       readySab = msg.readySab;
-      ctrl = new Int32Array(sab, 0, 8);
+      ctrl = new Int32Array(sab, 0, CTRL_INT32S);
       readySignal = new Int32Array(readySab, 0, 1);
       startHeartbeat();
     }
     if (msg.asyncSab) {
       asyncSab = msg.asyncSab;
-      asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
+      asyncCtrl = new Int32Array(msg.asyncSab, 0, CTRL_INT32S);
     }
     try {
       await initOPFSEngine(msg.config);
@@ -5164,13 +5181,13 @@ self.onmessage = async (e) => {
     if (hasSAB) {
       sab = msg.sab;
       readySab = msg.readySab;
-      ctrl = new Int32Array(sab, 0, 8);
+      ctrl = new Int32Array(sab, 0, CTRL_INT32S);
       readySignal = new Int32Array(readySab, 0, 1);
       startHeartbeat();
     }
     if (msg.asyncSab) {
       asyncSab = msg.asyncSab;
-      asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
+      asyncCtrl = new Int32Array(msg.asyncSab, 0, CTRL_INT32S);
     }
     return;
   }

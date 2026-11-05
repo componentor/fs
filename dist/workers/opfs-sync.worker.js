@@ -27,6 +27,105 @@ function coalesceWriteIndex(queue2, path) {
   return -1;
 }
 
+// src/workers/opfs-sync-echo.ts
+var ECHO_GRACE_MS = 3e3;
+function hashBytes(b) {
+  let h = 2166136261;
+  for (let i = 0; i < b.length; i++) {
+    h ^= b[i];
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0 ^ b.length;
+}
+function removedBy(event) {
+  if (event.op === "delete") return [event.path];
+  if (event.op === "rename") return event.newPath ? [event.path, event.newPath] : [event.path];
+  return [];
+}
+var MirrorEchoTracker = class {
+  constructor(now = Date.now) {
+    this.now = now;
+  }
+  pending = /* @__PURE__ */ new Set();
+  pendingRemovals = /* @__PURE__ */ new Set();
+  completed = /* @__PURE__ */ new Map();
+  removed = /* @__PURE__ */ new Map();
+  written = /* @__PURE__ */ new Map();
+  /** A mirror op was queued. */
+  enqueued(event) {
+    this.pending.add(event.path);
+    if (event.op === "rename" && event.newPath) this.pending.add(event.newPath);
+    for (const p of removedBy(event)) this.pendingRemovals.add(p);
+  }
+  /** A mirror op finished (or gave up): its grace window starts now. */
+  finished(event) {
+    const t = this.now();
+    this.pending.delete(event.path);
+    this.completed.set(event.path, t);
+    if (event.op === "rename" && event.newPath) {
+      this.pending.delete(event.newPath);
+      this.completed.set(event.newPath, t);
+    }
+    for (const p of removedBy(event)) {
+      this.pendingRemovals.delete(p);
+      this.removed.set(p, t);
+    }
+  }
+  /** We wrote these bytes to `path`. */
+  wrote(path, bytes) {
+    this.written.set(path, hashBytes(bytes));
+  }
+  /** Did a mirror op on `path` finish within the grace window? */
+  recentlyCompleted(path) {
+    const ts = this.completed.get(path);
+    return ts !== void 0 && this.now() - ts < ECHO_GRACE_MS;
+  }
+  /** Has a mirror op on `path` finished and not been swept yet (the window plus up to one sweep)? */
+  wasCompleted(path) {
+    return this.completed.has(path);
+  }
+  /** Is an observed write to `path` carrying `bytes` our own echo? */
+  isWriteEcho(path, bytes) {
+    if (this.pending.has(path)) return true;
+    if (!this.recentlyCompleted(path)) return false;
+    return this.written.get(path) === hashBytes(bytes);
+  }
+  /** Is an observed 'disappeared' of `path` our own echo? */
+  isDeleteEcho(path) {
+    if (this.pending.has(path)) return true;
+    const now = this.now();
+    let p = path;
+    while (true) {
+      if (this.pendingRemovals.has(p)) return true;
+      const ts = this.removed.get(p);
+      if (ts !== void 0 && now - ts < ECHO_GRACE_MS) return true;
+      const slash = p.lastIndexOf("/");
+      if (slash <= 0) return false;
+      p = p.substring(0, slash);
+    }
+  }
+  /**
+   * Is an observed 'moved' (from → to) our own echo? We never move natively — a mirror rename is
+   * copy + delete — so only an op in flight on either end, or one that removed the source,
+   * explains it.
+   */
+  isMoveEcho(from, to) {
+    if (this.pending.has(to)) return true;
+    return this.isDeleteEcho(from);
+  }
+  /** Drop entries past the grace window. */
+  sweep() {
+    const cutoff = this.now() - ECHO_GRACE_MS;
+    for (const [p, ts] of this.completed) {
+      if (ts < cutoff) {
+        this.completed.delete(p);
+        this.written.delete(p);
+      }
+    }
+    for (const [p, ts] of this.removed) if (ts < cutoff) this.removed.delete(p);
+  }
+};
+
 // src/workers/opfs-sync.worker.ts
 var serverPort;
 var mirrorRoot;
@@ -52,70 +151,16 @@ function normalizePath(p) {
 function pathSegments(p) {
   return normalizePath(p).split("/").filter(Boolean);
 }
+var echo = new MirrorEchoTracker();
+setInterval(() => echo.sweep(), 5e3);
 var debug = false;
-var pendingPaths = /* @__PURE__ */ new Set();
-var completedPaths = /* @__PURE__ */ new Map();
-var lastWriteHash = /* @__PURE__ */ new Map();
-function hashBytes(b) {
-  let h = 2166136261;
-  for (let i = 0; i < b.length; i++) {
-    h ^= b[i];
-    h = Math.imul(h, 16777619);
-  }
-  return h >>> 0 ^ b.length;
-}
-function isOurWriteEcho(path, bytes) {
-  path = normalizePath(path);
-  if (pendingPaths.has(path)) return true;
-  const ts = completedPaths.get(path);
-  if (!ts || Date.now() - ts >= GRACE_MS) return false;
-  return lastWriteHash.get(path) === hashBytes(bytes);
-}
-var GRACE_MS = 3e3;
-function trackPending(path) {
-  pendingPaths.add(normalizePath(path));
-}
-function untrackPending(path) {
-  pendingPaths.delete(normalizePath(path));
-}
-function trackCompleted(path) {
-  completedPaths.set(normalizePath(path), Date.now());
-}
-function isOurEcho(path, checkParents = false) {
-  path = normalizePath(path);
-  const now = Date.now();
-  if (pendingPaths.has(path)) return true;
-  const ts = completedPaths.get(path);
-  if (ts && now - ts < GRACE_MS) return true;
-  if (checkParents) {
-    let parent = path;
-    while (true) {
-      const slash = parent.lastIndexOf("/");
-      if (slash <= 0) break;
-      parent = parent.substring(0, slash);
-      if (pendingPaths.has(parent)) return true;
-      const pts = completedPaths.get(parent);
-      if (pts && now - pts < GRACE_MS) return true;
-    }
-  }
-  return false;
-}
-setInterval(() => {
-  const cutoff = Date.now() - GRACE_MS;
-  for (const [p, ts] of completedPaths) {
-    if (ts < cutoff) {
-      completedPaths.delete(p);
-      lastWriteHash.delete(p);
-    }
-  }
-}, 5e3);
 var queue = [];
 var processing = false;
+function echoOp(event) {
+  return { op: event.op, path: normalizePath(event.path), newPath: event.newPath && normalizePath(event.newPath) };
+}
 function enqueue(event) {
-  trackPending(event.path);
-  if (event.op === "rename" && event.newPath) {
-    trackPending(event.newPath);
-  }
+  echo.enqueued(echoOp(event));
   if (event.op === "write") {
     const idx = coalesceWriteIndex(queue, event.path);
     if (idx !== -1) {
@@ -167,12 +212,7 @@ async function processNext() {
       await new Promise((r) => setTimeout(r, 10 * attempt));
     }
   }
-  untrackPending(event.path);
-  trackCompleted(event.path);
-  if (event.op === "rename" && event.newPath) {
-    untrackPending(event.newPath);
-    trackCompleted(event.newPath);
-  }
+  echo.finished(echoOp(event));
   processNext();
 }
 async function ensureParentDirs(path) {
@@ -201,7 +241,7 @@ async function writeToOPFS(path, data) {
   } finally {
     accessHandle.close();
   }
-  lastWriteHash.set(normalizePath(path), hashBytes(bytes));
+  echo.wrote(normalizePath(path), bytes);
 }
 async function deleteFromOPFS(path) {
   try {
@@ -394,12 +434,12 @@ function applyExternalRecords(records) {
         syncExternalChange(path, record.handle ?? null);
         break;
       case "disappeared":
-        if (isOurEcho(path, true)) continue;
+        if (echo.isDeleteEcho(path)) continue;
         syncExternalDelete(path);
         break;
       case "moved": {
         const from = normalizePath(record.from);
-        if (isOurEcho(path) || isOurEcho(from)) continue;
+        if (echo.isMoveEcho(from, path)) continue;
         syncExternalRename(from, path);
         break;
       }
@@ -411,10 +451,10 @@ async function syncExternalChange(path, handle) {
     if (!handle || handle.kind !== "file") return;
     const fileHandle = handle;
     let data = await fileHandle.getFile().then((f) => f.arrayBuffer());
-    if (isOurWriteEcho(path, new Uint8Array(data))) return;
-    if (completedPaths.has(normalizePath(path))) {
+    if (echo.isWriteEcho(path, new Uint8Array(data))) return;
+    if (echo.wasCompleted(path)) {
       data = await fileHandle.getFile().then((f) => f.arrayBuffer());
-      if (isOurWriteEcho(path, new Uint8Array(data))) return;
+      if (echo.isWriteEcho(path, new Uint8Array(data))) return;
     }
     serverPort.postMessage({
       op: "external-write",

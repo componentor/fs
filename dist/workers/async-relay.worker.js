@@ -86,6 +86,7 @@ var SAB_OFFSETS = {
   HEADER_SIZE: 36
   // Data payload starts here
 };
+var CTRL_INT32S = SAB_OFFSETS.HEADER_SIZE >> 2;
 var SIGNAL = {
   IDLE: 0,
   REQUEST: 1,
@@ -299,7 +300,7 @@ self.onmessage = async (e) => {
   const msg = e.data;
   if (msg.type === "init-leader") {
     asyncSab = msg.asyncSab;
-    asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
+    asyncCtrl = new Int32Array(msg.asyncSab, 0, CTRL_INT32S);
     if (msg.wakeSab) {
       wakeCtrl = new Int32Array(msg.wakeSab, 0, 1);
     }

@@ -49,9 +49,8 @@ async function run(page: any, debug: boolean) {
 
     let externalApplied = false;
     if (hasObserver && mirrored) {
-      // Wait out the mirror's 3 s echo window: deletes are matched to our own recent writes by
-      // time alone, so an external delete inside it would be taken for our own echo.
-      await sleep(3200);
+      // No waiting out the mirror's echo window: an external delete of files we wrote a moment ago
+      // must still be applied (it used to be dropped as our own echo for 3 s).
       // External changes: write one file and delete a whole directory straight in OPFS.
       const dir = await (await opfs.getDirectoryHandle(DIR)).getDirectoryHandle('dir');
       const fh = await dir.getFileHandle('external.txt', { create: true });

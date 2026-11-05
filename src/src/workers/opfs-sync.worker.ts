@@ -7,6 +7,7 @@
  */
 
 import { coalesceWriteIndex } from './opfs-sync-plan.js';
+import { MirrorEchoTracker, type MirrorOp } from './opfs-sync-echo.js';
 
 /** One external change, as detected by the owner and forwarded here. */
 interface ExternalRecord {
@@ -53,117 +54,25 @@ function pathSegments(p: string): string[] {
   return normalizePath(p).split('/').filter(Boolean);
 }
 
-// Echo suppression — two structures:
-//
-// pendingPaths (Set): paths currently in the queue or being processed.
-//   Added on enqueue, removed after OPFS operation completes.
-//   No timeout — stays as long as the item is in the queue.
-//   Prevents false externals when queue takes >1s (e.g., 500-file batches).
-//
-// completedPaths (Map<path, timestamp>): paths recently written by us.
-//   Added when processing completes, removed ONLY by periodic cleanup.
-//   Grace window catches delayed/batched observer events after processing.
-//
-// lastWriteHash (Map<path, hash>): content hash of the bytes we last wrote to a
-//   path. Lets a 'modified'/'appeared' echo be distinguished from a GENUINE
-//   external change that lands inside the grace window: a timestamp match alone
-//   would wrongly suppress a real external write within 3s of our own write to
-//   the same path. We suppress only when the observed bytes match what we wrote.
-//
-// Parent path check (opt-in): if /dir was deleted by us, /dir/file disappearing
-// is also our echo (recursive removeEntry fires per-child events).
-// ONLY used for 'disappeared' events — NOT for 'appeared'/'modified', since
-// creating /dir doesn't mean /dir/new-file appearing is our echo.
+// Echo suppression — telling the observer records our own mirror ops cause from genuine
+// external changes. See opfs-sync-echo.ts for what is tracked and why.
+const echo = new MirrorEchoTracker();
+setInterval(() => echo.sweep(), 5000);
 
 // Diagnostics (the init log, skippable read failures) only print with `debug: true`, set at init.
 let debug = false;
-
-const pendingPaths = new Set<string>();
-const completedPaths = new Map<string, number>();
-const lastWriteHash = new Map<string, number>();
-
-/** Fast FNV-1a 32-bit content hash for echo detection (collision → at worst one suppressed real change, ~1/2^32). */
-function hashBytes(b: Uint8Array): number {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < b.length; i++) {
-    h ^= b[i];
-    h = Math.imul(h, 0x01000193);
-  }
-  return (h >>> 0) ^ b.length; // fold length in so same-prefix different-length differ
-}
-
-/**
- * Is an observed write to `path` carrying `bytes` our own echo? True only if the
- * bytes match what we last wrote within the grace window. A genuine external
- * write (different bytes) is NOT suppressed even inside the window.
- */
-function isOurWriteEcho(path: string, bytes: Uint8Array): boolean {
-  path = normalizePath(path);
-  if (pendingPaths.has(path)) return true; // our write is still mid-flight
-  const ts = completedPaths.get(path);
-  if (!ts || Date.now() - ts >= GRACE_MS) return false;
-  return lastWriteHash.get(path) === hashBytes(bytes);
-}
-const GRACE_MS = 3000;
-
-function trackPending(path: string): void {
-  pendingPaths.add(normalizePath(path));
-}
-
-function untrackPending(path: string): void {
-  pendingPaths.delete(normalizePath(path));
-}
-
-function trackCompleted(path: string): void {
-  completedPaths.set(normalizePath(path), Date.now());
-}
-
-function isOurEcho(path: string, checkParents = false): boolean {
-  path = normalizePath(path);
-  const now = Date.now();
-
-  // Check exact path
-  if (pendingPaths.has(path)) return true;
-  const ts = completedPaths.get(path);
-  if (ts && now - ts < GRACE_MS) return true;
-
-  // Walk up parent paths — ONLY for 'disappeared' events.
-  // Handles recursive delete cascading: removeEntry(dir, {recursive:true})
-  // fires individual 'disappeared' for every child file.
-  // NOT used for 'appeared'/'modified' — a parent being tracked doesn't mean
-  // a new file appearing inside it is our echo (could be genuinely external).
-  if (checkParents) {
-    let parent = path;
-    while (true) {
-      const slash = parent.lastIndexOf('/');
-      if (slash <= 0) break;
-      parent = parent.substring(0, slash);
-      if (pendingPaths.has(parent)) return true;
-      const pts = completedPaths.get(parent);
-      if (pts && now - pts < GRACE_MS) return true;
-    }
-  }
-
-  return false;
-}
-
-// Periodic cleanup — the ONLY way completedPaths entries get removed
-setInterval(() => {
-  const cutoff = Date.now() - GRACE_MS;
-  for (const [p, ts] of completedPaths) {
-    if (ts < cutoff) { completedPaths.delete(p); lastWriteHash.delete(p); }
-  }
-}, 5000);
 
 // Event queue — process one at a time, in order
 const queue: SyncEvent[] = [];
 let processing = false;
 
+/** The tracker works on normalized paths; the queued event keeps the paths it arrived with. */
+function echoOp(event: SyncEvent): MirrorOp {
+  return { op: event.op, path: normalizePath(event.path), newPath: event.newPath && normalizePath(event.newPath) };
+}
+
 function enqueue(event: SyncEvent): void {
-  trackPending(event.path);
-  if (event.op === 'rename' && event.newPath) {
-    trackPending(event.newPath);
-  }
+  echo.enqueued(echoOp(event));
 
   // Coalesce bursts of 'write' events for the same path that are still
   // waiting in the queue. Each write event carries a full-file
@@ -244,12 +153,7 @@ async function processNext(): Promise<void> {
   }
 
   // Move from pending → completed (starts grace window for delayed observer events)
-  untrackPending(event.path);
-  trackCompleted(event.path);
-  if (event.op === 'rename' && event.newPath) {
-    untrackPending(event.newPath);
-    trackCompleted(event.newPath);
-  }
+  echo.finished(echoOp(event));
 
   processNext();
 }
@@ -286,8 +190,8 @@ async function writeToOPFS(path: string, data: ArrayBuffer): Promise<void> {
     accessHandle.close();
   }
   // Record what we wrote so the observer can tell our echo from a genuine
-  // external change to the same path within the grace window (see isOurWriteEcho).
-  lastWriteHash.set(normalizePath(path), hashBytes(bytes));
+  // external change to the same path within the grace window.
+  echo.wrote(normalizePath(path), bytes);
 }
 
 async function deleteFromOPFS(path: string): Promise<void> {
@@ -565,14 +469,14 @@ function applyExternalRecords(records: ExternalRecord[]): void {
         syncExternalChange(path, record.handle ?? null);
         break;
       case 'disappeared':
-        // No content to compare for a delete — fall back to the time-based echo check
-        // (including the parent walk for recursive-delete cascades).
-        if (isOurEcho(path, true)) continue;
+        // No content to compare: ours only if one of our own ops removed this path or an
+        // ancestor (a recursive removeEntry reports every child) within the grace window.
+        if (echo.isDeleteEcho(path)) continue;
         syncExternalDelete(path);
         break;
       case 'moved': {
         const from = normalizePath(record.from!);
-        if (isOurEcho(path) || isOurEcho(from)) continue;
+        if (echo.isMoveEcho(from, path)) continue;
         syncExternalRename(from, path);
         break;
       }
@@ -591,7 +495,7 @@ async function syncExternalChange(path: string, handle: FileSystemHandle | null)
     // Our own echo? Suppress only when the observed bytes match what we wrote
     // within the grace window — a genuine external change (different bytes) is
     // forwarded even if it lands inside the window.
-    if (isOurWriteEcho(path, new Uint8Array(data))) return;
+    if (echo.isWriteEcho(path, new Uint8Array(data))) return;
 
     // The observer's snapshot can LAG our own write: a freshly-created file
     // fires 'appeared' and getFile() may return the empty creation state even
@@ -599,9 +503,9 @@ async function syncExternalChange(path: string, handle: FileSystemHandle | null)
     // match our recorded hash, so it would look "external" and bounce back an
     // empty write, clobbering the file. If we recently wrote this path, re-read
     // the current bytes once and re-check before forwarding.
-    if (completedPaths.has(normalizePath(path))) {
+    if (echo.wasCompleted(path)) {
       data = await fileHandle.getFile().then((f) => f.arrayBuffer());
-      if (isOurWriteEcho(path, new Uint8Array(data))) return;
+      if (echo.isWriteEcho(path, new Uint8Array(data))) return;
     }
 
     serverPort.postMessage({
