@@ -75,6 +75,18 @@ let opfsSyncPort: MessagePort | null = null;
 let opfsSyncEnabled = false;
 /** The mirror worker, so it can be shut down instead of orphaned. See the spawn site below. */
 let opfsSyncWorker: Worker | null = null;
+/**
+ * Resolves once the OPFS mirror worker has started; init awaits it before reporting ready.
+ *
+ * On WebKit a worker started from inside another worker needs the PAGE's event loop to come up.
+ * Reporting ready first let the page make its first synchronous call while the mirror was still
+ * booting, and that call's spin starved the boot: the relay made no progress, the call aborted
+ * after 30s, and every later synchronous call on the page hung the same way. While the page
+ * awaits init it is not spinning, so the mirror starts in a few milliseconds.
+ */
+let mirrorReady: Promise<void> | null = null;
+/** A mirror that never reports ready (no OPFS in this context, say) must not hold init up. */
+const OPFS_SYNC_READY_TIMEOUT_MS = 2000;
 
 // Watch broadcast (leader mode only — fires on every VFS mutation)
 let watchBc: BroadcastChannel | null = null;
@@ -1342,8 +1354,19 @@ async function initEngine(config: {
     // Started from embedded source rather than a sibling URL. This relay is itself a blob worker
     // now, so `import.meta.url` here would be a blob: URL and `./opfs-sync.worker.js` would not
     // resolve to anything — a nested worker has to carry its child's source with it.
-    opfsSyncWorker = workerFromSource(opfsSyncSource, 'vfs-opfs-sync');
-    opfsSyncWorker.postMessage(
+    const mirror = workerFromSource(opfsSyncSource, 'vfs-opfs-sync');
+    opfsSyncWorker = mirror;
+    // Its 'ready' is awaited at the end of init — see OPFS_SYNC_READY_TIMEOUT_MS.
+    mirrorReady = new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, OPFS_SYNC_READY_TIMEOUT_MS);
+      mirror.onmessage = (ev: MessageEvent) => {
+        if (ev.data?.type !== 'ready') return;
+        clearTimeout(timer);
+        mirror.onmessage = null;
+        resolve();
+      };
+    });
+    mirror.postMessage(
       { type: 'init', root: config.opfsSyncRoot ?? config.root, debug },
       [mc.port2],
     );
@@ -1365,6 +1388,12 @@ async function initEngine(config: {
 
   // Watch broadcast channel — fires on every VFS mutation for fs.watch() support
   watchBc = new BroadcastChannel(`${config.ns}-watch`);
+
+  // Started last so the mirror boots while the pre-grow above runs.
+  if (mirrorReady) {
+    await mirrorReady;
+    mirrorReady = null;
+  }
 }
 
 /** Initialize OPFS-direct mode engine (no VFS binary) */
