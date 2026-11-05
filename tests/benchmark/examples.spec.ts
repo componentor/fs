@@ -38,10 +38,17 @@ test('example 03-worker-hosted mounts and writes from the worker', async ({ page
   await page.goto('/examples/03-worker-hosted/');
   await expect(page.locator('#out')).toContainText('worker ready', { timeout: 60_000 });
 
+  // Counted from whatever the volume already holds: the example keeps its log, and WebKit's OPFS
+  // outlives the test's browser profile, so a second run starts with the first run's lines.
+  const out = page.locator('#out');
+  await expect(out).toContainText(/\d+ line\(s\)/, { timeout: 30_000 });
+  const lines = async () => Number((await out.innerText()).match(/(\d+) line\(s\)/g)!.pop()!.match(/\d+/)![0]);
+  const before = await lines();
+
   await page.click('#write');
-  await expect(page.locator('#out')).toContainText('1 line(s)', { timeout: 30_000 });
+  await expect(out).toContainText(`${before + 1} line(s)`, { timeout: 30_000 });
   await page.click('#write');
-  await expect(page.locator('#out')).toContainText('2 line(s)', { timeout: 30_000 });
+  await expect(out).toContainText(`${before + 2} line(s)`, { timeout: 30_000 });
 
   expect(problems, problems.join('\n')).toEqual([]);
 });

@@ -113,15 +113,20 @@ test('the URL-based approach this replaced still fails, so the test above is not
 
   const outcome = await page.evaluate(async (port) => {
     // Precisely what `spawnWorker` used to do once `import.meta.url` pointed at another origin.
+    let worker: Worker;
     try {
-      new Worker(`http://localhost:${port}/workers/sync-relay.worker.js`, { type: 'module' });
-      return 'constructed';
+      worker = new Worker(`http://localhost:${port}/workers/sync-relay.worker.js`, { type: 'module' });
     } catch (e) {
-      return (e as Error).name;
+      return (e as Error).name; // Chromium refuses in the constructor
     }
+    // Firefox and WebKit construct the worker and refuse the load instead, with an error event.
+    return await new Promise<string>((resolve) => {
+      worker.onerror = () => resolve('load-refused');
+      setTimeout(() => resolve('loaded'), 5000);
+    });
   }, PORT);
 
-  // If this ever starts returning 'constructed', the browser rule changed and the embedding is
-  // no longer load-bearing — worth knowing before someone removes it.
-  expect(outcome).toBe('SecurityError');
+  // If this ever reports 'loaded', the browser rule changed and the embedding is no longer
+  // load-bearing — worth knowing before someone removes it.
+  expect(['SecurityError', 'load-refused']).toContain(outcome);
 });
