@@ -51,6 +51,7 @@ import {
   fstatSync as _fstatSync, ftruncateSync as _ftruncateSync, fdatasyncSync as _fdatasyncSync,
   open as _open, createFileHandle as _createFileHandle,
 } from './methods/open.js';
+import { toWriteData, toWriteDataAsync } from './methods/data-arg.js';
 import { opendir as _opendir } from './methods/opendir.js';
 import { Dir as VFSDir } from './dir.js';
 import { readStreamFromHandle, writeStreamFromHandle } from './handle-streams.js';
@@ -1301,11 +1302,13 @@ export class VFSFileSystem {
   }
 
   writeFileSync(filePath: PathLike | number, data: string | Uint8Array, options?: WriteOptions | Encoding): void {
+    if (typeof data !== 'string' && !(data instanceof Uint8Array)) data = toWriteData(data, 'data');
     if (isFdArg(filePath)) return _writeFileFdSync(this._sync, filePath, data, options);
     _writeFileSync(this._sync, toPathString(filePath), data, options);
   }
 
   appendFileSync(filePath: PathLike | number, data: string | Uint8Array, options?: WriteOptions | Encoding): void {
+    if (typeof data !== 'string' && !(data instanceof Uint8Array)) data = toWriteData(data, 'data');
     if (isFdArg(filePath)) return _appendFileFdSync(this._sync, filePath, data, options);
     _appendFileSync(this._sync, toPathString(filePath), data, options);
   }
@@ -1631,6 +1634,7 @@ export class VFSFileSystem {
     lengthOrEncoding?: number | string,
     position?: number | null
   ): number {
+    if (typeof bufferOrString !== 'string' && !(bufferOrString instanceof Uint8Array)) bufferOrString = toWriteData(bufferOrString, 'buffer');
     return _writeSyncFd(this._sync, fd, bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position);
   }
 
@@ -2318,6 +2322,7 @@ export class VFSFileSystem {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    data = toWriteData(data, 'data'); // thrown here, at the call, as node does
     if (isFdArg(filePath)) return this._cbVoid(_writeFileFd(this._async, filePath, data, opts), cb);
     toPathString(filePath);
     return this._cbVoid(this.promises.writeFile(filePath, data, opts), cb);
@@ -2329,6 +2334,7 @@ export class VFSFileSystem {
     const cb = typeof optionsOrCallback === 'function' ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === 'function' ? undefined : optionsOrCallback;
+    data = toWriteData(data, 'data'); // thrown here, at the call, as node does
     if (isFdArg(filePath)) return this._cbVoid(_appendFileFd(this._async, filePath, data, opts), cb);
     toPathString(filePath);
     return this._cbVoid(this.promises.appendFile(filePath, data, opts), cb);
@@ -2637,6 +2643,7 @@ export class VFSFileSystem {
   write(fd: number, bufferOrString: Uint8Array | string, offsetOrPosition?: any, lengthOrEncoding?: any, position?: any, callback?: any): void {
     const cb = [offsetOrPosition, lengthOrEncoding, position, callback].find(a => typeof a === 'function');
     this._validateCb(cb);
+    toWriteData(bufferOrString, 'buffer'); // thrown here, at the call, as node does — not to the callback
     try {
       let bytesWritten: number;
       if (typeof bufferOrString === 'string') {
@@ -2752,11 +2759,13 @@ class VFSPromises {
   }
 
   async writeFile(filePath: PathLike | FileHandle, data: string | Uint8Array, options?: WriteOptions | Encoding) {
+    if (typeof data !== 'string' && !(data instanceof Uint8Array)) data = await toWriteDataAsync(data, options); // no extra tick for the common case
     if (isFileHandle(filePath)) return filePath.writeFile(data, options);
     return _writeFile(this._async, toPathString(filePath), data, options);
   }
 
   async appendFile(filePath: PathLike | FileHandle, data: string | Uint8Array, options?: WriteOptions | Encoding) {
+    if (typeof data !== 'string' && !(data instanceof Uint8Array)) data = await toWriteDataAsync(data, options); // no extra tick for the common case
     if (isFileHandle(filePath)) return filePath.appendFile(data, options);
     return _appendFile(this._async, toPathString(filePath), data, options);
   }

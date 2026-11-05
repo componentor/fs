@@ -6,6 +6,7 @@ import type { SyncRequestFn, AsyncRequestFn } from './context.js';
 import { OP, encodeRequest, encodeRequestU32 } from '../protocol/opcodes.js';
 import { statusToError, invalidArgValue } from '../errors.js';
 import { toEpochMs } from '../protocol/payloads.js';
+import { toWriteData, toWriteDataAsync } from './data-arg.js';
 import { parseFileMode, encodeMode } from './mode.js';
 import {
   encodeFdPayload, encodeFreadPayload, encodeFwritePayload, encodeFtruncatePayload,
@@ -266,6 +267,7 @@ export function createFileHandle(fd: number, asyncRequest: AsyncRequestFn): File
     },
 
     async write(bufferOrString: Uint8Array | string, offsetOrPositionOrOptions?: number | { offset?: number; length?: number; position?: number | null }, lengthOrEncoding?: number | string, position?: number | null) {
+      bufferOrString = toWriteData(bufferOrString, 'buffer');
       let writeData: Uint8Array;
       let pos: number;
       let resultBuffer: Uint8Array;
@@ -331,6 +333,7 @@ export function createFileHandle(fd: number, asyncRequest: AsyncRequestFn): File
     },
 
     async writeFile(data: string | Uint8Array, options?: WriteOptions | Encoding) {
+      if (typeof data !== 'string' && !(data instanceof Uint8Array)) data = await toWriteDataAsync(data, options); // no extra tick for the common case
       const encoding = typeof options === 'string' ? options : options?.encoding;
       const encoded = typeof data === 'string'
         ? (encoding ? encodeString(data, encoding) : encoder.encode(data))
@@ -357,6 +360,7 @@ export function createFileHandle(fd: number, asyncRequest: AsyncRequestFn): File
      * it, and cost an extra `fstat` round-trip per call.
      */
     async appendFile(data: string | Uint8Array, options?: WriteOptions | Encoding) {
+      if (typeof data !== 'string' && !(data instanceof Uint8Array)) data = await toWriteDataAsync(data, options); // no extra tick for the common case
       return this.writeFile(data, options);
     },
 

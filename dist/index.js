@@ -93,13 +93,18 @@ function inspectArg(value) {
   if (typeof value === "bigint") return `${value}n`;
   return String(value);
 }
+function receivedArg(actual) {
+  if (actual === null || actual === void 0) return String(actual);
+  if (typeof actual === "object" || typeof actual === "function") {
+    return `an instance of ${actual.constructor?.name ?? "Object"}`;
+  }
+  return `type ${typeof actual} (${inspectArg(actual)})`;
+}
 function invalidArgType(name, expected, actual) {
-  let received;
-  if (actual === null || actual === void 0) received = String(actual);
-  else if (typeof actual === "object" || typeof actual === "function") {
-    received = `an instance of ${actual.constructor?.name ?? "Object"}`;
-  } else received = `type ${typeof actual} (${inspectArg(actual)})`;
-  const err = new TypeError(`The "${name}" ${kind(name)} must be of type ${expected}. Received ${received}`);
+  return invalidArgTypeMessage(`The "${name}" ${kind(name)} must be of type ${expected}`, actual);
+}
+function invalidArgTypeMessage(subject, actual) {
+  const err = new TypeError(`${subject}. Received ${receivedArg(actual)}`);
   err.code = "ERR_INVALID_ARG_TYPE";
   return err;
 }
@@ -1069,6 +1074,51 @@ function toUnixTimestamp(time, name = "time") {
   throw invalidArgType(name, "number | string | Date", time);
 }
 
+// src/methods/data-arg.ts
+function toWriteData(data, name) {
+  if (typeof data === "string" || data instanceof Uint8Array) return data;
+  if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+  throw invalidArgType(name, "string or an instance of Buffer, TypedArray, or DataView", data);
+}
+async function toWriteDataAsync(data, options) {
+  if (typeof data === "string" || data instanceof Uint8Array || ArrayBuffer.isView(data)) return toWriteData(data, "data");
+  if (data === null || typeof data !== "object" || !(Symbol.iterator in data || Symbol.asyncIterator in data)) {
+    return toWriteData(data, "data");
+  }
+  const encoding = (typeof options === "string" ? options : options?.encoding) || "utf8";
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of data) {
+    const bytes = chunkBytes(chunk, encoding);
+    chunks.push(bytes);
+    total += bytes.byteLength;
+  }
+  if (chunks.length === 1) return chunks[0];
+  const out = new Uint8Array(total);
+  let at = 0;
+  for (const c of chunks) {
+    out.set(c, at);
+    at += c.byteLength;
+  }
+  return out;
+}
+function chunkBytes(chunk, encoding) {
+  if (typeof chunk === "string") return encodeString(chunk, encoding);
+  if (chunk instanceof Uint8Array) return chunk;
+  if (ArrayBuffer.isView(chunk)) return new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+  if (chunk instanceof ArrayBuffer || typeof SharedArrayBuffer !== "undefined" && chunk instanceof SharedArrayBuffer) {
+    return new Uint8Array(chunk);
+  }
+  if (chunk instanceof String) return encodeString(chunk.valueOf(), encoding);
+  if (chunk !== null && typeof chunk === "object" && typeof chunk.length === "number") {
+    return Uint8Array.from(chunk);
+  }
+  throw invalidArgTypeMessage(
+    "The first argument must be of type string or an instance of Buffer, ArrayBuffer, or Array or an Array-like Object",
+    chunk
+  );
+}
+
 // src/methods/mode.ts
 var OCTAL_STRING = /^[0-7]+$/;
 function parseFileMode(mode, name, def) {
@@ -1874,6 +1924,7 @@ function createFileHandle(fd, asyncRequest) {
       return { bytesRead, buffer };
     },
     async write(bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position) {
+      bufferOrString = toWriteData(bufferOrString, "buffer");
       let writeData;
       let pos;
       let resultBuffer;
@@ -1929,6 +1980,7 @@ function createFileHandle(fd, asyncRequest) {
       return result;
     },
     async writeFile(data, options) {
+      if (typeof data !== "string" && !(data instanceof Uint8Array)) data = await toWriteDataAsync(data, options);
       const encoding = typeof options === "string" ? options : options?.encoding;
       const encoded = typeof data === "string" ? encoding ? encodeString(data, encoding) : encoder2.encode(data) : data;
       const { status } = await asyncRequest(OP.FWRITE, "", 0, null, void 0, { fd, data: encoded, position: -1 });
@@ -1950,6 +2002,7 @@ function createFileHandle(fd, asyncRequest) {
      * it, and cost an extra `fstat` round-trip per call.
      */
     async appendFile(data, options) {
+      if (typeof data !== "string" && !(data instanceof Uint8Array)) data = await toWriteDataAsync(data, options);
       return this.writeFile(data, options);
     },
     async chmod(mode) {
@@ -4884,10 +4937,12 @@ var VFSFileSystem = class {
     return readFileSync(this._sync, toPathString(filePath), options);
   }
   writeFileSync(filePath, data, options) {
+    if (typeof data !== "string" && !(data instanceof Uint8Array)) data = toWriteData(data, "data");
     if (isFdArg(filePath)) return writeFileFdSync(this._sync, filePath, data, options);
     writeFileSync(this._sync, toPathString(filePath), data, options);
   }
   appendFileSync(filePath, data, options) {
+    if (typeof data !== "string" && !(data instanceof Uint8Array)) data = toWriteData(data, "data");
     if (isFdArg(filePath)) return appendFileFdSync(this._sync, filePath, data, options);
     appendFileSync(this._sync, toPathString(filePath), data, options);
   }
@@ -5169,6 +5224,7 @@ var VFSFileSystem = class {
     return readSync(this._sync, fd, bufferOrOptions, offsetOrOptions, length, position);
   }
   writeSync(fd, bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position) {
+    if (typeof bufferOrString !== "string" && !(bufferOrString instanceof Uint8Array)) bufferOrString = toWriteData(bufferOrString, "buffer");
     return writeSyncFd(this._sync, fd, bufferOrString, offsetOrPositionOrOptions, lengthOrEncoding, position);
   }
   fstatSync(fd, options) {
@@ -5747,6 +5803,7 @@ var VFSFileSystem = class {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    data = toWriteData(data, "data");
     if (isFdArg(filePath)) return this._cbVoid(writeFileFd(this._async, filePath, data, opts), cb);
     toPathString(filePath);
     return this._cbVoid(this.promises.writeFile(filePath, data, opts), cb);
@@ -5755,6 +5812,7 @@ var VFSFileSystem = class {
     const cb = typeof optionsOrCallback === "function" ? optionsOrCallback : callback;
     this._validateCb(cb);
     const opts = typeof optionsOrCallback === "function" ? void 0 : optionsOrCallback;
+    data = toWriteData(data, "data");
     if (isFdArg(filePath)) return this._cbVoid(appendFileFd(this._async, filePath, data, opts), cb);
     toPathString(filePath);
     return this._cbVoid(this.promises.appendFile(filePath, data, opts), cb);
@@ -5990,6 +6048,7 @@ var VFSFileSystem = class {
   write(fd, bufferOrString, offsetOrPosition, lengthOrEncoding, position, callback) {
     const cb = [offsetOrPosition, lengthOrEncoding, position, callback].find((a) => typeof a === "function");
     this._validateCb(cb);
+    toWriteData(bufferOrString, "buffer");
     try {
       let bytesWritten;
       if (typeof bufferOrString === "string") {
@@ -6086,10 +6145,12 @@ var VFSPromises = class {
     return readFile(this._async, toPathString(filePath), options);
   }
   async writeFile(filePath, data, options) {
+    if (typeof data !== "string" && !(data instanceof Uint8Array)) data = await toWriteDataAsync(data, options);
     if (isFileHandle(filePath)) return filePath.writeFile(data, options);
     return writeFile(this._async, toPathString(filePath), data, options);
   }
   async appendFile(filePath, data, options) {
+    if (typeof data !== "string" && !(data instanceof Uint8Array)) data = await toWriteDataAsync(data, options);
     if (isFileHandle(filePath)) return filePath.appendFile(data, options);
     return appendFile(this._async, toPathString(filePath), data, options);
   }

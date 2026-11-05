@@ -117,16 +117,23 @@ function inspectArg(value: unknown): string {
   return String(value);
 }
 
+/** Node's "Received …" tail: null/undefined bare, objects by constructor, other primitives with their type. */
+function receivedArg(actual: unknown): string {
+  if (actual === null || actual === undefined) return String(actual);
+  if (typeof actual === 'object' || typeof actual === 'function') {
+    return `an instance of ${(actual as object).constructor?.name ?? 'Object'}`;
+  }
+  return `type ${typeof actual} (${inspectArg(actual)})`;
+}
+
 /** `ERR_INVALID_ARG_TYPE` — the argument is the wrong type entirely (null, boolean, object). */
 export function invalidArgType(name: string, expected: string, actual: unknown): TypeError {
-  // Node prints null/undefined bare, objects by constructor, other primitives with their type.
-  let received: string;
-  if (actual === null || actual === undefined) received = String(actual);
-  else if (typeof actual === 'object' || typeof actual === 'function') {
-    received = `an instance of ${(actual as object).constructor?.name ?? 'Object'}`;
-  } else received = `type ${typeof actual} (${inspectArg(actual)})`;
+  return invalidArgTypeMessage(`The "${name}" ${kind(name)} must be of type ${expected}`, actual);
+}
 
-  const err = new TypeError(`The "${name}" ${kind(name)} must be of type ${expected}. Received ${received}`);
+/** `ERR_INVALID_ARG_TYPE` with node's own wording for the subject, e.g. `Buffer.from`'s "The first argument". */
+export function invalidArgTypeMessage(subject: string, actual: unknown): TypeError {
+  const err = new TypeError(`${subject}. Received ${receivedArg(actual)}`);
   (err as TypeError & { code: string }).code = 'ERR_INVALID_ARG_TYPE';
   return err;
 }
