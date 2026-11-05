@@ -81,7 +81,7 @@ console if you're unsure which tier you're on.
 - **External-change aware** — a `FileSystemObserver` syncs edits made outside the library back into the VFS (Chrome 129+), on by default in `hybrid` mode. Available to instances running on a page; a **worker-hosted** instance does not watch, because a worker cannot detach an observer before the page kills it and Chromium aborts on one that outlives its scope — see [Known divergences](https://github.com/componentor/fs/blob/main/docs/node-compatibility.md#known-divergences-from-node). Mirroring *outward* is unaffected either way.
 - **isomorphic-git ready** — battle-tested against real git operations.
 - **Multi-drive (experimental)** — a uniform async `Drive` abstraction + `DriveManager` for cross-drive copy/move with progress. See [Multi-Drive API](https://github.com/componentor/fs/blob/main/docs/multi-drive.md).
-- **No worker files, no bundler config** — the worker bundles are embedded in the entry as source text and started as same-origin blobs, so there is no URL for a bundler to rewrite and nothing to host. Works from a `<script type="module">`, from a CDN, and under Vite dev *and* build with an empty config.
+- **No worker files, no bundler config** — the worker bundles are embedded in the entry as source text and started as same-origin blobs, so there is no URL for a bundler to rewrite and nothing to host. Works from a `<script type="module">`, from a CDN, and under Vite dev *and* build with an empty config. The one exception is the optional multi-tab service worker, which must be a real file: pass its URL as `swUrl` (one import under Vite — see [Multiple tabs](https://github.com/componentor/fs/blob/main/docs/multi-tab.md)).
 - **TypeScript-first** — complete type definitions included.
 
 ## How it compares
@@ -117,7 +117,8 @@ import { VFSFileSystem } from 'sync-opfs';
 ```
 
 **No bundler configuration needed.** The worker bundles are embedded, so there is nothing to
-resolve, copy or host. TypeScript types are included. There is also a CDN build that works in a
+resolve, copy or host. TypeScript types are included. Only multi-tab coordination needs one extra
+line: the service worker's URL as `swUrl` — see **[Multiple tabs](https://github.com/componentor/fs/blob/main/docs/multi-tab.md)**. There is also a CDN build that works in a
 plain `.html` file with no build step — see **[Installation](https://github.com/componentor/fs/blob/main/docs/installation.md)**.
 
 ## Quick Start

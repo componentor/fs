@@ -20,8 +20,16 @@ nothing for Vite to resolve or rewrite — this used to need an `optimizeDeps.ex
 no longer does. Verified against both `vite dev` and `vite build`.
 
 **The service worker, if you need multiple tabs.** Service workers must be served as a real file
-at a URL whose scope covers your app, which a bundled chunk is not. Copy it into `public/` and
-point the instance at it:
+at a URL whose scope covers your app, which a bundled chunk is not. The simplest way is to import
+the shipped file as an asset URL (`&no-inline`, because a 1 KB file would otherwise be inlined as a
+`data:` URL, which cannot be registered):
+
+```js
+import swUrl from '@componentor/fs/sw?url&no-inline';
+const fs = new VFSFileSystem({ swUrl });
+```
+
+Or copy it into `public/` and point the instance at it (re-copy after upgrading):
 
 ```bash
 cp node_modules/@componentor/fs/dist/workers/service.worker.js public/vfs-service-worker.js

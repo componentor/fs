@@ -27,6 +27,19 @@ import { VFSFileSystem } from '@componentor/fs';
 is nothing to resolve, copy or host — verified against `vite dev` and `vite build` with a config
 containing nothing but the isolation headers. TypeScript types are included.
 
+The one exception is the **multi-tab service worker**: a service worker must be a real file at a
+URL, and the default lookup next to the library's own module fails under bundlers (see below). A
+single-tab app needs nothing; for multiple tabs, pass `swUrl` — under Vite that is one import:
+
+```js
+import { VFSFileSystem } from '@componentor/fs';
+import swUrl from '@componentor/fs/sw?url&no-inline';
+
+const fs = new VFSFileSystem({ swUrl });
+```
+
+Details and the alternatives are in [Multiple tabs](./multi-tab.md#service-worker-setup-multi-tab).
+
 The same package is also published as [`sync-opfs`](https://www.npmjs.com/package/sync-opfs) if
 you prefer that name: `npm install sync-opfs`.
 

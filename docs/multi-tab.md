@@ -10,7 +10,13 @@ Sharing one filesystem across tabs: the service-worker broker that makes it work
 
 Multi-tab coordination requires a service worker that acts as a MessagePort broker between tabs. The built service worker is shipped at `dist/workers/service.worker.js`. Unlike regular workers (which are resolved by the bundler), **service workers must be served as a real file at a public URL**.
 
-Most bundlers (Vite, webpack) handle `new URL('./workers/service.worker.js', import.meta.url)` automatically, but if the default resolution doesn't work in your setup, use the `swUrl` option:
+Without `swUrl` the library looks for it next to its own module, at
+`new URL('./workers/service.worker.js', import.meta.url)`. **Under a bundler that lookup fails**:
+with Vite, dev pre-bundling moves the module into `node_modules/.vite/deps/`, where there is no
+`workers/` folder (the registration gets a 404), and a production build can leave no valid URL at
+all (`Failed to construct 'URL': Invalid URL`). The library then logs
+`[VFS] SW broker unavailable, single-tab only` and every tab runs on its own. So in a bundled app,
+always pass the URL with the `swUrl` option:
 
 ```typescript
 const fs = new VFSFileSystem({
@@ -18,7 +24,20 @@ const fs = new VFSFileSystem({
 });
 ```
 
-**Vite example** — copy the file to `public/`:
+**Vite (recommended)** — import the shipped file as an asset URL. It stays in step with the
+installed version and is emitted as a real file in the build:
+
+```typescript
+import swUrl from '@componentor/fs/sw?url&no-inline';
+
+const fs = new VFSFileSystem({ swUrl });
+```
+
+`&no-inline` matters: the file is about 1 KB, under Vite's default 4 KB `assetsInlineLimit`, so a
+plain `?url` import is inlined as a `data:` URL in the build — and a service worker cannot be
+registered from a `data:` URL. (`no-inline` needs Vite 5 or later.)
+
+**Any setup** — copy the file to your public folder and point at it (re-copy after upgrading):
 
 ```bash
 cp node_modules/@componentor/fs/dist/workers/service.worker.js public/vfs-service-worker.js
