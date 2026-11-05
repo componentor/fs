@@ -155,6 +155,11 @@ var CODE_TO_STATUS = {
 var encoder = new TextEncoder();
 var PREGROW_HEADROOM_BLOCKS = 16384;
 var decoder = new TextDecoder();
+var DIR_TIMES_PERSIST_MS = 1e3;
+function samePrefix(a, b, n) {
+  for (let i = 0; i < n; i++) if (a.charCodeAt(i) !== b.charCodeAt(i)) return false;
+  return true;
+}
 function isUnder(child, parent) {
   return parent === "/" ? child !== "/" : child.startsWith(parent + "/");
 }
@@ -200,6 +205,25 @@ var VFSEngine = class _VFSEngine {
   // Reusable buffers to avoid allocations
   inodeBuf = new Uint8Array(INODE_SIZE);
   inodeView = new DataView(this.inodeBuf.buffer);
+  // Directory mtime/ctime changes are applied to the cached inode at once (so stat is always right)
+  // and written to disk in batches: at most once per DIR_TIMES_PERSIST_MS from commitPending, and
+  // always on flush(). A burst of creates in one directory therefore costs no extra I/O per create.
+  // MTIME and CTIME are adjacent in the inode record, so each directory is one 16-byte write.
+  dirTimesDirty = /* @__PURE__ */ new Set();
+  dirTimesPersistedAt = 0;
+  dirTimesLatest = 0;
+  // time of the latest pending change, so commitPending needs no clock read
+  // ensureParent's lookup, reused by createInode when nothing in the namespace changed since.
+  parentHintPath = null;
+  parentHintIdx = -1;
+  parentHintGen = -1;
+  dirTimesBuf = new Uint8Array(16);
+  dirTimesView = new DataView(this.dirTimesBuf.buffer);
+  // Inode slot → (inode index of the directory holding that name) + 1; 0 = not known. The slot is
+  // the one owning the name: the inode itself, or the hard-link record for a link name. Lets
+  // unlink/rename stamp the parent directory without a path lookup. In memory only: filled as names
+  // are created or moved, cleared when a slot is freed; an unknown entry falls back to a lookup.
+  nameParent = new Int32Array(0);
   // In-memory inode cache — eliminates disk reads for hot inodes
   inodeCache = /* @__PURE__ */ new Map();
   superblockBuf = new Uint8Array(SUPERBLOCK.SIZE);
@@ -323,6 +347,10 @@ var VFSEngine = class _VFSEngine {
   /** Release the sync access handle (call on fatal error or shutdown) */
   closeHandle() {
     try {
+      if (this.dirTimesDirty.size) this.persistDirTimes();
+    } catch (_) {
+    }
+    try {
       this.handle?.close();
     } catch (_) {
     }
@@ -333,6 +361,7 @@ var VFSEngine = class _VFSEngine {
     this.linkInodes.clear();
     this.linkPathsByTarget.clear();
     this.inodeCount = DEFAULT_INODE_COUNT;
+    this.nameParent = new Int32Array(this.inodeCount);
     this.blockSize = DEFAULT_BLOCK_SIZE;
     this.totalBlocks = layout.totalBlocks;
     this.freeBlocks = layout.totalBlocks;
@@ -492,6 +521,9 @@ var VFSEngine = class _VFSEngine {
       this.writeSuperblock();
       this.superblockDirty = false;
     }
+    if (this.dirTimesDirty.size && this.dirTimesLatest - this.dirTimesPersistedAt >= DIR_TIMES_PERSIST_MS) {
+      this.persistDirTimes();
+    }
   }
   /** Find the last used block index (-1 if the data region is empty). */
   findLastUsedBlock() {
@@ -574,8 +606,10 @@ var VFSEngine = class _VFSEngine {
    *  Bulk-reads the entire inode table + path table in 2 I/O calls,
    *  then parses in memory (avoids 10k+ individual reads). */
   rebuildIndex() {
+    if (this.dirTimesDirty.size) this.persistDirTimes();
     this.pathIndex.clear();
     this.inodeCache.clear();
+    this.nameParent = new Int32Array(this.inodeCount);
     this.linkInodes.clear();
     this.linkPathsByTarget.clear();
     const pendingLinks = [];
@@ -659,6 +693,66 @@ var VFSEngine = class _VFSEngine {
     this.pathIndexGen++;
   }
   // ========== Low-level inode I/O ==========
+  /** ensureParent's resolved parent for `path`, if that was the last lookup; consumes it. */
+  takeParentHint(path) {
+    const idx = this.parentHintPath === path ? this.parentHintIdx : -1;
+    this.parentHintPath = null;
+    return idx;
+  }
+  /** The inode slot that owns this name: its hard-link record, or the inode itself. */
+  nameSlot(path, idx) {
+    return this.linkInodes.size === 0 ? idx : this.linkInodes.get(path) ?? idx;
+  }
+  /**
+   * rename(2): both directories changed — one directory when it stays in the same one.
+   * Returns the new parent's inode index (-1 if it has none), like touchParentDir.
+   */
+  touchRenameDirs(oldPath, newPath, now, newParentIdx, oldParentIdx) {
+    const newParent = this.touchParentDir(newPath, now, newParentIdx);
+    if (oldParentIdx >= 0) {
+      if (oldParentIdx !== newParent) this.touchParentDir(oldPath, now, oldParentIdx);
+      return newParent;
+    }
+    const slash = oldPath.lastIndexOf("/");
+    if (slash !== newPath.lastIndexOf("/") || !samePrefix(oldPath, newPath, slash)) {
+      this.touchParentDir(oldPath, now, -1);
+    }
+    return newParent;
+  }
+  /**
+   * A directory's entries changed (a name was added, removed or renamed in it): like POSIX, its
+   * mtime and ctime move to `now`. Updates the cached inode; persistDirTimes writes it later.
+   * Implicit directories have no inode, so there is nothing to update. `knownParentIdx` skips the
+   * lookup when the caller already has the parent. Returns the parent's inode index, or -1.
+   */
+  touchParentDir(path, now, knownParentIdx) {
+    let idx = knownParentIdx;
+    if (idx < 0) {
+      const slash = path.lastIndexOf("/");
+      const found = this.pathIndex.get(slash > 0 ? path.substring(0, slash) : "/");
+      if (found === void 0) return -1;
+      idx = found;
+    }
+    const dir = this.readInode(idx);
+    if (dir.type !== INODE_TYPE.DIRECTORY) return -1;
+    if (dir.mtime === now && dir.ctime === now) return idx;
+    dir.mtime = dir.ctime = now;
+    this.dirTimesDirty.add(idx);
+    this.dirTimesLatest = now;
+    return idx;
+  }
+  /** Write the pending directory timestamps (the cached values) to the inode table. */
+  persistDirTimes() {
+    for (const idx of this.dirTimesDirty) {
+      const dir = this.inodeCache.get(idx);
+      if (!dir || dir.type !== INODE_TYPE.DIRECTORY) continue;
+      this.dirTimesView.setFloat64(0, dir.mtime, true);
+      this.dirTimesView.setFloat64(8, dir.ctime, true);
+      this.handle.write(this.dirTimesBuf, { at: this.inodeTableOffset + idx * INODE_SIZE + INODE.MTIME });
+    }
+    this.dirTimesDirty.clear();
+    this.dirTimesPersistedAt = this.dirTimesLatest;
+  }
   readInode(idx) {
     const cached = this.inodeCache.get(idx);
     if (cached) return cached;
@@ -929,6 +1023,9 @@ var VFSEngine = class _VFSEngine {
     this.bitmapOffset += growth;
     this.dataOffset += growth;
     this.inodeCount = newCount;
+    const nameParent = new Int32Array(newCount);
+    nameParent.set(this.nameParent.subarray(0, Math.min(this.nameParent.length, newCount)));
+    this.nameParent = nameParent;
     this.superblockDirty = true;
     return oldCount;
   }
@@ -1040,6 +1137,8 @@ var VFSEngine = class _VFSEngine {
   }
   // ========== Core inode creation helper ==========
   createInode(path, type, mode, size, data) {
+    const knownParentIdx = path === this.parentHintPath && this.pathIndexGen === this.parentHintGen ? this.parentHintIdx : -1;
+    this.parentHintPath = null;
     const idx = this.findFreeInode();
     const { offset: pathOff, length: pathLen } = this.appendPath(path);
     const now = Date.now();
@@ -1068,6 +1167,7 @@ var VFSEngine = class _VFSEngine {
     this.writeInode(idx, inode);
     this.setPathIndex(path, idx);
     this.pathIndexGen++;
+    this.nameParent[idx] = this.touchParentDir(path, now, knownParentIdx) + 1;
     return idx;
   }
   // ========== Hard links ==========
@@ -1132,6 +1232,7 @@ var VFSEngine = class _VFSEngine {
   releaseInode(idx, inode) {
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
+    this.nameParent[idx] = 0;
     if (idx < this.freeInodeHint) this.freeInodeHint = idx;
   }
   /**
@@ -1155,7 +1256,7 @@ var VFSEngine = class _VFSEngine {
    * commit per logical operation, not per name.
    */
   removeName(path, idx) {
-    const linkIdx = this.linkInodes.get(path);
+    const linkIdx = this.linkInodes.size === 0 ? void 0 : this.linkInodes.get(path);
     if (linkIdx !== void 0) {
       this.linkInodes.delete(path);
       this.untrackLinkPath(idx, path);
@@ -1168,10 +1269,11 @@ var VFSEngine = class _VFSEngine {
       return;
     }
     const inode = this.readInode(idx);
-    const links = this.linkPathsByTarget.get(idx);
+    const links = this.linkPathsByTarget.size === 0 ? void 0 : this.linkPathsByTarget.get(idx);
     if (links && links.size > 0) {
       const promoted = links.values().next().value;
       const promotedLinkIdx = this.linkInodes.get(promoted);
+      this.nameParent[idx] = this.nameParent[promotedLinkIdx];
       this.linkInodes.delete(promoted);
       this.untrackLinkPath(idx, promoted);
       this.releaseInode(promotedLinkIdx, this.readInode(promotedLinkIdx));
@@ -1198,14 +1300,14 @@ var VFSEngine = class _VFSEngine {
    * The path index is the caller's to update; this only fixes the on-disk record and the
    * link registry.
    */
-  repathName(oldPath, newPath, idx, touchMtime) {
-    const linkIdx = this.linkInodes.get(oldPath);
+  repathName(oldPath, newPath, idx, ctimeNow) {
+    const linkIdx = this.linkInodes.size === 0 ? void 0 : this.linkInodes.get(oldPath);
     const ownerIdx = linkIdx ?? idx;
     const owner = this.readInode(ownerIdx);
     const { offset: pathOff, length: pathLen } = this.appendPath(newPath);
     owner.pathOffset = pathOff;
     owner.pathLength = pathLen;
-    if (touchMtime) owner.mtime = Date.now();
+    if (ctimeNow) owner.ctime = ctimeNow;
     this.writeInode(ownerIdx, owner);
     if (linkIdx !== void 0) {
       this.linkInodes.delete(oldPath);
@@ -1223,6 +1325,7 @@ var VFSEngine = class _VFSEngine {
    * name is a separate file over there and has to be re-mirrored.
    */
   linkNamesFor(path) {
+    if (this.linkPathsByTarget.size === 0) return [];
     path = this.normalizePath(path);
     const idx = this.pathIndex.get(path);
     if (idx === void 0) return [];
@@ -1330,7 +1433,7 @@ var VFSEngine = class _VFSEngine {
       }
       inode.size = data.byteLength;
       inode.blockCount = neededBlocks;
-      inode.mtime = Date.now();
+      inode.mtime = inode.ctime = Date.now();
       this.writeInode(existingIdx, inode);
       tInode = this.debug ? performance.now() : 0;
     } else {
@@ -1366,7 +1469,7 @@ var VFSEngine = class _VFSEngine {
     if (neededBlocks <= inode.blockCount) {
       this.handle.write(data, { at: this.dataOffset + inode.firstBlock * this.blockSize + inode.size });
       inode.size = combinedSize;
-      inode.mtime = Date.now();
+      inode.mtime = inode.ctime = Date.now();
       this.writeInode(existingIdx, inode);
       this.commitPending();
       return { status: 0 };
@@ -1391,7 +1494,7 @@ var VFSEngine = class _VFSEngine {
     inode.firstBlock = newFirst;
     inode.blockCount = neededBlocks;
     inode.size = combinedSize;
-    inode.mtime = Date.now();
+    inode.mtime = inode.ctime = Date.now();
     this.writeInode(existingIdx, inode);
     this.commitPending();
     return { status: 0 };
@@ -1403,8 +1506,10 @@ var VFSEngine = class _VFSEngine {
     if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
+    const parentIdx = this.nameParent[this.nameSlot(path, idx)] - 1;
     this.removeName(path, idx);
     this.pathIndexGen++;
+    this.touchParentDir(path, Date.now(), parentIdx);
     this.commitPending();
     return { status: 0 };
   }
@@ -1491,6 +1596,7 @@ var VFSEngine = class _VFSEngine {
     const parts = path.split("/").filter(Boolean);
     let current = "";
     let firstCreated = null;
+    let parentIdx = -1;
     for (const part of parts) {
       current += "/" + part;
       if (this.pathIndex.has(current)) {
@@ -1499,9 +1605,15 @@ var VFSEngine = class _VFSEngine {
         if (inode.type !== INODE_TYPE.DIRECTORY) {
           return { status: CODE_TO_STATUS.ENOTDIR, data: null };
         }
+        parentIdx = idx;
         continue;
       }
-      this.createInode(current, INODE_TYPE.DIRECTORY, this.dirModeFor(reqMode), 0);
+      if (parentIdx >= 0) {
+        this.parentHintPath = current;
+        this.parentHintIdx = parentIdx;
+        this.parentHintGen = this.pathIndexGen;
+      }
+      parentIdx = this.createInode(current, INODE_TYPE.DIRECTORY, this.dirModeFor(reqMode), 0);
       if (!firstCreated) firstCreated = current;
     }
     this.commitPending();
@@ -1542,8 +1654,10 @@ var VFSEngine = class _VFSEngine {
       this.commitPending();
       return { status: 0 };
     }
+    const parentIdx = this.nameParent[idx] - 1;
     this.removeName(path, idx);
     this.pathIndexGen++;
+    this.touchParentDir(path, Date.now(), parentIdx);
     this.commitPending();
     return { status: 0 };
   }
@@ -1614,6 +1728,7 @@ var VFSEngine = class _VFSEngine {
     }
     const parentStatus = this.ensureParent(newPath);
     if (parentStatus !== 0) return { status: parentStatus };
+    const newParentIdx = this.takeParentHint(newPath);
     const existingIdx = this.pathIndex.get(newPath);
     const targetIsImplicitDir = existingIdx === void 0 && this.isImplicitDirectory(newPath);
     if (existingIdx !== void 0 || targetIsImplicitDir) {
@@ -1635,7 +1750,10 @@ var VFSEngine = class _VFSEngine {
       }
     }
     const inode = this.readInode(idx);
-    this.repathName(oldPath, newPath, idx, true);
+    const slot = this.nameSlot(oldPath, idx);
+    const oldParentIdx = this.nameParent[slot] - 1;
+    const now = Date.now();
+    this.repathName(oldPath, newPath, idx, now);
     this.deletePathIndex(oldPath);
     this.setPathIndex(newPath, idx);
     this.pathIndexGen++;
@@ -1650,11 +1768,12 @@ var VFSEngine = class _VFSEngine {
       for (const [p, i] of toRename) {
         const suffix = p.substring(oldPath.length);
         const childNewPath = newPath + suffix;
-        this.repathName(p, childNewPath, i, false);
+        this.repathName(p, childNewPath, i, 0);
         this.deletePathIndex(p);
         this.setPathIndex(childNewPath, i);
       }
     }
+    this.nameParent[slot] = this.touchRenameDirs(oldPath, newPath, now, newParentIdx, oldParentIdx) + 1;
     this.commitPending();
     return { status: 0 };
   }
@@ -1716,7 +1835,7 @@ var VFSEngine = class _VFSEngine {
       inode.blockCount = neededBlocks;
       inode.size = len;
     }
-    inode.mtime = Date.now();
+    inode.mtime = inode.ctime = Date.now();
     this.writeInode(idx, inode);
     this.commitPending();
     return { status: 0 };
@@ -1768,7 +1887,7 @@ var VFSEngine = class _VFSEngine {
     destInode.firstBlock = newFirst;
     destInode.blockCount = neededBlocks;
     destInode.size = srcSize;
-    destInode.mtime = Date.now();
+    destInode.mtime = destInode.ctime = Date.now();
     destInode.mode = destInode.mode & ~4095 | srcMode & 4095;
     this.writeInode(destIdx, destInode);
     this.commitPending();
@@ -1906,6 +2025,7 @@ var VFSEngine = class _VFSEngine {
     }
     const parentStatus = this.ensureParent(newPath);
     if (parentStatus !== 0) return { status: parentStatus };
+    const newParentIdx = this.takeParentHint(newPath);
     const linkIdx = this.createLinkInode(newPath, srcIdx);
     this.linkInodes.set(newPath, linkIdx);
     this.trackLinkPath(srcIdx, newPath);
@@ -1914,6 +2034,7 @@ var VFSEngine = class _VFSEngine {
     srcInode.nlink = this.nameCount(srcIdx);
     srcInode.ctime = Date.now();
     this.writeInode(srcIdx, srcInode);
+    this.nameParent[linkIdx] = this.touchParentDir(newPath, srcInode.ctime, newParentIdx) + 1;
     this.commitPending();
     return { status: 0 };
   }
@@ -2035,7 +2156,7 @@ var VFSEngine = class _VFSEngine {
       const dataOffset = this.dataOffset + inode.firstBlock * this.blockSize + pos;
       this.handle.write(data, { at: dataOffset });
     }
-    inode.mtime = Date.now();
+    inode.mtime = inode.ctime = Date.now();
     this.writeInode(entry.inodeIdx, inode);
     if (position === null) {
       entry.position = endPos;
@@ -2298,6 +2419,7 @@ var VFSEngine = class _VFSEngine {
     if (path === "/" || path.length === 0) return;
     let parent = "/";
     let start = 1;
+    let flat = path.charCodeAt(0) === 47;
     while (start <= path.length) {
       let end = path.indexOf("/", start);
       if (end === -1) end = path.length;
@@ -2309,7 +2431,9 @@ var VFSEngine = class _VFSEngine {
           this.childIndex.set(parent, children);
         }
         children.set(name, (children.get(name) ?? 0) + 1);
-        parent = parent === "/" ? "/" + name : parent + "/" + name;
+        parent = flat ? path.substring(0, end) : parent === "/" ? "/" + name : parent + "/" + name;
+      } else {
+        flat = false;
       }
       start = end + 1;
     }
@@ -2318,6 +2442,7 @@ var VFSEngine = class _VFSEngine {
     if (path === "/" || path.length === 0) return;
     let parent = "/";
     let start = 1;
+    let flat = path.charCodeAt(0) === 47;
     while (start <= path.length) {
       let end = path.indexOf("/", start);
       if (end === -1) end = path.length;
@@ -2333,7 +2458,9 @@ var VFSEngine = class _VFSEngine {
         } else {
           children.set(name, cur - 1);
         }
-        parent = parent === "/" ? "/" + name : parent + "/" + name;
+        parent = flat ? path.substring(0, end) : parent === "/" ? "/" + name : parent + "/" + name;
+      } else {
+        flat = false;
       }
       start = end + 1;
     }
@@ -2437,6 +2564,9 @@ var VFSEngine = class _VFSEngine {
     }
     const parentInode = this.readInode(parentIdx);
     if (parentInode.type !== INODE_TYPE.DIRECTORY) return CODE_TO_STATUS.ENOTDIR;
+    this.parentHintPath = path;
+    this.parentHintIdx = parentIdx;
+    this.parentHintGen = this.pathIndexGen;
     return 0;
   }
   /** Clean up all fds owned by a tab */
@@ -2487,6 +2617,7 @@ var VFSEngine = class _VFSEngine {
     return result;
   }
   flush() {
+    if (this.dirTimesDirty.size) this.persistDirTimes();
     this.handle.flush();
   }
 };
@@ -3714,7 +3845,7 @@ function terminateWorker(worker) {
 }
 
 // src/workers/inlined/opfs-sync.workertext
-var opfs_sync_default = 'function E(e){if(e.startsWith("/")||(e="/"+e),e.length===1)return e;const t=[];for(const r of e.split("/"))if(!(r===""||r===".")){if(r===".."){t.pop();continue}t.push(r)}return"/"+t.join("/")}function j(e,t){const r=E(t);for(let n=e.length-1;n>=0;n--){const a=e[n];if(E(a.path)!==r){if(a.op==="rename"&&a.newPath&&E(a.newPath)===r)return-1;continue}return a.op==="write"?n:-1}return-1}var h,m;function f(e){if(e.charCodeAt(0)!==47&&(e="/"+e),e.indexOf("//")!==-1&&(e=e.replace(/\\/\\/+/g,"/")),e.indexOf("/.")!==-1){const t=e.split("/"),r=[];for(const n of t)if(!(n==="."||n==="")){if(n===".."){r.pop();continue}r.push(n)}e="/"+r.join("/")}return e.length>1&&e.charCodeAt(e.length-1)===47&&(e=e.slice(0,-1)),e||"/"}function H(e){return f(e).split("/").filter(Boolean)}var D=new Set,p=new Map,M=new Map;function O(e){let t=2166136261;for(let r=0;r<e.length;r++)t^=e[r],t=Math.imul(t,16777619);return t>>>0^e.length}function P(e,t){if(e=f(e),D.has(e))return!0;const r=p.get(e);return!r||Date.now()-r>=A?!1:M.get(e)===O(t)}var A=3e3;function R(e){D.add(f(e))}function T(e){D.delete(f(e))}function z(e){p.set(f(e),Date.now())}function b(e,t=!1){e=f(e);const r=Date.now();if(D.has(e))return!0;const n=p.get(e);if(n&&r-n<A)return!0;if(t){let a=e;for(;;){const o=a.lastIndexOf("/");if(o<=0)break;if(a=a.substring(0,o),D.has(a))return!0;const i=p.get(a);if(i&&r-i<A)return!0}}return!1}setInterval(()=>{const e=Date.now()-A;for(const[t,r]of p)r<e&&(p.delete(t),M.delete(t))},5e3);var g=[],F=!1;function q(e){if(R(e.path),e.op==="rename"&&e.newPath&&R(e.newPath),e.op==="write"){const t=j(g,e.path);if(t!==-1){g[t].data=e.data,g[t].ts=e.ts;return}}g.push(e),F||I()}async function G(e){switch(e.op){case"write":e.data?await B(e.path,e.data):await B(e.path,new ArrayBuffer(0));break;case"delete":await K(e.path);break;case"mkdir":await X(e.path);break;case"rename":await J(e.path,e.newPath);break}}var C=4;async function I(){if(g.length===0){F=!1;return}F=!0;const e=g.shift();for(let t=1;t<=C;t++)try{await G(e);break}catch(r){if(t===C){console.warn("[opfs-sync] mirror failed after retries:",e.op,e.path,r);break}await new Promise(n=>setTimeout(n,10*t))}T(e.path),z(e.path),e.op==="rename"&&e.newPath&&(T(e.newPath),z(e.newPath)),I()}async function S(e){const t=H(e);t.pop();let r=m;for(const n of t)r=await r.getDirectoryHandle(n,{create:!0});return r}function y(e){const t=H(e);return t[t.length-1]||""}async function B(e,t){const r=await S(e),n=y(e),a=await r.getFileHandle(n,{create:!0}),o=new Uint8Array(t),i=await a.createSyncAccessHandle();try{i.truncate(0),i.write(o,{at:0}),i.flush()}finally{i.close()}M.set(f(e),O(o))}async function K(e){try{await(await x(e)).removeEntry(y(e),{recursive:!0})}catch{}}async function X(e){let t=m;for(const r of H(e))t=await t.getDirectoryHandle(r,{create:!0})}var U=2*1024*1024;async function J(e,t){let r=null,n=null,a,o,i=!1,u=null;for(let s=0;s<6;s++)try{a=await x(e),o=await a.getFileHandle(y(e)),i=!0;break}catch(d){u=d;const l=d?.message||"";if(d?.name==="TypeMismatchError"||l.includes("TypeMismatch")||l.includes("not a file")||l.includes("not an entry of requested type")){try{await W(e,t)}catch(c){console.warn("[opfs-sync] rename (dir) failed:",e,"\\u2192",t,c)}return}if(s<5){await new Promise(c=>setTimeout(c,8*(s+1)));continue}}if(!i){try{await W(e,t);return}catch{}console.warn("[opfs-sync] rename failed (source not found after retries):",e,"\\u2192",t,u);return}try{r=await o.createSyncAccessHandle();const s=r.getSize();if(n=await(await(await S(t)).getFileHandle(y(t),{create:!0})).createSyncAccessHandle(),n.truncate(0),s>0){const w=new Uint8Array(Math.min(s,U));let c=0;for(;c<s;){const k=Math.min(w.length,s-c),v=k===w.length?w:w.subarray(0,k);r.read(v,{at:c}),n.write(v,{at:c}),c+=k}}n.flush();try{n.close()}catch{}n=null;try{r.close()}catch{}r=null,await N(a,y(e))}catch(s){console.warn("[opfs-sync] rename failed:",e,"\\u2192",t,s)}finally{if(n)try{n.close()}catch{}if(r)try{r.close()}catch{}}}async function W(e,t){const r=await x(e),n=await r.getDirectoryHandle(y(e)),a=await S(t);try{await a.removeEntry(y(t),{recursive:!0})}catch(i){if(i?.name!=="NotFoundError")throw i}const o=await a.getDirectoryHandle(y(t),{create:!0});await _(n,o),await N(r,y(e),{recursive:!0})}async function N(e,t,r){let n=null;for(let a=0;a<4;a++)try{await e.removeEntry(t,r);return}catch(o){if(o?.name==="NotFoundError")return;n=o,await new Promise(i=>setTimeout(i,10*(a+1)))}throw n}async function _(e,t){for await(const[r,n]of e.entries())if(n.kind==="directory"){const a=await t.getDirectoryHandle(r,{create:!0});await _(n,a)}else{const a=n,o=await t.getFileHandle(r,{create:!0});let i=null,u=null;try{i=await a.createSyncAccessHandle(),u=await o.createSyncAccessHandle();const s=i.getSize();if(u.truncate(0),s>0){const d=new Uint8Array(Math.min(s,U));let l=0;for(;l<s;){const w=Math.min(d.length,s-l),c=w===d.length?d:d.subarray(0,w);i.read(c,{at:l}),u.write(c,{at:l}),l+=w}}u.flush()}finally{if(u)try{u.close()}catch{}if(i)try{i.close()}catch{}}}}async function x(e){const t=H(e);t.pop();let r=m;for(const n of t)r=await r.getDirectoryHandle(n);return r}function L(e){for(const t of e){const r=f(t.path);if(!(r==="/.vfs.bin"||r==="/.vfs"||r.startsWith("/.vfs")))switch(t.kind){case"appeared":case"modified":Q(r,t.handle??null);break;case"disappeared":if(b(r,!0))continue;V(r);break;case"moved":{const n=f(t.from);if(b(r)||b(n))continue;Y(n,r);break}}}}async function Q(e,t){try{if(!t||t.kind!=="file")return;const r=t;let n=await r.getFile().then(a=>a.arrayBuffer());if(P(e,new Uint8Array(n))||p.has(f(e))&&(n=await r.getFile().then(a=>a.arrayBuffer()),P(e,new Uint8Array(n))))return;h.postMessage({op:"external-write",path:e,data:n,ts:Date.now()},[n])}catch(r){console.warn("[opfs-sync] external change read failed:",e,r)}}function V(e){h.postMessage({op:"external-delete",path:e,ts:Date.now()})}function Y(e,t){h.postMessage({op:"external-rename",path:e,newPath:t,ts:Date.now()})}self.onmessage=async e=>{const t=e.data;if(t.type==="init"){if(h=e.ports[0],m=await navigator.storage.getDirectory(),t.root&&t.root!=="/"){const r=t.root.split("/").filter(Boolean);for(const n of r)m=await m.getDirectoryHandle(n,{create:!0})}console.log("[opfs-sync] initialized with root:",t.root||"/","mirrorRoot.name:",m.name||"(opfs-root)"),h.onmessage=r=>{if(r.data?.type==="external-records"){L(r.data.records);return}q(r.data)},h.start(),self.postMessage({type:"ready"});return}if(t.type==="shutdown"){try{h?.close()}catch{}self.postMessage({type:"shutdown-done"}),self.close();return}};\n';
+var opfs_sync_default = 'function E(e){if(e.startsWith("/")||(e="/"+e),e.length===1)return e;const t=[];for(const r of e.split("/"))if(!(r===""||r===".")){if(r===".."){t.pop();continue}t.push(r)}return"/"+t.join("/")}function q(e,t){const r=E(t);for(let n=e.length-1;n>=0;n--){const a=e[n];if(E(a.path)!==r){if(a.op==="rename"&&a.newPath&&E(a.newPath)===r)return-1;continue}return a.op==="write"?n:-1}return-1}var h,m;function f(e){if(e.charCodeAt(0)!==47&&(e="/"+e),e.indexOf("//")!==-1&&(e=e.replace(/\\/\\/+/g,"/")),e.indexOf("/.")!==-1){const t=e.split("/"),r=[];for(const n of t)if(!(n==="."||n==="")){if(n===".."){r.pop();continue}r.push(n)}e="/"+r.join("/")}return e.length>1&&e.charCodeAt(e.length-1)===47&&(e=e.slice(0,-1)),e||"/"}function H(e){return f(e).split("/").filter(Boolean)}var M=!1,D=new Set,p=new Map,b=new Map;function P(e){let t=2166136261;for(let r=0;r<e.length;r++)t^=e[r],t=Math.imul(t,16777619);return t>>>0^e.length}function R(e,t){if(e=f(e),D.has(e))return!0;const r=p.get(e);return!r||Date.now()-r>=A?!1:b.get(e)===P(t)}var A=3e3;function T(e){D.add(f(e))}function z(e){D.delete(f(e))}function C(e){p.set(f(e),Date.now())}function F(e,t=!1){e=f(e);const r=Date.now();if(D.has(e))return!0;const n=p.get(e);if(n&&r-n<A)return!0;if(t){let a=e;for(;;){const o=a.lastIndexOf("/");if(o<=0)break;if(a=a.substring(0,o),D.has(a))return!0;const i=p.get(a);if(i&&r-i<A)return!0}}return!1}setInterval(()=>{const e=Date.now()-A;for(const[t,r]of p)r<e&&(p.delete(t),b.delete(t))},5e3);var g=[],S=!1;function G(e){if(T(e.path),e.op==="rename"&&e.newPath&&T(e.newPath),e.op==="write"){const t=q(g,e.path);if(t!==-1){g[t].data=e.data,g[t].ts=e.ts;return}}g.push(e),S||B()}async function K(e){switch(e.op){case"write":e.data?await U(e.path,e.data):await U(e.path,new ArrayBuffer(0));break;case"delete":await X(e.path);break;case"mkdir":await J(e.path);break;case"rename":await L(e.path,e.newPath);break}}var I=4;async function B(){if(g.length===0){S=!1;return}S=!0;const e=g.shift();for(let t=1;t<=I;t++)try{await K(e);break}catch(r){if(t===I){console.warn("[opfs-sync] mirror failed after retries:",e.op,e.path,r);break}await new Promise(n=>setTimeout(n,10*t))}z(e.path),C(e.path),e.op==="rename"&&e.newPath&&(z(e.newPath),C(e.newPath)),B()}async function x(e){const t=H(e);t.pop();let r=m;for(const n of t)r=await r.getDirectoryHandle(n,{create:!0});return r}function y(e){const t=H(e);return t[t.length-1]||""}async function U(e,t){const r=await x(e),n=y(e),a=await r.getFileHandle(n,{create:!0}),o=new Uint8Array(t),i=await a.createSyncAccessHandle();try{i.truncate(0),i.write(o,{at:0}),i.flush()}finally{i.close()}b.set(f(e),P(o))}async function X(e){try{await(await v(e)).removeEntry(y(e),{recursive:!0})}catch{}}async function J(e){let t=m;for(const r of H(e))t=await t.getDirectoryHandle(r,{create:!0})}var W=2*1024*1024;async function L(e,t){let r=null,n=null,a,o,i=!1,u=null;for(let s=0;s<6;s++)try{a=await v(e),o=await a.getFileHandle(y(e)),i=!0;break}catch(d){u=d;const l=d?.message||"";if(d?.name==="TypeMismatchError"||l.includes("TypeMismatch")||l.includes("not a file")||l.includes("not an entry of requested type")){try{await N(e,t)}catch(c){console.warn("[opfs-sync] rename (dir) failed:",e,"\\u2192",t,c)}return}if(s<5){await new Promise(c=>setTimeout(c,8*(s+1)));continue}}if(!i){try{await N(e,t);return}catch{}console.warn("[opfs-sync] rename failed (source not found after retries):",e,"\\u2192",t,u);return}try{r=await o.createSyncAccessHandle();const s=r.getSize();if(n=await(await(await x(t)).getFileHandle(y(t),{create:!0})).createSyncAccessHandle(),n.truncate(0),s>0){const w=new Uint8Array(Math.min(s,W));let c=0;for(;c<s;){const k=Math.min(w.length,s-c),O=k===w.length?w:w.subarray(0,k);r.read(O,{at:c}),n.write(O,{at:c}),c+=k}}n.flush();try{n.close()}catch{}n=null;try{r.close()}catch{}r=null,await _(a,y(e))}catch(s){console.warn("[opfs-sync] rename failed:",e,"\\u2192",t,s)}finally{if(n)try{n.close()}catch{}if(r)try{r.close()}catch{}}}async function N(e,t){const r=await v(e),n=await r.getDirectoryHandle(y(e)),a=await x(t);try{await a.removeEntry(y(t),{recursive:!0})}catch(i){if(i?.name!=="NotFoundError")throw i}const o=await a.getDirectoryHandle(y(t),{create:!0});await j(n,o),await _(r,y(e),{recursive:!0})}async function _(e,t,r){let n=null;for(let a=0;a<4;a++)try{await e.removeEntry(t,r);return}catch(o){if(o?.name==="NotFoundError")return;n=o,await new Promise(i=>setTimeout(i,10*(a+1)))}throw n}async function j(e,t){for await(const[r,n]of e.entries())if(n.kind==="directory"){const a=await t.getDirectoryHandle(r,{create:!0});await j(n,a)}else{const a=n,o=await t.getFileHandle(r,{create:!0});let i=null,u=null;try{i=await a.createSyncAccessHandle(),u=await o.createSyncAccessHandle();const s=i.getSize();if(u.truncate(0),s>0){const d=new Uint8Array(Math.min(s,W));let l=0;for(;l<s;){const w=Math.min(d.length,s-l),c=w===d.length?d:d.subarray(0,w);i.read(c,{at:l}),u.write(c,{at:l}),l+=w}}u.flush()}finally{if(u)try{u.close()}catch{}if(i)try{i.close()}catch{}}}}async function v(e){const t=H(e);t.pop();let r=m;for(const n of t)r=await r.getDirectoryHandle(n);return r}function Q(e){for(const t of e){const r=f(t.path);if(!(r==="/.vfs.bin"||r==="/.vfs"||r.startsWith("/.vfs")))switch(t.kind){case"appeared":case"modified":V(r,t.handle??null);break;case"disappeared":if(F(r,!0))continue;Y(r);break;case"moved":{const n=f(t.from);if(F(r)||F(n))continue;Z(n,r);break}}}}async function V(e,t){try{if(!t||t.kind!=="file")return;const r=t;let n=await r.getFile().then(a=>a.arrayBuffer());if(R(e,new Uint8Array(n))||p.has(f(e))&&(n=await r.getFile().then(a=>a.arrayBuffer()),R(e,new Uint8Array(n))))return;h.postMessage({op:"external-write",path:e,data:n,ts:Date.now()},[n])}catch(r){M&&console.warn("[opfs-sync] external change read failed:",e,r)}}function Y(e){h.postMessage({op:"external-delete",path:e,ts:Date.now()})}function Z(e,t){h.postMessage({op:"external-rename",path:e,newPath:t,ts:Date.now()})}self.onmessage=async e=>{const t=e.data;if(t.type==="init"){if(M=t.debug===!0,h=e.ports[0],m=await navigator.storage.getDirectory(),t.root&&t.root!=="/"){const r=t.root.split("/").filter(Boolean);for(const n of r)m=await m.getDirectoryHandle(n,{create:!0})}M&&console.log("[opfs-sync] initialized with root:",t.root||"/","mirrorRoot.name:",m.name||"(opfs-root)"),h.onmessage=r=>{if(r.data?.type==="external-records"){Q(r.data.records);return}G(r.data)},h.start(),self.postMessage({type:"ready"});return}if(t.type==="shutdown"){try{h?.close()}catch{}self.postMessage({type:"shutdown-done"}),self.close();return}};\n';
 
 // src/protocol/mirror-plan.ts
 function sampleOpenPreState(engine2, flags, path) {
@@ -4684,7 +4815,7 @@ async function initEngine(config) {
     opfsSyncPort.start();
     opfsSyncWorker = workerFromSource(opfs_sync_default, "vfs-opfs-sync");
     opfsSyncWorker.postMessage(
-      { type: "init", root: config.opfsSyncRoot ?? config.root },
+      { type: "init", root: config.opfsSyncRoot ?? config.root, debug },
       [mc.port2]
     );
   }
@@ -4891,7 +5022,7 @@ function handleExternalChange(msg) {
         resyncHardlinksFor(msg.path);
         broadcastWatch(OP.WRITE, msg.path);
       }
-      console.log("[sync-relay] external-write:", msg.path, `${msg.data?.byteLength ?? 0}B`, `status=${result.status}`);
+      if (debug) console.log("[sync-relay] external-write:", msg.path, `${msg.data?.byteLength ?? 0}B`, `status=${result.status}`);
       break;
     }
     case "external-delete": {
@@ -4907,7 +5038,7 @@ function handleExternalChange(msg) {
         resyncSymlinksUnder(msg.path);
         broadcastWatch(wasDir ? OP.RMDIR : OP.UNLINK, msg.path);
       }
-      console.log("[sync-relay] external-delete:", msg.path, `dir=${wasDir}`, `ok=${ok}`);
+      if (debug) console.log("[sync-relay] external-delete:", msg.path, `dir=${wasDir}`, `ok=${ok}`);
       break;
     }
     case "external-rename":
@@ -4921,7 +5052,7 @@ function handleExternalChange(msg) {
           resyncSymlinksUnder(msg.path);
           broadcastWatch(OP.RENAME, msg.path, msg.newPath);
         }
-        console.log("[sync-relay] external-rename:", msg.path, "\u2192", msg.newPath, `status=${result.status}`);
+        if (debug) console.log("[sync-relay] external-rename:", msg.path, "\u2192", msg.newPath, `status=${result.status}`);
       }
       break;
   }

@@ -1344,7 +1344,7 @@ async function initEngine(config: {
     // resolve to anything — a nested worker has to carry its child's source with it.
     opfsSyncWorker = workerFromSource(opfsSyncSource, 'vfs-opfs-sync');
     opfsSyncWorker.postMessage(
-      { type: 'init', root: config.opfsSyncRoot ?? config.root },
+      { type: 'init', root: config.opfsSyncRoot ?? config.root, debug },
       [mc.port2],
     );
   }
@@ -1705,7 +1705,7 @@ function handleExternalChange(msg: { op: string; path: string; newPath?: string;
         resyncHardlinksFor(msg.path); // other names of the same inode, stale in OPFS now
         broadcastWatch(OP.WRITE, msg.path);
       }
-      console.log('[sync-relay] external-write:', msg.path, `${msg.data?.byteLength ?? 0}B`, `status=${result.status}`);
+      if (debug) console.log('[sync-relay] external-write:', msg.path, `${msg.data?.byteLength ?? 0}B`, `status=${result.status}`);
       break;
     }
     case 'external-delete': {
@@ -1718,7 +1718,7 @@ function handleExternalChange(msg: { op: string; path: string; newPath?: string;
         resyncSymlinksUnder(msg.path); // links whose target vanished → placeholder
         broadcastWatch(wasDir ? OP.RMDIR : OP.UNLINK, msg.path);
       }
-      console.log('[sync-relay] external-delete:', msg.path, `dir=${wasDir}`, `ok=${ok}`);
+      if (debug) console.log('[sync-relay] external-delete:', msg.path, `dir=${wasDir}`, `ok=${ok}`);
       break;
     }
     case 'external-rename':
@@ -1732,7 +1732,7 @@ function handleExternalChange(msg: { op: string; path: string; newPath?: string;
           resyncSymlinksUnder(msg.path); // links pointing at the renamed-away target
           broadcastWatch(OP.RENAME, msg.path, msg.newPath);
         }
-        console.log('[sync-relay] external-rename:', msg.path, '→', msg.newPath, `status=${result.status}`);
+        if (debug) console.log('[sync-relay] external-rename:', msg.path, '→', msg.newPath, `status=${result.status}`);
       }
       break;
   }

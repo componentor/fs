@@ -155,6 +155,11 @@ var CODE_TO_STATUS = {
 var encoder = new TextEncoder();
 var PREGROW_HEADROOM_BLOCKS = 16384;
 var decoder = new TextDecoder();
+var DIR_TIMES_PERSIST_MS = 1e3;
+function samePrefix(a, b, n) {
+  for (let i = 0; i < n; i++) if (a.charCodeAt(i) !== b.charCodeAt(i)) return false;
+  return true;
+}
 function isUnder(child, parent) {
   return parent === "/" ? child !== "/" : child.startsWith(parent + "/");
 }
@@ -200,6 +205,25 @@ var VFSEngine = class _VFSEngine {
   // Reusable buffers to avoid allocations
   inodeBuf = new Uint8Array(INODE_SIZE);
   inodeView = new DataView(this.inodeBuf.buffer);
+  // Directory mtime/ctime changes are applied to the cached inode at once (so stat is always right)
+  // and written to disk in batches: at most once per DIR_TIMES_PERSIST_MS from commitPending, and
+  // always on flush(). A burst of creates in one directory therefore costs no extra I/O per create.
+  // MTIME and CTIME are adjacent in the inode record, so each directory is one 16-byte write.
+  dirTimesDirty = /* @__PURE__ */ new Set();
+  dirTimesPersistedAt = 0;
+  dirTimesLatest = 0;
+  // time of the latest pending change, so commitPending needs no clock read
+  // ensureParent's lookup, reused by createInode when nothing in the namespace changed since.
+  parentHintPath = null;
+  parentHintIdx = -1;
+  parentHintGen = -1;
+  dirTimesBuf = new Uint8Array(16);
+  dirTimesView = new DataView(this.dirTimesBuf.buffer);
+  // Inode slot → (inode index of the directory holding that name) + 1; 0 = not known. The slot is
+  // the one owning the name: the inode itself, or the hard-link record for a link name. Lets
+  // unlink/rename stamp the parent directory without a path lookup. In memory only: filled as names
+  // are created or moved, cleared when a slot is freed; an unknown entry falls back to a lookup.
+  nameParent = new Int32Array(0);
   // In-memory inode cache — eliminates disk reads for hot inodes
   inodeCache = /* @__PURE__ */ new Map();
   superblockBuf = new Uint8Array(SUPERBLOCK.SIZE);
@@ -323,6 +347,10 @@ var VFSEngine = class _VFSEngine {
   /** Release the sync access handle (call on fatal error or shutdown) */
   closeHandle() {
     try {
+      if (this.dirTimesDirty.size) this.persistDirTimes();
+    } catch (_) {
+    }
+    try {
       this.handle?.close();
     } catch (_) {
     }
@@ -333,6 +361,7 @@ var VFSEngine = class _VFSEngine {
     this.linkInodes.clear();
     this.linkPathsByTarget.clear();
     this.inodeCount = DEFAULT_INODE_COUNT;
+    this.nameParent = new Int32Array(this.inodeCount);
     this.blockSize = DEFAULT_BLOCK_SIZE;
     this.totalBlocks = layout.totalBlocks;
     this.freeBlocks = layout.totalBlocks;
@@ -492,6 +521,9 @@ var VFSEngine = class _VFSEngine {
       this.writeSuperblock();
       this.superblockDirty = false;
     }
+    if (this.dirTimesDirty.size && this.dirTimesLatest - this.dirTimesPersistedAt >= DIR_TIMES_PERSIST_MS) {
+      this.persistDirTimes();
+    }
   }
   /** Find the last used block index (-1 if the data region is empty). */
   findLastUsedBlock() {
@@ -574,8 +606,10 @@ var VFSEngine = class _VFSEngine {
    *  Bulk-reads the entire inode table + path table in 2 I/O calls,
    *  then parses in memory (avoids 10k+ individual reads). */
   rebuildIndex() {
+    if (this.dirTimesDirty.size) this.persistDirTimes();
     this.pathIndex.clear();
     this.inodeCache.clear();
+    this.nameParent = new Int32Array(this.inodeCount);
     this.linkInodes.clear();
     this.linkPathsByTarget.clear();
     const pendingLinks = [];
@@ -659,6 +693,66 @@ var VFSEngine = class _VFSEngine {
     this.pathIndexGen++;
   }
   // ========== Low-level inode I/O ==========
+  /** ensureParent's resolved parent for `path`, if that was the last lookup; consumes it. */
+  takeParentHint(path) {
+    const idx = this.parentHintPath === path ? this.parentHintIdx : -1;
+    this.parentHintPath = null;
+    return idx;
+  }
+  /** The inode slot that owns this name: its hard-link record, or the inode itself. */
+  nameSlot(path, idx) {
+    return this.linkInodes.size === 0 ? idx : this.linkInodes.get(path) ?? idx;
+  }
+  /**
+   * rename(2): both directories changed — one directory when it stays in the same one.
+   * Returns the new parent's inode index (-1 if it has none), like touchParentDir.
+   */
+  touchRenameDirs(oldPath, newPath, now, newParentIdx, oldParentIdx) {
+    const newParent = this.touchParentDir(newPath, now, newParentIdx);
+    if (oldParentIdx >= 0) {
+      if (oldParentIdx !== newParent) this.touchParentDir(oldPath, now, oldParentIdx);
+      return newParent;
+    }
+    const slash = oldPath.lastIndexOf("/");
+    if (slash !== newPath.lastIndexOf("/") || !samePrefix(oldPath, newPath, slash)) {
+      this.touchParentDir(oldPath, now, -1);
+    }
+    return newParent;
+  }
+  /**
+   * A directory's entries changed (a name was added, removed or renamed in it): like POSIX, its
+   * mtime and ctime move to `now`. Updates the cached inode; persistDirTimes writes it later.
+   * Implicit directories have no inode, so there is nothing to update. `knownParentIdx` skips the
+   * lookup when the caller already has the parent. Returns the parent's inode index, or -1.
+   */
+  touchParentDir(path, now, knownParentIdx) {
+    let idx = knownParentIdx;
+    if (idx < 0) {
+      const slash = path.lastIndexOf("/");
+      const found = this.pathIndex.get(slash > 0 ? path.substring(0, slash) : "/");
+      if (found === void 0) return -1;
+      idx = found;
+    }
+    const dir = this.readInode(idx);
+    if (dir.type !== INODE_TYPE.DIRECTORY) return -1;
+    if (dir.mtime === now && dir.ctime === now) return idx;
+    dir.mtime = dir.ctime = now;
+    this.dirTimesDirty.add(idx);
+    this.dirTimesLatest = now;
+    return idx;
+  }
+  /** Write the pending directory timestamps (the cached values) to the inode table. */
+  persistDirTimes() {
+    for (const idx of this.dirTimesDirty) {
+      const dir = this.inodeCache.get(idx);
+      if (!dir || dir.type !== INODE_TYPE.DIRECTORY) continue;
+      this.dirTimesView.setFloat64(0, dir.mtime, true);
+      this.dirTimesView.setFloat64(8, dir.ctime, true);
+      this.handle.write(this.dirTimesBuf, { at: this.inodeTableOffset + idx * INODE_SIZE + INODE.MTIME });
+    }
+    this.dirTimesDirty.clear();
+    this.dirTimesPersistedAt = this.dirTimesLatest;
+  }
   readInode(idx) {
     const cached = this.inodeCache.get(idx);
     if (cached) return cached;
@@ -929,6 +1023,9 @@ var VFSEngine = class _VFSEngine {
     this.bitmapOffset += growth;
     this.dataOffset += growth;
     this.inodeCount = newCount;
+    const nameParent = new Int32Array(newCount);
+    nameParent.set(this.nameParent.subarray(0, Math.min(this.nameParent.length, newCount)));
+    this.nameParent = nameParent;
     this.superblockDirty = true;
     return oldCount;
   }
@@ -1040,6 +1137,8 @@ var VFSEngine = class _VFSEngine {
   }
   // ========== Core inode creation helper ==========
   createInode(path, type, mode, size, data) {
+    const knownParentIdx = path === this.parentHintPath && this.pathIndexGen === this.parentHintGen ? this.parentHintIdx : -1;
+    this.parentHintPath = null;
     const idx = this.findFreeInode();
     const { offset: pathOff, length: pathLen } = this.appendPath(path);
     const now = Date.now();
@@ -1068,6 +1167,7 @@ var VFSEngine = class _VFSEngine {
     this.writeInode(idx, inode);
     this.setPathIndex(path, idx);
     this.pathIndexGen++;
+    this.nameParent[idx] = this.touchParentDir(path, now, knownParentIdx) + 1;
     return idx;
   }
   // ========== Hard links ==========
@@ -1132,6 +1232,7 @@ var VFSEngine = class _VFSEngine {
   releaseInode(idx, inode) {
     inode.type = INODE_TYPE.FREE;
     this.writeInode(idx, inode);
+    this.nameParent[idx] = 0;
     if (idx < this.freeInodeHint) this.freeInodeHint = idx;
   }
   /**
@@ -1155,7 +1256,7 @@ var VFSEngine = class _VFSEngine {
    * commit per logical operation, not per name.
    */
   removeName(path, idx) {
-    const linkIdx = this.linkInodes.get(path);
+    const linkIdx = this.linkInodes.size === 0 ? void 0 : this.linkInodes.get(path);
     if (linkIdx !== void 0) {
       this.linkInodes.delete(path);
       this.untrackLinkPath(idx, path);
@@ -1168,10 +1269,11 @@ var VFSEngine = class _VFSEngine {
       return;
     }
     const inode = this.readInode(idx);
-    const links = this.linkPathsByTarget.get(idx);
+    const links = this.linkPathsByTarget.size === 0 ? void 0 : this.linkPathsByTarget.get(idx);
     if (links && links.size > 0) {
       const promoted = links.values().next().value;
       const promotedLinkIdx = this.linkInodes.get(promoted);
+      this.nameParent[idx] = this.nameParent[promotedLinkIdx];
       this.linkInodes.delete(promoted);
       this.untrackLinkPath(idx, promoted);
       this.releaseInode(promotedLinkIdx, this.readInode(promotedLinkIdx));
@@ -1198,14 +1300,14 @@ var VFSEngine = class _VFSEngine {
    * The path index is the caller's to update; this only fixes the on-disk record and the
    * link registry.
    */
-  repathName(oldPath, newPath, idx, touchMtime) {
-    const linkIdx = this.linkInodes.get(oldPath);
+  repathName(oldPath, newPath, idx, ctimeNow) {
+    const linkIdx = this.linkInodes.size === 0 ? void 0 : this.linkInodes.get(oldPath);
     const ownerIdx = linkIdx ?? idx;
     const owner = this.readInode(ownerIdx);
     const { offset: pathOff, length: pathLen } = this.appendPath(newPath);
     owner.pathOffset = pathOff;
     owner.pathLength = pathLen;
-    if (touchMtime) owner.mtime = Date.now();
+    if (ctimeNow) owner.ctime = ctimeNow;
     this.writeInode(ownerIdx, owner);
     if (linkIdx !== void 0) {
       this.linkInodes.delete(oldPath);
@@ -1223,6 +1325,7 @@ var VFSEngine = class _VFSEngine {
    * name is a separate file over there and has to be re-mirrored.
    */
   linkNamesFor(path) {
+    if (this.linkPathsByTarget.size === 0) return [];
     path = this.normalizePath(path);
     const idx = this.pathIndex.get(path);
     if (idx === void 0) return [];
@@ -1330,7 +1433,7 @@ var VFSEngine = class _VFSEngine {
       }
       inode.size = data.byteLength;
       inode.blockCount = neededBlocks;
-      inode.mtime = Date.now();
+      inode.mtime = inode.ctime = Date.now();
       this.writeInode(existingIdx, inode);
       tInode = this.debug ? performance.now() : 0;
     } else {
@@ -1366,7 +1469,7 @@ var VFSEngine = class _VFSEngine {
     if (neededBlocks <= inode.blockCount) {
       this.handle.write(data, { at: this.dataOffset + inode.firstBlock * this.blockSize + inode.size });
       inode.size = combinedSize;
-      inode.mtime = Date.now();
+      inode.mtime = inode.ctime = Date.now();
       this.writeInode(existingIdx, inode);
       this.commitPending();
       return { status: 0 };
@@ -1391,7 +1494,7 @@ var VFSEngine = class _VFSEngine {
     inode.firstBlock = newFirst;
     inode.blockCount = neededBlocks;
     inode.size = combinedSize;
-    inode.mtime = Date.now();
+    inode.mtime = inode.ctime = Date.now();
     this.writeInode(existingIdx, inode);
     this.commitPending();
     return { status: 0 };
@@ -1403,8 +1506,10 @@ var VFSEngine = class _VFSEngine {
     if (idx === void 0) return { status: CODE_TO_STATUS.ENOENT };
     const inode = this.readInode(idx);
     if (inode.type === INODE_TYPE.DIRECTORY) return { status: CODE_TO_STATUS.EISDIR };
+    const parentIdx = this.nameParent[this.nameSlot(path, idx)] - 1;
     this.removeName(path, idx);
     this.pathIndexGen++;
+    this.touchParentDir(path, Date.now(), parentIdx);
     this.commitPending();
     return { status: 0 };
   }
@@ -1491,6 +1596,7 @@ var VFSEngine = class _VFSEngine {
     const parts = path.split("/").filter(Boolean);
     let current = "";
     let firstCreated = null;
+    let parentIdx = -1;
     for (const part of parts) {
       current += "/" + part;
       if (this.pathIndex.has(current)) {
@@ -1499,9 +1605,15 @@ var VFSEngine = class _VFSEngine {
         if (inode.type !== INODE_TYPE.DIRECTORY) {
           return { status: CODE_TO_STATUS.ENOTDIR, data: null };
         }
+        parentIdx = idx;
         continue;
       }
-      this.createInode(current, INODE_TYPE.DIRECTORY, this.dirModeFor(reqMode), 0);
+      if (parentIdx >= 0) {
+        this.parentHintPath = current;
+        this.parentHintIdx = parentIdx;
+        this.parentHintGen = this.pathIndexGen;
+      }
+      parentIdx = this.createInode(current, INODE_TYPE.DIRECTORY, this.dirModeFor(reqMode), 0);
       if (!firstCreated) firstCreated = current;
     }
     this.commitPending();
@@ -1542,8 +1654,10 @@ var VFSEngine = class _VFSEngine {
       this.commitPending();
       return { status: 0 };
     }
+    const parentIdx = this.nameParent[idx] - 1;
     this.removeName(path, idx);
     this.pathIndexGen++;
+    this.touchParentDir(path, Date.now(), parentIdx);
     this.commitPending();
     return { status: 0 };
   }
@@ -1614,6 +1728,7 @@ var VFSEngine = class _VFSEngine {
     }
     const parentStatus = this.ensureParent(newPath);
     if (parentStatus !== 0) return { status: parentStatus };
+    const newParentIdx = this.takeParentHint(newPath);
     const existingIdx = this.pathIndex.get(newPath);
     const targetIsImplicitDir = existingIdx === void 0 && this.isImplicitDirectory(newPath);
     if (existingIdx !== void 0 || targetIsImplicitDir) {
@@ -1635,7 +1750,10 @@ var VFSEngine = class _VFSEngine {
       }
     }
     const inode = this.readInode(idx);
-    this.repathName(oldPath, newPath, idx, true);
+    const slot = this.nameSlot(oldPath, idx);
+    const oldParentIdx = this.nameParent[slot] - 1;
+    const now = Date.now();
+    this.repathName(oldPath, newPath, idx, now);
     this.deletePathIndex(oldPath);
     this.setPathIndex(newPath, idx);
     this.pathIndexGen++;
@@ -1650,11 +1768,12 @@ var VFSEngine = class _VFSEngine {
       for (const [p, i] of toRename) {
         const suffix = p.substring(oldPath.length);
         const childNewPath = newPath + suffix;
-        this.repathName(p, childNewPath, i, false);
+        this.repathName(p, childNewPath, i, 0);
         this.deletePathIndex(p);
         this.setPathIndex(childNewPath, i);
       }
     }
+    this.nameParent[slot] = this.touchRenameDirs(oldPath, newPath, now, newParentIdx, oldParentIdx) + 1;
     this.commitPending();
     return { status: 0 };
   }
@@ -1716,7 +1835,7 @@ var VFSEngine = class _VFSEngine {
       inode.blockCount = neededBlocks;
       inode.size = len;
     }
-    inode.mtime = Date.now();
+    inode.mtime = inode.ctime = Date.now();
     this.writeInode(idx, inode);
     this.commitPending();
     return { status: 0 };
@@ -1768,7 +1887,7 @@ var VFSEngine = class _VFSEngine {
     destInode.firstBlock = newFirst;
     destInode.blockCount = neededBlocks;
     destInode.size = srcSize;
-    destInode.mtime = Date.now();
+    destInode.mtime = destInode.ctime = Date.now();
     destInode.mode = destInode.mode & ~4095 | srcMode & 4095;
     this.writeInode(destIdx, destInode);
     this.commitPending();
@@ -1906,6 +2025,7 @@ var VFSEngine = class _VFSEngine {
     }
     const parentStatus = this.ensureParent(newPath);
     if (parentStatus !== 0) return { status: parentStatus };
+    const newParentIdx = this.takeParentHint(newPath);
     const linkIdx = this.createLinkInode(newPath, srcIdx);
     this.linkInodes.set(newPath, linkIdx);
     this.trackLinkPath(srcIdx, newPath);
@@ -1914,6 +2034,7 @@ var VFSEngine = class _VFSEngine {
     srcInode.nlink = this.nameCount(srcIdx);
     srcInode.ctime = Date.now();
     this.writeInode(srcIdx, srcInode);
+    this.nameParent[linkIdx] = this.touchParentDir(newPath, srcInode.ctime, newParentIdx) + 1;
     this.commitPending();
     return { status: 0 };
   }
@@ -2035,7 +2156,7 @@ var VFSEngine = class _VFSEngine {
       const dataOffset = this.dataOffset + inode.firstBlock * this.blockSize + pos;
       this.handle.write(data, { at: dataOffset });
     }
-    inode.mtime = Date.now();
+    inode.mtime = inode.ctime = Date.now();
     this.writeInode(entry.inodeIdx, inode);
     if (position === null) {
       entry.position = endPos;
@@ -2298,6 +2419,7 @@ var VFSEngine = class _VFSEngine {
     if (path === "/" || path.length === 0) return;
     let parent = "/";
     let start = 1;
+    let flat = path.charCodeAt(0) === 47;
     while (start <= path.length) {
       let end = path.indexOf("/", start);
       if (end === -1) end = path.length;
@@ -2309,7 +2431,9 @@ var VFSEngine = class _VFSEngine {
           this.childIndex.set(parent, children);
         }
         children.set(name, (children.get(name) ?? 0) + 1);
-        parent = parent === "/" ? "/" + name : parent + "/" + name;
+        parent = flat ? path.substring(0, end) : parent === "/" ? "/" + name : parent + "/" + name;
+      } else {
+        flat = false;
       }
       start = end + 1;
     }
@@ -2318,6 +2442,7 @@ var VFSEngine = class _VFSEngine {
     if (path === "/" || path.length === 0) return;
     let parent = "/";
     let start = 1;
+    let flat = path.charCodeAt(0) === 47;
     while (start <= path.length) {
       let end = path.indexOf("/", start);
       if (end === -1) end = path.length;
@@ -2333,7 +2458,9 @@ var VFSEngine = class _VFSEngine {
         } else {
           children.set(name, cur - 1);
         }
-        parent = parent === "/" ? "/" + name : parent + "/" + name;
+        parent = flat ? path.substring(0, end) : parent === "/" ? "/" + name : parent + "/" + name;
+      } else {
+        flat = false;
       }
       start = end + 1;
     }
@@ -2437,6 +2564,9 @@ var VFSEngine = class _VFSEngine {
     }
     const parentInode = this.readInode(parentIdx);
     if (parentInode.type !== INODE_TYPE.DIRECTORY) return CODE_TO_STATUS.ENOTDIR;
+    this.parentHintPath = path;
+    this.parentHintIdx = parentIdx;
+    this.parentHintGen = this.pathIndexGen;
     return 0;
   }
   /** Clean up all fds owned by a tab */
@@ -2487,6 +2617,7 @@ var VFSEngine = class _VFSEngine {
     return result;
   }
   flush() {
+    if (this.dirTimesDirty.size) this.persistDirTimes();
     this.handle.flush();
   }
 };

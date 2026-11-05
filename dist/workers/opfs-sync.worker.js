@@ -52,6 +52,7 @@ function normalizePath(p) {
 function pathSegments(p) {
   return normalizePath(p).split("/").filter(Boolean);
 }
+var debug = false;
 var pendingPaths = /* @__PURE__ */ new Set();
 var completedPaths = /* @__PURE__ */ new Map();
 var lastWriteHash = /* @__PURE__ */ new Map();
@@ -422,7 +423,7 @@ async function syncExternalChange(path, handle) {
       ts: Date.now()
     }, [data]);
   } catch (err) {
-    console.warn("[opfs-sync] external change read failed:", path, err);
+    if (debug) console.warn("[opfs-sync] external change read failed:", path, err);
   }
 }
 function syncExternalDelete(path) {
@@ -443,6 +444,7 @@ function syncExternalRename(oldPath, newPath) {
 self.onmessage = async (e) => {
   const msg = e.data;
   if (msg.type === "init") {
+    debug = msg.debug === true;
     serverPort = e.ports[0];
     mirrorRoot = await navigator.storage.getDirectory();
     if (msg.root && msg.root !== "/") {
@@ -451,7 +453,7 @@ self.onmessage = async (e) => {
         mirrorRoot = await mirrorRoot.getDirectoryHandle(segment, { create: true });
       }
     }
-    console.log("[opfs-sync] initialized with root:", msg.root || "/", "mirrorRoot.name:", mirrorRoot.name || "(opfs-root)");
+    if (debug) console.log("[opfs-sync] initialized with root:", msg.root || "/", "mirrorRoot.name:", mirrorRoot.name || "(opfs-root)");
     serverPort.onmessage = (ev) => {
       if (ev.data?.type === "external-records") {
         applyExternalRecords(ev.data.records);

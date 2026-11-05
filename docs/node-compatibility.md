@@ -65,6 +65,13 @@ All deliberate:
   one per link, and the `opfs` mirror has no way to represent sharing, so each name is a
   separate file there (kept in step on every write, but a hard link that reaches OPFS and comes
   back through a repair/load is two independent files).
+- **A directory's mtime/ctime reach disk up to a second late.** Which timestamps an operation
+  changes matches Node, directories included: creating, removing or renaming an entry moves its
+  directory's mtime and ctime, and `stat` shows the new times at once. Writing them is batched,
+  though — at most once per second from the per-operation commit, and always on `flush()` and
+  on close — so a burst of creates in one directory costs no extra write per file. If the page
+  is killed mid-burst, a remount can show a directory time up to a second older than the last
+  change. File timestamps are written with every operation, as before.
 - **No `ENAMETOOLONG`.** Real filesystems cap a path component at 255 bytes; we accept longer
   names. Enforcing the limit would reject names existing volumes may already contain, so the
   cap is left off.

@@ -75,6 +75,9 @@ function pathSegments(p: string): string[] {
 // ONLY used for 'disappeared' events — NOT for 'appeared'/'modified', since
 // creating /dir doesn't mean /dir/new-file appearing is our echo.
 
+// Diagnostics (the init log, skippable read failures) only print with `debug: true`, set at init.
+let debug = false;
+
 const pendingPaths = new Set<string>();
 const completedPaths = new Map<string, number>();
 const lastWriteHash = new Map<string, number>();
@@ -610,7 +613,7 @@ async function syncExternalChange(path: string, handle: FileSystemHandle | null)
   } catch (err) {
     // File may have been deleted between observer event and our read, or
     // a sync access handle may be holding the lock — either is fine to skip
-    console.warn('[opfs-sync] external change read failed:', path, err);
+    if (debug) console.warn('[opfs-sync] external change read failed:', path, err);
   }
 }
 
@@ -637,6 +640,7 @@ self.onmessage = async (e: MessageEvent) => {
   const msg = e.data;
 
   if (msg.type === 'init') {
+    debug = msg.debug === true;
     serverPort = e.ports[0];
     mirrorRoot = await navigator.storage.getDirectory();
 
@@ -648,7 +652,7 @@ self.onmessage = async (e: MessageEvent) => {
       }
     }
 
-    console.log('[opfs-sync] initialized with root:', msg.root || '/', 'mirrorRoot.name:', mirrorRoot.name || '(opfs-root)');
+    if (debug) console.log('[opfs-sync] initialized with root:', msg.root || '/', 'mirrorRoot.name:', mirrorRoot.name || '(opfs-root)');
 
     // Detection lives in the owner's scope now — see applyExternalRecords.
 
