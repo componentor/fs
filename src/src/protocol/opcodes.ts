@@ -97,6 +97,16 @@ export const SAB_OFFSETS = {
 } as const;
 
 /**
+ * Length, in Int32s, of a view over the control header — every slot above, WORK included.
+ *
+ * Every `ctrl` view is built with this. They used to be built with a literal 8, which stopped at
+ * byte 32 when WORK was added there: `Atomics` on WORK then threw `RangeError: Invalid atomic
+ * access index` on both sides, so in `opfs` mode the relay's progress bump failed every write
+ * (EIO) and the page's wait threw before it could see an answer.
+ */
+export const CTRL_INT32S = SAB_OFFSETS.HEADER_SIZE >> 2;
+
+/**
  * The readiness SAB: one Int32 slot, written by the relay and read by anything asking whether the
  * volume is mounted.
  *

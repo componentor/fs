@@ -22,7 +22,7 @@
 
 import { VFSEngine } from '../vfs/engine.js';
 import { OPFSEngine } from '../opfs-engine.js';
-import { SAB_OFFSETS, SIGNAL, OP, STATUS, decodeRequest, decodeSecondPath, encodeResponse } from '../protocol/opcodes.js';
+import { SAB_OFFSETS, SIGNAL, OP, STATUS, decodeRequest, decodeSecondPath, encodeResponse, CTRL_INT32S } from '../protocol/opcodes.js';
 import { FollowerForwarder } from '../protocol/follower-forward.js';
 import { waitWhile, SAB_WAIT_DEADLINE_MS } from '../protocol/sab-wait.js';
 import { planRenameMirror, planPendingReroutes, resolveLinkTarget, registerLink, deregisterLink, collectKeysUnder } from './opfs-sync-plan.js';
@@ -1784,14 +1784,14 @@ self.onmessage = async (e: MessageEvent) => {
     if (hasSAB) {
       sab = msg.sab;
       readySab = msg.readySab;
-      ctrl = new Int32Array(sab, 0, 8);
+      ctrl = new Int32Array(sab, 0, CTRL_INT32S);
       readySignal = new Int32Array(readySab, 0, 1);
       startHeartbeat(); // begin pulsing before init work so a slow init isn't mistaken for a dead worker
     }
 
     if (msg.asyncSab) {
       asyncSab = msg.asyncSab;
-      asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
+      asyncCtrl = new Int32Array(msg.asyncSab, 0, CTRL_INT32S);
     }
 
     try {
@@ -1836,14 +1836,14 @@ self.onmessage = async (e: MessageEvent) => {
     if (hasSAB) {
       sab = msg.sab;
       readySab = msg.readySab;
-      ctrl = new Int32Array(sab, 0, 8);
+      ctrl = new Int32Array(sab, 0, CTRL_INT32S);
       readySignal = new Int32Array(readySab, 0, 1);
       startHeartbeat(); // begin pulsing before init work so a slow init isn't mistaken for a dead worker
     }
 
     if (msg.asyncSab) {
       asyncSab = msg.asyncSab;
-      asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
+      asyncCtrl = new Int32Array(msg.asyncSab, 0, CTRL_INT32S);
     }
 
     try {
@@ -1881,14 +1881,14 @@ self.onmessage = async (e: MessageEvent) => {
     if (hasSAB) {
       sab = msg.sab;
       readySab = msg.readySab;
-      ctrl = new Int32Array(sab, 0, 8);
+      ctrl = new Int32Array(sab, 0, CTRL_INT32S);
       readySignal = new Int32Array(readySab, 0, 1);
       startHeartbeat(); // begin pulsing before init work so a slow init isn't mistaken for a dead worker
     }
 
     if (msg.asyncSab) {
       asyncSab = msg.asyncSab;
-      asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
+      asyncCtrl = new Int32Array(msg.asyncSab, 0, CTRL_INT32S);
     }
 
     // Leader port will be sent separately

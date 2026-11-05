@@ -18,7 +18,7 @@ import type {
 } from './types.js';
 import { NodeReadable, NodeWritable } from './node-streams.js';
 import type { SyncRequestFn, AsyncRequestFn } from './methods/context.js';
-import { SAB_OFFSETS, SIGNAL, OP, READY_SAB_SIZE, encodeRequest, decodeResponse } from './protocol/opcodes.js';
+import { SAB_OFFSETS, SIGNAL, OP, READY_SAB_SIZE, encodeRequest, decodeResponse, CTRL_INT32S } from './protocol/opcodes.js';
 import { acquireFsLock, releaseFsLock } from './protocol/fs-lock.js';
 
 // ---- Method imports ----
@@ -490,7 +490,7 @@ export class VFSFileSystem {
       this.sab = new SharedArrayBuffer(sabSize);
       this.readySab = new SharedArrayBuffer(READY_SAB_SIZE);
       this.asyncSab = new SharedArrayBuffer(sabSize);
-      this.ctrl = new Int32Array(this.sab, 0, 8);
+      this.ctrl = new Int32Array(this.sab, 0, CTRL_INT32S);
       this.readySignal = new Int32Array(this.readySab, 0, 1);
     }
 
@@ -1017,7 +1017,7 @@ export class VFSFileSystem {
       this.sab = new SharedArrayBuffer(sabSize);
       this.readySab = new SharedArrayBuffer(READY_SAB_SIZE);
       this.asyncSab = new SharedArrayBuffer(sabSize);
-      this.ctrl = new Int32Array(this.sab, 0, 8);
+      this.ctrl = new Int32Array(this.sab, 0, CTRL_INT32S);
       this.readySignal = new Int32Array(this.readySab, 0, 1);
     }
 
@@ -2187,7 +2187,7 @@ export class VFSFileSystem {
       this.sab = new SharedArrayBuffer(sabSize);
       this.readySab = new SharedArrayBuffer(READY_SAB_SIZE);
       this.asyncSab = new SharedArrayBuffer(sabSize);
-      this.ctrl = new Int32Array(this.sab, 0, 8);
+      this.ctrl = new Int32Array(this.sab, 0, CTRL_INT32S);
       this.readySignal = new Int32Array(this.readySab, 0, 1);
     }
 

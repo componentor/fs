@@ -20,8 +20,7 @@
 import {
   SAB_OFFSETS, SIGNAL, STATUS,
   encodeRequest, encodeTwoPathRequest, decodeResponse,
-  OP,
-} from '../protocol/opcodes.js';
+  OP, CTRL_INT32S } from '../protocol/opcodes.js';
 import {
   encodeFdPayload, encodeFreadPayload, encodeFwritePayload, encodeFtruncatePayload,
 } from '../protocol/payloads.js';
@@ -196,7 +195,7 @@ self.onmessage = async (e: MessageEvent) => {
   // --- Leader mode init (with SAB) ---
   if (msg.type === 'init-leader') {
     asyncSab = msg.asyncSab;
-    asyncCtrl = new Int32Array(msg.asyncSab, 0, 8);
+    asyncCtrl = new Int32Array(msg.asyncSab, 0, CTRL_INT32S);
     if (msg.wakeSab) {
       wakeCtrl = new Int32Array(msg.wakeSab, 0, 1);
     }
