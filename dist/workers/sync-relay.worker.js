@@ -3349,6 +3349,23 @@ var SIGNAL = {
 };
 var encoder3 = new TextEncoder();
 var decoder2 = new TextDecoder();
+function encodeRequest(op, path, flags = 0, data) {
+  const pathBytes = encoder3.encode(path);
+  const dataLen = data ? data.byteLength : 0;
+  const totalLen = 16 + pathBytes.byteLength + dataLen;
+  const buf = new ArrayBuffer(totalLen);
+  const view = new DataView(buf);
+  view.setUint32(0, op, true);
+  view.setUint32(4, flags, true);
+  view.setUint32(8, pathBytes.byteLength, true);
+  view.setUint32(12, dataLen, true);
+  const bytes = new Uint8Array(buf);
+  bytes.set(pathBytes, 16);
+  if (data) {
+    bytes.set(data, 16 + pathBytes.byteLength);
+  }
+  return buf;
+}
 function decodeRequest(buf) {
   if (buf.byteLength < 16) {
     throw new Error(`Request buffer too small: ${buf.byteLength} < 16 bytes (possible SAB race)`);
@@ -3387,6 +3404,10 @@ function decodeSecondPath(data) {
 // src/protocol/follower-forward.ts
 var FORWARD_DEADLINE_MS = 1e4;
 var UNPROVEN_DEADLINE_MS = 1e3;
+var TAKEOVER_SILENCE_MS = 15e3;
+var TAKEOVER_MIN_TIMEOUTS = 3;
+var PROBE_INTERVAL_MS = 2500;
+var MAX_ABANDONED_TRACKED = 256;
 var FollowerForwarder = class _FollowerForwarder {
   constructor(getTabId, deadlineMs = FORWARD_DEADLINE_MS, onUnprovenTimeout) {
     this.getTabId = getTabId;
@@ -3403,6 +3424,14 @@ var FollowerForwarder = class _FollowerForwarder {
   timer = null;
   /** Cleared whenever the port is replaced; set by the first response it delivers. */
   portProven = false;
+  /** In-flight no-SAB requests, by wire id (see {@link forwardTracked}). */
+  tracked = /* @__PURE__ */ new Map();
+  /** Wire ids that timed out on the current port, so their late answers are dropped. */
+  abandonedTracked = /* @__PURE__ */ new Set();
+  trackedCounter = 0;
+  /** When this port last asked for a fresh leader (0 = not yet). */
+  freshLeaderAskedAt = 0;
+  observer = null;
   get hasPort() {
     return this.port !== null;
   }
@@ -3411,13 +3440,72 @@ var FollowerForwarder = class _FollowerForwarder {
     if (this.port && this.port !== port) {
       this.port.close();
       this.abortPending();
+      this.abortTracked();
+      this.abandonedTracked.clear();
     }
     this.port = port;
     this.portProven = false;
+    this.freshLeaderAskedAt = 0;
   }
-  /** Post a non-tracked message on the leader port (no-SAB async relay path). */
-  postRaw(message, transfer) {
-    this.port?.postMessage(message, transfer);
+  /** Report every timeout and delivery to `observer` (the silent-leader watch). */
+  observe(observer) {
+    this.observer = observer;
+  }
+  /** Number of no-SAB requests currently in flight. */
+  get trackedInFlight() {
+    return this.tracked.size;
+  }
+  /**
+   * Forward a no-SAB promise-API request (many may be in flight at once).
+   *
+   * Same contract as {@link forward}: `settle` is called exactly once, with the leader's response
+   * or, after the deadline (the short one for an unproven port), with an EIO response. No retry;
+   * a late answer is dropped. The wire id is this forwarder's own (`t<n>`), so it can never
+   * collide with the numeric ids of {@link forward} or with anything the caller uses.
+   */
+  forwardTracked(buffer, settle) {
+    if (!this.port) {
+      settle(encodeResponse(STATUS.EIO));
+      return;
+    }
+    const id = `t${++this.trackedCounter}`;
+    const deadline = this.portProven ? this.deadlineMs : UNPROVEN_DEADLINE_MS;
+    const timer = setTimeout(() => {
+      const entry = this.tracked.get(id);
+      if (!entry) return;
+      this.tracked.delete(id);
+      this.abandonedTracked.add(id);
+      if (this.abandonedTracked.size > MAX_ABANDONED_TRACKED) {
+        this.abandonedTracked.delete(this.abandonedTracked.values().next().value);
+      }
+      entry.settle(encodeResponse(STATUS.EIO));
+      this.observer?.noteTimeout();
+      if (!this.portProven) this.requestFreshLeader();
+    }, deadline);
+    this.tracked.set(id, { settle, timer });
+    this.port.postMessage({ id, tabId: this.getTabId(), buffer }, [buffer]);
+  }
+  /** Fail every in-flight tracked request with EIO (reconnect, teardown). */
+  abortTracked() {
+    const entries = [...this.tracked.values()];
+    this.tracked.clear();
+    for (const entry of entries) {
+      clearTimeout(entry.timer);
+      entry.settle(encodeResponse(STATUS.EIO));
+    }
+  }
+  /**
+   * Ask for a fresh leader port, at most once per port per unproven deadline.
+   *
+   * The serial SAB path times out one request at a time, so this changes nothing there. The
+   * no-SAB path can time out a whole burst at once, and each reconnect aborts what the previous
+   * one started — so a burst asks once.
+   */
+  requestFreshLeader() {
+    const now = Date.now();
+    if (this.freshLeaderAskedAt && now - this.freshLeaderAskedAt < UNPROVEN_DEADLINE_MS) return;
+    this.freshLeaderAskedAt = now;
+    this.onUnprovenTimeout?.();
   }
   /** Until this epoch-ms timestamp, the port is suspected dead-under-spin
    *  and fail-fast-eligible requests fail immediately. 0 = healthy. */
@@ -3471,20 +3559,32 @@ var FollowerForwarder = class _FollowerForwarder {
             this.portSuspectUntil = Date.now() + _FollowerForwarder.SUSPECT_WINDOW_MS;
           }
           r(encodeResponse(STATUS.EIO));
-          if (unproven) this.onUnprovenTimeout?.();
+          this.observer?.noteTimeout();
+          if (unproven) this.requestFreshLeader();
         }
       }, deadline);
     });
   }
   /**
    * Offer a response message to the forwarder.
-   * Returns true if it was consumed (matched the in-flight request, or was
-   * the late echo of an abandoned one); false if it belongs to another
-   * consumer (the no-SAB async-relay path).
+   * Returns true if it was consumed (matched an in-flight request, or was
+   * the late echo of an abandoned one); false if no request of this
+   * forwarder's matches it — the caller drops it.
    */
   handleResponse(id, buffer) {
     this.portSuspectUntil = 0;
     this.portProven = true;
+    this.observer?.noteResponse();
+    if (typeof id === "string") {
+      const entry = this.tracked.get(id);
+      if (entry) {
+        clearTimeout(entry.timer);
+        this.tracked.delete(id);
+        entry.settle(buffer);
+        return true;
+      }
+      return this.abandonedTracked.delete(id);
+    }
     if (id === this.pendingSeq) {
       if (this.pendingResolve) {
         this.clearTimer();
@@ -3514,6 +3614,67 @@ var FollowerForwarder = class _FollowerForwarder {
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = null;
+    }
+  }
+};
+var LeaderSilenceWatch = class {
+  constructor(onSilent, probe, options = {}) {
+    this.onSilent = onSilent;
+    this.probe = probe;
+    this.silenceMs = options.silenceMs ?? TAKEOVER_SILENCE_MS;
+    this.minTimeouts = options.minTimeouts ?? TAKEOVER_MIN_TIMEOUTS;
+    this.probeIntervalMs = options.probeIntervalMs ?? PROBE_INTERVAL_MS;
+  }
+  silentSince = 0;
+  timeouts = 0;
+  probeTimer = null;
+  stopped = false;
+  silenceMs;
+  minTimeouts;
+  probeIntervalMs;
+  /** True while a timeout is outstanding and nothing has been heard since. */
+  get silent() {
+    return this.silentSince !== 0;
+  }
+  noteTimeout() {
+    if (this.stopped) return;
+    if (!this.silentSince) this.silentSince = Date.now();
+    this.timeouts++;
+    if (!this.probeTimer) {
+      this.probeTimer = setInterval(() => {
+        if (this.check()) return;
+        this.probe();
+      }, this.probeIntervalMs);
+    }
+    this.check();
+  }
+  noteResponse() {
+    this.silentSince = 0;
+    this.timeouts = 0;
+    this.stopProbing();
+  }
+  /** Stop for good (the relay became leader, or is going away). */
+  stop() {
+    this.stopped = true;
+    this.silentSince = 0;
+    this.timeouts = 0;
+    this.stopProbing();
+  }
+  /** Fire if the rule holds; returns true when it fired. */
+  check() {
+    if (this.stopped || !this.silentSince) return false;
+    const silentForMs = Date.now() - this.silentSince;
+    if (this.timeouts < this.minTimeouts || silentForMs < this.silenceMs) return false;
+    const timeouts = this.timeouts;
+    this.silentSince = Date.now();
+    this.timeouts = 0;
+    this.onSilent({ silentForMs, timeouts });
+    return true;
+  }
+  stopProbing() {
+    if (this.probeTimer !== null) {
+      clearInterval(this.probeTimer);
+      this.probeTimer = null;
     }
   }
 };
@@ -4045,16 +4206,24 @@ async function drainPortQueueAsync() {
 var forwarder = new FollowerForwarder(() => tabId, void 0, () => {
   self.postMessage({ type: "need-leader" });
 });
-var asyncRelayPort = null;
+var silenceWatch = new LeaderSilenceWatch(
+  ({ silentForMs, timeouts }) => {
+    if (leaderInitialized) return;
+    self.postMessage({ type: "leader-silent", silentForMs, timeouts });
+  },
+  () => {
+    if (leaderInitialized || !forwarder.hasPort) return;
+    forwarder.forwardTracked(encodeRequest(OP.EXISTS, "/"), () => {
+    });
+  }
+);
+forwarder.observe(silenceWatch);
 function forwardToLeader(payload) {
   return forwarder.forward(payload);
 }
 function onLeaderMessage(e) {
   if (e.data.buffer instanceof ArrayBuffer) {
-    if (forwarder.handleResponse(e.data.id, e.data.buffer)) return;
-    if (asyncRelayPort) {
-      asyncRelayPort.postMessage({ id: e.data.id, buffer: e.data.buffer }, [e.data.buffer]);
-    }
+    forwarder.handleResponse(e.data.id, e.data.buffer);
   }
 }
 var OP_NAMES = {
@@ -5079,7 +5248,6 @@ self.onmessage = async (e) => {
   if (msg.type === "async-port") {
     const port = msg.port ?? e.ports[0];
     if (port) {
-      asyncRelayPort = port;
       port.onmessage = async (ev) => {
         if (ev.data.buffer instanceof ArrayBuffer) {
           if (leaderInitialized) {
@@ -5087,9 +5255,11 @@ self.onmessage = async (e) => {
             const response = encodeResponse(result.status, result.data);
             port.postMessage({ id: ev.data.id, buffer: response }, [response]);
             if (!opfsMode && result._op !== void 0) notifyOPFSSync(result._op, result._path, result._newPath);
-          } else if (forwarder.hasPort) {
-            const buf = ev.data.buffer;
-            forwarder.postRaw({ id: ev.data.id, tabId, buffer: buf }, [buf]);
+          } else {
+            const id = ev.data.id;
+            forwarder.forwardTracked(ev.data.buffer, (response) => {
+              port.postMessage({ id, buffer: response }, [response]);
+            });
           }
         }
       };
@@ -5100,6 +5270,7 @@ self.onmessage = async (e) => {
   if (msg.type === "init-leader") {
     if (leaderInitialized) return;
     leaderInitialized = true;
+    silenceWatch.stop();
     tabId = msg.tabId;
     const hasSAB = msg.sab != null;
     if (hasSAB) {
@@ -5139,6 +5310,7 @@ self.onmessage = async (e) => {
   if (msg.type === "init-opfs") {
     leaderInitialized = true;
     readySent = false;
+    silenceWatch.stop();
     tabId = msg.tabId;
     const hasSAB = msg.sab != null;
     if (hasSAB) {
@@ -5224,6 +5396,8 @@ self.onmessage = async (e) => {
     return;
   }
   if (msg.type === "shutdown") {
+    silenceWatch.stop();
+    forwarder.abortTracked();
     try {
       engine.flush();
     } catch {

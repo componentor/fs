@@ -1030,6 +1030,23 @@ declare class VFSFileSystem {
     private brokerSw;
     private brokerControlPort;
     private leaderChangeBc;
+    /** Bumped on every grant of the leader lock, so a stale grant's rejection is not mistaken for the current one's. */
+    private leaderLockGeneration;
+    /** A steal of the leader lock from a silent leader is in flight — at most one at a time. */
+    private takeoverInFlight;
+    /** Set while handing the volume back after our lock was stolen. */
+    private steppingDown;
+    /** When a new leader last announced itself (`leader-changed`), 0 = never. */
+    private lastLeaderChangeAt;
+    /**
+     * Set while promoting after a takeover, until the volume opens. Changes what happens when the
+     * volume-acquire deadline passes: report the failure but keep the lock and keep retrying, because
+     * the handle is almost certainly held by the frozen leader we took over from, which hands it back
+     * when it thaws (see {@link retryVolumeOpen}).
+     */
+    private takeoverPromotion;
+    /** The failure reported while a takeover waits for the volume; cleared when it opens. */
+    private takeoverError;
     private _sync;
     /**
      * Which counter proves the relay is getting somewhere, for the current mode.
@@ -1047,12 +1064,85 @@ declare class VFSFileSystem {
     constructor(config?: VFSConfig);
     /** Spawn workers and establish communication */
     private bootstrap;
+    /**
+     * Messages from the sync relay of a first-started instance, and of a leader that stepped down
+     * and became a follower again (see {@link stepDownFromLeader}).
+     */
+    private onSyncRelayMessage;
+    /** Async-relay responses: settle the matching promise-API call. */
+    private onAsyncRelayMessage;
+    /**
+     * Settle every promise-API call still waiting on a relay that is being terminated.
+     *
+     * A terminated async relay never answers, so a call it was carrying would stay pending for
+     * good. Its outcome is unknown — it may have reached the leader — which is what EIO says.
+     */
+    private failAsyncPending;
     /** Use Web Locks API for leader election. The tab that acquires the lock is
      *  the leader; all others become followers. When the leader dies, the browser
      *  releases the lock and the next waiting tab is promoted. */
     private acquireLeaderLock;
+    /** Mark the leader lock as held by this instance; returns the grant's generation. */
+    private beginLeaderLockHold;
+    /** The promise a granted lock callback awaits: resolving it ({@link releaseLeaderLock}) gives the lock back. */
+    private leaderLockHeld;
+    /**
+     * A leader-lock request settled with an error.
+     *
+     * The one that matters: another instance took the lock with `steal` (see
+     * {@link takeOverSilentLeader}). The browser then rejects the holder's request with an
+     * `AbortError` — while this instance's relay still has the volume open and is still serving.
+     * It has to stop and hand the volume back, or two instances would both believe they own it.
+     * Anything else — a queued bid aborted on dispose, a request that was never granted, a grant
+     * this instance has since replaced — needs nothing.
+     */
+    private onLeaderLockLost;
     /** Queue for leader takeover when the current leader's lock is released */
     private waitForLeaderLock;
+    /**
+     * Take the leader lock from a leader that has stopped answering.
+     *
+     * Asked for by the sync relay (`leader-silent`) once the leader has been silent for
+     * `TAKEOVER_SILENCE_MS` across at least `TAKEOVER_MIN_TIMEOUTS` timed-out requests and
+     * reconnects — see follower-forward.ts. Without this, a page that started as a follower of a
+     * frozen or stale tab waited behind it for good: the lock was held, so it was never promoted,
+     * and nothing it asked for was ever answered.
+     *
+     * `steal` releases the current holder's lock and grants it here, ahead of any queue. The old
+     * holder's request rejects with an `AbortError`, on which it steps down and gives the volume
+     * back ({@link stepDownFromLeader}). This instance then promotes through the ordinary path, so
+     * opening the volume uses the same retry and deadline as any handoff: if the old holder never
+     * lets go of its handle, the promotion fails with a clear error after `VOLUME_ACQUIRE_DEADLINE_MS`
+     * instead of hanging. The volume's exclusive sync access handle is what keeps two instances from
+     * ever writing it at once, whatever the locks say.
+     *
+     * Only with Web Locks, never once closed, at most one in flight, and not when a new leader has
+     * announced itself during the silence (it gets its own window first).
+     */
+    private takeOverSilentLeader;
+    /**
+     * Stop serving after another instance stole the leader lock, then carry on as a follower.
+     *
+     * In order: stop accepting followers (broker heartbeat, control port, the broker's slot — only
+     * if it is still ours), give the volume back through the same `shutdown` the unload path uses
+     * (the relay closes its exclusive handle before anything else), terminate both relays, and fail
+     * any promise-API call they were carrying with EIO — it may or may not have been applied.
+     *
+     * Then this instance becomes a follower of the new leader, with fresh relays, and queues for the
+     * lock again. That is the existing follower start, the one a second tab uses, so nothing here is
+     * a new state: callers waiting on `whenReady()`/`init()` see the next `ready`, and a later
+     * promise call goes to the new leader. Ending closed instead would turn one tab's recovery into
+     * the other tab's outage.
+     */
+    private stepDownFromLeader;
+    /**
+     * End a takeover's promotion. If its volume deadline had passed, the failure it reported is
+     * withdrawn: `readyPromise` was rejected with it, so callers get a fresh one (the caller resolves
+     * it on `ready`, or a later transition settles it), and sync calls stop throwing it.
+     */
+    private clearTakeoverFailure;
+    /** Fresh SABs (when available) and fresh relay workers, for a role change. */
+    private spawnRelays;
     /** Send init-leader message to sync-relay worker */
     private sendLeaderInit;
     /** Send init-opfs message to sync-relay for OPFS-direct mode */

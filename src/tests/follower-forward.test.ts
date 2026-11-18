@@ -12,7 +12,10 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { FollowerForwarder, FORWARD_DEADLINE_MS, type LeaderPortLike } from '../src/protocol/follower-forward.js';
+import {
+  FollowerForwarder, LeaderSilenceWatch, FORWARD_DEADLINE_MS, UNPROVEN_DEADLINE_MS,
+  TAKEOVER_SILENCE_MS, TAKEOVER_MIN_TIMEOUTS, PROBE_INTERVAL_MS, type LeaderPortLike,
+} from '../src/protocol/follower-forward.js';
 import { STATUS } from '../src/protocol/opcodes.js';
 
 class FakePort implements LeaderPortLike {
@@ -179,10 +182,12 @@ describe('FollowerForwarder', () => {
     expect(statusOf(await p)).toBe(STATUS.EIO);
   });
 
-  it('postRaw passes messages through untracked', () => {
-    forwarder.postRaw({ id: 'a3', buffer: new ArrayBuffer(4) });
+  it('the no-SAB path is tracked under its own string ids, never the caller\'s', () => {
+    // It used to be posted raw (`postRaw`), untracked and without a deadline.
+    forwarder.forwardTracked(new ArrayBuffer(4), () => {});
     expect(port.posted.length).toBe(1);
-    expect(port.posted[0].message.id).toBe('a3');
+    expect(port.posted[0].message.id).toMatch(/^t\d+$/);
+    expect(port.posted[0].message.tabId).toBe('tab-1');
   });
 
   it('a subarray payload is copied so the posted buffer has exactly the payload bytes', async () => {
@@ -273,5 +278,283 @@ describe('FollowerForwarder', () => {
     const status = statusOf(await p);
     expect(status).toBe(11);
     expect(status).not.toBe(STATUS.ENOTEMPTY);
+  });
+});
+
+/**
+ * The no-SAB follower path: the promise API of a page without crossOriginIsolated.
+ *
+ * Found in Vue Play Studio: a page started as a follower of a leader that never answered (a frozen
+ * or stale tab holding the lock). `init()` resolved — a follower is ready at once — and the first
+ * `fs.promises.mkdir` hung forever, because this path posted raw: no deadline, no EIO, no request
+ * for a fresh leader. These pin down that it now has the SAB path's contract.
+ */
+describe('FollowerForwarder — no-SAB tracked path', () => {
+  let forwarder: FollowerForwarder;
+  let port: FakePort;
+  let needLeader: number;
+
+  /** Collects settle results by call. */
+  function call(): { result: ArrayBuffer | null; calls: number; settle: (b: ArrayBuffer) => void } {
+    const c = { result: null as ArrayBuffer | null, calls: 0, settle: (b: ArrayBuffer) => { c.calls++; c.result = b; } };
+    return c;
+  }
+  const lastId = () => port.posted[port.posted.length - 1].message.id as string;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    needLeader = 0;
+    forwarder = new FollowerForwarder(() => 'tab-1', undefined, () => { needLeader++; });
+    port = new FakePort();
+    forwarder.setPort(port);
+  });
+  afterEach(() => { vi.useRealTimers(); });
+
+  /** One answered round trip, so the port is on the generous deadline. */
+  function prove(): void {
+    const c = call();
+    forwarder.forwardTracked(new ArrayBuffer(4), c.settle);
+    forwarder.handleResponse(lastId(), makeResponse());
+    expect(c.calls).toBe(1);
+  }
+
+  it('a leader answer settles the matching call with that buffer', () => {
+    const c = call();
+    forwarder.forwardTracked(new ArrayBuffer(4), c.settle);
+    const response = makeResponse();
+    expect(forwarder.handleResponse(lastId(), response)).toBe(true);
+    expect(c.calls).toBe(1);
+    expect(c.result).toBe(response);
+    expect(forwarder.trackedInFlight).toBe(0);
+  });
+
+  it('a silent leader on an unproven port: EIO after the short deadline, and a fresh leader is asked for', () => {
+    const c = call();
+    forwarder.forwardTracked(new ArrayBuffer(4), c.settle);
+    vi.advanceTimersByTime(UNPROVEN_DEADLINE_MS - 1);
+    expect(c.calls).toBe(0);
+    vi.advanceTimersByTime(2);
+    expect(c.calls).toBe(1);
+    expect(statusOf(c.result!)).toBe(STATUS.EIO);
+    expect(needLeader).toBe(1);
+  });
+
+  it('a silent leader on a proven port: EIO after the full deadline, no reconnect (same as the SAB path)', () => {
+    prove();
+    const c = call();
+    forwarder.forwardTracked(new ArrayBuffer(4), c.settle);
+    vi.advanceTimersByTime(UNPROVEN_DEADLINE_MS + 1);
+    expect(c.calls).toBe(0);
+    vi.advanceTimersByTime(FORWARD_DEADLINE_MS);
+    expect(statusOf(c.result!)).toBe(STATUS.EIO);
+    expect(needLeader).toBe(0);
+  });
+
+  it('a late answer to a timed-out call is dropped, once', () => {
+    const c = call();
+    forwarder.forwardTracked(new ArrayBuffer(4), c.settle);
+    const id = lastId();
+    vi.advanceTimersByTime(UNPROVEN_DEADLINE_MS + 1);
+    expect(statusOf(c.result!)).toBe(STATUS.EIO);
+    expect(forwarder.handleResponse(id, makeResponse())).toBe(true);   // consumed, not leaked
+    expect(c.calls).toBe(1);                                              // never settled twice
+    expect(forwarder.handleResponse(id, makeResponse())).toBe(false);  // and only once
+  });
+
+  it('a burst of timeouts on one port asks for a fresh leader once', () => {
+    const calls = [call(), call(), call(), call()];
+    for (const c of calls) forwarder.forwardTracked(new ArrayBuffer(4), c.settle);
+    vi.advanceTimersByTime(UNPROVEN_DEADLINE_MS + 1);
+    for (const c of calls) expect(statusOf(c.result!)).toBe(STATUS.EIO);
+    expect(needLeader).toBe(1);
+  });
+
+  it('each new unproven port that times out asks again', () => {
+    const a = call();
+    forwarder.forwardTracked(new ArrayBuffer(4), a.settle);
+    vi.advanceTimersByTime(UNPROVEN_DEADLINE_MS + 1);
+    port = new FakePort();
+    forwarder.setPort(port);
+    const b = call();
+    forwarder.forwardTracked(new ArrayBuffer(4), b.settle);
+    vi.advanceTimersByTime(UNPROVEN_DEADLINE_MS + 1);
+    expect(needLeader).toBe(2);
+  });
+
+  it('a reconnect fails what the old port was carrying with EIO, and nothing fires later', () => {
+    const c = call();
+    forwarder.forwardTracked(new ArrayBuffer(4), c.settle);
+    const old = port;
+    forwarder.setPort(new FakePort());
+    expect(old.closed).toBe(true);
+    expect(c.calls).toBe(1);
+    expect(statusOf(c.result!)).toBe(STATUS.EIO);
+    vi.advanceTimersByTime(FORWARD_DEADLINE_MS * 2);
+    expect(c.calls).toBe(1);
+    expect(needLeader).toBe(0);
+  });
+
+  it('with no leader port at all, EIO at once instead of a dropped request', () => {
+    const lone = new FollowerForwarder(() => 'tab-1');
+    const c = call();
+    lone.forwardTracked(new ArrayBuffer(4), c.settle);
+    expect(c.calls).toBe(1);
+    expect(statusOf(c.result!)).toBe(STATUS.EIO);
+  });
+
+  it('many calls in flight settle independently', () => {
+    const a = call();
+    const b = call();
+    forwarder.forwardTracked(new ArrayBuffer(4), a.settle);
+    const idA = lastId();
+    forwarder.forwardTracked(new ArrayBuffer(4), b.settle);
+    const idB = lastId();
+    const rb = makeResponse();
+    forwarder.handleResponse(idB, rb);
+    expect(b.result).toBe(rb);
+    expect(a.calls).toBe(0);
+    const ra = makeResponse();
+    forwarder.handleResponse(idA, ra);
+    expect(a.result).toBe(ra);
+  });
+
+  it('tracked and serial requests never answer each other', async () => {
+    const c = call();
+    forwarder.forwardTracked(new ArrayBuffer(4), c.settle);
+    const trackedId = lastId();
+    const p = forwarder.forward(new Uint8Array([1]));
+    const seqId = port.posted[port.posted.length - 1].message.id;
+    const r1 = makeResponse();
+    forwarder.handleResponse(seqId, r1);
+    await expect(p).resolves.toBe(r1);
+    expect(c.calls).toBe(0);
+    forwarder.handleResponse(trackedId, makeResponse());
+    expect(c.calls).toBe(1);
+  });
+
+  it('reports timeouts and deliveries to its observer', () => {
+    const seen: string[] = [];
+    forwarder.observe({ noteTimeout: () => seen.push('timeout'), noteResponse: () => seen.push('response') });
+    forwarder.forwardTracked(new ArrayBuffer(4), () => {});
+    vi.advanceTimersByTime(UNPROVEN_DEADLINE_MS + 1);
+    forwarder.forwardTracked(new ArrayBuffer(4), () => {});
+    forwarder.handleResponse(lastId(), makeResponse());
+    expect(seen).toEqual(['timeout', 'response']);
+  });
+});
+
+/**
+ * When the leader has been silent long enough, the follower asks to take the lock over.
+ * The page side (the actual `steal`) is in leader-takeover.test.ts.
+ */
+describe('LeaderSilenceWatch', () => {
+  let fired: Array<{ silentForMs: number; timeouts: number }>;
+  let probes: number;
+  let watch: LeaderSilenceWatch;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    fired = [];
+    probes = 0;
+    watch = new LeaderSilenceWatch((info) => fired.push(info), () => { probes++; });
+  });
+  afterEach(() => { watch.stop(); vi.useRealTimers(); });
+
+  it('a healthy follower never probes and never fires', () => {
+    watch.noteResponse();
+    vi.advanceTimersByTime(TAKEOVER_SILENCE_MS * 4);
+    expect(probes).toBe(0);
+    expect(fired).toEqual([]);
+  });
+
+  it('a silent leader: probes while silent, then fires once both thresholds hold', () => {
+    watch.noteTimeout();
+    vi.advanceTimersByTime(PROBE_INTERVAL_MS);
+    expect(probes).toBe(1);   // the app made no further calls; the watch keeps asking
+    // Time alone is not enough: still one timeout.
+    vi.advanceTimersByTime(TAKEOVER_SILENCE_MS);
+    expect(fired).toEqual([]);
+    for (let i = 1; i < TAKEOVER_MIN_TIMEOUTS; i++) watch.noteTimeout();
+    expect(fired.length).toBe(1);
+    expect(fired[0].timeouts).toBe(TAKEOVER_MIN_TIMEOUTS);
+    expect(fired[0].silentForMs).toBeGreaterThanOrEqual(TAKEOVER_SILENCE_MS);
+  });
+
+  it('timeouts alone are not enough before the silence window passes', () => {
+    for (let i = 0; i < TAKEOVER_MIN_TIMEOUTS * 3; i++) watch.noteTimeout();
+    vi.advanceTimersByTime(TAKEOVER_SILENCE_MS - PROBE_INTERVAL_MS);
+    expect(fired).toEqual([]);
+  });
+
+  it('fires from the probe tick even if no timeout lands exactly at the window end', () => {
+    for (let i = 0; i < TAKEOVER_MIN_TIMEOUTS; i++) watch.noteTimeout();
+    vi.advanceTimersByTime(TAKEOVER_SILENCE_MS + PROBE_INTERVAL_MS);
+    expect(fired.length).toBe(1);
+  });
+
+  it('any answer from a leader resets it — a responsive leader is never taken over', () => {
+    for (let i = 0; i < TAKEOVER_MIN_TIMEOUTS; i++) watch.noteTimeout();
+    vi.advanceTimersByTime(TAKEOVER_SILENCE_MS - 1_000);
+    watch.noteResponse();   // late, but alive
+    const probesAtAnswer = probes;
+    vi.advanceTimersByTime(TAKEOVER_SILENCE_MS * 2);
+    expect(fired).toEqual([]);
+    expect(probes).toBe(probesAtAnswer);   // and probing stopped
+  });
+
+  it('after firing it opens a fresh window rather than firing again at once', () => {
+    for (let i = 0; i < TAKEOVER_MIN_TIMEOUTS; i++) watch.noteTimeout();
+    vi.advanceTimersByTime(TAKEOVER_SILENCE_MS + PROBE_INTERVAL_MS);
+    expect(fired.length).toBe(1);
+    watch.noteTimeout();
+    vi.advanceTimersByTime(PROBE_INTERVAL_MS);
+    expect(fired.length).toBe(1);
+  });
+
+  it('stop() ends probing and firing for good', () => {
+    watch.noteTimeout();
+    watch.stop();
+    for (let i = 0; i < TAKEOVER_MIN_TIMEOUTS; i++) watch.noteTimeout();
+    vi.advanceTimersByTime(TAKEOVER_SILENCE_MS * 2);
+    expect(probes).toBe(0);
+    expect(fired).toEqual([]);
+  });
+
+  it('driven by a forwarder against a port that never answers: fires within ~silence + one probe', () => {
+    let needLeader = 0;
+    const forwarder = new FollowerForwarder(() => 'tab-1', undefined, () => { needLeader++; });
+    let port = new FakePort();
+    forwarder.setPort(port);
+    watch.stop();
+    watch = new LeaderSilenceWatch(
+      (info) => fired.push(info),
+      () => { probes++; forwarder.forwardTracked(new ArrayBuffer(4), () => {}); },
+    );
+    forwarder.observe(watch);
+
+    const start = Date.now();
+    // The app's one call — then nothing more from the app.
+    let settled: ArrayBuffer | null = null;
+    forwarder.forwardTracked(new ArrayBuffer(4), (b) => { settled = b; });
+    vi.advanceTimersByTime(UNPROVEN_DEADLINE_MS + 1);
+    expect(statusOf(settled!)).toBe(STATUS.EIO);
+    expect(needLeader).toBe(1);
+    // The page answers each need-leader with a new port — to the same silent leader.
+    let answered = 0;
+    let ports = 1;
+    for (let t = 0; t <= TAKEOVER_SILENCE_MS + PROBE_INTERVAL_MS && !fired.length; t += 100) {
+      if (needLeader > answered) {
+        answered = needLeader;
+        port = new FakePort();
+        forwarder.setPort(port);
+        ports++;
+      }
+      vi.advanceTimersByTime(100);
+    }
+    expect(fired.length).toBe(1);
+    expect(fired[0].timeouts).toBeGreaterThanOrEqual(TAKEOVER_MIN_TIMEOUTS);
+    expect(ports).toBeGreaterThanOrEqual(TAKEOVER_MIN_TIMEOUTS);   // across reconnect attempts
+    // ~1s first deadline + the 15s window, give or take one probe interval.
+    expect(Date.now() - start).toBeLessThanOrEqual(UNPROVEN_DEADLINE_MS + TAKEOVER_SILENCE_MS + PROBE_INTERVAL_MS + 100);
   });
 });

@@ -1,6 +1,7 @@
 // src/workers/service.worker.ts
 var sw = self;
 var serverPort = null;
+var serverId = null;
 var pending = [];
 sw.addEventListener("install", () => {
   sw.skipWaiting();
@@ -12,6 +13,7 @@ sw.addEventListener("message", (event) => {
   if (msg.type === "register-server") {
     serverPort = event.ports[0];
     if (!serverPort) return;
+    serverId = typeof msg.serverId === "string" ? msg.serverId : null;
     while (pending.length > 0) {
       const entry = pending.shift();
       serverPort.postMessage(
@@ -22,7 +24,9 @@ sw.addEventListener("message", (event) => {
     return;
   }
   if (msg.type === "deregister-server") {
+    if (typeof msg.serverId === "string" && serverId !== null && msg.serverId !== serverId) return;
     serverPort = null;
+    serverId = null;
     return;
   }
   if (msg.type === "transfer-port") {

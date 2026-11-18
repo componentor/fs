@@ -49,4 +49,5 @@ Multi-tab (via Service Worker + navigator.locks):
   Tab 1 (Leader) ←→ Service Worker ←→ Tab 2 (Follower)
   Tab 1 holds VFS engine, Tab 2 forwards requests via MessagePort
   If Tab 1 dies, Tab 2 auto-promotes to leader
+  If Tab 1 stays silent (frozen/stale), Tab 2 steals the lock and Tab 1 steps down
 ```

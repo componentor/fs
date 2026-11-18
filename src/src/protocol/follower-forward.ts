@@ -23,6 +23,22 @@
  *  - On reconnection (new leader port), any in-flight request is aborted
  *    with EIO, matching the previous behavior but with a correctly-labeled
  *    status code.
+ *
+ * Both follower paths are covered by that contract:
+ *  - the SAB path (`forward`) — one request at a time, from the relay's
+ *    follower loop;
+ *  - the no-SAB path (`forwardTracked`) — the promise API of a page without
+ *    crossOriginIsolated, many requests in flight at once. It used to be
+ *    posted raw and untracked, so a leader that never answered (a frozen or
+ *    stale tab holding the lock) left `fs.promises.*` pending forever. It now
+ *    carries the same deadlines, the same unproven-port fast deadline, the
+ *    same `need-leader` request, and drops late responses the same way.
+ *
+ * And a leader that stays silent is not waited on forever either: every
+ * timeout and every delivery is reported to a {@link LeaderSilenceWatch},
+ * which probes the leader while it is silent and, once the silence has lasted
+ * long enough to rule out a slow operation, asks the page to take the leader
+ * lock over (`navigator.locks` `steal`). See {@link TAKEOVER_SILENCE_MS}.
  */
 
 import { STATUS, encodeResponse } from './opcodes.js';
@@ -53,6 +69,45 @@ export const FORWARD_DEADLINE_MS = 10_000;
  */
 export const UNPROVEN_DEADLINE_MS = 1_000;
 
+/**
+ * How long the leader must have been silent before a follower takes the lock from it.
+ *
+ * Silence is counted from the first request that timed out, and ends with ANY message from a
+ * leader port — a late answer to an abandoned request counts, because a leader that answers late
+ * is slow, not gone. Longer than {@link FORWARD_DEADLINE_MS}, so a single slow operation on a
+ * working port (which times out at 10s) cannot cause a takeover on its own; short enough that a
+ * page stuck behind a frozen tab recovers in seconds rather than never.
+ */
+export const TAKEOVER_SILENCE_MS = 15_000;
+
+/**
+ * Timed-out requests the silence must include before a takeover, across reconnects.
+ *
+ * Time alone is not evidence: a follower that made one call 15s ago and nothing since has not
+ * re-checked the leader in between. Three timeouts means the leader was asked at least three
+ * times, on at least two ports when the first was unproven (each unproven timeout asks for a
+ * fresh one), and answered none of them.
+ */
+export const TAKEOVER_MIN_TIMEOUTS = 3;
+
+/**
+ * While the leader is silent, the follower probes it this often with a read-only request.
+ *
+ * So the takeover rule does not depend on the app making calls: an app whose first call failed
+ * with EIO may well never make a second one, and would otherwise stay broken. Probes stop at the
+ * first message from a leader, so a healthy follower never sends one.
+ */
+export const PROBE_INTERVAL_MS = 2_500;
+
+/** Abandoned tracked ids kept for late-response matching; bounded so a dead leader cannot grow it. */
+const MAX_ABANDONED_TRACKED = 256;
+
+/** Told about every timeout and every delivery; see {@link LeaderSilenceWatch}. */
+export interface ForwardObserver {
+  noteTimeout(): void;
+  noteResponse(): void;
+}
+
 /** Minimal structural type so tests can use fake ports. */
 export interface LeaderPortLike {
   postMessage(message: unknown, transfer?: Transferable[]): void;
@@ -72,6 +127,14 @@ export class FollowerForwarder {
   private timer: ReturnType<typeof setTimeout> | null = null;
   /** Cleared whenever the port is replaced; set by the first response it delivers. */
   private portProven = false;
+  /** In-flight no-SAB requests, by wire id (see {@link forwardTracked}). */
+  private tracked = new Map<string, { settle: (buf: ArrayBuffer) => void; timer: ReturnType<typeof setTimeout> }>();
+  /** Wire ids that timed out on the current port, so their late answers are dropped. */
+  private abandonedTracked = new Set<string>();
+  private trackedCounter = 0;
+  /** When this port last asked for a fresh leader (0 = not yet). */
+  private freshLeaderAskedAt = 0;
+  private observer: ForwardObserver | null = null;
 
   constructor(
     private readonly getTabId: () => string,
@@ -97,15 +160,83 @@ export class FollowerForwarder {
     if (this.port && this.port !== port) {
       this.port.close();
       this.abortPending();
+      // The old port is closed, so nothing more can arrive on it: its in-flight
+      // requests fail now, and its abandoned ids can be forgotten.
+      this.abortTracked();
+      this.abandonedTracked.clear();
     }
     this.port = port;
     // A new port has proved nothing yet, whatever the old one managed.
     this.portProven = false;
+    this.freshLeaderAskedAt = 0;
   }
 
-  /** Post a non-tracked message on the leader port (no-SAB async relay path). */
-  postRaw(message: unknown, transfer?: Transferable[]): void {
-    this.port?.postMessage(message, transfer);
+  /** Report every timeout and delivery to `observer` (the silent-leader watch). */
+  observe(observer: ForwardObserver | null): void {
+    this.observer = observer;
+  }
+
+  /** Number of no-SAB requests currently in flight. */
+  get trackedInFlight(): number {
+    return this.tracked.size;
+  }
+
+  /**
+   * Forward a no-SAB promise-API request (many may be in flight at once).
+   *
+   * Same contract as {@link forward}: `settle` is called exactly once, with the leader's response
+   * or, after the deadline (the short one for an unproven port), with an EIO response. No retry;
+   * a late answer is dropped. The wire id is this forwarder's own (`t<n>`), so it can never
+   * collide with the numeric ids of {@link forward} or with anything the caller uses.
+   */
+  forwardTracked(buffer: ArrayBuffer, settle: (buf: ArrayBuffer) => void): void {
+    if (!this.port) {
+      settle(encodeResponse(STATUS.EIO));
+      return;
+    }
+    const id = `t${++this.trackedCounter}`;
+    const deadline = this.portProven ? this.deadlineMs : UNPROVEN_DEADLINE_MS;
+    const timer = setTimeout(() => {
+      const entry = this.tracked.get(id);
+      if (!entry) return;
+      this.tracked.delete(id);
+      this.abandonedTracked.add(id);
+      if (this.abandonedTracked.size > MAX_ABANDONED_TRACKED) {
+        // Oldest first (Set keeps insertion order). Its answer, if it ever comes, is then
+        // unmatched — and an unmatched answer is dropped by the caller too.
+        this.abandonedTracked.delete(this.abandonedTracked.values().next().value as string);
+      }
+      entry.settle(encodeResponse(STATUS.EIO));
+      this.observer?.noteTimeout();
+      if (!this.portProven) this.requestFreshLeader();
+    }, deadline);
+    // Registered before posting: a port may answer synchronously (tests do).
+    this.tracked.set(id, { settle, timer });
+    this.port.postMessage({ id, tabId: this.getTabId(), buffer }, [buffer]);
+  }
+
+  /** Fail every in-flight tracked request with EIO (reconnect, teardown). */
+  abortTracked(): void {
+    const entries = [...this.tracked.values()];
+    this.tracked.clear();
+    for (const entry of entries) {
+      clearTimeout(entry.timer);
+      entry.settle(encodeResponse(STATUS.EIO));
+    }
+  }
+
+  /**
+   * Ask for a fresh leader port, at most once per port per unproven deadline.
+   *
+   * The serial SAB path times out one request at a time, so this changes nothing there. The
+   * no-SAB path can time out a whole burst at once, and each reconnect aborts what the previous
+   * one started — so a burst asks once.
+   */
+  private requestFreshLeader(): void {
+    const now = Date.now();
+    if (this.freshLeaderAskedAt && now - this.freshLeaderAskedAt < UNPROVEN_DEADLINE_MS) return;
+    this.freshLeaderAskedAt = now;
+    this.onUnprovenTimeout?.();
   }
 
   /** Until this epoch-ms timestamp, the port is suspected dead-under-spin
@@ -179,7 +310,8 @@ export class FollowerForwarder {
             this.portSuspectUntil = Date.now() + FollowerForwarder.SUSPECT_WINDOW_MS;
           }
           r(encodeResponse(STATUS.EIO));
-          if (unproven) this.onUnprovenTimeout?.();
+          this.observer?.noteTimeout();
+          if (unproven) this.requestFreshLeader();
         }
       }, deadline);
     });
@@ -187,16 +319,29 @@ export class FollowerForwarder {
 
   /**
    * Offer a response message to the forwarder.
-   * Returns true if it was consumed (matched the in-flight request, or was
-   * the late echo of an abandoned one); false if it belongs to another
-   * consumer (the no-SAB async-relay path).
+   * Returns true if it was consumed (matched an in-flight request, or was
+   * the late echo of an abandoned one); false if no request of this
+   * forwarder's matches it — the caller drops it.
    */
   handleResponse(id: unknown, buffer: ArrayBuffer): boolean {
     // Any delivery proves the port works — clear the dead-under-spin
     // suspicion so sync requests resume attempting, and promote the port off
-    // the short unproven deadline onto the generous one.
+    // the short unproven deadline onto the generous one. It also proves the
+    // leader is alive, late or not, which ends any silence being counted.
     this.portSuspectUntil = 0;
     this.portProven = true;
+    this.observer?.noteResponse();
+    if (typeof id === 'string') {
+      const entry = this.tracked.get(id);
+      if (entry) {
+        clearTimeout(entry.timer);
+        this.tracked.delete(id);
+        entry.settle(buffer);
+        return true;
+      }
+      // Late answer to a tracked request that already failed with EIO — drop it.
+      return this.abandonedTracked.delete(id);
+    }
     if (id === this.pendingSeq) {
       if (this.pendingResolve) {
         this.clearTimer();
@@ -229,6 +374,96 @@ export class FollowerForwarder {
     if (this.timer !== null) {
       clearTimeout(this.timer);
       this.timer = null;
+    }
+  }
+}
+
+export interface SilenceWatchOptions {
+  silenceMs?: number;
+  minTimeouts?: number;
+  probeIntervalMs?: number;
+}
+
+/**
+ * Decides when a follower's leader has been silent long enough to take the lock from it.
+ *
+ * Fires `onSilent` when BOTH hold: at least {@link TAKEOVER_MIN_TIMEOUTS} requests timed out with
+ * no message from any leader port in between, and the first of them timed out at least
+ * {@link TAKEOVER_SILENCE_MS} ago. Any delivery resets it. While silent it calls `probe` every
+ * {@link PROBE_INTERVAL_MS}, so the evidence accumulates even when the app makes no calls.
+ *
+ * After firing it starts a fresh window rather than going quiet: the page may decline the takeover
+ * (a new leader announced itself meanwhile), and if that leader is silent too, it gets its own
+ * window and the follower asks again. The page keeps at most one takeover in flight.
+ */
+export class LeaderSilenceWatch implements ForwardObserver {
+  private silentSince = 0;
+  private timeouts = 0;
+  private probeTimer: ReturnType<typeof setInterval> | null = null;
+  private stopped = false;
+  private readonly silenceMs: number;
+  private readonly minTimeouts: number;
+  private readonly probeIntervalMs: number;
+
+  constructor(
+    private readonly onSilent: (info: { silentForMs: number; timeouts: number }) => void,
+    private readonly probe: () => void,
+    options: SilenceWatchOptions = {},
+  ) {
+    this.silenceMs = options.silenceMs ?? TAKEOVER_SILENCE_MS;
+    this.minTimeouts = options.minTimeouts ?? TAKEOVER_MIN_TIMEOUTS;
+    this.probeIntervalMs = options.probeIntervalMs ?? PROBE_INTERVAL_MS;
+  }
+
+  /** True while a timeout is outstanding and nothing has been heard since. */
+  get silent(): boolean {
+    return this.silentSince !== 0;
+  }
+
+  noteTimeout(): void {
+    if (this.stopped) return;
+    if (!this.silentSince) this.silentSince = Date.now();
+    this.timeouts++;
+    if (!this.probeTimer) {
+      this.probeTimer = setInterval(() => {
+        if (this.check()) return;
+        this.probe();
+      }, this.probeIntervalMs);
+    }
+    this.check();
+  }
+
+  noteResponse(): void {
+    this.silentSince = 0;
+    this.timeouts = 0;
+    this.stopProbing();
+  }
+
+  /** Stop for good (the relay became leader, or is going away). */
+  stop(): void {
+    this.stopped = true;
+    this.silentSince = 0;
+    this.timeouts = 0;
+    this.stopProbing();
+  }
+
+  /** Fire if the rule holds; returns true when it fired. */
+  private check(): boolean {
+    if (this.stopped || !this.silentSince) return false;
+    const silentForMs = Date.now() - this.silentSince;
+    if (this.timeouts < this.minTimeouts || silentForMs < this.silenceMs) return false;
+    const timeouts = this.timeouts;
+    // A fresh window, still probing — see the class note.
+    this.silentSince = Date.now();
+    this.timeouts = 0;
+    this.onSilent({ silentForMs, timeouts });
+    return true;
+  }
+
+  private stopProbing(): void {
+    if (this.probeTimer !== null) {
+      clearInterval(this.probeTimer);
+      this.probeTimer = null;
     }
   }
 }

@@ -53,6 +53,35 @@ const fs = new VFSFileSystem({ swUrl: './vfs-service-worker.js' });
 
 If you only use a single tab, the service worker is not needed — the tab always runs as the leader.
 
+## When the leader stops answering
+
+A follower's calls go to the leader tab and wait for its answer. If that answer never comes — the
+leader is a frozen background tab, a stale page, or its port was lost in the service worker — the
+follower does not wait forever:
+
+- **Every forwarded call has a deadline**, on both paths (sync calls with SharedArrayBuffer, and the
+  promise API without it): 10s on a port that has answered before, 1s on one that never has. A call
+  that misses it rejects with `EIO`, meaning *outcome unknown*: a write may or may not have been
+  applied, so it is not retried for you. A port that never answered also asks for a fresh
+  connection to the current leader.
+- **A leader that stays silent is taken over.** When at least 3 calls have timed out and nothing
+  has been heard from any leader for 15s (across reconnects), the follower takes the leader lock
+  with `navigator.locks.request(name, { steal: true })` and promotes itself. While the leader is
+  silent the follower checks it every 2.5s with a read-only request, so this happens even if your
+  app made only one call. Any answer, even a late one, resets the count, so a slow but live leader
+  is never taken over. Expect about 16s from the first unanswered call to the takeover when the
+  leader never answered this tab at all, and about 25s when it had been answering and then went
+  silent (calls and probes on a port that has answered wait the full 10s).
+- **The old leader steps down.** When its lock is stolen it stops serving, hands the volume back
+  (the same shutdown used when a page unloads) and carries on as a follower of the new leader.
+  Calls it was in the middle of reject with `EIO`.
+- **The worst case is an error, not a hang, and it clears.** The volume's exclusive handle means
+  two tabs can never write it at once. If the old leader is frozen and keeps the handle, the new
+  leader cannot open the volume: after the usual 15s volume-acquire deadline, `init()` and calls
+  reject with a clear error. It keeps the lock and retries every 2s, so when the old tab thaws
+  (it then steps down and hands the volume back), the new leader opens the volume and calls work
+  again, with no reload.
+
 ## Synchronous calls on Safari need a worker
 
 `Atomics.wait` is illegal on a page's main thread, so a sync call busy-spins instead. On Chromium

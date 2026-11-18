@@ -18,7 +18,7 @@ import type {
 } from './types.js';
 import { NodeReadable, NodeWritable } from './node-streams.js';
 import type { SyncRequestFn, AsyncRequestFn } from './methods/context.js';
-import { SAB_OFFSETS, SIGNAL, OP, READY_SAB_SIZE, encodeRequest, decodeResponse, CTRL_INT32S } from './protocol/opcodes.js';
+import { SAB_OFFSETS, SIGNAL, OP, STATUS, READY_SAB_SIZE, encodeRequest, decodeResponse, CTRL_INT32S } from './protocol/opcodes.js';
 import { acquireFsLock, releaseFsLock } from './protocol/fs-lock.js';
 
 // ---- Method imports ----
@@ -125,6 +125,8 @@ const SPIN_STALL_TIMEOUT_MS = 30_000;
  * and is still far longer than any real handle reclaim.
  */
 const VOLUME_ACQUIRE_DEADLINE_MS = 15_000;
+/** After a takeover's volume deadline passes, how often to keep trying to open the volume. */
+const TAKEOVER_RECOVERY_RETRY_MS = 2_000;
 
 /** How long observer records may sit before reaching the mirror (bounds external-change latency). */
 const EXTERNAL_FLUSH_MS = 250;
@@ -404,6 +406,23 @@ export class VFSFileSystem {
   private brokerSw: { postMessage(message: unknown, transfer?: Transferable[]): void } | null = null;
   private brokerControlPort: MessagePort | null = null;
   private leaderChangeBc: BroadcastChannel | null = null;
+  /** Bumped on every grant of the leader lock, so a stale grant's rejection is not mistaken for the current one's. */
+  private leaderLockGeneration = 0;
+  /** A steal of the leader lock from a silent leader is in flight — at most one at a time. */
+  private takeoverInFlight = false;
+  /** Set while handing the volume back after our lock was stolen. */
+  private steppingDown = false;
+  /** When a new leader last announced itself (`leader-changed`), 0 = never. */
+  private lastLeaderChangeAt = 0;
+  /**
+   * Set while promoting after a takeover, until the volume opens. Changes what happens when the
+   * volume-acquire deadline passes: report the failure but keep the lock and keep retrying, because
+   * the handle is almost certainly held by the frozen leader we took over from, which hands it back
+   * when it thaws (see {@link retryVolumeOpen}).
+   */
+  private takeoverPromotion = false;
+  /** The failure reported while a takeover waits for the volume; cleared when it opens. */
+  private takeoverError: Error | null = null;
 
   // Bound request functions for method delegation
   private _sync: SyncRequestFn = (buf) => this.syncRequest(buf);
@@ -502,70 +521,94 @@ export class VFSFileSystem {
     this.installUnloadTeardown();
     void this.watchExternalChanges();
 
-    // Handle messages from sync-relay
-    this.syncWorker.onmessage = (e: MessageEvent) => {
-      const msg = e.data;
-      // The relay's port to the leader went unanswered. `leader-changed` is announced once, so a
-      // follower that arrived after the announcement has no other way to find the current leader.
-      if (msg.type === 'need-leader') {
-        if (this.isFollower && !this.closed) this.connectToLeader();
-        return;
-      }
-      if (msg.type === 'ready') {
-        this.isReady = true;
-        this.transitioning = false;
-        // Opened — so a later volume handoff starts from the fast retry again,
-        // and gets its own full deadline rather than inheriting this one's clock.
-        this.volumeRetryDelayMs = 0;
-        this.volumeRetryStartedAt = 0;
-        // Initialize async-relay AFTER sync-relay is ready to avoid
-        // requests arriving before the leader loop is running.
-        this.initAsyncRelay();
-        this.resolveReady();
-        this.fireReadyListeners();
-        if (!this.isFollower) {
-          this.initLeaderBroker();
-        }
-      } else if (msg.type === 'init-failed') {
-        if (msg.error?.startsWith('Corrupt VFS:')) {
-          this.handleCorruptVFS(msg.error);
-        } else if (this.holdingLeaderLock) {
-          // We hold the lock but the OPFS handle has not been released yet — retry.
-          //
-          // Backed off from a flat 500ms, because that interval is the whole cost when the
-          // handle is released a moment after the first attempt: the boot waits out the rest
-          // of the tick for nothing. A departing leader now hands the volume back explicitly
-          // (see installUnloadTeardown), so the common case is "free within a few ms" — but a
-          // tab that was killed, crashed, or force-quit never got to say anything, and only
-          // the browser's own reclaim ends that wait. Start fast for the first case, and grow
-          // to the old interval so the second cannot spin.
-          if (this.retryVolumeOpen(msg.error)) {
-            setTimeout(() => this.sendLeaderInit(), this.volumeRetryDelayMs);
-          }
-        } else if (!('locks' in navigator)) {
-          // No Web Locks fallback — become follower via OPFS handle detection
-          this.startAsFollower();
-        }
-      }
-    };
-
-    // Handle async responses from async-relay
-    this.asyncWorker.onmessage = (e: MessageEvent) => {
-      const msg = e.data;
-      if (msg.type === 'response') {
-        const pending = this.asyncPending.get(msg.callId);
-        if (pending) {
-          this.asyncPending.delete(msg.callId);
-          pending.resolve({ status: msg.status, data: msg.data });
-        }
-      }
-    };
+    this.syncWorker.onmessage = (e: MessageEvent) => this.onSyncRelayMessage(e);
+    this.asyncWorker.onmessage = (e: MessageEvent) => this.onAsyncRelayMessage(e);
 
     // Async-relay is initialized later in the 'ready' handler to avoid
     // requests arriving before the sync-relay's leader loop is running.
 
     // Leader election via Web Locks
     this.acquireLeaderLock();
+  }
+
+  /**
+   * Messages from the sync relay of a first-started instance, and of a leader that stepped down
+   * and became a follower again (see {@link stepDownFromLeader}).
+   */
+  private onSyncRelayMessage(e: MessageEvent): void {
+    const msg = e.data;
+    // The relay's port to the leader went unanswered. `leader-changed` is announced once, so a
+    // follower that arrived after the announcement has no other way to find the current leader.
+    if (msg.type === 'need-leader') {
+      if (this.isFollower && !this.closed) this.connectToLeader();
+      return;
+    }
+    // The leader has stayed silent long enough to rule out a slow operation — take over.
+    if (msg.type === 'leader-silent') {
+      this.takeOverSilentLeader(Number(msg.silentForMs) || 0);
+      return;
+    }
+    if (msg.type === 'ready') {
+      this.isReady = true;
+      this.transitioning = false;
+      // Opened — so a later volume handoff starts from the fast retry again,
+      // and gets its own full deadline rather than inheriting this one's clock.
+      this.volumeRetryDelayMs = 0;
+      this.volumeRetryStartedAt = 0;
+      // Initialize async-relay AFTER sync-relay is ready to avoid
+      // requests arriving before the leader loop is running.
+      this.initAsyncRelay();
+      this.resolveReady();
+      this.fireReadyListeners();
+      if (!this.isFollower) {
+        this.initLeaderBroker();
+      }
+    } else if (msg.type === 'init-failed') {
+      if (msg.error?.startsWith('Corrupt VFS:')) {
+        this.handleCorruptVFS(msg.error);
+      } else if (this.holdingLeaderLock) {
+        // We hold the lock but the OPFS handle has not been released yet — retry.
+        //
+        // Backed off from a flat 500ms, because that interval is the whole cost when the
+        // handle is released a moment after the first attempt: the boot waits out the rest
+        // of the tick for nothing. A departing leader now hands the volume back explicitly
+        // (see installUnloadTeardown), so the common case is "free within a few ms" — but a
+        // tab that was killed, crashed, or force-quit never got to say anything, and only
+        // the browser's own reclaim ends that wait. Start fast for the first case, and grow
+        // to the old interval so the second cannot spin.
+        if (this.retryVolumeOpen(msg.error)) {
+          setTimeout(() => this.sendLeaderInit(), this.volumeRetryDelayMs);
+        }
+      } else if (!('locks' in navigator)) {
+        // No Web Locks fallback — become follower via OPFS handle detection
+        this.startAsFollower();
+      }
+    }
+  }
+
+  /** Async-relay responses: settle the matching promise-API call. */
+  private onAsyncRelayMessage(e: MessageEvent): void {
+    const msg = e.data;
+    if (msg.type === 'response') {
+      const pending = this.asyncPending.get(msg.callId);
+      if (pending) {
+        this.asyncPending.delete(msg.callId);
+        pending.resolve({ status: msg.status, data: msg.data });
+      }
+    }
+  }
+
+  /**
+   * Settle every promise-API call still waiting on a relay that is being terminated.
+   *
+   * A terminated async relay never answers, so a call it was carrying would stay pending for
+   * good. Its outcome is unknown — it may have reached the leader — which is what EIO says.
+   */
+  private failAsyncPending(): void {
+    if (this.asyncPending.size === 0) return;
+    const pending = [...this.asyncPending.values()];
+    this.asyncPending.clear();
+    for (const call of pending) call.resolve({ status: STATUS.EIO, data: null });
   }
 
   /** Use Web Locks API for leader election. The tab that acquires the lock is
@@ -580,11 +623,12 @@ export class VFSFileSystem {
     // Chrome can invoke the ifAvailable callback twice (once with lock, once
     // with null). The `decided` flag ensures only the first invocation acts.
     let decided = false;
+    let generation = 0;
     navigator.locks.request(`${this.ns}-leader`, { ifAvailable: true }, async (lock) => {
       if (decided) return;
       decided = true;
       if (lock) {
-        this.holdingLeaderLock = true;
+        generation = this.beginLeaderLockHold();
         this.startAsLeader();
         // Held until the tab closes *or* the instance is disposed. It used to be
         // `new Promise(() => {})` — never resolved — so a disposed leader kept the lock for the
@@ -592,12 +636,40 @@ export class VFSFileSystem {
         // leader whose workers were already terminated, and its first synchronous call spun until
         // the 30s stall guard. Creating and disposing instances in a loop is exactly what
         // `dispose` is documented for, so the lock has to come back.
-        await new Promise<void>((resolve) => { this.releaseLeaderLock = resolve; });
+        await this.leaderLockHeld();
       } else {
         this.startAsFollower();
         this.waitForLeaderLock();
       }
-    });
+    }).catch((err) => this.onLeaderLockLost(err, generation));
+  }
+
+  /** Mark the leader lock as held by this instance; returns the grant's generation. */
+  private beginLeaderLockHold(): number {
+    this.holdingLeaderLock = true;
+    return ++this.leaderLockGeneration;
+  }
+
+  /** The promise a granted lock callback awaits: resolving it ({@link releaseLeaderLock}) gives the lock back. */
+  private leaderLockHeld(): Promise<void> {
+    return new Promise<void>((resolve) => { this.releaseLeaderLock = resolve; });
+  }
+
+  /**
+   * A leader-lock request settled with an error.
+   *
+   * The one that matters: another instance took the lock with `steal` (see
+   * {@link takeOverSilentLeader}). The browser then rejects the holder's request with an
+   * `AbortError` — while this instance's relay still has the volume open and is still serving.
+   * It has to stop and hand the volume back, or two instances would both believe they own it.
+   * Anything else — a queued bid aborted on dispose, a request that was never granted, a grant
+   * this instance has since replaced — needs nothing.
+   */
+  private onLeaderLockLost(err: unknown, generation: number): void {
+    if (!generation || generation !== this.leaderLockGeneration) return;
+    if ((err as { name?: unknown } | null)?.name !== 'AbortError') return;
+    if (this.closed || !this.holdingLeaderLock) return;
+    void this.stepDownFromLeader();
   }
 
   /** Queue for leader takeover when the current leader's lock is released */
@@ -607,13 +679,162 @@ export class VFSFileSystem {
     // leader goes away, taking ownership of a volume it can no longer serve.
     const bid = new AbortController();
     this.leaderLockBid = bid;
+    let generation = 0;
     navigator.locks.request(`${this.ns}-leader`, { signal: bid.signal }, async () => {
-      this.leaderLockBid = null;
+      if (this.leaderLockBid === bid) this.leaderLockBid = null;
       if (this.closed) return;
-      this.holdingLeaderLock = true;
+      generation = this.beginLeaderLockHold();
       this.promoteToLeader();
-      await new Promise<void>((resolve) => { this.releaseLeaderLock = resolve; });
-    }).catch(() => { /* aborted on dispose, or the page is going away */ });
+      await this.leaderLockHeld();
+    }).catch((err) => {
+      // Aborted on dispose or by a takeover (never granted: nothing to do), the page is going
+      // away — or granted and later stolen, which is the one case that needs a step-down.
+      this.onLeaderLockLost(err, generation);
+    });
+  }
+
+  /**
+   * Take the leader lock from a leader that has stopped answering.
+   *
+   * Asked for by the sync relay (`leader-silent`) once the leader has been silent for
+   * `TAKEOVER_SILENCE_MS` across at least `TAKEOVER_MIN_TIMEOUTS` timed-out requests and
+   * reconnects — see follower-forward.ts. Without this, a page that started as a follower of a
+   * frozen or stale tab waited behind it for good: the lock was held, so it was never promoted,
+   * and nothing it asked for was ever answered.
+   *
+   * `steal` releases the current holder's lock and grants it here, ahead of any queue. The old
+   * holder's request rejects with an `AbortError`, on which it steps down and gives the volume
+   * back ({@link stepDownFromLeader}). This instance then promotes through the ordinary path, so
+   * opening the volume uses the same retry and deadline as any handoff: if the old holder never
+   * lets go of its handle, the promotion fails with a clear error after `VOLUME_ACQUIRE_DEADLINE_MS`
+   * instead of hanging. The volume's exclusive sync access handle is what keeps two instances from
+   * ever writing it at once, whatever the locks say.
+   *
+   * Only with Web Locks, never once closed, at most one in flight, and not when a new leader has
+   * announced itself during the silence (it gets its own window first).
+   */
+  private takeOverSilentLeader(silentForMs: number): void {
+    if (this.closed || !this.isFollower || this.takeoverInFlight) return;
+    if (typeof navigator === 'undefined' || !('locks' in navigator)) return;
+    if (this.lastLeaderChangeAt && Date.now() - this.lastLeaderChangeAt < silentForMs) return;
+
+    this.takeoverInFlight = true;
+    console.warn(`[VFS] The leader has not answered for ${Math.round(silentForMs / 1000)}s — taking over the leader lock`);
+
+    // The steal replaces the queued bid. Left queued, the bid would be granted later to an
+    // instance that already leads.
+    const bid = this.leaderLockBid;
+    this.leaderLockBid = null;
+    bid?.abort();
+
+    let generation = 0;
+    navigator.locks.request(`${this.ns}-leader`, { steal: true }, async () => {
+      this.takeoverInFlight = false;
+      if (this.closed) return;   // returning gives the stolen lock straight back
+      generation = this.beginLeaderLockHold();
+      this.takeoverPromotion = true;
+      this.promoteToLeader();
+      await this.leaderLockHeld();
+    }).catch((err) => {
+      this.takeoverInFlight = false;
+      if (!generation) {
+        // Never granted (a browser without `steal`, say): queue an ordinary bid again, so this
+        // instance is at least promoted when the lock does come free.
+        if (!this.closed && this.isFollower && !this.leaderLockBid) this.waitForLeaderLock();
+        return;
+      }
+      this.onLeaderLockLost(err, generation);
+    });
+  }
+
+  /**
+   * Stop serving after another instance stole the leader lock, then carry on as a follower.
+   *
+   * In order: stop accepting followers (broker heartbeat, control port, the broker's slot — only
+   * if it is still ours), give the volume back through the same `shutdown` the unload path uses
+   * (the relay closes its exclusive handle before anything else), terminate both relays, and fail
+   * any promise-API call they were carrying with EIO — it may or may not have been applied.
+   *
+   * Then this instance becomes a follower of the new leader, with fresh relays, and queues for the
+   * lock again. That is the existing follower start, the one a second tab uses, so nothing here is
+   * a new state: callers waiting on `whenReady()`/`init()` see the next `ready`, and a later
+   * promise call goes to the new leader. Ending closed instead would turn one tab's recovery into
+   * the other tab's outage.
+   */
+  private async stepDownFromLeader(): Promise<void> {
+    if (this.closed || this.isFollower || this.steppingDown) return;
+    this.steppingDown = true;
+    try {
+      console.warn('[VFS] Another tab took over the leader lock — handing the volume back and continuing as a follower');
+      this.holdingLeaderLock = false;
+      // Lets the stolen grant's callback finish; the browser has already released the lock.
+      const release = this.releaseLeaderLock;
+      this.releaseLeaderLock = null;
+      release?.();
+
+      this.isFollower = true;
+      this.isReady = false;
+      this.transitioning = true;
+      // A takeover still waiting for the volume is over; its failure no longer applies.
+      this.clearTakeoverFailure();
+      this.resetReadyPromise();
+
+      if (this.brokerHeartbeatTimer) {
+        clearInterval(this.brokerHeartbeatTimer);
+        this.brokerHeartbeatTimer = null;
+      }
+      if (this.brokerControlPort) {
+        try { this.brokerControlPort.close(); } catch { /* ignore */ }
+        this.brokerControlPort = null;
+      }
+      this.brokerInitialized = false;
+      this.deregisterBroker();
+
+      await this.shutdownRelay();
+      terminateWorker(this.syncWorker);
+      terminateWorker(this.asyncWorker);
+      this.failAsyncPending();
+      if (this.closed) return;   // disposed meanwhile: dispose does the rest
+
+      this.volumeRetryDelayMs = 0;
+      this.volumeRetryStartedAt = 0;
+      this.spawnRelays();
+      this.syncWorker.onmessage = (e: MessageEvent) => this.onSyncRelayMessage(e);
+      this.asyncWorker.onmessage = (e: MessageEvent) => this.onAsyncRelayMessage(e);
+      this.startAsFollower();
+      this.waitForLeaderLock();
+    } finally {
+      this.steppingDown = false;
+    }
+  }
+
+  /**
+   * End a takeover's promotion. If its volume deadline had passed, the failure it reported is
+   * withdrawn: `readyPromise` was rejected with it, so callers get a fresh one (the caller resolves
+   * it on `ready`, or a later transition settles it), and sync calls stop throwing it.
+   */
+  private clearTakeoverFailure(): void {
+    this.takeoverPromotion = false;
+    if (!this.takeoverError) return;
+    if (this.initError === this.takeoverError) {
+      this.initError = null;
+      this.resetReadyPromise();
+    }
+    this.takeoverError = null;
+  }
+
+  /** Fresh SABs (when available) and fresh relay workers, for a role change. */
+  private spawnRelays(): void {
+    const sabSize = this.config.sabSize;
+    if (this.hasSAB) {
+      this.sab = new SharedArrayBuffer(sabSize);
+      this.readySab = new SharedArrayBuffer(READY_SAB_SIZE);
+      this.asyncSab = new SharedArrayBuffer(sabSize);
+      this.ctrl = new Int32Array(this.sab, 0, CTRL_INT32S);
+      this.readySignal = new Int32Array(this.readySab, 0, 1);
+    }
+    this.syncWorker = this.spawnWorker('sync-relay');
+    this.asyncWorker = this.spawnWorker('async-relay');
   }
 
   /** Send init-leader message to sync-relay worker */
@@ -706,6 +927,32 @@ export class VFSFileSystem {
       // Start fast — the common case frees within a few ms — then grow, so a
       // holder that never lets go cannot spin the timer.
       this.volumeRetryDelayMs = Math.min((this.volumeRetryDelayMs || 0) * 2 || 25, 500);
+      return true;
+    }
+
+    if (this.takeoverPromotion) {
+      // After a takeover the handle is held by the leader we took over from: it was silent, so it
+      // is most likely frozen, and it gives the handle back when it thaws (its stolen lock makes it
+      // step down — see stepDownFromLeader). Giving up here for good would leave this tab broken
+      // even after that, where before the takeover it would simply have resumed. So: report the
+      // failure — `init()`, waiting promise calls and sync calls reject with it, rather than hang —
+      // but keep the lock and keep trying, slowly. The next `ready` clears the failure.
+      if (!this.initError) {
+        const err = new Error(
+          `Took over from a leader that stopped answering, but could not open the volume after `
+          + `${Math.round((now - this.volumeRetryStartedAt) / 1000)}s: ${error ?? 'unknown error'}. `
+          + `The previous leader still holds it (a frozen tab, most likely); retrying until it lets go.`,
+        );
+        console.error(`[VFS] ${label}: ${err.message}`);
+        this.initError = err;
+        this.takeoverError = err;
+        this.rejectReady(err);
+        if (this.hasSAB) {
+          Atomics.store(this.readySignal, 0, -1);
+          Atomics.notify(this.readySignal, 0);
+        }
+      }
+      this.volumeRetryDelayMs = TAKEOVER_RECOVERY_RETRY_MS;
       return true;
     }
 
@@ -807,8 +1054,11 @@ export class VFSFileSystem {
     this.connectToLeader();
 
     // Listen for leader changes (BroadcastChannel is scope-independent, unlike SW clients API)
+    this.leaderChangeBc?.close();
     this.leaderChangeBc = new BroadcastChannel(`${this.ns}-leader-change`);
     this.leaderChangeBc.onmessage = () => {
+      // A takeover waits while a newly announced leader has not had a full silence window.
+      this.lastLeaderChangeAt = Date.now();
       if (this.isFollower) {
         console.log('[VFS] Leader changed — reconnecting');
         this.connectToLeader();
@@ -941,7 +1191,9 @@ export class VFSFileSystem {
         // GC-eligible. The onmessage listener doesn't keep port1 alive — a
         // port that can't receive messages can't fire events.
         const mc = new MessageChannel();
-        sw.postMessage({ type: 'register-server' }, [mc.port2]);
+        // `serverId` lets a deregister from a leader that has since been replaced leave the
+        // new leader's registration alone (see deregisterBroker).
+        sw.postMessage({ type: 'register-server', serverId: this.tabId }, [mc.port2]);
 
         mc.port1.onmessage = (event: MessageEvent) => {
           if (event.data.type === 'client-port') {
@@ -1008,23 +1260,14 @@ export class VFSFileSystem {
     // Reset readyPromise for async callers during transition
     this.resetReadyPromise();
 
-    // Terminate old workers
+    // Terminate old workers. Calls the old async relay was carrying were going to the old leader
+    // and can no longer be answered: they fail with EIO rather than stay pending forever.
     terminateWorker(this.syncWorker);
     terminateWorker(this.asyncWorker);
+    this.failAsyncPending();
 
-    // Allocate fresh SABs (only if available)
-    const sabSize = this.config.sabSize;
-    if (this.hasSAB) {
-      this.sab = new SharedArrayBuffer(sabSize);
-      this.readySab = new SharedArrayBuffer(READY_SAB_SIZE);
-      this.asyncSab = new SharedArrayBuffer(sabSize);
-      this.ctrl = new Int32Array(this.sab, 0, CTRL_INT32S);
-      this.readySignal = new Int32Array(this.readySab, 0, 1);
-    }
-
-    // Spawn new workers
-    this.syncWorker = this.spawnWorker('sync-relay');
-    this.asyncWorker = this.spawnWorker('async-relay');
+    // Fresh SABs (only if available) and workers
+    this.spawnRelays();
 
     // Handle sync-relay messages
     this.syncWorker.onmessage = (e: MessageEvent) => {
@@ -1038,6 +1281,7 @@ export class VFSFileSystem {
         // attempt — the ordinary handoff this retries for, failed as though it were permanent.
         this.volumeRetryDelayMs = 0;
         this.volumeRetryStartedAt = 0;
+        this.clearTakeoverFailure();
         this.resolveReady();
         this.fireReadyListeners();
         this.initLeaderBroker();
@@ -1045,22 +1289,19 @@ export class VFSFileSystem {
         if (msg.error?.startsWith('Corrupt VFS:')) {
           this.handleCorruptVFS(msg.error);
         } else if (this.retryVolumeOpen(msg.error, 'Promotion')) {
-          setTimeout(() => this.sendLeaderInit(), this.volumeRetryDelayMs);
+          // Only while this is still the promoting leader on these relays: a takeover's retries
+          // can outlive a step-down or a dispose, and must not send `init-leader` to what follows.
+          const worker = this.syncWorker;
+          setTimeout(() => {
+            if (this.closed || this.isFollower || this.syncWorker !== worker) return;
+            this.sendLeaderInit();
+          }, this.volumeRetryDelayMs);
         }
       }
     };
 
     // Handle async responses
-    this.asyncWorker.onmessage = (e: MessageEvent) => {
-      const msg = e.data;
-      if (msg.type === 'response') {
-        const pending = this.asyncPending.get(msg.callId);
-        if (pending) {
-          this.asyncPending.delete(msg.callId);
-          pending.resolve({ status: msg.status, data: msg.data });
-        }
-      }
-    };
+    this.asyncWorker.onmessage = (e: MessageEvent) => this.onAsyncRelayMessage(e);
 
     if (this.hasSAB) {
       // Initialize async-relay with SAB
@@ -2087,10 +2328,14 @@ export class VFSFileSystem {
       this.brokerHeartbeatTimer = null;
     }
     this.deregisterBroker();
+    // A disposed follower must not reconnect (or keep a channel open) when a leader announces itself.
+    this.leaderChangeBc?.close();
+    this.leaderChangeBc = null;
 
     await this.shutdownRelay();
     terminateWorker(this.syncWorker);
     terminateWorker(this.asyncWorker);
+    this.failAsyncPending();
     // Last, so a tab promoted by this release does not race the relay we just shut down.
     this.leaderLockBid?.abort();
     this.leaderLockBid = null;
@@ -2111,7 +2356,9 @@ export class VFSFileSystem {
    */
   private deregisterBroker(): void {
     if (!this.brokerSw) return;
-    try { this.brokerSw.postMessage({ type: 'deregister-server' }); } catch { /* SW already gone */ }
+    // Carries this instance's id: a leader that steps down after its lock was stolen may be
+    // deregistering after the new leader registered, and must not clear that registration.
+    try { this.brokerSw.postMessage({ type: 'deregister-server', serverId: this.tabId }); } catch { /* SW already gone */ }
     this.brokerSw = null;
   }
 
@@ -2185,6 +2432,7 @@ export class VFSFileSystem {
     await this.shutdownRelay();
     terminateWorker(this.syncWorker);
     terminateWorker(this.asyncWorker);
+    this.failAsyncPending();
 
     const sabSize = this.config.sabSize;
     if (this.hasSAB) {

@@ -5,7 +5,8 @@
  * Uses MessagePorts for all communication (no clients.get() / scope dependency).
  *
  * Protocol:
- *   Leader:   { type: 'register-server' } + [controlPort]
+ *   Leader:   { type: 'register-server', serverId } + [controlPort]
+ *             { type: 'deregister-server', serverId }  (ignored unless serverId is the registered one)
  *   Follower: { type: 'transfer-port', tabId } + [dataPort]
  *   → Leader receives on controlPort: { type: 'client-port', tabId } + [dataPort]
  */
@@ -16,6 +17,8 @@ const sw = self as unknown as ServiceWorkerGlobalScope;
 
 // Leader's control port — used to forward follower ports to the leader
 let serverPort: MessagePort | null = null;
+// Which leader registered it (absent from leaders older than 4.3.6)
+let serverId: string | null = null;
 
 // Ports received before the leader registered
 const pending: Array<{ tabId: string; port: MessagePort }> = [];
@@ -37,6 +40,7 @@ sw.addEventListener('message', (event: ExtendableMessageEvent) => {
     // Leader sends a control port for receiving follower ports
     serverPort = event.ports[0];
     if (!serverPort) return;
+    serverId = typeof msg.serverId === 'string' ? msg.serverId : null;
 
     // Flush any ports that arrived before the leader registered
     while (pending.length > 0) {
@@ -55,8 +59,15 @@ sw.addEventListener('message', (event: ExtendableMessageEvent) => {
   // posting to a detached port is a silent no-op per spec — so a follower's port vanished instead
   // of being queued, and its next call waited out the full 10s forward deadline before returning
   // EIO. Clearing the slot puts arrivals back on `pending`, where the next leader flushes them.
+  //
+  // Only the registered leader's deregister counts. A leader whose lock was stolen (a follower
+  // took over from it while it was frozen) steps down whenever it next runs, which can be after
+  // the new leader has registered — clearing the slot then would drop every follower's port until
+  // the new leader's next heartbeat. A message without an id (an older leader) still clears it.
   if (msg.type === 'deregister-server') {
+    if (typeof msg.serverId === 'string' && serverId !== null && msg.serverId !== serverId) return;
     serverPort = null;
+    serverId = null;
     return;
   }
 

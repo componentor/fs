@@ -22,8 +22,8 @@
 
 import { VFSEngine } from '../vfs/engine.js';
 import { OPFSEngine } from '../opfs-engine.js';
-import { SAB_OFFSETS, SIGNAL, OP, STATUS, decodeRequest, decodeSecondPath, encodeResponse, CTRL_INT32S } from '../protocol/opcodes.js';
-import { FollowerForwarder } from '../protocol/follower-forward.js';
+import { SAB_OFFSETS, SIGNAL, OP, STATUS, decodeRequest, decodeSecondPath, encodeRequest, encodeResponse, CTRL_INT32S } from '../protocol/opcodes.js';
+import { FollowerForwarder, LeaderSilenceWatch } from '../protocol/follower-forward.js';
 import { waitWhile, SAB_WAIT_DEADLINE_MS } from '../protocol/sab-wait.js';
 import { planRenameMirror, planPendingReroutes, resolveLinkTarget, registerLink, deregisterLink, collectKeysUnder } from './opfs-sync-plan.js';
 
@@ -290,8 +290,22 @@ const forwarder = new FollowerForwarder(() => tabId, undefined, () => {
   (self as unknown as Worker).postMessage({ type: 'need-leader' });
 });
 
-// No-SAB mode: async-relay port (for forwarding in follower mode)
-let asyncRelayPort: MessagePort | null = null;
+// A leader that never answers is taken over rather than waited on forever. The watch counts
+// timeouts against deliveries across reconnects, probes the leader with a read-only EXISTS while
+// it is silent (so the app need not keep calling), and asks the page to steal the leader lock once
+// the silence rules out a slow operation. The page decides — it owns `navigator.locks`, knows
+// whether the instance is closed, and keeps at most one takeover in flight.
+const silenceWatch = new LeaderSilenceWatch(
+  ({ silentForMs, timeouts }) => {
+    if (leaderInitialized) return;
+    (self as unknown as Worker).postMessage({ type: 'leader-silent', silentForMs, timeouts });
+  },
+  () => {
+    if (leaderInitialized || !forwarder.hasPort) return;
+    forwarder.forwardTracked(encodeRequest(OP.EXISTS, '/'), () => { /* the answer is the point, not its content */ });
+  },
+);
+forwarder.observe(silenceWatch);
 
 function forwardToLeader(payload: Uint8Array): Promise<ArrayBuffer> {
   return forwarder.forward(payload);
@@ -299,12 +313,10 @@ function forwardToLeader(payload: Uint8Array): Promise<ArrayBuffer> {
 
 function onLeaderMessage(e: MessageEvent): void {
   if (e.data.buffer instanceof ArrayBuffer) {
-    // Sequence-matched sync response (or late echo of an abandoned one)?
-    if (forwarder.handleResponse(e.data.id, e.data.buffer)) return;
-    if (asyncRelayPort) {
-      // No-SAB follower: forward response back to async-relay
-      asyncRelayPort.postMessage({ id: e.data.id, buffer: e.data.buffer }, [e.data.buffer]);
-    }
+    // Every response the leader sends is one of the forwarder's: a sequence-matched sync
+    // response, a tracked no-SAB response, or the late echo of either after its deadline.
+    // Anything unmatched belongs to a request that has already been answered, so it is dropped.
+    forwarder.handleResponse(e.data.id, e.data.buffer);
   }
 }
 
@@ -1776,7 +1788,6 @@ self.onmessage = async (e: MessageEvent) => {
   if (msg.type === 'async-port') {
     const port = msg.port ?? e.ports[0];
     if (port) {
-      asyncRelayPort = port;
       port.onmessage = async (ev: MessageEvent) => {
         if (ev.data.buffer instanceof ArrayBuffer) {
           if (leaderInitialized) {
@@ -1787,13 +1798,16 @@ self.onmessage = async (e: MessageEvent) => {
             const response = encodeResponse(result.status, result.data);
             port.postMessage({ id: ev.data.id, buffer: response }, [response]);
             if (!opfsMode && result._op !== undefined) notifyOPFSSync(result._op, result._path!, result._newPath);
-          } else if (forwarder.hasPort) {
-            // Follower mode: forward to leader via leader port. Not tracked
-            // by the forwarder — the async-relay matches responses by its
-            // own string ids (which can never collide with the forwarder's
-            // numeric sequence ids).
-            const buf = ev.data.buffer;
-            forwarder.postRaw({ id: ev.data.id, tabId, buffer: buf }, [buf]);
+          } else {
+            // Follower mode: forward to the leader, tracked. It used to be posted raw, with no
+            // deadline, so a leader that never answered (a frozen or stale tab holding the lock)
+            // left the promise API pending forever. Now it settles: the leader's answer, or EIO
+            // after the deadline (outcome unknown, no retry) — and with no leader port at all,
+            // EIO at once rather than a request dropped on the floor.
+            const id = ev.data.id;
+            forwarder.forwardTracked(ev.data.buffer, (response) => {
+              port.postMessage({ id, buffer: response }, [response]);
+            });
           }
         }
       };
@@ -1806,6 +1820,7 @@ self.onmessage = async (e: MessageEvent) => {
   if (msg.type === 'init-leader') {
     if (leaderInitialized) return; // Prevent duplicate init during async gap
     leaderInitialized = true;
+    silenceWatch.stop();
 
     tabId = msg.tabId;
     const hasSAB = msg.sab != null;
@@ -1858,6 +1873,7 @@ self.onmessage = async (e: MessageEvent) => {
     // Reset guards for re-init (corruption fallback or mode=opfs)
     leaderInitialized = true;
     readySent = false;
+    silenceWatch.stop();
 
     tabId = msg.tabId;
     const hasSAB = msg.sab != null;
@@ -1984,6 +2000,9 @@ self.onmessage = async (e: MessageEvent) => {
   // happen here, and the order between them is the whole point: the volume's exclusive handle goes
   // back to the origin, and the mirror worker gets told to stop rather than being killed mid-write.
   if (msg.type === 'shutdown') {
+    // A follower shutting down stops probing and answers what it still has in flight.
+    silenceWatch.stop();
+    forwarder.abortTracked();
     // The volume goes back FIRST, before anything that can await.
     //
     // This handler also runs on `pagehide`, where the page has a moment rather than a
